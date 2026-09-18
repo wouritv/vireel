@@ -1,3 +1,10 @@
+import asyncio
+import json
+import subprocess
+import sys
+import types
+from unittest.mock import MagicMock
+
 import pytest
 
 import film_summary as fs
@@ -63,32 +70,37 @@ def test_validate_technical_constraints_passes_for_valid_media():
 
 
 def test_validate_technical_constraints_rejects_oversized_file():
+    kwargs = _valid_technical_kwargs(size_bytes=30 * 1024 ** 3)
     with pytest.raises(fs.FilmSummaryValidationError) as exc_info:
-        fs.validate_technical_constraints(**_valid_technical_kwargs(size_bytes=30 * 1024 ** 3))
+        fs.validate_technical_constraints(**kwargs)
     assert exc_info.value.code == fs.FilmSummaryErrorCode.SOURCE_TOO_LARGE
 
 
 def test_validate_technical_constraints_rejects_too_short():
+    kwargs = _valid_technical_kwargs(duration_seconds=60)
     with pytest.raises(fs.FilmSummaryValidationError) as exc_info:
-        fs.validate_technical_constraints(**_valid_technical_kwargs(duration_seconds=60))
+        fs.validate_technical_constraints(**kwargs)
     assert exc_info.value.code == fs.FilmSummaryErrorCode.SOURCE_TOO_SHORT
 
 
 def test_validate_technical_constraints_rejects_too_long():
+    kwargs = _valid_technical_kwargs(duration_seconds=100000)
     with pytest.raises(fs.FilmSummaryValidationError) as exc_info:
-        fs.validate_technical_constraints(**_valid_technical_kwargs(duration_seconds=100000))
+        fs.validate_technical_constraints(**kwargs)
     assert exc_info.value.code == fs.FilmSummaryErrorCode.SOURCE_TOO_LONG
 
 
 def test_validate_technical_constraints_rejects_missing_video_track():
+    kwargs = _valid_technical_kwargs(has_video_track=False)
     with pytest.raises(fs.FilmSummaryValidationError) as exc_info:
-        fs.validate_technical_constraints(**_valid_technical_kwargs(has_video_track=False))
+        fs.validate_technical_constraints(**kwargs)
     assert exc_info.value.code == fs.FilmSummaryErrorCode.NO_VIDEO_TRACK
 
 
 def test_validate_technical_constraints_rejects_missing_audio_track():
+    kwargs = _valid_technical_kwargs(has_audio_track=False)
     with pytest.raises(fs.FilmSummaryValidationError) as exc_info:
-        fs.validate_technical_constraints(**_valid_technical_kwargs(has_audio_track=False))
+        fs.validate_technical_constraints(**kwargs)
     assert exc_info.value.code == fs.FilmSummaryErrorCode.NO_AUDIO_TRACK
 
 
@@ -372,6 +384,379 @@ def test_build_tts_instructions_substitutes_language():
     instructions = fs.build_tts_instructions("French")
     assert "fluent French" in instructions
     assert "{{LANGUAGE}}" not in instructions
+
+
+# ---------------------------------------------------------------------------
+# classify_media_type (network call mocked)
+# ---------------------------------------------------------------------------
+
+def _fake_openai_response(content, prompt_tokens=10, completion_tokens=5):
+    fake_message = types.SimpleNamespace(content=content)
+    fake_choice = types.SimpleNamespace(message=fake_message)
+    fake_usage = types.SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+    return types.SimpleNamespace(choices=[fake_choice], usage=fake_usage)
+
+
+def test_classify_media_type_raises_when_api_key_missing(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(RuntimeError):
+        asyncio.run(fs.classify_media_type(metadata={}, transcript_sample="", scene_stats={}))
+
+
+def test_classify_media_type_returns_verdict_with_usage(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    response = _fake_openai_response(
+        '{"is_film": true, "confidence": 0.9, "estimated_category": "narrative_film", '
+        '"positive_signals": [], "negative_signals": [], "reason_code": "accepted", '
+        '"user_message": "", "requires_secondary_review": false}'
+    )
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = response
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    verdict = asyncio.run(fs.classify_media_type(metadata={"duration_seconds": 3600}, transcript_sample="hello", scene_stats={}))
+
+    assert verdict["is_film"] is True
+    assert verdict["usage"]["prompt_tokens"] == 10
+
+
+def test_classify_media_type_sends_keyframes_as_image_content(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    response = _fake_openai_response(
+        '{"is_film": false, "confidence": 0.9, "estimated_category": "interview", '
+        '"positive_signals": [], "negative_signals": [], "reason_code": "not_narrative", '
+        '"user_message": "", "requires_secondary_review": false}'
+    )
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = response
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    asyncio.run(fs.classify_media_type(
+        metadata={}, transcript_sample="", scene_stats={}, keyframe_data_urls=["data:image/jpeg;base64,AA=="],
+    ))
+
+    sent_messages = fake_client.chat.completions.create.call_args.kwargs["messages"]
+    user_content = sent_messages[-1]["content"]
+    assert isinstance(user_content, list)
+    assert any(part.get("type") == "image_url" for part in user_content)
+
+
+def test_classify_media_type_raises_on_bad_json(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = _fake_openai_response("not json")
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    with pytest.raises(fs.FilmSummaryValidationError) as exc_info:
+        asyncio.run(fs.classify_media_type(metadata={}, transcript_sample="", scene_stats={}))
+    assert exc_info.value.code == fs.FilmSummaryErrorCode.GENERATION_INVALID
+
+
+# ---------------------------------------------------------------------------
+# generate_edit_plan (network call mocked)
+# ---------------------------------------------------------------------------
+
+def test_generate_edit_plan_returns_validated_plan_and_usage(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    plan_json = json.dumps(_valid_raw_plan())
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = _fake_openai_response(plan_json)
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    movie_metadata = {"title": "M", "source_duration_ms": 3600000, "source_language": "en", "narration_language": "en"}
+    result = asyncio.run(fs.generate_edit_plan(
+        movie_metadata=movie_metadata, target_duration_ms=600000, narration_language="en", narration_style="cinematic",
+        transcript_segments=[], scene_index=[], generation_constraints={},
+    ))
+
+    assert result["plan"]["movie"] == movie_metadata
+    assert result["usage"]["prompt_tokens"] == 10
+
+
+def test_generate_edit_plan_raises_on_bad_json(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = _fake_openai_response("not json")
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    with pytest.raises(fs.FilmSummaryValidationError) as exc_info:
+        asyncio.run(fs.generate_edit_plan(
+            movie_metadata={}, target_duration_ms=600000, narration_language="en", narration_style="cinematic",
+            transcript_segments=[], scene_index=[], generation_constraints={},
+        ))
+    assert exc_info.value.code == fs.FilmSummaryErrorCode.PLAN_INVALID
+
+
+# ---------------------------------------------------------------------------
+# synthesize_tts_segment (network call mocked)
+# ---------------------------------------------------------------------------
+
+def test_synthesize_tts_segment_returns_probed_duration(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    output_path = str(tmp_path / "segment.mp3")
+
+    fake_response = MagicMock()
+    fake_response.__enter__ = MagicMock(return_value=fake_response)
+    fake_response.__exit__ = MagicMock(return_value=False)
+    fake_client = MagicMock()
+    fake_client.audio.speech.with_streaming_response.create.return_value = fake_response
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+    monkeypatch.setattr(fs, "probe_media_duration_seconds", lambda path: 12.5)
+
+    duration = asyncio.run(fs.synthesize_tts_segment(
+        text="Hello", voice="cedar", model="gpt-4o-mini-tts", instructions="narrate", output_path=output_path,
+    ))
+
+    assert duration == 12.5
+    fake_response.stream_to_file.assert_called_once_with(output_path)
+
+
+def test_synthesize_tts_segment_wraps_failures_as_tts_failed(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake_client = MagicMock()
+    fake_client.audio.speech.with_streaming_response.create.side_effect = RuntimeError("boom")
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    with pytest.raises(fs.FilmSummaryValidationError) as exc_info:
+        asyncio.run(fs.synthesize_tts_segment(
+            text="Hello", voice="cedar", model="gpt-4o-mini-tts", instructions="narrate",
+            output_path=str(tmp_path / "segment.mp3"),
+        ))
+    assert exc_info.value.code == fs.FilmSummaryErrorCode.TTS_FAILED
+
+
+# ---------------------------------------------------------------------------
+# transcribe_video_with_timecodes (AssemblyAI mocked out at module level)
+# ---------------------------------------------------------------------------
+
+def test_transcribe_video_with_timecodes_raises_when_api_key_missing(monkeypatch):
+    monkeypatch.delenv("ASSEMBLYAI_API_KEY", raising=False)
+    with pytest.raises(RuntimeError):
+        asyncio.run(fs.transcribe_video_with_timecodes("/tmp/does-not-matter.mp4"))
+
+
+def _install_fake_assemblyai(monkeypatch, *, utterances=None, status_error=False, fallback_text=""):
+    # Note: the fake transcript is built as a SimpleNamespace (not a class
+    # body) because a class body can't close over an enclosing function's
+    # locals the way a nested function can -- `attr = utterances` inside a
+    # class statement here would raise NameError.
+    fake_module = types.ModuleType("assemblyai")
+
+    class _TranscriptStatus:
+        error = "error"
+        completed = "completed"
+
+    fake_transcript = types.SimpleNamespace(
+        status=_TranscriptStatus.error if status_error else _TranscriptStatus.completed,
+        error="boom" if status_error else None,
+        utterances=utterances,
+        text=fallback_text,
+        language_code="en",
+        audio_duration=42.0,
+    )
+
+    class _Transcriber:
+        def __init__(self, config=None):
+            self.config = config
+
+        def transcribe(self, video_path):
+            return fake_transcript
+
+    fake_module.settings = types.SimpleNamespace(api_key=None)
+    fake_module.TranscriptStatus = _TranscriptStatus
+    fake_module.TranscriptionConfig = lambda **kwargs: kwargs
+    fake_module.Transcriber = _Transcriber
+    monkeypatch.setitem(sys.modules, "assemblyai", fake_module)
+
+
+def test_transcribe_video_with_timecodes_returns_segments(monkeypatch):
+    monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test-key")
+    utterance = types.SimpleNamespace(start=1000, end=4000, speaker="A", text="Hello there")
+    _install_fake_assemblyai(monkeypatch, utterances=[utterance])
+
+    result = asyncio.run(fs.transcribe_video_with_timecodes("/tmp/video.mp4"))
+
+    assert result["segments"] == [{"start_ms": 1000, "end_ms": 4000, "speaker": "A", "text": "Hello there"}]
+    assert result["language"] == "en"
+
+
+def test_transcribe_video_with_timecodes_falls_back_to_single_segment(monkeypatch):
+    monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test-key")
+    _install_fake_assemblyai(monkeypatch, utterances=[], fallback_text="Full transcript text")
+
+    result = asyncio.run(fs.transcribe_video_with_timecodes("/tmp/video.mp4"))
+
+    assert len(result["segments"]) == 1
+    assert result["segments"][0]["text"] == "Full transcript text"
+    assert result["segments"][0]["end_ms"] == 42000
+
+
+def test_transcribe_video_with_timecodes_raises_on_transcript_error(monkeypatch):
+    monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test-key")
+    _install_fake_assemblyai(monkeypatch, utterances=[], status_error=True)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(fs.transcribe_video_with_timecodes("/tmp/video.mp4"))
+
+
+# ---------------------------------------------------------------------------
+# download_youtube_source (delegates to the shared youtube_download module)
+# ---------------------------------------------------------------------------
+
+def test_download_youtube_source_delegates_to_shared_youtube_download(monkeypatch, tmp_path):
+    fake_module = types.ModuleType("youtube_download")
+    calls = []
+
+    def fake_download_youtube_video(url, output_dir):
+        calls.append((url, output_dir))
+        return (f"{output_dir}/My_Movie.mp4", "My_Movie")
+
+    fake_module.download_youtube_video = fake_download_youtube_video
+    monkeypatch.setitem(sys.modules, "youtube_download", fake_module)
+
+    result = fs.download_youtube_source("https://youtu.be/xyz", str(tmp_path))
+
+    assert calls == [("https://youtu.be/xyz", str(tmp_path))]
+    assert result["path"] == f"{tmp_path}/My_Movie.mp4"
+    assert result["title"] == "My Movie"
+
+
+# ---------------------------------------------------------------------------
+# detect_scenes (PySceneDetect mocked out at module level)
+# ---------------------------------------------------------------------------
+
+def _install_fake_scenedetect(monkeypatch, *, scene_list, duration_seconds=0.0):
+    scenedetect_mod = types.ModuleType("scenedetect")
+    detectors_mod = types.ModuleType("scenedetect.detectors")
+
+    class _FakeVideo:
+        duration = types.SimpleNamespace(get_seconds=lambda: duration_seconds)
+
+    class _FakeSceneManager:
+        def __init__(self):
+            self.detectors = []
+
+        def add_detector(self, detector):
+            self.detectors.append(detector)
+
+        def detect_scenes(self, video):
+            pass
+
+        def get_scene_list(self):
+            return scene_list
+
+    scenedetect_mod.open_video = lambda path: _FakeVideo()
+    scenedetect_mod.SceneManager = _FakeSceneManager
+    detectors_mod.ContentDetector = lambda threshold=27.0, min_scene_len=15: MagicMock()
+    monkeypatch.setitem(sys.modules, "scenedetect", scenedetect_mod)
+    monkeypatch.setitem(sys.modules, "scenedetect.detectors", detectors_mod)
+
+
+def _fake_timecode(seconds):
+    return types.SimpleNamespace(get_seconds=lambda: seconds)
+
+
+def test_detect_scenes_converts_scene_list_to_milliseconds(monkeypatch):
+    scene_list = [(_fake_timecode(0.0), _fake_timecode(2.5)), (_fake_timecode(2.5), _fake_timecode(5.0))]
+    _install_fake_scenedetect(monkeypatch, scene_list=scene_list)
+
+    scenes = fs.detect_scenes("/tmp/video.mp4")
+
+    assert scenes == [
+        {"scene_id": "scene_001", "start_ms": 0, "end_ms": 2500, "quality_flags": []},
+        {"scene_id": "scene_002", "start_ms": 2500, "end_ms": 5000, "quality_flags": []},
+    ]
+
+
+def test_detect_scenes_falls_back_to_single_scene_when_no_boundaries_found(monkeypatch):
+    _install_fake_scenedetect(monkeypatch, scene_list=[], duration_seconds=10.0)
+
+    scenes = fs.detect_scenes("/tmp/video.mp4")
+
+    assert scenes == [{"scene_id": "scene_001", "start_ms": 0, "end_ms": 10000, "quality_flags": []}]
+
+
+# ---------------------------------------------------------------------------
+# probe_technical_metadata / probe_media_duration_seconds / extract_keyframe
+# ---------------------------------------------------------------------------
+
+_FFPROBE_JSON = json.dumps({
+    "format": {"format_name": "mov,mp4", "duration": "120.5"},
+    "streams": [
+        {"codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080, "avg_frame_rate": "30/1"},
+        {"codec_type": "audio", "codec_name": "aac"},
+    ],
+})
+
+
+def test_probe_technical_metadata_parses_ffprobe_output(monkeypatch):
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: _FFPROBE_JSON.encode())
+
+    meta = fs.probe_technical_metadata("/tmp/video.mp4")
+
+    assert meta["has_video"] is True
+    assert meta["has_audio"] is True
+    assert meta["width"] == 1920
+    assert meta["height"] == 1080
+    assert meta["fps"] == 30.0
+    assert meta["duration_seconds"] == 120.5
+
+
+def test_probe_technical_metadata_returns_defaults_on_ffprobe_failure(monkeypatch):
+    def _raise(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, "ffprobe")
+
+    monkeypatch.setattr(subprocess, "check_output", _raise)
+
+    meta = fs.probe_technical_metadata("/tmp/video.mp4")
+
+    assert meta["has_video"] is False
+    assert meta["has_audio"] is False
+    assert meta["duration_seconds"] == 0.0
+
+
+def test_parse_video_stream_fps_handles_zero_denominator():
+    assert fs._parse_video_stream_fps({"avg_frame_rate": "30/0"}) == 0.0
+
+
+def test_parse_video_stream_fps_handles_malformed_rate():
+    assert fs._parse_video_stream_fps({"avg_frame_rate": "not-a-rate"}) == 0.0
+
+
+def test_probe_media_duration_seconds_parses_output(monkeypatch):
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: b"5.5\n")
+    assert fs.probe_media_duration_seconds("/tmp/audio.mp3") == 5.5
+
+
+def test_probe_media_duration_seconds_returns_zero_on_failure(monkeypatch):
+    def _raise(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, "ffprobe")
+
+    monkeypatch.setattr(subprocess, "check_output", _raise)
+    assert fs.probe_media_duration_seconds("/tmp/audio.mp3") == 0.0
+
+
+def test_extract_keyframe_returns_true_on_success(monkeypatch, tmp_path):
+    output_path = tmp_path / "frame.jpg"
+
+    def _fake_run(cmd, **kwargs):
+        output_path.write_bytes(b"fake")
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    assert fs.extract_keyframe("/tmp/video.mp4", 1000, str(output_path)) is True
+
+
+def test_extract_keyframe_returns_false_on_nonzero_exit(monkeypatch, tmp_path):
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=1))
+    assert fs.extract_keyframe("/tmp/video.mp4", 1000, str(tmp_path / "frame.jpg")) is False
+
+
+def test_extract_classification_keyframes_skips_frames_that_fail_to_extract(monkeypatch):
+    scene_index = [{"scene_id": f"scene_{i:03d}", "start_ms": i * 1000, "end_ms": (i + 1) * 1000} for i in range(5)]
+    monkeypatch.setattr(fs, "extract_keyframe", lambda *a, **k: False)
+
+    assert fs.extract_classification_keyframes("/tmp/video.mp4", scene_index) == []
 
 
 # ---------------------------------------------------------------------------

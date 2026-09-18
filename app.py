@@ -9123,6 +9123,111 @@ async def _resolve_film_summary_source(
     }
 
 
+async def _resolve_film_summary_request_fields(
+    request: Request, title: Optional[str], target_duration_seconds: Optional[float],
+    source_language: Optional[str], narration_language: Optional[str], narration_style: Optional[str],
+    voice_id: Optional[str],
+) -> Tuple[Optional[str], Optional[float], Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """JSON-body submissions (YouTube link, no multipart) carry the extra
+    fields in the body instead of Form() -- same content-type branching as
+    _resolve_anonymous_story_page_context. Pulled out of create_film_summary
+    to keep its cognitive complexity down."""
+    content_type = request.headers.get("content-type", "")
+    if _CONTENT_TYPE_JSON not in content_type:
+        return title, target_duration_seconds, source_language, narration_language, narration_style, voice_id
+    body = await request.json()
+    return (
+        body.get("title", title),
+        body.get("target_duration_seconds", target_duration_seconds),
+        body.get("source_language", source_language),
+        body.get("narration_language", narration_language),
+        body.get("narration_style", narration_style),
+        body.get("voice_id", voice_id),
+    )
+
+
+def _resolve_film_summary_title(title: Optional[str], source_title: str) -> str:
+    resolved = title or source_title or "Resume de film"
+    return resolved.strip()[:200]
+
+
+def _cleanup_film_summary_upload(input_path: Optional[str], output_dir: str) -> None:
+    if input_path and os.path.exists(input_path):
+        os.remove(input_path)
+    shutil.rmtree(output_dir, ignore_errors=True)
+
+
+async def _validate_film_summary_technical_constraints_or_cleanup(
+    input_path: str, size_bytes: float, output_dir: str,
+) -> float:
+    """Probe technical metadata and run Niveau 1 validation, cleaning up the
+    partially-uploaded source on rejection. Pulled out of
+    create_film_summary to keep its cognitive complexity down."""
+    local_duration = _probe_local_video_duration_seconds(input_path)
+    tech_meta = film_summary.probe_technical_metadata(input_path)
+    duration_seconds = local_duration or tech_meta["duration_seconds"]
+    try:
+        film_summary.validate_technical_constraints(
+            duration_seconds=duration_seconds,
+            size_bytes=float(size_bytes),
+            has_video_track=tech_meta["has_video"],
+            has_audio_track=tech_meta["has_audio"],
+            max_upload_size_bytes=FILM_SUMMARY_MAX_UPLOAD_SIZE_BYTES,
+            min_source_duration_seconds=FILM_SUMMARY_MIN_SOURCE_DURATION_SECONDS,
+            max_source_duration_seconds=FILM_SUMMARY_MAX_SOURCE_DURATION_SECONDS,
+        )
+    except film_summary.FilmSummaryValidationError as exc:
+        _cleanup_film_summary_upload(input_path, output_dir)
+        raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
+    return local_duration
+
+
+def _resolve_film_summary_target_duration(target_duration_seconds: Optional[float], local_duration: float) -> int:
+    if target_duration_seconds:
+        return int(target_duration_seconds)
+    return film_summary.derive_target_duration_seconds(
+        local_duration, FILM_SUMMARY_MIN_TARGET_DURATION_SECONDS, FILM_SUMMARY_MAX_TARGET_DURATION_SECONDS,
+    )
+
+
+def _row_field(row: Optional[Dict[str, Any]], key: str) -> Optional[Any]:
+    if not row:
+        return None
+    return row.get(key)
+
+
+def _resolve_film_summary_narration_settings(narration_language: Optional[str], narration_style: Optional[str]) -> Tuple[str, str]:
+    resolved_language = (narration_language or "").strip()[:50]
+    resolved_style = (narration_style or "cinematic").strip()[:50]
+    return resolved_language, resolved_style or "cinematic"
+
+
+async def _persist_film_summary_row(
+    user_id: str, project_id: Optional[str], film_title: str, source_type: str, source_url_value: Optional[str],
+    source_s3_key: Optional[str], local_duration: float, resolved_target_duration: int, source_language: Optional[str],
+    resolved_narration_language: str, resolved_narration_style: str, resolved_voice_id: str, film_job_id: str,
+) -> Optional[Dict[str, Any]]:
+    if not is_supabase_configured():
+        return None
+    return await supabase_insert_film_summary({
+        "user_id": user_id,
+        "project_id": project_id,
+        "title": film_title,
+        "source_type": source_type,
+        "source_url": source_url_value,
+        "source_s3_key": source_s3_key,
+        "source_duration_seconds": int(local_duration or 0),
+        "target_duration_seconds": resolved_target_duration,
+        "source_language": (source_language or "").strip()[:50] or None,
+        "narration_language": resolved_narration_language or None,
+        "narration_style": resolved_narration_style,
+        "voice_id": resolved_voice_id,
+        "status": film_summary.FilmSummaryStatus.QUEUED,
+        "stage": film_summary.FilmSummaryStage.UPLOADING,
+        "job_id": film_job_id,
+    })
+
+
 @app.post("/api/film-summaries", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 404: {"description": "Not Found"}, 413: {"description": "Payload Too Large"}, 429: {"description": "Too Many Requests"}})
 async def create_film_summary(
     request: Request,
@@ -9143,18 +9248,11 @@ async def create_film_summary(
     url, ack_flag = await _resolve_process_endpoint_url_and_ack(request, url, acknowledged)
     _validate_process_endpoint_inputs(url, file, ack_flag)
 
-    # JSON-body submissions (YouTube link, no multipart) carry the extra
-    # fields in the body instead of Form() -- same content-type branching
-    # as _resolve_anonymous_story_page_context.
-    content_type = request.headers.get("content-type", "")
-    if _CONTENT_TYPE_JSON in content_type:
-        body = await request.json()
-        title = body.get("title", title)
-        target_duration_seconds = body.get("target_duration_seconds", target_duration_seconds)
-        source_language = body.get("source_language", source_language)
-        narration_language = body.get("narration_language", narration_language)
-        narration_style = body.get("narration_style", narration_style)
-        voice_id = body.get("voice_id", voice_id)
+    title, target_duration_seconds, source_language, narration_language, narration_style, voice_id = (
+        await _resolve_film_summary_request_fields(
+            request, title, target_duration_seconds, source_language, narration_language, narration_style, voice_id,
+        )
+    )
 
     try:
         film_summary.validate_target_duration_seconds(
@@ -9176,32 +9274,10 @@ async def create_film_summary(
     size_bytes = source["size_bytes"]
     source_type = source["source_type"]
     source_url_value = source["source_url_value"]
-    film_title = (title or source["film_title"] or "Resume de film").strip()[:200]
+    film_title = _resolve_film_summary_title(title, source["film_title"])
 
-    local_duration = _probe_local_video_duration_seconds(input_path)
-    tech_meta = film_summary.probe_technical_metadata(input_path)
-    try:
-        film_summary.validate_technical_constraints(
-            duration_seconds=local_duration or tech_meta["duration_seconds"],
-            size_bytes=float(size_bytes),
-            has_video_track=tech_meta["has_video"],
-            has_audio_track=tech_meta["has_audio"],
-            max_upload_size_bytes=FILM_SUMMARY_MAX_UPLOAD_SIZE_BYTES,
-            min_source_duration_seconds=FILM_SUMMARY_MIN_SOURCE_DURATION_SECONDS,
-            max_source_duration_seconds=FILM_SUMMARY_MAX_SOURCE_DURATION_SECONDS,
-        )
-    except film_summary.FilmSummaryValidationError as exc:
-        if input_path and os.path.exists(input_path):
-            os.remove(input_path)
-        shutil.rmtree(output_dir, ignore_errors=True)
-        raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
-
-    resolved_target_duration = (
-        int(target_duration_seconds) if target_duration_seconds
-        else film_summary.derive_target_duration_seconds(
-            local_duration, FILM_SUMMARY_MIN_TARGET_DURATION_SECONDS, FILM_SUMMARY_MAX_TARGET_DURATION_SECONDS,
-        )
-    )
+    local_duration = await _validate_film_summary_technical_constraints_or_cleanup(input_path, size_bytes, output_dir)
+    resolved_target_duration = _resolve_film_summary_target_duration(target_duration_seconds, local_duration)
 
     analysis_required_credits = _estimate_film_summary_analysis_required_credits(local_duration, float(size_bytes))
     await _reserve_film_summary_credits_or_cleanup(user_id, analysis_required_credits, input_path, output_dir)
@@ -9212,32 +9288,17 @@ async def create_film_summary(
         user_id, film_job_id, source_name, input_path, int(size_bytes), local_duration,
         source_type, source_url_value, film_title,
     )
-    project_id = project.get("id") if project else None
-    source_s3_key = project.get("source_s3_key") if project else None
+    project_id = _row_field(project, "id")
+    source_s3_key = _row_field(project, "source_s3_key")
 
-    resolved_narration_language = (narration_language or "").strip()[:50]
-    resolved_narration_style = (narration_style or "cinematic").strip()[:50] or "cinematic"
+    resolved_narration_language, resolved_narration_style = _resolve_film_summary_narration_settings(narration_language, narration_style)
     resolved_voice_id = film_summary.resolve_tts_voice(voice_id, FILM_SUMMARY_TTS_DEFAULT_VOICE)
 
-    film_row = None
-    if is_supabase_configured():
-        film_row = await supabase_insert_film_summary({
-            "user_id": user_id,
-            "project_id": project_id,
-            "title": film_title,
-            "source_type": source_type,
-            "source_url": source_url_value,
-            "source_s3_key": source_s3_key,
-            "source_duration_seconds": int(local_duration or 0),
-            "target_duration_seconds": resolved_target_duration,
-            "source_language": (source_language or "").strip()[:50] or None,
-            "narration_language": resolved_narration_language or None,
-            "narration_style": resolved_narration_style,
-            "voice_id": resolved_voice_id,
-            "status": film_summary.FilmSummaryStatus.QUEUED,
-            "stage": film_summary.FilmSummaryStage.UPLOADING,
-            "job_id": film_job_id,
-        })
+    film_row = await _persist_film_summary_row(
+        user_id, project_id, film_title, source_type, source_url_value, source_s3_key, local_duration,
+        resolved_target_duration, source_language, resolved_narration_language, resolved_narration_style,
+        resolved_voice_id, film_job_id,
+    )
 
     await reel_job_manager.create_job(
         user_id=user_id,
@@ -9258,12 +9319,12 @@ async def create_film_summary(
     )
     await reel_job_manager.enqueue_job(film_job_id)
 
+    film_summary_id = _row_field(film_row, "id")
     _spawn_background_task(_run_film_summary_analysis_job(
         job_id=film_job_id,
         user_id=user_id,
-        film_summary_id=film_row.get("id") if film_row else None,
+        film_summary_id=film_summary_id,
         project_id=project_id,
-        source_s3_key=source_s3_key,
         input_path=input_path,
         output_dir=output_dir,
         local_duration=local_duration,
@@ -9276,7 +9337,7 @@ async def create_film_summary(
 
     return {
         "job_id": film_job_id,
-        "film_summary_id": film_row.get("id") if film_row else None,
+        "film_summary_id": film_summary_id,
         "project_id": project_id,
         "status": "queued",
     }
@@ -9311,7 +9372,7 @@ async def _mark_film_summary_job_terminal(
 
 async def _run_film_summary_analysis_job(
     job_id: str, user_id: str, film_summary_id: Optional[str], project_id: Optional[str],
-    source_s3_key: Optional[str], input_path: str, output_dir: str, local_duration: float,
+    input_path: str, output_dir: str, local_duration: float,
     size_bytes: float, analysis_required_credits: float, target_duration_seconds: float,
     narration_language: str, narration_style: str,
 ) -> None:
@@ -9323,19 +9384,12 @@ async def _run_film_summary_analysis_job(
             narration_language, narration_style,
         )
     except film_summary.FilmSummaryValidationError as exc:
-        status = film_summary.FilmSummaryStatus.REJECTED if exc.code in _FILM_SUMMARY_REJECTION_CODES else film_summary.FilmSummaryStatus.FAILED
-        stage = film_summary.FilmSummaryStage.REJECTED if status == film_summary.FilmSummaryStatus.REJECTED else film_summary.FilmSummaryStage.FAILED
-        await reel_job_manager.fail_job(job_id, str(exc), error_code=exc.code)
-        await _mark_film_summary_job_terminal(user_id, film_summary_id, project_id, status, stage, exc.code, str(exc))
-        await reel_job_manager.refund_reservation(job_id, user_id, analysis_required_credits, operation_type=film_summary.CREDIT_OPERATION_TYPE)
+        await _handle_film_summary_validation_failure(exc, job_id, user_id, film_summary_id, project_id, analysis_required_credits)
     except Exception as exc:  # noqa: BLE001 -- any unexpected failure must still fail the job and refund the user
-        logger.exception(f"Film summary analysis job {job_id} failed")
-        await reel_job_manager.fail_job(job_id, "Technical failure while analyzing the film", error_code="GENERATION_INVALID")
-        await _mark_film_summary_job_terminal(
-            user_id, film_summary_id, project_id, film_summary.FilmSummaryStatus.FAILED,
-            film_summary.FilmSummaryStage.FAILED, "GENERATION_INVALID", str(exc),
+        await _handle_film_summary_unexpected_failure(
+            exc, job_id, user_id, film_summary_id, project_id, analysis_required_credits,
+            f"Film summary analysis job {job_id} failed",
         )
-        await reel_job_manager.refund_reservation(job_id, user_id, analysis_required_credits, operation_type=film_summary.CREDIT_OPERATION_TYPE)
     finally:
         if os.path.exists(output_dir):
             shutil.rmtree(output_dir, ignore_errors=True)
@@ -9948,19 +10002,92 @@ async def retry_film_summary_endpoint(film_summary_id: str, user_id: Annotated[s
         source_language=row.get("source_language") or "",
         narration_language=row.get("narration_language") or "",
         narration_style=row.get("narration_style") or "cinematic",
-        cached_transcript_segments=row.get("transcript_segments") or [],
-        cached_scene_index=row.get("scene_index") or [],
-        cached_classification=row.get("classification") or {},
+        cached={
+            "transcript_segments": row.get("transcript_segments") or [],
+            "scene_index": row.get("scene_index") or [],
+            "classification": row.get("classification") or {},
+        },
     ))
 
     return {"job_id": retry_job_id, "film_summary_id": film_summary_id, "status": "queued"}
 
 
+async def _handle_film_summary_validation_failure(
+    exc: "film_summary.FilmSummaryValidationError", job_id: str, user_id: str,
+    film_summary_id: Optional[str], project_id: Optional[str], required_credits: float,
+) -> None:
+    """Shared terminal-state handling for a FilmSummaryValidationError caught
+    by the analysis or retry job runner: rejected-source codes land the row
+    in `rejected` (terminal, not retryable), everything else in `failed`
+    (retryable). Pulled out of both runners to keep their cognitive
+    complexity down and avoid duplicating this branch."""
+    status = film_summary.FilmSummaryStatus.REJECTED if exc.code in _FILM_SUMMARY_REJECTION_CODES else film_summary.FilmSummaryStatus.FAILED
+    stage = film_summary.FilmSummaryStage.REJECTED if status == film_summary.FilmSummaryStatus.REJECTED else film_summary.FilmSummaryStage.FAILED
+    await reel_job_manager.fail_job(job_id, str(exc), error_code=exc.code)
+    await _mark_film_summary_job_terminal(user_id, film_summary_id, project_id, status, stage, exc.code, str(exc))
+    await reel_job_manager.refund_reservation(job_id, user_id, required_credits, operation_type=film_summary.CREDIT_OPERATION_TYPE)
+
+
+async def _handle_film_summary_unexpected_failure(
+    exc: Exception, job_id: str, user_id: str, film_summary_id: Optional[str], project_id: Optional[str],
+    required_credits: float, log_message: str,
+) -> None:
+    logger.exception(log_message)
+    await reel_job_manager.fail_job(job_id, "Technical failure while processing the film summary", error_code="GENERATION_INVALID")
+    await _mark_film_summary_job_terminal(
+        user_id, film_summary_id, project_id, film_summary.FilmSummaryStatus.FAILED,
+        film_summary.FilmSummaryStage.FAILED, "GENERATION_INVALID", str(exc),
+    )
+    await reel_job_manager.refund_reservation(job_id, user_id, required_credits, operation_type=film_summary.CREDIT_OPERATION_TYPE)
+
+
+async def _resume_film_summary_analysis_from_cache(
+    job_id: str, user_id: str, film_summary_id: str, input_path: str, local_duration: float,
+    target_duration_seconds: float, source_language: str, narration_language: str, narration_style: str,
+    cached: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """Resume a failed analysis job at the first stage whose cached output
+    is missing ("une reprise apres echec ne regenere pas les etapes deja
+    valides", spec section 19), instead of always restarting from
+    transcription. Pulled out of _run_film_summary_retry_job to keep its
+    cognitive complexity down."""
+    cached_transcript_segments = cached.get("transcript_segments") or []
+    cached_scene_index = cached.get("scene_index") or []
+    cached_classification = cached.get("classification") or {}
+
+    if cached_transcript_segments and cached_scene_index and cached_classification:
+        return await _run_planning_and_validation_stages(
+            job_id, user_id, film_summary_id, local_duration, target_duration_seconds,
+            source_language, narration_language, narration_style, cached_transcript_segments, cached_scene_index,
+        )
+
+    if cached_transcript_segments and cached_scene_index:
+        transcript_segments, scene_index = cached_transcript_segments, cached_scene_index
+    else:
+        transcript_segments, scene_index, detected_language = await _run_transcription_and_scene_detection_stages(
+            job_id, user_id, film_summary_id, input_path,
+        )
+        source_language = source_language or detected_language
+
+    classification_usage = await _run_classification_gate(
+        job_id, user_id, film_summary_id, local_duration, narration_language or source_language,
+        input_path, transcript_segments, scene_index,
+    )
+    plan, validation_report, planning_usage = await _run_planning_and_validation_stages(
+        job_id, user_id, film_summary_id, local_duration, target_duration_seconds,
+        source_language, narration_language, narration_style, transcript_segments, scene_index,
+    )
+    usage = {
+        "prompt_tokens": classification_usage.get("prompt_tokens", 0) + planning_usage.get("prompt_tokens", 0),
+        "completion_tokens": classification_usage.get("completion_tokens", 0) + planning_usage.get("completion_tokens", 0),
+    }
+    return plan, validation_report, usage
+
+
 async def _run_film_summary_retry_job(
     job_id: str, user_id: str, film_summary_id: str, project_id: Optional[str], source_s3_key: Optional[str],
     output_dir: str, local_duration: float, analysis_required_credits: float, target_duration_seconds: float,
-    source_language: str, narration_language: str, narration_style: str, cached_transcript_segments: List[Dict[str, Any]],
-    cached_scene_index: List[Dict[str, Any]], cached_classification: Dict[str, Any],
+    source_language: str, narration_language: str, narration_style: str, cached: Dict[str, Any],
 ) -> None:
     try:
         await reel_job_manager.start_job(job_id)
@@ -9969,55 +10096,22 @@ async def _run_film_summary_retry_job(
         if not source_s3_key or not download_s3_object(bucket_name, source_s3_key, input_path):
             raise film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.RENDER_FAILED, "Source video is not available for retry")
 
-        # "Une reprise apres echec ne regenere pas les etapes deja
-        # valides" (spec section 19): resume at the first stage whose
-        # cached output is missing, instead of always restarting from
-        # transcription.
-        if cached_transcript_segments and cached_scene_index and cached_classification:
-            plan, validation_report, usage = await _run_planning_and_validation_stages(
-                job_id, user_id, film_summary_id, local_duration, target_duration_seconds,
-                source_language, narration_language, narration_style, cached_transcript_segments, cached_scene_index,
-            )
-        else:
-            if cached_transcript_segments and cached_scene_index:
-                transcript_segments, scene_index = cached_transcript_segments, cached_scene_index
-            else:
-                transcript_segments, scene_index, detected_language = await _run_transcription_and_scene_detection_stages(
-                    job_id, user_id, film_summary_id, input_path,
-                )
-                source_language = source_language or detected_language
-
-            classification_usage = await _run_classification_gate(
-                job_id, user_id, film_summary_id, local_duration, narration_language or source_language,
-                input_path, transcript_segments, scene_index,
-            )
-            plan, validation_report, planning_usage = await _run_planning_and_validation_stages(
-                job_id, user_id, film_summary_id, local_duration, target_duration_seconds,
-                source_language, narration_language, narration_style, transcript_segments, scene_index,
-            )
-            usage = {
-                "prompt_tokens": classification_usage.get("prompt_tokens", 0) + planning_usage.get("prompt_tokens", 0),
-                "completion_tokens": classification_usage.get("completion_tokens", 0) + planning_usage.get("completion_tokens", 0),
-            }
+        plan, validation_report, usage = await _resume_film_summary_analysis_from_cache(
+            job_id, user_id, film_summary_id, input_path, local_duration, target_duration_seconds,
+            source_language, narration_language, narration_style, cached,
+        )
 
         await _finalize_film_summary_analysis(
             job_id, user_id, film_summary_id, project_id, local_duration, 0.0,
             analysis_required_credits, plan, validation_report, usage,
         )
     except film_summary.FilmSummaryValidationError as exc:
-        status = film_summary.FilmSummaryStatus.REJECTED if exc.code in _FILM_SUMMARY_REJECTION_CODES else film_summary.FilmSummaryStatus.FAILED
-        stage = film_summary.FilmSummaryStage.REJECTED if status == film_summary.FilmSummaryStatus.REJECTED else film_summary.FilmSummaryStage.FAILED
-        await reel_job_manager.fail_job(job_id, str(exc), error_code=exc.code)
-        await _mark_film_summary_job_terminal(user_id, film_summary_id, project_id, status, stage, exc.code, str(exc))
-        await reel_job_manager.refund_reservation(job_id, user_id, analysis_required_credits, operation_type=film_summary.CREDIT_OPERATION_TYPE)
+        await _handle_film_summary_validation_failure(exc, job_id, user_id, film_summary_id, project_id, analysis_required_credits)
     except Exception as exc:  # noqa: BLE001
-        logger.exception(f"Film summary retry job {job_id} failed")
-        await reel_job_manager.fail_job(job_id, "Technical failure while retrying the film summary", error_code="GENERATION_INVALID")
-        await _mark_film_summary_job_terminal(
-            user_id, film_summary_id, project_id, film_summary.FilmSummaryStatus.FAILED,
-            film_summary.FilmSummaryStage.FAILED, "GENERATION_INVALID", str(exc),
+        await _handle_film_summary_unexpected_failure(
+            exc, job_id, user_id, film_summary_id, project_id, analysis_required_credits,
+            f"Film summary retry job {job_id} failed",
         )
-        await reel_job_manager.refund_reservation(job_id, user_id, analysis_required_credits, operation_type=film_summary.CREDIT_OPERATION_TYPE)
     finally:
         if os.path.exists(output_dir):
             shutil.rmtree(output_dir, ignore_errors=True)

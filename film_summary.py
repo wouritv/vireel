@@ -403,6 +403,103 @@ def compute_total_estimated_duration_ms(segments: List[Dict[str, Any]]) -> int:
     return total
 
 
+def _validate_segment_sequence_numbers(segments: List[Dict[str, Any]]) -> List[str]:
+    sequences = [seg.get("sequence") for seg in segments]
+    if sequences == sorted(sequences) and sequences == list(range(1, len(segments) + 1)):
+        return []
+    return ["Segment sequence numbers must be contiguous, starting at 1, in playback order"]
+
+
+def _validate_voice_over_segment(
+    seg: Dict[str, Any], source_duration_ms: int, known_scene_ids: set,
+    clip_signatures: Dict[Tuple[Any, int, int], int],
+) -> List[str]:
+    errors = []
+    for clip in seg.get("clips") or []:
+        start_ms, end_ms = clip.get("start_ms"), clip.get("end_ms")
+        if start_ms is None or end_ms is None or start_ms < 0 or end_ms <= start_ms or end_ms > source_duration_ms:
+            errors.append(f"Segment {seg.get('id')} has an out-of-bounds clip timecode")
+            continue
+        if known_scene_ids and clip.get("scene_id") not in known_scene_ids:
+            errors.append(f"Segment {seg.get('id')} references unknown scene_id {clip.get('scene_id')}")
+        signature = (clip.get("scene_id"), start_ms, end_ms)
+        clip_signatures[signature] = clip_signatures.get(signature, 0) + 1
+    return errors
+
+
+def _validate_timed_segment(
+    seg: Dict[str, Any], source_duration_ms: int, known_character_ids: set,
+) -> Tuple[List[str], List[str], Optional[Tuple[int, int]]]:
+    errors: List[str] = []
+    warnings: List[str] = []
+    start_ms, end_ms = seg.get("start_ms"), seg.get("end_ms")
+    valid_range = None
+    if start_ms is None or end_ms is None or start_ms < 0 or end_ms <= start_ms or end_ms > source_duration_ms:
+        errors.append(f"Segment {seg.get('id')} has an out-of-bounds timecode")
+    else:
+        valid_range = (start_ms, end_ms)
+    for speaker_id in seg.get("speaker_ids") or []:
+        if known_character_ids and speaker_id not in known_character_ids:
+            warnings.append(f"Segment {seg.get('id')} references unknown character {speaker_id}")
+    return errors, warnings, valid_range
+
+
+def _validate_segments(
+    segments: List[Dict[str, Any]], source_duration_ms: int, known_scene_ids: set, known_character_ids: set,
+) -> Tuple[List[str], List[str], List[Tuple[int, int]], Dict[Tuple[Any, int, int], int]]:
+    """Per-segment checks (type, clip/timecode bounds, scene/character
+    references), collecting the shared state (dialogue ranges, clip
+    signatures) the overlap/repetition checks need afterwards. Split out
+    of validate_edit_plan_content -- a single loop mixing every one of
+    these concerns was the bulk of that function's cognitive complexity."""
+    errors: List[str] = []
+    warnings: List[str] = []
+    dialogue_ranges: List[Tuple[int, int]] = []
+    clip_signatures: Dict[Tuple[Any, int, int], int] = {}
+
+    for seg in segments:
+        seg_type = seg.get("type")
+        if seg_type not in SEGMENT_TYPES:
+            errors.append(f"Segment {seg.get('id')} has unknown type {seg_type}")
+        elif seg_type == SEGMENT_TYPE_VOICE_OVER:
+            errors.extend(_validate_voice_over_segment(seg, source_duration_ms, known_scene_ids, clip_signatures))
+        else:
+            seg_errors, seg_warnings, valid_range = _validate_timed_segment(seg, source_duration_ms, known_character_ids)
+            errors.extend(seg_errors)
+            warnings.extend(seg_warnings)
+            if valid_range:
+                dialogue_ranges.append(valid_range)
+
+    return errors, warnings, dialogue_ranges, clip_signatures
+
+
+def _validate_dialogue_overlap(dialogue_ranges: List[Tuple[int, int]]) -> List[str]:
+    ranges = sorted(dialogue_ranges)
+    for i in range(1, len(ranges)):
+        if ranges[i][0] < ranges[i - 1][1]:
+            return ["Two original_dialogue/breathing segments overlap in source time"]
+    return []
+
+
+def _validate_repeated_clips(clip_signatures: Dict[Tuple[Any, int, int], int]) -> List[str]:
+    repeated = [sig for sig, count in clip_signatures.items() if count > 1]
+    if not repeated:
+        return []
+    return [f"{len(repeated)} clip(s) reused more than once without justification"]
+
+
+def _validate_duration_tolerance(total_ms: int, target_ms: int, duration_tolerance_ratio: float) -> List[str]:
+    if target_ms <= 0:
+        return []
+    tolerance_ms = target_ms * duration_tolerance_ratio
+    if abs(total_ms - target_ms) <= tolerance_ms:
+        return []
+    return [
+        f"Total estimated duration {total_ms}ms is outside the {duration_tolerance_ratio:.0%} "
+        f"tolerance around the {target_ms}ms target"
+    ]
+
+
 def validate_edit_plan_content(
     plan: Dict[str, Any], *, source_duration_ms: int, valid_scene_ids: Optional[List[str]] = None,
     duration_tolerance_ratio: float = 0.15,
@@ -412,68 +509,27 @@ def validate_edit_plan_content(
     chronology and repetition. Pure and side-effect free -- returns a
     report instead of raising, so callers (both the automatic pipeline
     stage and the manual /validate endpoint) can decide what to do with
-    non-fatal warnings."""
-    errors: List[str] = []
-    warnings: List[str] = []
+    non-fatal warnings. Each check lives in its own _validate_* helper
+    above; this function only orchestrates and merges their results, to
+    keep its own cognitive complexity low."""
     known_scene_ids = set(valid_scene_ids or [])
     known_character_ids = {c.get("id") for c in (plan.get("characters") or [])}
-
     segments = plan.get("segments") or []
-    if not segments:
-        errors.append("Plan has no segments")
 
-    sequences = [seg.get("sequence") for seg in segments]
-    if sequences != sorted(sequences) or sequences != list(range(1, len(segments) + 1)):
-        errors.append("Segment sequence numbers must be contiguous, starting at 1, in playback order")
+    errors: List[str] = [] if segments else ["Plan has no segments"]
+    errors.extend(_validate_segment_sequence_numbers(segments))
 
-    dialogue_ranges: List[Tuple[int, int]] = []
-    clip_signatures: Dict[Tuple[Any, int, int], int] = {}
+    segment_errors, warnings, dialogue_ranges, clip_signatures = _validate_segments(
+        segments, source_duration_ms, known_scene_ids, known_character_ids,
+    )
+    errors.extend(segment_errors)
 
-    for seg in segments:
-        seg_type = seg.get("type")
-        if seg_type not in SEGMENT_TYPES:
-            errors.append(f"Segment {seg.get('id')} has unknown type {seg_type}")
-            continue
-
-        if seg_type == SEGMENT_TYPE_VOICE_OVER:
-            for clip in seg.get("clips") or []:
-                start_ms, end_ms = clip.get("start_ms"), clip.get("end_ms")
-                if start_ms is None or end_ms is None or start_ms < 0 or end_ms <= start_ms or end_ms > source_duration_ms:
-                    errors.append(f"Segment {seg.get('id')} has an out-of-bounds clip timecode")
-                    continue
-                if known_scene_ids and clip.get("scene_id") not in known_scene_ids:
-                    errors.append(f"Segment {seg.get('id')} references unknown scene_id {clip.get('scene_id')}")
-                signature = (clip.get("scene_id"), start_ms, end_ms)
-                clip_signatures[signature] = clip_signatures.get(signature, 0) + 1
-        else:
-            start_ms, end_ms = seg.get("start_ms"), seg.get("end_ms")
-            if start_ms is None or end_ms is None or start_ms < 0 or end_ms <= start_ms or end_ms > source_duration_ms:
-                errors.append(f"Segment {seg.get('id')} has an out-of-bounds timecode")
-            else:
-                dialogue_ranges.append((start_ms, end_ms))
-            for speaker_id in seg.get("speaker_ids") or []:
-                if known_character_ids and speaker_id not in known_character_ids:
-                    warnings.append(f"Segment {seg.get('id')} references unknown character {speaker_id}")
-
-    dialogue_ranges.sort()
-    for i in range(1, len(dialogue_ranges)):
-        if dialogue_ranges[i][0] < dialogue_ranges[i - 1][1]:
-            errors.append("Two original_dialogue/breathing segments overlap in source time")
-            break
-
-    repeated = [sig for sig, count in clip_signatures.items() if count > 1]
-    if repeated:
-        warnings.append(f"{len(repeated)} clip(s) reused more than once without justification")
+    errors.extend(_validate_dialogue_overlap(dialogue_ranges))
+    warnings.extend(_validate_repeated_clips(clip_signatures))
 
     total_ms = compute_total_estimated_duration_ms(segments)
     target_ms = int(plan.get("target_duration_ms") or 0)
-    if target_ms > 0:
-        tolerance_ms = target_ms * duration_tolerance_ratio
-        if abs(total_ms - target_ms) > tolerance_ms:
-            errors.append(
-                f"Total estimated duration {total_ms}ms is outside the {duration_tolerance_ratio:.0%} "
-                f"tolerance around the {target_ms}ms target"
-            )
+    errors.extend(_validate_duration_tolerance(total_ms, target_ms, duration_tolerance_ratio))
 
     return {
         "valid": not errors,
@@ -747,47 +803,56 @@ async def generate_edit_plan(
     return {"plan": plan, "usage": usage}
 
 
+def _build_utterance_segments(transcript: Any) -> List[Dict[str, Any]]:
+    segments = [
+        {
+            "start_ms": int(utterance.start or 0),
+            "end_ms": int(utterance.end or 0),
+            "speaker": str(utterance.speaker or ""),
+            "text": (utterance.text or "").strip(),
+        }
+        for utterance in (transcript.utterances or [])
+    ]
+    if segments:
+        return segments
+
+    # Fall back to a single segment spanning the whole transcript when the
+    # source has no distinguishable speakers/utterances.
+    text = (transcript.text or "").strip()
+    if not text:
+        return []
+    audio_ms = int((transcript.audio_duration or 0) * 1000)
+    return [{"start_ms": 0, "end_ms": audio_ms, "speaker": "", "text": text}]
+
+
+def _transcribe_with_assemblyai(video_path: str, api_key: str) -> Dict[str, Any]:
+    import assemblyai as aai
+
+    aai.settings.api_key = api_key
+    config = aai.TranscriptionConfig(punctuate=True, format_text=True, speaker_labels=True)
+    transcript = aai.Transcriber(config=config).transcribe(video_path)
+    if transcript.status == aai.TranscriptStatus.error:
+        raise RuntimeError(transcript.error or "AssemblyAI transcription failed")
+
+    return {
+        "text": transcript.text or "",
+        "language": transcript.language_code or "unknown",
+        "segments": _build_utterance_segments(transcript),
+    }
+
+
 async def transcribe_video_with_timecodes(video_path: str) -> Dict[str, Any]:
     """Transcribe a local video with AssemblyAI, keeping per-utterance
     timecodes (ms) and speaker labels -- unlike anonymous_stories.
     transcribe_video, this feature needs timecodes to cite transcript
-    evidence and quote original dialogue verbatim with real bounds."""
+    evidence and quote original dialogue verbatim with real bounds. The
+    actual call runs in _transcribe_with_assemblyai (a plain, non-nested
+    function) rather than a closure here, since a nested function's body
+    counts against *this* function's cognitive complexity."""
     api_key = os.environ.get("ASSEMBLYAI_API_KEY")
     if not api_key:
         raise RuntimeError("ASSEMBLYAI_API_KEY is not configured")
-
-    def _call():
-        import assemblyai as aai
-
-        aai.settings.api_key = api_key
-        config = aai.TranscriptionConfig(punctuate=True, format_text=True, speaker_labels=True)
-        transcript = aai.Transcriber(config=config).transcribe(video_path)
-        if transcript.status == aai.TranscriptStatus.error:
-            raise RuntimeError(transcript.error or "AssemblyAI transcription failed")
-
-        segments = []
-        for utterance in (transcript.utterances or []):
-            segments.append({
-                "start_ms": int(utterance.start or 0),
-                "end_ms": int(utterance.end or 0),
-                "speaker": str(utterance.speaker or ""),
-                "text": (utterance.text or "").strip(),
-            })
-        if not segments:
-            # Fall back to a single segment spanning the whole transcript
-            # when the source has no distinguishable speakers/utterances.
-            text = (transcript.text or "").strip()
-            if text:
-                audio_ms = int((transcript.audio_duration or 0) * 1000)
-                segments.append({"start_ms": 0, "end_ms": audio_ms, "speaker": "", "text": text})
-
-        return {
-            "text": transcript.text or "",
-            "language": transcript.language_code or "unknown",
-            "segments": segments,
-        }
-
-    return await asyncio.to_thread(_call)
+    return await asyncio.to_thread(_transcribe_with_assemblyai, video_path, api_key)
 
 
 def download_youtube_source(url: str, output_dir: str) -> Dict[str, str]:
@@ -801,22 +866,53 @@ def download_youtube_source(url: str, output_dir: str) -> Dict[str, str]:
     return {"path": path, "title": sanitized_title.replace("_", " ").strip()}
 
 
-def probe_technical_metadata(video_path: str, timeout_seconds: int = 60) -> Dict[str, Any]:
-    """ffprobe-based technical probe used for Niveau 1 validation: real
-    container/codec introspection rather than trusting the file extension
-    (spec section 5: "l'extension seule n'est jamais suffisante")."""
-    result = {
-        "has_video": False, "has_audio": False, "width": 0, "height": 0, "fps": 0.0,
-        "video_codec": "", "audio_codec": "", "duration_seconds": 0.0, "container_format_name": "",
-    }
+def _probe_technical_metadata_json(video_path: str, timeout_seconds: int) -> Optional[Dict[str, Any]]:
     try:
         cmd = [
             "ffprobe", "-v", "error", "-print_format", "json",
             "-show_format", "-show_streams", video_path,
         ]
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=timeout_seconds).decode()
-        data = json.loads(out)
+        return json.loads(out)
     except Exception:
+        return None
+
+
+def _parse_video_stream_fps(stream: Dict[str, Any]) -> float:
+    rate = str(stream.get("avg_frame_rate") or "0/1")
+    try:
+        num, den = rate.split("/")
+        return (float(num) / float(den)) if float(den) else 0.0
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def _apply_stream_metadata(result: Dict[str, Any], streams: List[Dict[str, Any]]) -> None:
+    for stream in streams:
+        codec_type = stream.get("codec_type")
+        if codec_type == "video" and not result["has_video"]:
+            result["has_video"] = True
+            result["video_codec"] = str(stream.get("codec_name") or "")
+            result["width"] = _safe_int(stream.get("width"))
+            result["height"] = _safe_int(stream.get("height"))
+            result["fps"] = _parse_video_stream_fps(stream)
+        elif codec_type == "audio" and not result["has_audio"]:
+            result["has_audio"] = True
+            result["audio_codec"] = str(stream.get("codec_name") or "")
+
+
+def probe_technical_metadata(video_path: str, timeout_seconds: int = 60) -> Dict[str, Any]:
+    """ffprobe-based technical probe used for Niveau 1 validation: real
+    container/codec introspection rather than trusting the file extension
+    (spec section 5: "l'extension seule n'est jamais suffisante"). Stream
+    parsing lives in the _parse_video_stream_fps/_apply_stream_metadata
+    helpers above to keep this function's own cognitive complexity low."""
+    result = {
+        "has_video": False, "has_audio": False, "width": 0, "height": 0, "fps": 0.0,
+        "video_codec": "", "audio_codec": "", "duration_seconds": 0.0, "container_format_name": "",
+    }
+    data = _probe_technical_metadata_json(video_path, timeout_seconds)
+    if data is None:
         return result
 
     fmt = data.get("format") or {}
@@ -826,23 +922,7 @@ def probe_technical_metadata(video_path: str, timeout_seconds: int = 60) -> Dict
     except (TypeError, ValueError):
         pass
 
-    for stream in data.get("streams") or []:
-        codec_type = stream.get("codec_type")
-        if codec_type == "video" and not result["has_video"]:
-            result["has_video"] = True
-            result["video_codec"] = str(stream.get("codec_name") or "")
-            result["width"] = _safe_int(stream.get("width"))
-            result["height"] = _safe_int(stream.get("height"))
-            rate = str(stream.get("avg_frame_rate") or "0/1")
-            try:
-                num, den = rate.split("/")
-                result["fps"] = (float(num) / float(den)) if float(den) else 0.0
-            except (ValueError, ZeroDivisionError):
-                result["fps"] = 0.0
-        elif codec_type == "audio" and not result["has_audio"]:
-            result["has_audio"] = True
-            result["audio_codec"] = str(stream.get("codec_name") or "")
-
+    _apply_stream_metadata(result, data.get("streams") or [])
     return result
 
 
