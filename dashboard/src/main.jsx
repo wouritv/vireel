@@ -20,6 +20,9 @@ import NewCaptionPage from "./pages/NewCaptionPage";
 import AnonymousStoriesProjectsPage from "./pages/AnonymousStoriesProjectsPage";
 import AnonymousStoryCreatePage from "./pages/AnonymousStoryCreatePage";
 import AnonymousStoryProjectDetailPage from "./pages/AnonymousStoryProjectDetailPage";
+import FilmSummariesProjectsPage from "./pages/FilmSummariesProjectsPage";
+import FilmSummaryCreatePage from "./pages/FilmSummaryCreatePage";
+import FilmSummaryProjectDetailPage from "./pages/FilmSummaryProjectDetailPage";
 import ResetPassword from "./pages/ResetPassword";
 import UpdatePassword from "./pages/UpdatePassword";
 import AbonnementPage from "./pages/AbonnementPage";
@@ -75,6 +78,9 @@ ReactDOM.createRoot(document.getElementById("root")).render(
                             <Route path="anonymous-stories" element={<AnonymousStoriesProjectsPage />} />
                             <Route path="anonymous-stories/new" element={<AnonymousStoryCreatePage />} />
                             <Route path="anonymous-stories/projects/:projectId" element={<AnonymousStoryProjectDetailPage />} />
+                            <Route path="film-summaries" element={<FilmSummariesProjectsPage />} />
+                            <Route path="film-summaries/new" element={<FilmSummaryCreatePage />} />
+                            <Route path="film-summaries/projects/:projectId" element={<FilmSummaryProjectDetailPage />} />
                             <Route path="social-publications" element={<SocialPublicationsPage />} />
                             <Route path="settings" element={<DashboardTabPage tabKey="settings" />} />
                             <Route path="abonnements" element={<AbonnementPage />} />
