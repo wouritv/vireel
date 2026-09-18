@@ -4,6 +4,8 @@
 // FilmSummaryErrorCode in film_summary.py for the backend side of this
 // contract).
 
+import { resolveJobStepState, errorMessageForCodeWithNamespace } from "./jobStepStatus";
+
 /**
  * Normalize a raw /api/status/{job_id} job status to the frontend canonical
  * form used across every feature's progress UI.
@@ -22,10 +24,7 @@ export function normalizeFilmSummaryJobStatus(status) {
  * given -- the caller's `t()` call handles a missing translation.
  */
 export function errorMessageForCode(t, code, fallback) {
-    if (!code) return fallback;
-    const camel = String(code).toLowerCase().replace(/_([a-z0-9])/g, (_match, c) => c.toUpperCase());
-    const key = `filmSummary.error${camel.charAt(0).toUpperCase()}${camel.slice(1)}`;
-    return t(key, fallback);
+    return errorMessageForCodeWithNamespace(t, "filmSummary", code, fallback);
 }
 
 // Mirrors app.py's _FILM_SUMMARY_REJECTION_CODES: these error codes mean the
@@ -81,22 +80,6 @@ const ANALYSIS_STAGE_ORDER = ["transcribing", "detecting_scenes", "validating_fi
 // _run_film_summary_render_pipeline_stages reports them (10-40/45/90%).
 const RENDER_STAGE_ORDER = ["generating_voice", "rendering_preview", "rendering_final"];
 
-/**
- * State of a single step given the job's overall status, which stage index
- * is currently reported (-1 when none has been reported yet), and this
- * step's own index. Same shape as anonymousStories.js's
- * resolveStoryStepState, kept as its own function for the same reason: a
- * nested closure with this branching counts every branch twice.
- */
-function resolveFilmSummaryStepState(status, stageIndex, index) {
-    if (status === "complete") return "done";
-    if (index < stageIndex) return "done";
-
-    const isCurrentStep = index === stageIndex || (stageIndex === -1 && index === 0);
-    if (!isCurrentStep) return "pending";
-    return status === "error" ? "error" : "active";
-}
-
 // Step data for both phases -- a plain list instead of two near-identical
 // functions, so there's one small builder (buildProcessSteps below) instead
 // of duplicated per-phase logic. "uploading" carries a fixedState since the
@@ -133,7 +116,7 @@ function buildProcessSteps(steps, stageOrder, status, stage, t) {
             key: step.key,
             label: t(`filmSummary.step${suffix}`, step.labelFallback),
             description: t(`filmSummary.step${suffix}Desc`, step.descFallback),
-            state: step.fixedState || resolveFilmSummaryStepState(status, stageIndex, stageOrder.indexOf(step.key)),
+            state: step.fixedState || resolveJobStepState(status, stageIndex, stageOrder.indexOf(step.key)),
         };
     });
 }

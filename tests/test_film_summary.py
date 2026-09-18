@@ -399,8 +399,9 @@ def _fake_openai_response(content, prompt_tokens=10, completion_tokens=5):
 
 def test_classify_media_type_raises_when_api_key_missing(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    coro = fs.classify_media_type(metadata={}, transcript_sample="", scene_stats={})
     with pytest.raises(RuntimeError):
-        asyncio.run(fs.classify_media_type(metadata={}, transcript_sample="", scene_stats={}))
+        asyncio.run(coro)
 
 
 def test_classify_media_type_returns_verdict_with_usage(monkeypatch):
@@ -447,8 +448,9 @@ def test_classify_media_type_raises_on_bad_json(monkeypatch):
     fake_client.chat.completions.create.return_value = _fake_openai_response("not json")
     monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
 
+    coro = fs.classify_media_type(metadata={}, transcript_sample="", scene_stats={})
     with pytest.raises(fs.FilmSummaryValidationError) as exc_info:
-        asyncio.run(fs.classify_media_type(metadata={}, transcript_sample="", scene_stats={}))
+        asyncio.run(coro)
     assert exc_info.value.code == fs.FilmSummaryErrorCode.GENERATION_INVALID
 
 
@@ -479,11 +481,12 @@ def test_generate_edit_plan_raises_on_bad_json(monkeypatch):
     fake_client.chat.completions.create.return_value = _fake_openai_response("not json")
     monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
 
+    coro = fs.generate_edit_plan(
+        movie_metadata={}, target_duration_ms=600000, narration_language="en", narration_style="cinematic",
+        transcript_segments=[], scene_index=[], generation_constraints={},
+    )
     with pytest.raises(fs.FilmSummaryValidationError) as exc_info:
-        asyncio.run(fs.generate_edit_plan(
-            movie_metadata={}, target_duration_ms=600000, narration_language="en", narration_style="cinematic",
-            transcript_segments=[], scene_index=[], generation_constraints={},
-        ))
+        asyncio.run(coro)
     assert exc_info.value.code == fs.FilmSummaryErrorCode.PLAN_INVALID
 
 
@@ -517,11 +520,12 @@ def test_synthesize_tts_segment_wraps_failures_as_tts_failed(monkeypatch, tmp_pa
     fake_client.audio.speech.with_streaming_response.create.side_effect = RuntimeError("boom")
     monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
 
+    coro = fs.synthesize_tts_segment(
+        text="Hello", voice="cedar", model="gpt-4o-mini-tts", instructions="narrate",
+        output_path=str(tmp_path / "segment.mp3"),
+    )
     with pytest.raises(fs.FilmSummaryValidationError) as exc_info:
-        asyncio.run(fs.synthesize_tts_segment(
-            text="Hello", voice="cedar", model="gpt-4o-mini-tts", instructions="narrate",
-            output_path=str(tmp_path / "segment.mp3"),
-        ))
+        asyncio.run(coro)
     assert exc_info.value.code == fs.FilmSummaryErrorCode.TTS_FAILED
 
 
@@ -531,8 +535,9 @@ def test_synthesize_tts_segment_wraps_failures_as_tts_failed(monkeypatch, tmp_pa
 
 def test_transcribe_video_with_timecodes_raises_when_api_key_missing(monkeypatch):
     monkeypatch.delenv("ASSEMBLYAI_API_KEY", raising=False)
+    coro = fs.transcribe_video_with_timecodes("/tmp/does-not-matter.mp4")
     with pytest.raises(RuntimeError):
-        asyncio.run(fs.transcribe_video_with_timecodes("/tmp/does-not-matter.mp4"))
+        asyncio.run(coro)
 
 
 def _install_fake_assemblyai(monkeypatch, *, utterances=None, status_error=False, fallback_text=""):
@@ -595,8 +600,9 @@ def test_transcribe_video_with_timecodes_raises_on_transcript_error(monkeypatch)
     monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test-key")
     _install_fake_assemblyai(monkeypatch, utterances=[], status_error=True)
 
+    coro = fs.transcribe_video_with_timecodes("/tmp/video.mp4")
     with pytest.raises(RuntimeError):
-        asyncio.run(fs.transcribe_video_with_timecodes("/tmp/video.mp4"))
+        asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------------

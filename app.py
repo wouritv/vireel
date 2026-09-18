@@ -9157,7 +9157,7 @@ def _cleanup_film_summary_upload(input_path: Optional[str], output_dir: str) -> 
     shutil.rmtree(output_dir, ignore_errors=True)
 
 
-async def _validate_film_summary_technical_constraints_or_cleanup(
+def _validate_film_summary_technical_constraints_or_cleanup(
     input_path: str, size_bytes: float, output_dir: str,
 ) -> float:
     """Probe technical metadata and run Niveau 1 validation, cleaning up the
@@ -9276,7 +9276,7 @@ async def create_film_summary(
     source_url_value = source["source_url_value"]
     film_title = _resolve_film_summary_title(title, source["film_title"])
 
-    local_duration = await _validate_film_summary_technical_constraints_or_cleanup(input_path, size_bytes, output_dir)
+    local_duration = _validate_film_summary_technical_constraints_or_cleanup(input_path, size_bytes, output_dir)
     resolved_target_duration = _resolve_film_summary_target_duration(target_duration_seconds, local_duration)
 
     analysis_required_credits = _estimate_film_summary_analysis_required_credits(local_duration, float(size_bytes))

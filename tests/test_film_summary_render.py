@@ -88,7 +88,8 @@ def test_extract_source_subclip_builds_scale_and_pad_filter(monkeypatch):
     render.extract_source_subclip("/tmp/source.mp4", 1000, 4000, "/tmp/out.mp4", canvas=CANVAS)
     cmd = calls[0]
     assert "scale=1280:720:force_original_aspect_ratio=decrease" in cmd[cmd.index("-vf") + 1]
-    assert "-ss" in cmd and "1.000" in cmd
+    assert "-ss" in cmd
+    assert "1.000" in cmd
 
 
 def test_build_blank_segment_uses_lavfi_color_source(monkeypatch):
@@ -145,7 +146,8 @@ def test_pad_or_trim_trims_when_too_long(monkeypatch, tmp_path):
     calls = _capture_ffmpeg_calls(monkeypatch)
     render.pad_or_trim_to_duration(str(tmp_path / "input.mp4"), 10.0, str(tmp_path / "output.mp4"))
     cmd = calls[0]
-    assert "-t" in cmd and "10.000" in cmd
+    assert "-t" in cmd
+    assert "10.000" in cmd
     assert "copy" in cmd
 
 
