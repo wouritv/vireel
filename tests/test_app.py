@@ -67,6 +67,7 @@ def _install_optional_dependency_stubs(monkeypatch):
     s3_mod.generate_presigned_url = lambda *args, **kwargs: ""
     s3_mod.delete_s3_object = lambda *args, **kwargs: True
     s3_mod.get_s3_object_size = lambda *args, **kwargs: 0
+    s3_mod.download_s3_object = lambda *args, **kwargs: True
     monkeypatch.setitem(sys.modules, "s3_uploader", s3_mod)
 
     sib_mod = types.ModuleType("sib_api_v3_sdk")

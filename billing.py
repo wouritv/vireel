@@ -23,6 +23,11 @@ DATA_IMPULSE_PRICE_BY_GO        = float(os.environ.get("DATA_IMPULSE_PRICE_BY_GO
 VIREEL_VPS_PRICE_BY_MINUTE       = float(os.environ.get("VIREEL_VPS_PRICE_BY_MINUTE",       "0.01"))
 
 ASSEMBLY_ESTIMATE_COST_PER_MINUTE = float(os.environ.get("ASSEMBLY_ESTIMATE_COST_PER_MINUTE", "0.21"))
+OPENAI_TTS_PRICE_PER_1K_CHARS = float(os.environ.get("OPENAI_TTS_PRICE_PER_1K_CHARS", "0.015"))
+# FFmpeg assembly for a film summary re-encodes each clip individually, then
+# concatenates, normalizes and re-encodes a preview -- several passes over
+# the VPS-minute cost a single caption/reel render represents.
+FILM_SUMMARY_RENDER_VPS_MULTIPLIER = float(os.environ.get("FILM_SUMMARY_RENDER_VPS_MULTIPLIER", "3.0"))
 OPEN_IA_INPUT_TOKEN_PER_DOLLAR    = float(os.environ.get("OPEN_IA_INPUT_TOKEN_PER_DOLLAR", "400000"))
 OPEN_IA_OUTPUT_TOKEN_PER_DOLLAR   = float(os.environ.get("OPEN_IA_OUTPUT_TOKEN_PER_DOLLAR", "100000"))
 GEMINI_INPUT_TOKEN_PER_DOLLAR     = float(os.environ.get("GEMINI_INPUT_TOKEN_PER_DOLLAR", "1000000"))
@@ -174,6 +179,47 @@ def estimate_publication_cost_usd(
         "openai_usd":       0.0,
         "gemini_usd":       0.0,
         "total_usd":        round(total_usd, 6),
+    }
+
+
+def estimate_film_summary_analysis_cost_usd(
+    duration_minutes: float = 20.0,
+    video_size_gb: float = 1.0,
+    uses_assembly: bool = True,
+    uses_openai: bool = True,  # NOSONAR(S1172) see estimate_reel_cost_usd above -- same rationale
+) -> Dict[str, Any]:
+    """Estimate the USD cost of the Film Summary analysis phase (technical
+    validation, film classification, transcription, scene detection,
+    planning) -- same cost shape as estimate_caption_cost_usd since both
+    are dominated by S3 storage, VPS processing time and AssemblyAI
+    transcription; real OpenAI cost is billed from actual token usage."""
+    return estimate_caption_cost_usd(
+        duration_minutes=duration_minutes, video_size_gb=video_size_gb,
+        uses_assembly=uses_assembly, uses_openai=uses_openai,
+    )
+
+
+def estimate_film_summary_render_cost_usd(
+    target_duration_minutes: float = 10.0,
+    narration_character_count: float = 0.0,
+    video_size_gb: float = 0.0,
+) -> Dict[str, Any]:
+    """Estimate the USD cost of the Film Summary render phase (per-segment
+    OpenAI TTS generation + multi-pass FFmpeg assembly)."""
+    s3_usd = video_size_gb * AMAZON_S3_GO_PRICE + 2 * AMAZON_S3_PUT_REQUEST_PRICE
+    vps_usd = target_duration_minutes * VIREEL_VPS_PRICE_BY_MINUTE * FILM_SUMMARY_RENDER_VPS_MULTIPLIER
+    tts_usd = (max(0.0, narration_character_count) / 1000.0) * OPENAI_TTS_PRICE_PER_1K_CHARS
+    total_usd = s3_usd + vps_usd + tts_usd
+
+    return {
+        "s3_usd":          round(s3_usd, 6),
+        "vps_usd":         round(vps_usd, 6),
+        "dataimpulse_usd": 0.0,
+        "assembly_usd":    0.0,
+        "tts_usd":         round(tts_usd, 6),
+        "openai_usd":      0.0,
+        "gemini_usd":      0.0,
+        "total_usd":       round(total_usd, 6),
     }
 
 
