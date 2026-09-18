@@ -97,74 +97,45 @@ function resolveFilmSummaryStepState(status, stageIndex, index) {
     return status === "error" ? "error" : "active";
 }
 
-function buildAnalysisProcessSteps(status, stage, t) {
-    const stageIndex = ANALYSIS_STAGE_ORDER.indexOf(stage);
-    const stateFor = (index) => resolveFilmSummaryStepState(status, stageIndex, index);
+// Step data for both phases -- a plain list instead of two near-identical
+// functions, so there's one small builder (buildProcessSteps below) instead
+// of duplicated per-phase logic. "uploading" carries a fixedState since the
+// source is already fully received/downloaded by the time a job_id exists
+// at all (it happens synchronously in the POST handler), so it's always
+// shown done once we're polling a job; every other step's state is derived
+// from where `stage` falls in its phase's order.
+const ANALYSIS_STEPS = [
+    { key: "uploading", labelFallback: "Reception de la source", descFallback: "Le film source est pret pour l'analyse.", fixedState: "done" },
+    { key: "transcribing", labelFallback: "Transcription de l'audio", descFallback: "Extraction du texte parle avec horodatage." },
+    { key: "detecting_scenes", labelFallback: "Detection des scenes", descFallback: "Decoupage du film en scenes exploitables." },
+    { key: "validating_film", labelFallback: "Verification du contenu", descFallback: "Confirmation qu'il s'agit bien d'un film narratif." },
+    { key: "planning", labelFallback: "Construction du plan de montage", descFallback: "Redaction de la narration et selection des extraits." },
+    { key: "validating_plan", labelFallback: "Validation du plan", descFallback: "Verification de la duree et de la coherence du montage." },
+];
 
-    return [
-        {
-            key: "uploading",
-            label: t("filmSummary.stepUploading", "Reception de la source"),
-            description: t("filmSummary.stepUploadingDesc", "Le film source est pret pour l'analyse."),
-            state: "done",
-        },
-        {
-            key: "transcribing",
-            label: t("filmSummary.stepTranscribing", "Transcription de l'audio"),
-            description: t("filmSummary.stepTranscribingDesc", "Extraction du texte parle avec horodatage."),
-            state: stateFor(0),
-        },
-        {
-            key: "detecting_scenes",
-            label: t("filmSummary.stepDetectingScenes", "Detection des scenes"),
-            description: t("filmSummary.stepDetectingScenesDesc", "Decoupage du film en scenes exploitables."),
-            state: stateFor(1),
-        },
-        {
-            key: "validating_film",
-            label: t("filmSummary.stepValidatingFilm", "Verification du contenu"),
-            description: t("filmSummary.stepValidatingFilmDesc", "Confirmation qu'il s'agit bien d'un film narratif."),
-            state: stateFor(2),
-        },
-        {
-            key: "planning",
-            label: t("filmSummary.stepPlanning", "Construction du plan de montage"),
-            description: t("filmSummary.stepPlanningDesc", "Redaction de la narration et selection des extraits."),
-            state: stateFor(3),
-        },
-        {
-            key: "validating_plan",
-            label: t("filmSummary.stepValidatingPlan", "Validation du plan"),
-            description: t("filmSummary.stepValidatingPlanDesc", "Verification de la duree et de la coherence du montage."),
-            state: stateFor(4),
-        },
-    ];
+const RENDER_STEPS = [
+    { key: "generating_voice", labelFallback: "Generation de la voix off", descFallback: "Synthese vocale de chaque segment narre." },
+    { key: "rendering_preview", labelFallback: "Assemblage de l'apercu", descFallback: "Montage des extraits et de la narration." },
+    { key: "rendering_final", labelFallback: "Finalisation de la video", descFallback: "Encodage et enregistrement du resultat final." },
+];
+
+// "detecting_scenes" -> "DetectingScenes", matching the stepXxx/stepXxxDesc
+// key naming already used in locales/{en,fr}/common.json.
+function toStepI18nSuffix(snakeKey) {
+    return snakeKey.split("_").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join("");
 }
 
-function buildRenderProcessSteps(status, stage, t) {
-    const stageIndex = RENDER_STAGE_ORDER.indexOf(stage);
-    const stateFor = (index) => resolveFilmSummaryStepState(status, stageIndex, index);
-
-    return [
-        {
-            key: "generating_voice",
-            label: t("filmSummary.stepGeneratingVoice", "Generation de la voix off"),
-            description: t("filmSummary.stepGeneratingVoiceDesc", "Synthese vocale de chaque segment narre."),
-            state: stateFor(0),
-        },
-        {
-            key: "rendering_preview",
-            label: t("filmSummary.stepRenderingPreview", "Assemblage de l'apercu"),
-            description: t("filmSummary.stepRenderingPreviewDesc", "Montage des extraits et de la narration."),
-            state: stateFor(1),
-        },
-        {
-            key: "rendering_final",
-            label: t("filmSummary.stepRenderingFinal", "Finalisation de la video"),
-            description: t("filmSummary.stepRenderingFinalDesc", "Encodage et enregistrement du resultat final."),
-            state: stateFor(2),
-        },
-    ];
+function buildProcessSteps(steps, stageOrder, status, stage, t) {
+    const stageIndex = stageOrder.indexOf(stage);
+    return steps.map((step) => {
+        const suffix = toStepI18nSuffix(step.key);
+        return {
+            key: step.key,
+            label: t(`filmSummary.step${suffix}`, step.labelFallback),
+            description: t(`filmSummary.step${suffix}Desc`, step.descFallback),
+            state: step.fixedState || resolveFilmSummaryStepState(status, stageIndex, stageOrder.indexOf(step.key)),
+        };
+    });
 }
 
 /**
@@ -179,6 +150,6 @@ function buildRenderProcessSteps(status, stage, t) {
 export function buildFilmSummaryProcessSteps({ status, stage, t, phase }) {
     const resolvedPhase = phase || (RENDER_STAGE_ORDER.includes(stage) ? "render" : "analysis");
     return resolvedPhase === "render"
-        ? buildRenderProcessSteps(status, stage, t)
-        : buildAnalysisProcessSteps(status, stage, t);
+        ? buildProcessSteps(RENDER_STEPS, RENDER_STAGE_ORDER, status, stage, t)
+        : buildProcessSteps(ANALYSIS_STEPS, ANALYSIS_STAGE_ORDER, status, stage, t);
 }
