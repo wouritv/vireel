@@ -473,7 +473,9 @@
     "captionGenerator": "Generate Captions",
     "captionGeneratorSubtitle": "Upload a video and let AI assist you in adding subtitles.",
     "anonymousStoryGenerator": "Create an anonymous story",
-    "anonymousStoryGeneratorSubtitle": "Turn a testimonial video into an anonymized written story, ready to publish."
+    "anonymousStoryGeneratorSubtitle": "Turn a testimonial video into an anonymized written story, ready to publish.",
+    "filmSummaryGenerator": "Create a film summary",
+    "filmSummaryGeneratorSubtitle": "Turn a full film into an edited, narrated summary, ready to review before generation."
   },
   "social": {
     "socialPublications": "Social posts",

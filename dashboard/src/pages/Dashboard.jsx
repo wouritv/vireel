@@ -1,4 +1,4 @@
-import { ArrowRight, MessageSquareText, Quote, Sparkles } from "lucide-react";
+import { ArrowRight, Clapperboard, MessageSquareText, Quote, Sparkles } from "lucide-react";
 import { useAuth } from "../state/AuthContext";
 import { useNavigate } from "react-router-dom";
 import { useEffect, useMemo, useState } from "react";
@@ -84,7 +84,7 @@ export default function Dashboard() {
                     <h3 className="mt-2 text-xl font-bold">{t("dashboard.generationJourney","Parcours de generation")}</h3>
                 </div>
 
-                <div className="grid gap-4 md:grid-cols-3">
+                <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                     <button
                         onClick={() => navigate("/dashboard/reel-generator")}
                         className="group rounded-2xl border border-slate-300 dark:border-white/10 bg-white/5 p-5 text-left hover:bg-white/10 transition"
@@ -125,6 +125,20 @@ export default function Dashboard() {
                         </div>
                         <h4 className="title-contrast mt-5 text-lg font-semibold">{t("dashboard.anonymousStoryGenerator", "Créer une histoire anonyme")}</h4>
                         <p className="mt-2 text-sm leading-6 text-slate-500 dark:text-zinc-400">{t("dashboard.anonymousStoryGeneratorSubtitle", "Transforme une video temoignage en histoire ecrite anonymisee, prete a publier.")}</p>
+                    </button>
+
+                    <button
+                        onClick={() => navigate("/dashboard/film-summaries/new")}
+                        className="group rounded-2xl border border-slate-300 dark:border-white/10 bg-white/5 p-5 text-left hover:bg-white/10 transition"
+                    >
+                        <div className="flex items-center justify-between">
+                            <span className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-teal-500/10 text-teal-400">
+                                <Clapperboard size={18} />
+                            </span>
+                            <ArrowRight size={16} className="text-slate-400 dark:text-zinc-500 group-hover:text-white" />
+                        </div>
+                        <h4 className="title-contrast mt-5 text-lg font-semibold">{t("dashboard.filmSummaryGenerator", "Créer un résumé de film")}</h4>
+                        <p className="mt-2 text-sm leading-6 text-slate-500 dark:text-zinc-400">{t("dashboard.filmSummaryGeneratorSubtitle", "Transforme un film complet en résumé monté et narré, prêt à revoir avant génération.")}</p>
                     </button>
 
                 </div>

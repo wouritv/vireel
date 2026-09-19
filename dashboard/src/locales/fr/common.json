@@ -474,7 +474,9 @@
     "captionGenerator": "Générer des Sous-titres",
     "captionGeneratorSubtitle": "Upload une vidéo et laisse le système boosté à l'IA t'accompagner dans l'ajout de sous titres.",
     "anonymousStoryGenerator": "Créer une histoire anonyme",
-    "anonymousStoryGeneratorSubtitle": "Transforme une vidéo témoignage en histoire écrite anonymisée, prête à publier."
+    "anonymousStoryGeneratorSubtitle": "Transforme une vidéo témoignage en histoire écrite anonymisée, prête à publier.",
+    "filmSummaryGenerator": "Créer un résumé de film",
+    "filmSummaryGeneratorSubtitle": "Transforme un film complet en résumé monté et narré, prêt à revoir avant génération."
   },
   "social": {
     "socialPublications": "Publications sociales",
