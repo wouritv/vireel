@@ -19,8 +19,13 @@
       URLs are returned dynamically by the backend (S3/CDN) and are not a
       fixed, known-ahead-of-time domain.
     - frame-src allows YouTube only, for the embedded preview player.
+    - frame-ancestors is NOT set here: browsers ignore that directive when
+      delivered via a <meta> tag (it only takes effect from an HTTP response
+      header), so keeping it here just produced a console warning with no
+      actual clickjacking protection. Enforce it at the reverse proxy/server
+      level instead if that protection is needed.
   -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' blob: https://*.supabase.co wss://*.supabase.co; worker-src 'self' blob:; frame-src https://www.youtube.com; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self';" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' blob: https://*.supabase.co wss://*.supabase.co; worker-src 'self' blob:; frame-src https://www.youtube.com; object-src 'none'; base-uri 'self'; form-action 'self';" />
 
   <!-- Primary SEO Meta Tags -->
   <title>Vireel – Créez des Reels avec l’IA</title>
