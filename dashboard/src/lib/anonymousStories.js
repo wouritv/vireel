@@ -1,5 +1,7 @@
 // Shared helpers for the anonymous stories ("Temoignages") feature pages.
 
+import { resolveJobStepState, errorMessageForCodeWithNamespace } from "./jobStepStatus";
+
 export function normalizeStoryJobStatus(status) {
     if (status === "completed") return "complete";
     if (status === "failed") return "error";
@@ -13,10 +15,7 @@ export function normalizeStoryJobStatus(status) {
  * code is given -- the caller's `t()` call handles a missing translation.
  */
 export function errorMessageForCode(t, code, fallback) {
-    if (!code) return fallback;
-    const camel = String(code).toLowerCase().replace(/_([a-z0-9])/g, (_match, c) => c.toUpperCase());
-    const key = `anonymousStories.error${camel.charAt(0).toUpperCase()}${camel.slice(1)}`;
-    return t(key, fallback);
+    return errorMessageForCodeWithNamespace(t, "anonymousStories", code, fallback);
 }
 
 // Meta's documented rejection text when a text-background post exceeds its
@@ -66,23 +65,6 @@ export function buildFullText(hook, introduction, story, questions) {
 const STORY_STAGE_ORDER = ["transcription", "generation", "finalization"];
 
 /**
- * State of a single step given the job's overall status, which stage index
- * is currently reported (-1 when none has been reported yet), and this
- * step's own index. Pulled out of buildAnonymousStoryProcessSteps (and
- * flattened to early returns) to keep cognitive complexity low -- a nested
- * closure with the same branching counts every branch twice (once for its
- * own nesting, once for being inside the outer function).
- */
-function resolveStoryStepState(status, stageIndex, index) {
-    if (status === "complete") return "done";
-    if (index < stageIndex) return "done";
-
-    const isCurrentStep = index === stageIndex || (stageIndex === -1 && index === 0);
-    if (!isCurrentStep) return "pending";
-    return status === "error" ? "error" : "active";
-}
-
-/**
  * Build the step list for the "Suivi du processus" progress card, in the
  * same shape/visual role as App.jsx's buildProcessingSteps for reels
  * (label + description + state per step) so both features present
@@ -90,7 +72,7 @@ function resolveStoryStepState(status, stageIndex, index) {
  */
 export function buildAnonymousStoryProcessSteps({ status, currentStep, t }) {
     const stageIndex = STORY_STAGE_ORDER.indexOf(currentStep);
-    const stateFor = (index) => resolveStoryStepState(status, stageIndex, index);
+    const stateFor = (index) => resolveJobStepState(status, stageIndex, index);
 
     return [
         {

@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
+import film_summary
+
 
 def _install_supabase_stubs(monkeypatch):
     supabase_mod = types.ModuleType("supabase")
@@ -67,6 +69,7 @@ def _install_optional_dependency_stubs(monkeypatch):
     s3_mod.generate_presigned_url = lambda *args, **kwargs: ""
     s3_mod.delete_s3_object = lambda *args, **kwargs: True
     s3_mod.get_s3_object_size = lambda *args, **kwargs: 0
+    s3_mod.download_s3_object = lambda *args, **kwargs: True
     monkeypatch.setitem(sys.modules, "s3_uploader", s3_mod)
 
     sib_mod = types.ModuleType("sib_api_v3_sdk")
@@ -2693,3 +2696,137 @@ def test_anonymous_story_max_duration_defaults_to_180_minutes(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
 
     assert app.ANONYMOUS_STORY_MAX_DURATION_MINUTES == 180.0
+
+
+# ---------------------------------------------------------------------------
+# Film Summary helpers (pure logic -- no Supabase/S3 network calls, same
+# convention as the caption/anonymous-story helper tests above)
+# ---------------------------------------------------------------------------
+
+def test_row_field_returns_none_for_missing_row(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    assert app._row_field(None, "id") is None
+    assert app._row_field({}, "id") is None
+
+
+def test_row_field_returns_value_when_present(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    assert app._row_field({"id": "abc", "source_s3_key": "key"}, "source_s3_key") == "key"
+
+
+def test_resolve_film_summary_title_prefers_explicit_title(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    assert app._resolve_film_summary_title("My Title", "Fallback") == "My Title"
+
+
+def test_resolve_film_summary_title_falls_back_to_source_title(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    assert app._resolve_film_summary_title(None, "Fallback") == "Fallback"
+
+
+def test_resolve_film_summary_title_falls_back_to_default(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    assert app._resolve_film_summary_title("", "") == "Resume de film"
+
+
+def test_resolve_film_summary_title_truncates_to_200_chars(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    result = app._resolve_film_summary_title("x" * 300, "")
+    assert len(result) == 200
+
+
+def test_resolve_film_summary_target_duration_uses_explicit_value(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    assert app._resolve_film_summary_target_duration(300.0, local_duration=3600.0) == 300
+
+
+def test_resolve_film_summary_target_duration_derives_when_not_given(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    result = app._resolve_film_summary_target_duration(None, local_duration=3600.0)
+    assert result == film_summary.derive_target_duration_seconds(
+        3600.0, app.FILM_SUMMARY_MIN_TARGET_DURATION_SECONDS, app.FILM_SUMMARY_MAX_TARGET_DURATION_SECONDS,
+    )
+
+
+def test_resolve_film_summary_narration_settings_defaults_style_to_cinematic(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    language, style = app._resolve_film_summary_narration_settings(None, None)
+    assert language == ""
+    assert style == "cinematic"
+
+
+def test_resolve_film_summary_narration_settings_preserves_explicit_values(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    language, style = app._resolve_film_summary_narration_settings(" fr ", " dramatic ")
+    assert language == "fr"
+    assert style == "dramatic"
+
+
+def test_total_narration_character_count_sums_voice_over_segments_only(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    plan = {
+        "segments": [
+            {"type": "voice_over", "narration": "Hello world"},
+            {"type": "voice_over", "narration": "!!"},
+            {"type": "original_dialogue", "transcript_excerpt": "should not be counted"},
+        ],
+    }
+    assert app._total_narration_character_count(plan) == len("Hello world") + len("!!")
+
+
+def test_estimate_film_summary_analysis_required_credits_is_non_negative(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    credits = app._estimate_film_summary_analysis_required_credits(duration_seconds=1200.0, size_bytes=1024 ** 3)
+    assert credits >= 0
+
+
+def test_estimate_film_summary_render_required_credits_is_non_negative(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    credits = app._estimate_film_summary_render_required_credits(target_duration_seconds=600.0, narration_character_count=5000)
+    assert credits >= 0
+
+
+def test_film_summary_rejection_codes_cover_source_and_content_rejections(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    assert film_summary.FilmSummaryErrorCode.NOT_A_FILM in app._FILM_SUMMARY_REJECTION_CODES
+    assert film_summary.FilmSummaryErrorCode.SOURCE_TOO_LONG in app._FILM_SUMMARY_REJECTION_CODES
+    assert film_summary.FilmSummaryErrorCode.TTS_FAILED not in app._FILM_SUMMARY_REJECTION_CODES
+
+
+def test_normalize_film_summary_row_excludes_content_by_default(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    row = {
+        "id": "fs_1", "title": "T", "status": "awaiting_review", "stage": "awaiting_user_review",
+        "edit_plan": {"segments": []}, "scene_index": [{"scene_id": "scene_001"}], "classification": {"is_film": True},
+    }
+    item = app._normalize_film_summary_row(row)
+    assert item["id"] == "fs_1"
+    assert "edit_plan" not in item
+    assert "scene_index" not in item
+
+
+def test_normalize_film_summary_row_includes_content_when_requested(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    row = {
+        "id": "fs_1", "title": "T", "status": "completed", "stage": "completed",
+        "edit_plan": {"segments": []}, "scene_index": [], "classification": {},
+        "validation_report": {"valid": True}, "preview_s3_key": "preview/key.mp4", "final_s3_key": "final/key.mp4",
+    }
+    item = app._normalize_film_summary_row(row, include_content=True)
+    assert item["edit_plan"] == {"segments": []}
+    assert item["validation_report"] == {"valid": True}
+    # generate_presigned_url is stubbed to return "" in this test environment.
+    assert item["preview_url"] == ""
+    assert item["final_url"] == ""
+
+
+def test_mark_film_summary_job_terminal_noops_without_supabase(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    # Neither SUPABASE_URL nor SUPABASE_SERVICE_ROLE_KEY are set in this test
+    # environment, so is_supabase_configured() is False and this should
+    # simply return without attempting any network call.
+    asyncio.run(app._mark_film_summary_job_terminal(
+        "user-1", "film-summary-1", "project-1",
+        app.film_summary.FilmSummaryStatus.REJECTED, app.film_summary.FilmSummaryStage.REJECTED,
+        "NOT_A_FILM", "This is not a film",
+    ))

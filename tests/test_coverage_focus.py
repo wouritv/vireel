@@ -87,6 +87,7 @@ def _import_app_with_stubs(monkeypatch):
     s3_uploader_mod.generate_presigned_url = MagicMock(return_value="https://presigned.url")
     s3_uploader_mod.delete_s3_object = MagicMock()
     s3_uploader_mod.get_s3_object_size = MagicMock(return_value=1024)
+    s3_uploader_mod.download_s3_object = MagicMock(return_value=True)
     monkeypatch.setitem(sys.modules, "s3_uploader", s3_uploader_mod)
 
     supabase_request_mod = types.ModuleType("supabase_request")
@@ -110,7 +111,10 @@ def _import_app_with_stubs(monkeypatch):
         "delete_style_edit_versions", "insert_anonymous_story",
         "list_anonymous_stories", "get_anonymous_story",
         "get_anonymous_story_by_job", "update_anonymous_story",
-        "soft_delete_anonymous_story", "get_anonymous_stories_by_project"]:
+        "soft_delete_anonymous_story", "get_anonymous_stories_by_project",
+        "get_job_record", "insert_film_summary", "list_film_summaries",
+        "get_film_summary", "update_film_summary", "soft_delete_film_summary",
+        "get_film_summaries_by_project"]:
         setattr(supabase_request_mod, func_name, MagicMock(return_value=None) if "get" not in func_name else AsyncMock(return_value=None))
 
     supabase_request_mod.is_supabase_configured = MagicMock(return_value=False)
@@ -124,6 +128,8 @@ def _import_app_with_stubs(monkeypatch):
     billing_mod.estimate_caption_cost_usd = MagicMock(return_value=0.2)
     billing_mod.estimate_publication_cost_usd = MagicMock(return_value=0.1)
     billing_mod.estimate_llm_usage_cost_usd = MagicMock(return_value=0.05)
+    billing_mod.estimate_film_summary_analysis_cost_usd = MagicMock(return_value=0.2)
+    billing_mod.estimate_film_summary_render_cost_usd = MagicMock(return_value=0.3)
     billing_mod.DEFAULT_REEL_CREDITS = 100
     billing_mod.DEFAULT_CAPTION_CREDITS = 50
     billing_mod.DEFAULT_PUBLICATION_CREDITS = 25
