@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, Check, Loader2, Pause, Play } from "lucide-react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { getApiUrl, fetchAppConfig } from "../config";
 import { getAuthHeaders } from "../lib/apiAuth";
@@ -11,10 +11,26 @@ import FilmSummaryProcessingPanel from "../components/FilmSummaryProcessingPanel
 import { errorMessageForCode, normalizeFilmSummaryJobStatus as normalizeStatus } from "../lib/filmSummary";
 
 const NARRATION_STYLE_KEYS = [
-    { value: "cinematic", labelKey: "filmSummary.narrationStyleCinematic", fallback: "Cinematographique" },
-    { value: "dramatic", labelKey: "filmSummary.narrationStyleDramatic", fallback: "Dramatique" },
-    { value: "documentary", labelKey: "filmSummary.narrationStyleDocumentary", fallback: "Documentaire" },
-    { value: "energetic", labelKey: "filmSummary.narrationStyleEnergetic", fallback: "Energique" },
+    {
+        value: "cinematic", labelKey: "filmSummary.narrationStyleCinematic", fallback: "Cinematographique",
+        descKey: "filmSummary.narrationStyleCinematicDesc",
+        descFallback: "Ton immersif proche d'une bande-annonce, met l'accent sur l'emotion et le suspense.",
+    },
+    {
+        value: "dramatic", labelKey: "filmSummary.narrationStyleDramatic", fallback: "Dramatique",
+        descKey: "filmSummary.narrationStyleDramaticDesc",
+        descFallback: "Rythme soutenu qui insiste sur les enjeux et les tensions entre les personnages.",
+    },
+    {
+        value: "documentary", labelKey: "filmSummary.narrationStyleDocumentary", fallback: "Documentaire",
+        descKey: "filmSummary.narrationStyleDocumentaryDesc",
+        descFallback: "Ton neutre et informatif, a la maniere d'une voix off de reportage.",
+    },
+    {
+        value: "energetic", labelKey: "filmSummary.narrationStyleEnergetic", fallback: "Energique",
+        descKey: "filmSummary.narrationStyleEnergeticDesc",
+        descFallback: "Rythme rapide et dynamique, adapte a un resume court et percutant.",
+    },
 ];
 
 // Same language set as CaptionsModal.jsx's FALLBACK_LANGUAGES, for a
@@ -58,6 +74,55 @@ export default function FilmSummaryCreatePage() {
     const [narrationLanguage, setNarrationLanguage] = useState("");
     const [narrationStyle, setNarrationStyle] = useState("cinematic");
     const [voiceId, setVoiceId] = useState("");
+
+    // Voice preview playback (GET /api/film-summaries/voice-previews/{voice})
+    // -- a short demo line synthesized once server-side and cached, so the
+    // user can hear each narrator voice before picking one instead of
+    // guessing from a bare id in a dropdown.
+    const [playingVoiceId, setPlayingVoiceId] = useState("");
+    const [loadingVoiceId, setLoadingVoiceId] = useState("");
+    const [voicePreviewError, setVoicePreviewError] = useState("");
+    const voicePreviewUrlsRef = useRef({});
+    const voiceAudioRef = useRef(null);
+
+    useEffect(() => {
+        return () => {
+            voiceAudioRef.current?.pause();
+        };
+    }, []);
+
+    const handlePlayVoicePreview = async (voice) => {
+        setVoicePreviewError("");
+        if (playingVoiceId === voice) {
+            voiceAudioRef.current?.pause();
+            setPlayingVoiceId("");
+            return;
+        }
+        try {
+            let previewUrl = voicePreviewUrlsRef.current[voice];
+            if (!previewUrl) {
+                setLoadingVoiceId(voice);
+                const response = await fetch(getApiUrl(`/api/film-summaries/voice-previews/${voice}`), {
+                    headers: getAuthHeaders(user?.id),
+                });
+                if (!response.ok) throw new Error("preview_unavailable");
+                const data = await response.json();
+                previewUrl = getApiUrl(data.preview_url);
+                voicePreviewUrlsRef.current[voice] = previewUrl;
+            }
+            if (!voiceAudioRef.current) voiceAudioRef.current = new Audio();
+            const audio = voiceAudioRef.current;
+            audio.src = previewUrl;
+            audio.onended = () => setPlayingVoiceId("");
+            await audio.play();
+            setPlayingVoiceId(voice);
+        } catch {
+            setVoicePreviewError(t("filmSummary.voicePreviewError", "Apercu audio indisponible pour le moment."));
+            setPlayingVoiceId("");
+        } finally {
+            setLoadingVoiceId("");
+        }
+    };
 
     const hasCredits = Number(credits || 0) > 0;
 
@@ -359,34 +424,97 @@ export default function FilmSummaryCreatePage() {
                             </select>
                         </div>
 
-                        <div className="space-y-2">
-                            <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-400 dark:text-zinc-500">
-                                {t("filmSummary.narrationStyleLabel", "Style de narration")}
-                            </label>
-                            <select
-                                value={narrationStyle}
-                                onChange={(e) => setNarrationStyle(e.target.value)}
-                                className="input-field w-full dark:text-white"
-                            >
-                                {NARRATION_STYLE_KEYS.map((option) => (
-                                    <option key={option.value} value={option.value}>{t(option.labelKey, option.fallback)}</option>
-                                ))}
-                            </select>
-                        </div>
+                    </div>
 
-                        <div className="space-y-2">
-                            <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-400 dark:text-zinc-500">
-                                {t("filmSummary.voiceLabel", "Voix du narrateur")}
-                            </label>
-                            <select
-                                value={voiceId || defaultVoice}
-                                onChange={(e) => setVoiceId(e.target.value)}
-                                className="input-field w-full dark:text-white"
-                            >
-                                {(allowedVoices.length ? allowedVoices : [defaultVoice]).map((voice) => (
-                                    <option key={voice} value={voice}>{voice}</option>
-                                ))}
-                            </select>
+                    <div className="space-y-2">
+                        <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-400 dark:text-zinc-500">
+                            {t("filmSummary.narrationStyleLabel", "Style de narration")}
+                        </label>
+                        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                            {NARRATION_STYLE_KEYS.map((option) => {
+                                const isSelected = narrationStyle === option.value;
+                                return (
+                                    <button
+                                        key={option.value}
+                                        type="button"
+                                        onClick={() => setNarrationStyle(option.value)}
+                                        aria-pressed={isSelected}
+                                        className={`relative rounded-xl border p-3 text-left transition ${
+                                            isSelected
+                                                ? "border-primary bg-primary/10"
+                                                : "border-slate-300 dark:border-white/10 bg-black/10 hover:bg-white/5"
+                                        }`}
+                                    >
+                                        {isSelected ? (
+                                            <span className="absolute right-2 top-2 inline-flex h-4 w-4 items-center justify-center rounded-full bg-primary text-white">
+                                                <Check size={10} />
+                                            </span>
+                                        ) : null}
+                                        <p className="pr-5 text-sm font-semibold text-slate-900 dark:text-white">{t(option.labelKey, option.fallback)}</p>
+                                        <p className="mt-1 text-xs leading-5 text-slate-500 dark:text-zinc-400">{t(option.descKey, option.descFallback)}</p>
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    </div>
+
+                    <div className="space-y-2">
+                        <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-400 dark:text-zinc-500">
+                            {t("filmSummary.voiceLabel", "Voix du narrateur")}
+                        </label>
+                        {voicePreviewError ? (
+                            <p className="text-xs text-amber-500 dark:text-amber-400">{voicePreviewError}</p>
+                        ) : null}
+                        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                            {(allowedVoices.length ? allowedVoices : [defaultVoice]).map((voice) => {
+                                const isSelected = (voiceId || defaultVoice) === voice;
+                                const isPlaying = playingVoiceId === voice;
+                                const isLoading = loadingVoiceId === voice;
+                                return (
+                                    <div
+                                        key={voice}
+                                        role="button"
+                                        tabIndex={0}
+                                        onClick={() => setVoiceId(voice)}
+                                        onKeyDown={(e) => {
+                                            if (e.key === "Enter" || e.key === " ") setVoiceId(voice);
+                                        }}
+                                        aria-pressed={isSelected}
+                                        className={`relative flex items-center justify-between gap-2 rounded-xl border p-3 text-left transition cursor-pointer ${
+                                            isSelected
+                                                ? "border-primary bg-primary/10"
+                                                : "border-slate-300 dark:border-white/10 bg-black/10 hover:bg-white/5"
+                                        }`}
+                                    >
+                                        <span className="flex items-center gap-2 text-sm font-semibold capitalize text-slate-900 dark:text-white">
+                                            {isSelected ? (
+                                                <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary text-white">
+                                                    <Check size={10} />
+                                                </span>
+                                            ) : null}
+                                            {voice}
+                                        </span>
+                                        <button
+                                            type="button"
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                handlePlayVoicePreview(voice);
+                                            }}
+                                            disabled={isLoading}
+                                            title={t("filmSummary.voiceListenLabel", "Ecouter un extrait")}
+                                            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-slate-300 dark:border-white/10 bg-white/5 text-slate-700 dark:text-zinc-200 hover:bg-white/10 disabled:opacity-50"
+                                        >
+                                            {isLoading ? (
+                                                <Loader2 size={14} className="animate-spin" />
+                                            ) : isPlaying ? (
+                                                <Pause size={14} />
+                                            ) : (
+                                                <Play size={14} />
+                                            )}
+                                        </button>
+                                    </div>
+                                );
+                            })}
                         </div>
                     </div>
 

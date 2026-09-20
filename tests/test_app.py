@@ -4,6 +4,7 @@ import io
 import os
 import sys
 import types
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -2830,3 +2831,41 @@ def test_mark_film_summary_job_terminal_noops_without_supabase(monkeypatch):
         app.film_summary.FilmSummaryStatus.REJECTED, app.film_summary.FilmSummaryStage.REJECTED,
         "NOT_A_FILM", "This is not a film",
     ))
+
+
+def test_film_summary_voice_preview_rejects_unknown_voice(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    with TestClient(app.app) as client:
+        resp = client.get("/api/film-summaries/voice-previews/not-a-real-voice", headers=_auth_headers("u1"))
+    assert resp.status_code == 400
+
+
+def test_film_summary_voice_preview_generates_and_caches_on_first_request(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "FILM_SUMMARY_VOICE_PREVIEWS_DIR", str(tmp_path))
+    synth = AsyncMock(side_effect=lambda **kwargs: Path(kwargs["output_path"]).write_bytes(b"fake-mp3") or 1.5)
+    monkeypatch.setattr(app.film_summary, "synthesize_tts_segment", synth)
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/film-summaries/voice-previews/cedar", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"preview_url": "/voice-previews/cedar.mp3"}
+    synth.assert_awaited_once()
+    assert synth.await_args.kwargs["voice"] == "cedar"
+    assert (tmp_path / "cedar.mp3").exists()
+
+
+def test_film_summary_voice_preview_skips_synthesis_when_cached(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "FILM_SUMMARY_VOICE_PREVIEWS_DIR", str(tmp_path))
+    (tmp_path / "nova.mp3").write_bytes(b"already-cached")
+    synth = AsyncMock()
+    monkeypatch.setattr(app.film_summary, "synthesize_tts_segment", synth)
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/film-summaries/voice-previews/nova", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"preview_url": "/voice-previews/nova.mp3"}
+    synth.assert_not_awaited()

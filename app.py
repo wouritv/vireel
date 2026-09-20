@@ -268,6 +268,14 @@ FILM_SUMMARY_DURATION_TOLERANCE_RATIO = float(os.environ.get("FILM_SUMMARY_DURAT
 FILM_SUMMARY_TTS_MODEL = os.environ.get("FILM_SUMMARY_TTS_MODEL", "gpt-4o-mini-tts")
 FILM_SUMMARY_TTS_DEFAULT_VOICE = os.environ.get("FILM_SUMMARY_TTS_DEFAULT_VOICE", "cedar")
 FILM_SUMMARY_JOB_MAX_ATTEMPTS = int(os.environ.get("FILM_SUMMARY_JOB_MAX_ATTEMPTS", "2"))
+# Fixed demo line synthesized once per voice for the create-form's "listen
+# before choosing" preview (see get_film_summary_voice_preview_endpoint) --
+# a single canned sentence, independent of the film's own narration
+# language, since the point is to hear the voice's timbre, not the language.
+FILM_SUMMARY_VOICE_PREVIEW_TEXT = os.environ.get(
+    "FILM_SUMMARY_VOICE_PREVIEW_TEXT",
+    "Bonjour, je suis la voix qui pourra raconter le resume de votre film.",
+)
 
 VIREEL_VIDEO_FORMAT = os.environ.get("VIREEL_VIDEO_FORMAT", "mp4,mov,avi")
 JOB_RETENTION_SECONDS = 3600  # 1 hour retention
@@ -2240,6 +2248,13 @@ app.mount("/videos", StaticFiles(directory=OUTPUT_DIR), name="videos")
 THUMBNAILS_DIR = os.path.join(OUTPUT_DIR, "thumbnails")
 os.makedirs(THUMBNAILS_DIR, exist_ok=True)
 app.mount("/thumbnails", StaticFiles(directory=THUMBNAILS_DIR), name="thumbnails")
+
+# Mount static files for serving cached film-summary narrator voice previews
+# (see get_film_summary_voice_preview_endpoint) -- generated once per voice
+# on first request, then served from disk forever after.
+FILM_SUMMARY_VOICE_PREVIEWS_DIR = os.path.join(OUTPUT_DIR, "voice_previews")
+os.makedirs(FILM_SUMMARY_VOICE_PREVIEWS_DIR, exist_ok=True)
+app.mount("/voice-previews", StaticFiles(directory=FILM_SUMMARY_VOICE_PREVIEWS_DIR), name="voice_previews")
 
 class ProcessRequest(BaseModel):
     url: str
@@ -9631,6 +9646,33 @@ async def list_film_summaries_endpoint(
         "page": max(page, 1),
         "page_size": min(max(page_size, 1), 100),
     }
+
+
+@app.get("/api/film-summaries/voice-previews/{voice_id}", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 502: {"description": "Bad Gateway"}})
+async def get_film_summary_voice_preview_endpoint(voice_id: str, _user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Returns a cached URL to a short demo line spoken by `voice_id`, so the
+    create-form can let the user listen before choosing a narrator voice.
+    Generated once per voice (OpenAI TTS) and cached on disk under
+    FILM_SUMMARY_VOICE_PREVIEWS_DIR -- every request after the first for a
+    given voice is a static file read, no OpenAI call.
+
+    Declared before the /{film_summary_id} route below so this static
+    "voice-previews" segment isn't swallowed as a film_summary_id."""
+    resolved_voice = str(voice_id or "").strip().lower()
+    if resolved_voice not in film_summary.ALLOWED_TTS_VOICES:
+        raise HTTPException(status_code=400, detail="Unknown voice")
+
+    preview_path = os.path.join(FILM_SUMMARY_VOICE_PREVIEWS_DIR, f"{resolved_voice}.mp3")
+    if not os.path.exists(preview_path):
+        try:
+            await film_summary.synthesize_tts_segment(
+                text=FILM_SUMMARY_VOICE_PREVIEW_TEXT, voice=resolved_voice, model=FILM_SUMMARY_TTS_MODEL,
+                instructions=film_summary.build_tts_instructions("French"), output_path=preview_path,
+            )
+        except film_summary.FilmSummaryValidationError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return {"preview_url": f"/voice-previews/{resolved_voice}.mp3"}
 
 
 @app.get("/api/film-summaries/{film_summary_id}", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
