@@ -649,10 +649,35 @@ The total duration includes voice-over, original dialogue and breathing segments
 EVIDENCE AND UNCERTAINTY
 Every narrated segment must include source_event_ids. Every clip must reference a valid scene_id. When names are uncertain, use the canonical identity from character_bible or neutral wording. Add unresolved issues to unresolved_ambiguities. If the evidence cannot support a coherent summary, return status="insufficient_evidence" and explain the blocking evidence gaps without generating fake content.
 
+OUTPUT SCHEMA
+Return exactly this JSON shape -- every field below is required unless marked optional, and no other top-level or segment field names are read:
+{
+  "status": "ok" | "insufficient_evidence"   (optional, default "ok"),
+  "explanation": string   (required only when status is "insufficient_evidence"),
+  "characters": [ { "id": string, "canonical_name": string, "aliases": [string], "role": string } ],
+  "segments": [ <segment, see below> ],
+  "total_estimated_duration_ms": integer   (your own best-effort sum, backend recomputes the authoritative value),
+  "unresolved_ambiguities": [string]
+}
+Every segment is a JSON object with these fields:
+- "id": a stable unique string you invent (e.g. "seg_01").
+- "sequence": REQUIRED integer. Segments MUST be numbered 1, 2, 3, ... with no gaps and no repeats, strictly in playback order -- segment N's sequence is always exactly N. This is validated mechanically; a missing, duplicated, non-integer or out-of-order sequence value fails the plan outright.
+- "type": exactly one of "voice_over", "original_dialogue", "breathing".
+When "type" is "voice_over", also include:
+- "narration": string, the spoken voice-over text.
+- "estimated_duration_ms": integer, your best estimate of this block's spoken duration.
+- "source_event_ids": [string], the story events/evidence this narration is based on.
+- "clips": [ { "scene_id": string (must exist in scene_index), "start_ms": integer, "end_ms": integer, "description": string, "match_score": number 0-1 } ].
+When "type" is "original_dialogue" or "breathing", instead include:
+- "start_ms": integer, "end_ms": integer -- the exact source timecodes played verbatim (must exist within scene_index/transcript_segments bounds).
+- "transcript_excerpt": string, the verbatim quoted transcript for this range (empty string for a silent "breathing" moment).
+- "speaker_ids": [string], referencing characters[].id.
+
 OUTPUT CONTRACT
-Return JSON only. Do not use Markdown. Do not include commentary before or after the JSON. The output must validate against the supplied schema. Use integer milliseconds for all durations and timecodes. Segment types are exactly: voice_over, original_dialogue, or breathing. Keep segments in playback order and use stable unique IDs.
+Return JSON only. Do not use Markdown. Do not include commentary before or after the JSON. The output must validate against the OUTPUT SCHEMA above exactly -- do not add, rename or omit fields. Use integer milliseconds for all durations and timecodes. Segment types are exactly: voice_over, original_dialogue, or breathing. Keep segments in playback order with contiguous 1-based sequence numbers and stable unique IDs.
 
 Before returning the JSON, silently verify:
+- every segment has an integer "sequence" field, and the full list is exactly 1, 2, 3, ... with no gaps, duplicates or reordering;
 - all important story claims are supported;
 - every scene_id and timecode exists and remains within bounds;
 - chronology is coherent;
