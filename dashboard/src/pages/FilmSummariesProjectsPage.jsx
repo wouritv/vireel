@@ -168,7 +168,7 @@ export default function FilmSummariesProjectsPage() {
         <div className="captions-page-shell flex-1 overflow-y-auto p-8 space-y-6">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
                 <div>
-                    <h1 className="text-3xl font-black tracking-tight">{t("filmSummary.title", "Mes resumes de film")}</h1>
+                    <h1 className="text-3xl font-black tracking-tight">{t("projects.filmSummariesTitle", "Mes projets Resume de film")}</h1>
                     <p className="mt-2 text-sm text-slate-500 dark:text-zinc-400">{t("projects.subtitle", "Organisez vos operations sans changer vos actions habituelles.")}</p>
                 </div>
                 <button
@@ -179,7 +179,7 @@ export default function FilmSummariesProjectsPage() {
                     <div className="w-8 h-8 rounded-full bg-primary/20 text-primary flex items-center justify-center shrink-0">
                         <Plus size={16} />
                     </div>
-                    <span className="text-sm font-bold text-white">{t("filmSummary.newButton", "Nouveau resume de film")}</span>
+                    <span className="text-sm font-bold text-white">{t("app.newOperation", "Nouvelle operation")}</span>
                 </button>
             </div>
 
@@ -308,12 +308,12 @@ export default function FilmSummariesProjectsPage() {
                     <table className="w-full table-fixed text-sm">
                         <thead>
                             <tr className="border-b border-slate-300 dark:border-white/10 text-left text-slate-500 dark:text-zinc-400 text-xs md:text-sm">
-                                <th className="w-[20%] px-2 md:px-3 py-3 font-medium">{t("filmSummary.columnTitle", "Titre")}</th>
+                                <th className="w-[20%] px-2 md:px-3 py-3 font-medium">{t("projects.tableName", "Projet")}</th>
                                 <th className="hidden md:table-cell w-[26%] px-2 md:px-3 py-3 font-medium">{t("generatedMedia.tableDescription", "Description")}</th>
-                                <th className="hidden sm:table-cell w-[10%] px-2 md:px-3 py-3 font-medium">{t("filmSummary.columnDuration", "Duree")}</th>
-                                <th className="w-[12%] px-2 md:px-3 py-3 font-medium">{t("filmSummary.columnStatus", "Statut")}</th>
-                                <th className="hidden lg:table-cell w-[14%] px-2 md:px-3 py-3 font-medium">{t("filmSummary.columnCreatedAt", "Cree le")}</th>
-                                <th className="w-[18%] px-2 md:px-3 py-3 font-medium text-right">{t("filmSummary.columnActions", "Actions")}</th>
+                                <th className="hidden sm:table-cell w-[10%] px-2 md:px-3 py-3 font-medium">{t("generatedMedia.tableDuration", "Duration")}</th>
+                                <th className="w-[12%] px-2 md:px-3 py-3 font-medium">{t("generatedMedia.tableStatus", "Status")}</th>
+                                <th className="hidden lg:table-cell w-[14%] px-2 md:px-3 py-3 font-medium">{t("generatedMedia.tableCreatedAt", "Created at")}</th>
+                                <th className="w-[18%] px-2 md:px-3 py-3 font-medium text-right">{t("generatedMedia.tableActions", "Actions")}</th>
                             </tr>
                         </thead>
                         <tbody>

@@ -17,6 +17,17 @@ const NARRATION_STYLE_KEYS = [
     { value: "energetic", labelKey: "filmSummary.narrationStyleEnergetic", fallback: "Energique" },
 ];
 
+// Same language set as CaptionsModal.jsx's FALLBACK_LANGUAGES, for a
+// consistent dropdown across the app's language pickers.
+const LANGUAGE_OPTIONS = [
+    { value: "fr", labelKey: "filmSummary.languageFrench", fallback: "Francais" },
+    { value: "en", labelKey: "filmSummary.languageEnglish", fallback: "Anglais" },
+    { value: "es", labelKey: "filmSummary.languageSpanish", fallback: "Espagnol" },
+    { value: "de", labelKey: "filmSummary.languageGerman", fallback: "Allemand" },
+    { value: "it", labelKey: "filmSummary.languageItalian", fallback: "Italien" },
+    { value: "pt", labelKey: "filmSummary.languagePortuguese", fallback: "Portugais" },
+];
+
 export default function FilmSummaryCreatePage() {
     const { user } = useAuth();
     const { credits } = useUserCredits();
@@ -319,13 +330,16 @@ export default function FilmSummaryCreatePage() {
                             <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-400 dark:text-zinc-500">
                                 {t("filmSummary.sourceLanguageLabel", "Langue source")}
                             </label>
-                            <input
-                                type="text"
+                            <select
                                 value={sourceLanguage}
                                 onChange={(e) => setSourceLanguage(e.target.value)}
-                                placeholder="fr, en, ..."
                                 className="input-field w-full dark:text-white"
-                            />
+                            >
+                                <option value="">{t("filmSummary.sourceLanguageAuto", "Detection automatique")}</option>
+                                {LANGUAGE_OPTIONS.map((option) => (
+                                    <option key={option.value} value={option.value}>{t(option.labelKey, option.fallback)}</option>
+                                ))}
+                            </select>
                             <p className="text-xs text-slate-500 dark:text-zinc-400">{t("filmSummary.sourceLanguageHint", "Optionnel -- detectee automatiquement depuis l'audio si laisse vide.")}</p>
                         </div>
 
@@ -333,13 +347,16 @@ export default function FilmSummaryCreatePage() {
                             <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-400 dark:text-zinc-500">
                                 {t("filmSummary.narrationLanguageLabel", "Langue de la narration")}
                             </label>
-                            <input
-                                type="text"
+                            <select
                                 value={narrationLanguage}
                                 onChange={(e) => setNarrationLanguage(e.target.value)}
-                                placeholder={t("filmSummary.narrationLanguageAuto", "Meme langue que la source")}
                                 className="input-field w-full dark:text-white"
-                            />
+                            >
+                                <option value="">{t("filmSummary.narrationLanguageAuto", "Meme langue que la source")}</option>
+                                {LANGUAGE_OPTIONS.map((option) => (
+                                    <option key={option.value} value={option.value}>{t(option.labelKey, option.fallback)}</option>
+                                ))}
+                            </select>
                         </div>
 
                         <div className="space-y-2">
