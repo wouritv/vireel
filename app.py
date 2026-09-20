@@ -264,6 +264,13 @@ FILM_SUMMARY_ALLOWED_MIME_TYPES = [
 ]
 FILM_SUMMARY_VALIDATION_THRESHOLD = float(os.environ.get("FILM_SUMMARY_VALIDATION_THRESHOLD", "0.75"))
 FILM_SUMMARY_SCENE_THRESHOLD = float(os.environ.get("FILM_SUMMARY_SCENE_THRESHOLD", "27.0"))
+# PySceneDetect decodes the source frame-by-frame with no progress
+# callback and no timeout of its own -- on a slow/oddly-encoded source this
+# can run far longer than the job is realistically ever going to finish,
+# stalling the job at "detecting_scenes" forever with no error surfaced to
+# the user. Bounded here so a stuck decode fails the job (SCENE_DETECTION_
+# FAILED, retryable) instead of hanging silently.
+FILM_SUMMARY_SCENE_DETECTION_TIMEOUT_SECONDS = int(os.environ.get("FILM_SUMMARY_SCENE_DETECTION_TIMEOUT_SECONDS", "1800"))
 FILM_SUMMARY_DURATION_TOLERANCE_RATIO = float(os.environ.get("FILM_SUMMARY_DURATION_TOLERANCE_RATIO", "0.15"))
 FILM_SUMMARY_TTS_MODEL = os.environ.get("FILM_SUMMARY_TTS_MODEL", "gpt-4o-mini-tts")
 FILM_SUMMARY_TTS_DEFAULT_VOICE = os.environ.get("FILM_SUMMARY_TTS_DEFAULT_VOICE", "cedar")
@@ -9450,7 +9457,15 @@ async def _run_transcription_and_scene_detection_stages(
     await reel_job_manager.update_progress(job_id, 40, film_summary.FilmSummaryStage.DETECTING_SCENES)
 
     try:
-        scenes = await asyncio.to_thread(film_summary.detect_scenes, input_path, FILM_SUMMARY_SCENE_THRESHOLD)
+        scenes = await asyncio.wait_for(
+            asyncio.to_thread(film_summary.detect_scenes, input_path, FILM_SUMMARY_SCENE_THRESHOLD),
+            timeout=FILM_SUMMARY_SCENE_DETECTION_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as exc:
+        raise film_summary.FilmSummaryValidationError(
+            film_summary.FilmSummaryErrorCode.SCENE_DETECTION_FAILED,
+            f"Scene detection timed out after {FILM_SUMMARY_SCENE_DETECTION_TIMEOUT_SECONDS}s",
+        ) from exc
     except Exception as exc:
         raise film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.SCENE_DETECTION_FAILED, str(exc)) from exc
 

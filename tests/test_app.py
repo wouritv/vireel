@@ -3,6 +3,7 @@ import asyncio
 import io
 import os
 import sys
+import time
 import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -2831,6 +2832,26 @@ def test_mark_film_summary_job_terminal_noops_without_supabase(monkeypatch):
         app.film_summary.FilmSummaryStatus.REJECTED, app.film_summary.FilmSummaryStage.REJECTED,
         "NOT_A_FILM", "This is not a film",
     ))
+
+
+def test_scene_detection_timeout_fails_job_instead_of_hanging(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "FILM_SUMMARY_SCENE_DETECTION_TIMEOUT_SECONDS", 0.05)
+    app.reel_job_manager.update_progress = AsyncMock()
+    monkeypatch.setattr(app.film_summary, "transcribe_video_with_timecodes", AsyncMock(return_value={
+        "text": "hello", "language": "en",
+        "segments": [{"start_ms": 0, "end_ms": 1000, "speaker": "", "text": "hello"}],
+    }))
+
+    def _hangs_forever(video_path, threshold):
+        time.sleep(1)
+        return []
+
+    monkeypatch.setattr(app.film_summary, "detect_scenes", _hangs_forever)
+
+    with pytest.raises(app.film_summary.FilmSummaryValidationError) as exc:
+        asyncio.run(app._run_transcription_and_scene_detection_stages("job-1", "u1", None, "/tmp/input.mp4"))
+    assert exc.value.code == app.film_summary.FilmSummaryErrorCode.SCENE_DETECTION_FAILED
 
 
 def test_film_summary_voice_preview_rejects_unknown_voice(monkeypatch):
