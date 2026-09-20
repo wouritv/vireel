@@ -638,10 +638,10 @@ VISUAL MATCHING RULES
 8. Never fabricate visual information based only on transcript dialogue. Use keyframe and scene evidence to confirm visual claims.
 
 ORIGINAL DIALOGUE RULES
-Use original movie dialogue selectively for declarations, revelations, breakups, confrontations, confessions, memorable comic lines, reunions, highly emotional moments and essential resolution lines. Voice-over must stop during original dialogue. Prefer approximately 3 to 6 original-dialogue moments in an 8-to-12-minute summary, but choose fewer or more when the evidence justifies it. The quoted transcript excerpt must match the supplied transcript.
+Use original movie dialogue selectively for declarations, revelations, breakups, confrontations, confessions, memorable comic lines, reunions, highly emotional moments and essential resolution lines. Voice-over must stop during original dialogue. Prefer approximately 3 to 6 original-dialogue moments in an 8-to-12-minute summary, but choose fewer or more when the evidence justifies it. The quoted transcript excerpt must match the supplied transcript. Each source time range (start_ms-end_ms) may be used by at most one original_dialogue or breathing segment in the whole plan -- never select the same or an overlapping source range twice, even to preview it early in the hook. If a later event must be foreshadowed in the hook, narrate it instead (a voice_over segment referencing the confirmed event) rather than replaying its exact original_dialogue/breathing range twice.
 
 CINEMATIC BREATHING RULES
-You may select short original-audio or silent visual moments for meaningful looks, crying, embraces, arrivals, departures, reactions, musical passages or silence after a revelation. Voice-over must stop during these segments. Use them sparingly.
+You may select short original-audio or silent visual moments for meaningful looks, crying, embraces, arrivals, departures, reactions, musical passages or silence after a revelation. Voice-over must stop during these segments. Use them sparingly, and never reuse or overlap a source time range already used by another original_dialogue or breathing segment (see ORIGINAL DIALOGUE RULES).
 
 DURATION RULES
 The total duration includes voice-over, original dialogue and breathing segments. Keep total_estimated_duration_ms within the tolerance supplied in generation_constraints. Do not pretend that a short sentence lasts 30 seconds. Never solve a duration deficit by selecting irrelevant footage or repeating information.
@@ -681,6 +681,7 @@ Before returning the JSON, silently verify:
 - all important story claims are supported;
 - every scene_id and timecode exists and remains within bounds;
 - chronology is coherent;
+- no two original_dialogue/breathing segments reuse or overlap the same source time range;
 - no clips overlap incompatibly;
 - narration length agrees with estimated duration;
 - original dialogue and breathing contain no simultaneous voice-over;
