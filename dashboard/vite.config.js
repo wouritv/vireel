@@ -33,6 +33,10 @@ export default defineConfig({
         target: 'http://backend:8000',
         changeOrigin: true,
       },
+      '/voice-previews': {
+        target: 'http://backend:8000',
+        changeOrigin: true,
+      },
       '/gallery': {
         target: 'http://backend:8000',
         changeOrigin: true,
