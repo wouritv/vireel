@@ -89,11 +89,32 @@ export default function FilmSummaryProjectDetailPage() {
         if (!activeJobId) return undefined;
         let cancelled = false;
         let timerId = null;
+        let pollFailureCount = 0;
 
         const poll = async () => {
             try {
                 const response = await fetch(getApiUrl(`/api/status/${activeJobId}`), { headers: getAuthHeaders(user?.id) });
-                if (!response.ok) return;
+                if (!response.ok) {
+                    // A session that expires mid-operation (a film summary
+                    // analysis can run well past an hour) previously left
+                    // this loop polling forever with nothing ever shown --
+                    // 401 specifically means no retry will ever succeed, so
+                    // stop immediately and say so instead of spinning
+                    // silently. Other failures get a few tries (transient
+                    // network blips) before giving up the same way.
+                    if (response.status === 401) {
+                        if (timerId) globalThis.clearInterval(timerId);
+                        setError(t("filmSummary.sessionExpired", "Ta session a expire. Reconnecte-toi puis reviens sur cette page pour continuer le suivi."));
+                        return;
+                    }
+                    pollFailureCount += 1;
+                    if (pollFailureCount >= 5) {
+                        if (timerId) globalThis.clearInterval(timerId);
+                        setError(t("filmSummary.genericError", "Une erreur est survenue."));
+                    }
+                    return;
+                }
+                pollFailureCount = 0;
                 const data = await response.json();
                 if (cancelled) return;
                 setCurrentStep(String(data.current_step || ""));
@@ -116,7 +137,7 @@ export default function FilmSummaryProjectDetailPage() {
             if (timerId) globalThis.clearInterval(timerId);
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [activeJobId, user?.id]);
+    }, [activeJobId, user?.id, t]);
 
     const handleCancel = async () => {
         if (!filmSummary?.id || !user?.id) return;

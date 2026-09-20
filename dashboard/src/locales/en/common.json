@@ -850,6 +850,7 @@
     "errorGenerationInvalid": "The film summary could not be generated. You can try again.",
     "errorInsufficientCredits": "You don't have enough credits for this operation.",
     "errorJobCancelled": "The operation was cancelled.",
+    "sessionExpired": "Your session has expired. Please sign in again and come back to this page to keep tracking progress.",
     "genericError": "Something went wrong. Please try again."
   }
 }

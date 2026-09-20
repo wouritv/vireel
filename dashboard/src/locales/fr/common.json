@@ -851,6 +851,7 @@
     "errorGenerationInvalid": "Le résumé de film n'a pas pu être généré. Tu peux réessayer.",
     "errorInsufficientCredits": "Tu n'as pas assez de crédits pour cette opération.",
     "errorJobCancelled": "L'opération a été annulée.",
+    "sessionExpired": "Ta session a expiré. Reconnecte-toi puis reviens sur cette page pour continuer le suivi.",
     "genericError": "Une erreur est survenue. Merci de réessayer."
   }
 }

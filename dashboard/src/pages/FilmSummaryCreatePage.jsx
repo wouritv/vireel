@@ -207,15 +207,27 @@ export default function FilmSummaryCreatePage() {
             try {
                 const response = await fetch(getApiUrl(`/api/status/${jobId}`), { headers: getAuthHeaders(user?.id) });
                 if (!response.ok) {
+                    // A session that expires mid-analysis (this can run well
+                    // past an hour) previously left this loop polling
+                    // forever, hitting the same 401 on every retry with
+                    // nothing ever shown to the user -- stop immediately and
+                    // say so, since no amount of retrying fixes an expired
+                    // session. Other failures still get a few tries first.
+                    if (response.status === 401) {
+                        if (timerId) globalThis.clearInterval(timerId);
+                        setError(t("filmSummary.sessionExpired", "Ta session a expire. Reconnecte-toi puis reviens sur cette page pour continuer le suivi."));
+                        return;
+                    }
                     pollFailureCountRef.current += 1;
-                    if (pollFailureCountRef.current >= 3) {
+                    if (pollFailureCountRef.current >= 5) {
+                        if (timerId) globalThis.clearInterval(timerId);
                         setError(t("filmSummary.genericError", "Une erreur est survenue."));
                     }
                     return;
                 }
+                pollFailureCountRef.current = 0;
                 const data = await response.json();
                 if (cancelled) return;
-                pollFailureCountRef.current = 0;
                 setStatus(normalizeStatus(data.status));
                 setCurrentStep(String(data.current_step || ""));
 
