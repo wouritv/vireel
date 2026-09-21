@@ -55,6 +55,7 @@ export default function FilmSummaryCreatePage() {
     const [jobId, setJobId] = useState("");
     const [status, setStatus] = useState(projectIdFromUrl ? "processing" : "idle");
     const [currentStep, setCurrentStep] = useState("");
+    const [rawProgress, setRawProgress] = useState(null);
     const [error, setError] = useState("");
     const [projectJobLoading, setProjectJobLoading] = useState(false);
     const pollFailureCountRef = useRef(0);
@@ -230,6 +231,7 @@ export default function FilmSummaryCreatePage() {
                 if (cancelled) return;
                 setStatus(normalizeStatus(data.status));
                 setCurrentStep(String(data.current_step || ""));
+                setRawProgress(Number.isFinite(data.progress) ? data.progress : null);
 
                 if (data.status === "failed") {
                     setError(errorMessageForCode(t, data?.error?.code, data?.error?.message || t("filmSummary.genericError", "Une erreur est survenue.")));
@@ -552,6 +554,7 @@ export default function FilmSummaryCreatePage() {
                         phase="analysis"
                         title={t("filmSummary.processingTitle", "Analyse de ton film")}
                         isLoadingStatus={projectJobLoading}
+                        rawProgress={rawProgress}
                     />
                 </div>
             )}

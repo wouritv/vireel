@@ -15,12 +15,17 @@ function StepStatusIcon({ state }) {
     return <Clock3 size={16} className="text-slate-400 dark:text-zinc-500" />;
 }
 
-export default function FilmSummaryProcessingPanel({ status, stage, phase, title, isLoadingStatus = false }) {
+export default function FilmSummaryProcessingPanel({ status, stage, phase, title, isLoadingStatus = false, rawProgress = null }) {
     const { t } = useTranslation();
     const steps = useMemo(() => buildFilmSummaryProcessSteps({ status, stage, phase, t }), [status, stage, phase, t]);
     const doneCount = steps.filter((step) => step.state === "done").length;
     const totalCount = steps.length;
-    const progressPercent = Math.round((doneCount / totalCount) * 100);
+    // The backend now reports real incremental progress within a single
+    // long-running step (e.g. rendering many segments one by one) via the
+    // job's own numeric progress field -- prefer that over the coarse
+    // steps-completed ratio when it's available, so a step that's actively
+    // working doesn't look frozen just because it hasn't finished yet.
+    const progressPercent = Number.isFinite(rawProgress) ? Math.round(rawProgress) : Math.round((doneCount / totalCount) * 100);
 
     return (
         <section className="rounded-2xl border border-slate-300 dark:border-white/10 bg-white/[0.03] p-5">

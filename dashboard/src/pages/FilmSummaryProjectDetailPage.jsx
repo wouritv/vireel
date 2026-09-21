@@ -31,6 +31,7 @@ export default function FilmSummaryProjectDetailPage() {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState("");
     const [currentStep, setCurrentStep] = useState("");
+    const [rawProgress, setRawProgress] = useState(null);
     const [cancelling, setCancelling] = useState(false);
     const [retrying, setRetrying] = useState(false);
     const [deleting, setDeleting] = useState(false);
@@ -118,6 +119,7 @@ export default function FilmSummaryProjectDetailPage() {
                 const data = await response.json();
                 if (cancelled) return;
                 setCurrentStep(String(data.current_step || ""));
+                setRawProgress(Number.isFinite(data.progress) ? data.progress : null);
                 if (data.status === "completed" || data.status === "failed") {
                     // The row's own status (awaiting_review, rejected,
                     // failed or completed) is the source of truth for which
@@ -272,6 +274,7 @@ export default function FilmSummaryProjectDetailPage() {
                                 stage={currentStep || filmSummary.stage}
                                 phase="analysis"
                                 title={t("filmSummary.processingTitle", "Analyse de ton film")}
+                                rawProgress={rawProgress}
                             />
                             {cancelButton}
                         </div>
@@ -284,6 +287,7 @@ export default function FilmSummaryProjectDetailPage() {
                                 stage={currentStep || filmSummary.stage}
                                 phase="render"
                                 title={t("filmSummary.renderingTitle", "Generation de ta video")}
+                                rawProgress={rawProgress}
                             />
                             {cancelButton}
                         </div>
