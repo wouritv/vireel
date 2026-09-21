@@ -295,6 +295,9 @@ def build_transcript_sample(transcript_segments: List[Dict[str, Any]], max_chars
     return "\n...\n".join(p for p in (start_part, middle_part, end_part) if p)[:max_chars]
 
 
+_AVERAGE_VOICE_OVER_SEGMENT_MS = 27500  # midpoint of the 20-35s range below
+
+
 def build_generation_constraints(
     target_duration_ms: int, duration_tolerance_ratio: float = 0.15,
 ) -> Dict[str, Any]:
@@ -311,6 +314,14 @@ def build_generation_constraints(
         "max_original_dialogue_segments": 6,
         "words_per_minute_low": 125,
         "words_per_minute_high": 150,
+        # A concrete sizing anchor for the model: tracking a running total
+        # against a target across many segments is a self-consistency task
+        # LLMs are prone to under- or overshoot on (observed misses as large
+        # as -48% and +27% of target even when the prompt states the
+        # tolerance in words) -- naming an approximate segment *count* up
+        # front, not just a duration target, gives it a concrete plan to
+        # build against instead of estimating durations in a vacuum.
+        "approximate_total_segment_count_hint": max(1, round(target_duration_ms / _AVERAGE_VOICE_OVER_SEGMENT_MS)),
     }
 
 
@@ -655,7 +666,7 @@ CINEMATIC BREATHING RULES
 You may select short original-audio or silent visual moments for meaningful looks, crying, embraces, arrivals, departures, reactions, musical passages or silence after a revelation. Voice-over must stop during these segments. Use them sparingly, and never reuse or overlap a source time range already used by another original_dialogue or breathing segment (see ORIGINAL DIALOGUE RULES).
 
 DURATION RULES
-The total duration includes voice-over, original dialogue and breathing segments. Keep total_estimated_duration_ms within the tolerance supplied in generation_constraints. Do not pretend that a short sentence lasts 30 seconds. Never solve a duration deficit by selecting irrelevant footage or repeating information.
+The total duration includes voice-over, original dialogue and breathing segments. Keep total_estimated_duration_ms within the tolerance supplied in generation_constraints. Do not pretend that a short sentence lasts 30 seconds. Never solve a duration deficit by selecting irrelevant footage or repeating information. Before writing segments, use generation_constraints.approximate_total_segment_count_hint as your sizing anchor: it is roughly target_duration_ms divided by a typical ~27-second voice-over block, so plan for approximately that many segments in total (voice-over blocks plus however many original-dialogue/breathing moments you add on top). Producing far fewer segments than that hint, or making voice-over blocks much shorter than 20-35 seconds each to compensate, is the most common way plans miss the duration tolerance -- if your draft segment count is well below the hint, add more voice-over blocks covering additional confirmed plot points rather than inflating estimated_duration_ms on existing ones.
 
 EVIDENCE AND UNCERTAINTY
 Every narrated segment must include source_event_ids. Every clip must reference a valid scene_id. When names are uncertain, use the canonical identity from character_bible or neutral wording. Add unresolved issues to unresolved_ambiguities. If the evidence cannot support a coherent summary, return status="insufficient_evidence" and explain the blocking evidence gaps without generating fake content.
@@ -801,14 +812,38 @@ def _call_planning_model(client, model_name: str, messages: List[Dict[str, Any]]
     )
 
 
-def _build_planning_correction_message(validation_report: Dict[str, Any]) -> Dict[str, str]:
+def _describe_duration_gap(plan: Dict[str, Any], target_duration_ms: int) -> str:
+    """Turns 'you missed the target' into a concrete number of segments to
+    add or remove -- the bare validator message alone ("total X outside
+    tolerance around Y") gave the model nothing to act on beyond re-guessing,
+    which is exactly the failure mode this corrective retry exists to fix."""
+    total_ms = int(plan.get("total_estimated_duration_ms") or 0)
+    gap_ms = target_duration_ms - total_ms
+    if gap_ms == 0:
+        return ""
+    segment_count = max(1, round(abs(gap_ms) / _AVERAGE_VOICE_OVER_SEGMENT_MS))
+    if gap_ms > 0:
+        return (
+            f" Your plan is {gap_ms}ms short of the target: add approximately {segment_count} more "
+            "voice-over segment(s) (~20-35s each) covering additional confirmed plot points -- do not "
+            "just inflate estimated_duration_ms on existing segments."
+        )
+    return (
+        f" Your plan is {abs(gap_ms)}ms over the target: remove or shorten approximately {segment_count} "
+        "segment(s), prioritizing the least essential voice-over blocks or dialogue moments, rather than "
+        "shrinking every segment slightly."
+    )
+
+
+def _build_planning_correction_message(validation_report: Dict[str, Any], plan: Dict[str, Any], target_duration_ms: int) -> Dict[str, str]:
     errors = "; ".join(validation_report.get("errors") or [])
+    duration_hint = _describe_duration_gap(plan, target_duration_ms) if "duration" in errors.lower() else ""
     return {
         "role": "user",
         "content": (
             "Your previous plan failed automated validation with these blocking errors: "
-            f"{errors}. Return a corrected full plan (same OUTPUT SCHEMA, JSON only) that fixes "
-            "every one of these issues while preserving everything else that was already correct."
+            f"{errors}.{duration_hint} Return a corrected full plan (same OUTPUT SCHEMA, JSON only) that "
+            "fixes every one of these issues while preserving everything else that was already correct."
         ),
     }
 
@@ -878,7 +913,7 @@ async def generate_edit_plan(
         if validation_report["valid"] or attempt == max_attempts - 1:
             break
         messages.append({"role": "assistant", "content": raw_text})
-        messages.append(_build_planning_correction_message(validation_report))
+        messages.append(_build_planning_correction_message(validation_report, plan, target_duration_ms))
 
     return {"plan": plan, "usage": total_usage}
 

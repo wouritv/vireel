@@ -457,6 +457,35 @@ def test_classify_media_type_raises_on_bad_json(monkeypatch):
     assert exc_info.value.code == fs.FilmSummaryErrorCode.GENERATION_INVALID
 
 
+def test_build_generation_constraints_includes_segment_count_hint():
+    constraints = fs.build_generation_constraints(401000)
+    # 401000 / 27500 (the documented average voice-over segment length) rounds to 15.
+    assert constraints["approximate_total_segment_count_hint"] == 15
+
+
+def test_describe_duration_gap_suggests_adding_segments_when_short():
+    message = fs._describe_duration_gap({"total_estimated_duration_ms": 240679}, 401000)
+    assert "160321ms short" in message
+    assert "add approximately 6 more" in message
+
+
+def test_describe_duration_gap_suggests_removing_segments_when_over():
+    message = fs._describe_duration_gap({"total_estimated_duration_ms": 511022}, 401000)
+    assert "110022ms over" in message
+    assert "remove or shorten approximately 4" in message
+
+
+def test_build_planning_correction_message_includes_duration_hint_only_for_duration_errors():
+    duration_report = {"errors": ["Total estimated duration 240679ms is outside the 15% tolerance around the 401000ms target"]}
+    plan = {"total_estimated_duration_ms": 240679}
+    message = fs._build_planning_correction_message(duration_report, plan, 401000)
+    assert "short of the target" in message["content"]
+
+    other_report = {"errors": ["Segment sequence numbers must be contiguous, starting at 1, in playback order"]}
+    other_message = fs._build_planning_correction_message(other_report, plan, 401000)
+    assert "short of the target" not in other_message["content"]
+
+
 # ---------------------------------------------------------------------------
 # generate_edit_plan (network call mocked)
 # ---------------------------------------------------------------------------
