@@ -9898,6 +9898,22 @@ async def _run_film_summary_render_pipeline_stages(
         })
     await reel_job_manager.update_progress(job_id, 45, film_summary.FilmSummaryStage.RENDERING_PREVIEW)
 
+    # render_edit_plan builds every segment's clip sequentially (each its
+    # own ffmpeg re-encode) inside a single asyncio.to_thread call -- with
+    # no feedback in between, a plan with many segments can legitimately
+    # take a long time while looking indistinguishable from a genuine hang
+    # (reported as "stuck with no error"). on_segment_done runs on the
+    # worker thread, so it hops back onto this coroutine's event loop via
+    # run_coroutine_threadsafe rather than awaiting directly.
+    render_loop = asyncio.get_running_loop()
+
+    def _on_segment_done(index: int, total: int) -> None:
+        pct = 45 + int(40 * (index + 1) / max(1, total))
+        asyncio.run_coroutine_threadsafe(
+            reel_job_manager.update_progress(job_id, min(pct, 85), film_summary.FilmSummaryStage.RENDERING_PREVIEW),
+            render_loop,
+        )
+
     final_path = os.path.join(output_dir, "final.mp4")
     preview_path = os.path.join(output_dir, "preview.mp4")
     try:
@@ -9906,6 +9922,7 @@ async def _run_film_summary_render_pipeline_stages(
             plan=plan_with_actual_durations, source_video_path=source_path,
             voiceover_paths_by_segment_id=voiceover_paths, work_dir=os.path.join(output_dir, "work"),
             final_output_path=final_path, preview_output_path=preview_path,
+            on_segment_done=_on_segment_done,
         )
     except film_summary.FilmSummaryValidationError:
         raise

@@ -296,3 +296,22 @@ def test_render_edit_plan_orchestrates_all_segments(monkeypatch, tmp_path):
 
     assert result == {"segment_count": 2, "final_duration_seconds": 13.0}
     assert concat_calls[0] == [str(tmp_path / "seg_1_final.mp4"), str(tmp_path / "seg_2_final.mp4")]
+
+
+def test_render_edit_plan_reports_progress_after_each_segment(monkeypatch, tmp_path):
+    monkeypatch.setattr(render, "_target_canvas", lambda path: CANVAS)
+    monkeypatch.setattr(render, "_build_voice_over_segment_clip", lambda *a, **k: str(tmp_path / "seg_1_final.mp4"))
+    monkeypatch.setattr(render, "_build_original_segment_clip", lambda *a, **k: str(tmp_path / "seg_2_final.mp4"))
+    monkeypatch.setattr(render, "concat_video_clips", lambda paths, out, work_dir: None)
+    monkeypatch.setattr(render, "normalize_audio_loudness", lambda inp, out: None)
+    monkeypatch.setattr(render, "encode_preview", lambda inp, out, **k: None)
+    monkeypatch.setattr(render, "probe_media_duration_seconds", lambda path: 13.0)
+
+    progress_calls = []
+    render.render_edit_plan(
+        plan=_sample_plan(), source_video_path="/tmp/source.mp4", voiceover_paths_by_segment_id={"seg_1": "/tmp/narration.mp3"},
+        work_dir=str(tmp_path), final_output_path=str(tmp_path / "final.mp4"), preview_output_path=str(tmp_path / "preview.mp4"),
+        on_segment_done=lambda index, total: progress_calls.append((index, total)),
+    )
+
+    assert progress_calls == [(0, 2), (1, 2)]

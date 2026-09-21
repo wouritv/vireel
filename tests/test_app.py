@@ -2854,6 +2854,38 @@ def test_scene_detection_timeout_fails_job_instead_of_hanging(monkeypatch):
     assert exc.value.code == app.film_summary.FilmSummaryErrorCode.SCENE_DETECTION_FAILED
 
 
+def test_render_pipeline_reports_incremental_progress_per_segment(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "download_s3_object", lambda bucket, key, path: True)
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda *a, **k: True)
+    app._finalize_film_summary_render = AsyncMock()
+    progress_calls = []
+    app.reel_job_manager.update_progress = AsyncMock(side_effect=lambda *a, **k: progress_calls.append(a))
+
+    def _fake_render_edit_plan(*, on_segment_done, **kwargs):
+        # Mirrors render_edit_plan calling back after each of 4 segments --
+        # this runs inside asyncio.to_thread, same as the real function, to
+        # exercise the actual cross-thread run_coroutine_threadsafe wiring.
+        for i in range(4):
+            on_segment_done(i, 4)
+        return {"segment_count": 4, "final_duration_seconds": 42.0}
+
+    monkeypatch.setattr(app.film_summary_render, "render_edit_plan", _fake_render_edit_plan)
+
+    plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "original_dialogue", "start_ms": 0, "end_ms": 1000}]}
+    asyncio.run(app._run_film_summary_render_pipeline_stages(
+        "job-1", "u1", "fs-1", "proj-1", "source-key", str(tmp_path), plan, "cedar", "fr",
+    ))
+
+    # 45% (render start) plus one call per segment, all within the 45-85%
+    # band reserved for segment-by-segment rendering progress.
+    render_stage_calls = [call for call in progress_calls if call[2] == app.film_summary.FilmSummaryStage.RENDERING_PREVIEW]
+    assert len(render_stage_calls) == 5
+    reported_percentages = [call[1] for call in render_stage_calls[1:]]
+    assert reported_percentages == sorted(reported_percentages)
+    assert all(45 <= pct <= 85 for pct in reported_percentages)
+
+
 def test_film_summary_voice_preview_rejects_unknown_voice(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     with TestClient(app.app) as client:

@@ -13,7 +13,7 @@ re-encoding twice.
 
 import os
 import subprocess
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from film_summary import FilmSummaryErrorCode, FilmSummaryValidationError, SEGMENT_TYPE_VOICE_OVER, probe_media_duration_seconds, probe_technical_metadata
 
@@ -194,9 +194,21 @@ def _build_original_segment_clip(segment: Dict[str, Any], source_video_path: str
 def render_edit_plan(
     *, plan: Dict[str, Any], source_video_path: str, voiceover_paths_by_segment_id: Dict[str, str],
     work_dir: str, final_output_path: str, preview_output_path: str,
+    on_segment_done: Optional[Callable[[int, int], None]] = None,
 ) -> Dict[str, Any]:
     """Assemble the validated edit plan into a preview and a final MP4
-    (spec 7.10). Returns {"segment_count", "final_duration_seconds"}."""
+    (spec 7.10). Returns {"segment_count", "final_duration_seconds"}.
+
+    Every segment (each its own ffmpeg re-encode, sometimes several for a
+    multi-clip voice-over block) runs sequentially inside this one call --
+    for a plan with many segments this can legitimately take a long time,
+    and previously reported no progress at all between the 45% mark (start
+    of rendering) and 90% (after this whole function returns), making a
+    genuinely slow-but-working render indistinguishable from a hang.
+    `on_segment_done(index, total)`, called synchronously after each
+    segment's clip finishes (this runs inside asyncio.to_thread, so the
+    callback must itself be thread-safe -- see app.py's caller), lets the
+    caller report real incremental progress instead."""
     os.makedirs(work_dir, exist_ok=True)
     canvas = _target_canvas(source_video_path)
 
@@ -205,13 +217,15 @@ def render_edit_plan(
         raise FilmSummaryValidationError(FilmSummaryErrorCode.RENDER_FAILED, "Plan has no segments to render")
 
     segment_clip_paths = []
-    for segment in segments:
+    for index, segment in enumerate(segments):
         if segment.get("type") == SEGMENT_TYPE_VOICE_OVER:
             narration_path = voiceover_paths_by_segment_id.get(segment["id"])
             clip_path = _build_voice_over_segment_clip(segment, source_video_path, narration_path, work_dir, canvas)
         else:
             clip_path = _build_original_segment_clip(segment, source_video_path, work_dir, canvas)
         segment_clip_paths.append(clip_path)
+        if on_segment_done:
+            on_segment_done(index, len(segments))
 
     concatenated_path = os.path.join(work_dir, "concatenated.mp4")
     concat_video_clips(segment_clip_paths, concatenated_path, work_dir)
