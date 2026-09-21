@@ -802,6 +802,7 @@
     "rejectedHint": "Rejected videos can't be retried -- start a new film summary with a different source.",
     "failedTitle": "Something went wrong",
     "failedHint": "A technical error occurred. You can retry the analysis.",
+    "technicalDetailsLabel": "Technical details",
     "deleteButton": "Delete",
     "reviewTitle": "Review the edit plan",
     "reviewSubtitle": "Edit the narration, check the validation report, then generate the final video.",

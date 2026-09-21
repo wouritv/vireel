@@ -9018,6 +9018,7 @@ def _normalize_film_summary_row(row: Dict[str, Any], *, include_content: bool = 
         "film_confidence": row.get("film_confidence"),
         "rejection_reason": row.get("rejection_reason"),
         "error_code": row.get("error_code"),
+        "error_message": row.get("error_message"),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
         "completed_at": row.get("completed_at"),

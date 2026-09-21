@@ -803,6 +803,7 @@
     "rejectedHint": "Les vidéos rejetées ne peuvent pas être relancées -- démarre un nouveau résumé avec une autre source.",
     "failedTitle": "Une erreur est survenue",
     "failedHint": "Une erreur technique s'est produite. Tu peux relancer l'analyse.",
+    "technicalDetailsLabel": "Détails techniques",
     "deleteButton": "Supprimer",
     "reviewTitle": "Valider le plan de montage",
     "reviewSubtitle": "Modifie la narration, vérifie le rapport de validation, puis génère la vidéo finale.",

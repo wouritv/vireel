@@ -43,8 +43,9 @@ def _run_ffmpeg(cmd: List[str], timeout_seconds: int = FFMPEG_STEP_TIMEOUT_SECON
         raise FilmSummaryValidationError(FilmSummaryErrorCode.RENDER_FAILED, f"FFmpeg timed out after {timeout_seconds}s") from exc
     elapsed = time.monotonic() - started_at
     if result.returncode != 0:
-        logger.error("ffmpeg failed after %.1fs (exit %s): %s", elapsed, result.returncode, " ".join(cmd))
-        raise FilmSummaryValidationError(FilmSummaryErrorCode.RENDER_FAILED, f"FFmpeg failed: {result.stderr.decode(errors='replace')[-2000:]}")
+        stderr_text = result.stderr.decode(errors="replace")[-2000:]
+        logger.error("ffmpeg failed after %.1fs (exit %s): %s\nstderr: %s", elapsed, result.returncode, " ".join(cmd), stderr_text)
+        raise FilmSummaryValidationError(FilmSummaryErrorCode.RENDER_FAILED, f"FFmpeg failed: {stderr_text}")
     logger.info("ffmpeg finished in %.1fs", elapsed)
 
 

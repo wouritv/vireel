@@ -311,6 +311,14 @@ export default function FilmSummaryProjectDetailPage() {
                             <h3 className="text-lg font-bold text-amber-300">{t("filmSummary.failedTitle", "Une erreur est survenue")}</h3>
                             <p className="text-sm text-amber-200">{errorMessageForCode(t, filmSummary.error_code, t("filmSummary.genericError", "Une erreur est survenue."))}</p>
                             <p className="text-xs text-amber-300/80">{t("filmSummary.failedHint", "Une erreur technique s'est produite. Tu peux relancer l'analyse.")}</p>
+                            {filmSummary.error_message ? (
+                                <details className="rounded-lg border border-amber-500/20 bg-black/20 px-3 py-2 text-xs text-amber-200/80">
+                                    <summary className="cursor-pointer select-none font-medium text-amber-300">
+                                        {t("filmSummary.technicalDetailsLabel", "Details techniques")}
+                                    </summary>
+                                    <pre className="mt-2 whitespace-pre-wrap break-words font-mono text-[11px] leading-5">{filmSummary.error_message}</pre>
+                                </details>
+                            ) : null}
                             <div className="flex flex-wrap gap-2">
                                 <button
                                     type="button"
