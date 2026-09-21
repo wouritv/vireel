@@ -11,11 +11,15 @@ the final concat demuxer pass can safely stream-copy (`-c copy`) instead of
 re-encoding twice.
 """
 
+import logging
 import os
 import subprocess
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 from film_summary import FilmSummaryErrorCode, FilmSummaryValidationError, SEGMENT_TYPE_VOICE_OVER, probe_media_duration_seconds, probe_technical_metadata
+
+logger = logging.getLogger(__name__)
 
 FFMPEG_STEP_TIMEOUT_SECONDS = int(os.environ.get("FFMPEG_STEP_TIMEOUT_SECONDS", str(2 * 3600)))
 EXPORT_VIDEO_PRESET = os.environ.get("VIREEL_EXPORT_PRESET", "veryfast")
@@ -25,12 +29,23 @@ PREVIEW_HEIGHT = int(os.environ.get("FILM_SUMMARY_PREVIEW_HEIGHT", "480"))
 
 
 def _run_ffmpeg(cmd: List[str], timeout_seconds: int = FFMPEG_STEP_TIMEOUT_SECONDS) -> None:
+    # This module previously had no logging at all: a stalled render gave
+    # no indication of which ffmpeg command was running or how long it had
+    # been running for, making "stuck with no error" reports (a slow-but-
+    # healthy render and a genuinely hung one look identical from outside)
+    # impossible to tell apart from the logs.
+    logger.info("Running ffmpeg: %s", " ".join(cmd))
+    started_at = time.monotonic()
     try:
         result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=timeout_seconds)
     except subprocess.TimeoutExpired as exc:
+        logger.error("ffmpeg timed out after %ss: %s", timeout_seconds, " ".join(cmd))
         raise FilmSummaryValidationError(FilmSummaryErrorCode.RENDER_FAILED, f"FFmpeg timed out after {timeout_seconds}s") from exc
+    elapsed = time.monotonic() - started_at
     if result.returncode != 0:
+        logger.error("ffmpeg failed after %.1fs (exit %s): %s", elapsed, result.returncode, " ".join(cmd))
         raise FilmSummaryValidationError(FilmSummaryErrorCode.RENDER_FAILED, f"FFmpeg failed: {result.stderr.decode(errors='replace')[-2000:]}")
+    logger.info("ffmpeg finished in %.1fs", elapsed)
 
 
 def _probe_duration_seconds(path: str) -> float:
@@ -218,6 +233,7 @@ def render_edit_plan(
 
     segment_clip_paths = []
     for index, segment in enumerate(segments):
+        logger.info("Rendering segment %s (%d/%d, type=%s)", segment.get("id"), index + 1, len(segments), segment.get("type"))
         if segment.get("type") == SEGMENT_TYPE_VOICE_OVER:
             narration_path = voiceover_paths_by_segment_id.get(segment["id"])
             clip_path = _build_voice_over_segment_clip(segment, source_video_path, narration_path, work_dir, canvas)
@@ -227,6 +243,7 @@ def render_edit_plan(
         if on_segment_done:
             on_segment_done(index, len(segments))
 
+    logger.info("All %d segment clips built, concatenating", len(segments))
     concatenated_path = os.path.join(work_dir, "concatenated.mp4")
     concat_video_clips(segment_clip_paths, concatenated_path, work_dir)
 
