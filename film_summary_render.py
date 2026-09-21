@@ -99,10 +99,19 @@ def build_blank_segment(duration_seconds: float, output_path: str, *, canvas: Di
 
 
 def concat_video_clips(clip_paths: List[str], output_path: str, work_dir: str) -> None:
+    # The concat demuxer resolves a relative path written into the file
+    # list against the *file list's own directory*, not the ffmpeg
+    # process's working directory -- since every clip path passed in here
+    # (built via os.path.join(work_dir, ...) upstream) is already relative
+    # to the app's own CWD, and the file list itself also lives inside
+    # work_dir, ffmpeg was concatenating work_dir onto an already-relative
+    # path, doubling it (e.g. "work/output/.../work/seg_01_clip_0.mp4") and
+    # failing with "No such file or directory". Writing absolute paths
+    # sidesteps the ambiguity entirely regardless of either directory.
     filelist_path = os.path.join(work_dir, f"concat_{os.path.basename(output_path)}.txt")
     with open(filelist_path, "w", encoding="utf-8") as handle:
         for path in clip_paths:
-            escaped = path.replace("'", "'\\''")
+            escaped = os.path.abspath(path).replace("'", "'\\''")
             handle.write(f"file '{escaped}'\n")
     cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", filelist_path, "-c", "copy", output_path]
     _run_ffmpeg(cmd)

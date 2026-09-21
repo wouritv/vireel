@@ -1,3 +1,4 @@
+import os
 import types
 
 import pytest
@@ -112,6 +113,28 @@ def test_concat_video_clips_writes_filelist_and_invokes_ffmpeg(monkeypatch, tmp_
     assert f"file '{clip_paths[0]}'" in content
     assert f"file '{clip_paths[1]}'" in content
     assert calls[0][:2] == ["ffmpeg", "-y"]
+
+
+def test_concat_video_clips_writes_absolute_paths_for_relative_inputs(monkeypatch, tmp_path):
+    # Reproduces the reported bug: clip paths built as relative to the
+    # app's CWD (e.g. "output/<job>/work/seg_01_clip_0.mp4") land in a file
+    # list that itself lives inside that same work dir. ffmpeg's concat
+    # demuxer resolves a relative entry against the file list's own
+    # directory, so a relative path here doubled the work dir and failed
+    # with "No such file or directory". Absolute paths sidestep that.
+    _capture_ffmpeg_calls(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    work_dir = "output/job-1/work"
+    os.makedirs(work_dir, exist_ok=True)
+    relative_clip_paths = [f"{work_dir}/seg_01_clip_0.mp4", f"{work_dir}/seg_01_clip_1.mp4"]
+
+    render.concat_video_clips(relative_clip_paths, f"{work_dir}/out.mp4", work_dir)
+
+    content = (tmp_path / work_dir / "concat_out.mp4.txt").read_text()
+    lines = [line for line in content.splitlines() if line]
+    assert len(lines) == 2
+    for line, relative_path in zip(lines, relative_clip_paths):
+        assert line == f"file '{os.path.abspath(relative_path)}'"
 
 
 # ---------------------------------------------------------------------------
