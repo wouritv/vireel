@@ -9624,6 +9624,7 @@ async def _finalize_film_summary_analysis(
         })
         debit_ok = await reel_job_manager.debit_credits_for_job(
             job_id=job_id, user_id=user_id, credits=final_credits,
+            storage_delta=-_bytes_to_gb(float(size_bytes or 0.0)),
             operation_type=film_summary.CREDIT_OPERATION_TYPE, reserved_credits=analysis_required_credits,
         )
         if not debit_ok:
@@ -9934,18 +9935,25 @@ async def _run_film_summary_render_pipeline_stages(
 
     preview_s3_key = f"{_FILM_SUMMARIES_PREFIX}{user_id}/{film_summary_id}/preview.mp4"
     final_s3_key = f"{_FILM_SUMMARIES_PREFIX}{user_id}/{film_summary_id}/final.mp4"
+    # Read before upload, while both files still exist locally -- output_dir
+    # (and everything under it, including these) is removed in the calling
+    # job runner's `finally` block right after this coroutine returns.
+    output_storage_bytes = (
+        (os.path.getsize(final_path) if os.path.exists(final_path) else 0)
+        + (os.path.getsize(preview_path) if os.path.exists(preview_path) else 0)
+    )
     upload_file_to_s3(preview_path, bucket_name, preview_s3_key)
     upload_file_to_s3(final_path, bucket_name, final_s3_key)
 
     await _finalize_film_summary_render(
         job_id, user_id, film_summary_id, project_id, plan_with_actual_durations,
-        preview_s3_key, final_s3_key, render_result,
+        preview_s3_key, final_s3_key, render_result, output_storage_bytes,
     )
 
 
 async def _finalize_film_summary_render(
     job_id: str, user_id: str, film_summary_id: str, project_id: Optional[str], plan: Dict[str, Any],
-    preview_s3_key: str, final_s3_key: str, render_result: Dict[str, Any],
+    preview_s3_key: str, final_s3_key: str, render_result: Dict[str, Any], output_storage_bytes: float = 0.0,
 ) -> None:
     character_count = _total_narration_character_count(plan)
     final_duration_seconds = float(render_result.get("final_duration_seconds") or 0.0)
@@ -9969,6 +9977,7 @@ async def _finalize_film_summary_render(
         })
         debit_ok = await reel_job_manager.debit_credits_for_job(
             job_id=job_id, user_id=user_id, credits=final_credits,
+            storage_delta=-_bytes_to_gb(float(output_storage_bytes or 0.0)),
             operation_type=film_summary.CREDIT_OPERATION_TYPE, reserved_credits=reserved_credits,
         )
         if not debit_ok:
@@ -10204,10 +10213,16 @@ async def delete_film_summary_endpoint(film_summary_id: str, user_id: Annotated[
 
     bucket = os.environ.get("AWS_S3_BUCKET", "")
     if bucket:
-        for key_field in ("source_s3_key", "preview_s3_key", "final_s3_key"):
+        total_freed_bytes = 0
+        for key_field, label in (
+            ("source_s3_key", "film summary source S3 file"),
+            ("preview_s3_key", "film summary preview S3 file"),
+            ("final_s3_key", "film summary final S3 file"),
+        ):
             key = row.get(key_field)
             if key:
-                delete_s3_object(bucket, key)
+                total_freed_bytes += _delete_s3_and_get_freed_bytes(bucket, key, label)
+        await _free_user_storage_after_project_deletion(user_id, total_freed_bytes)
 
     return {"deleted": True}
 

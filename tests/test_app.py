@@ -2854,6 +2854,66 @@ def test_scene_detection_timeout_fails_job_instead_of_hanging(monkeypatch):
     assert exc.value.code == app.film_summary.FilmSummaryErrorCode.SCENE_DETECTION_FAILED
 
 
+def test_finalize_film_summary_analysis_debits_source_storage(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    app.supabase_update_film_summary = AsyncMock()
+    app.supabase_update_project_status = AsyncMock()
+    app.reel_job_manager.complete_job = AsyncMock()
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+
+    one_gb_in_bytes = 1024 ** 3
+    asyncio.run(app._finalize_film_summary_analysis(
+        "job-1", "u1", "fs-1", "proj-1", 300.0, float(one_gb_in_bytes), 5.0,
+        {"segments": []}, {"valid": True, "errors": [], "warnings": []}, {"prompt_tokens": 0, "completion_tokens": 0},
+    ))
+
+    debit_mock.assert_awaited_once()
+    assert debit_mock.await_args.kwargs["storage_delta"] == pytest.approx(-1.0)
+
+
+def test_finalize_film_summary_render_debits_output_storage(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    app.supabase_update_film_summary = AsyncMock()
+    app.supabase_get_job_record = AsyncMock(return_value={"reserved_quota": 0.0})
+    app.supabase_update_project_status = AsyncMock()
+    app.supabase_update_project = AsyncMock()
+    app.reel_job_manager.complete_job = AsyncMock()
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+
+    half_gb_in_bytes = 1024 ** 3 // 2
+    asyncio.run(app._finalize_film_summary_render(
+        "job-1", "u1", "fs-1", "proj-1", {"segments": []},
+        "preview/key.mp4", "final/key.mp4", {"final_duration_seconds": 60.0}, float(half_gb_in_bytes),
+    ))
+
+    debit_mock.assert_awaited_once()
+    assert debit_mock.await_args.kwargs["storage_delta"] == pytest.approx(-0.5)
+
+
+def test_delete_film_summary_endpoint_frees_storage(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setenv("AWS_S3_BUCKET", "test-bucket")
+    row = {
+        "id": "fs-1", "source_s3_key": "source/key.mp4",
+        "preview_s3_key": "preview/key.mp4", "final_s3_key": "final/key.mp4",
+    }
+    app.supabase_get_film_summary = AsyncMock(return_value=row)
+    app.supabase_soft_delete_film_summary = AsyncMock(return_value=True)
+    app.get_s3_object_size = lambda bucket, key: 1024 ** 3
+    app.delete_s3_object = lambda bucket, key: True
+    free_storage_mock = AsyncMock()
+    app._free_user_storage_after_project_deletion = free_storage_mock
+
+    result = asyncio.run(app.delete_film_summary_endpoint("fs-1", "u1"))
+
+    assert result == {"deleted": True}
+    free_storage_mock.assert_awaited_once_with("u1", 3 * (1024 ** 3))
+
+
 def test_render_pipeline_reports_incremental_progress_per_segment(monkeypatch, tmp_path):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "download_s3_object", lambda bucket, key, path: True)
