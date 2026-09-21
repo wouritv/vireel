@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import types
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -2944,6 +2945,80 @@ def test_render_pipeline_reports_incremental_progress_per_segment(monkeypatch, t
     reported_percentages = [call[1] for call in render_stage_calls[1:]]
     assert reported_percentages == sorted(reported_percentages)
     assert all(45 <= pct <= 85 for pct in reported_percentages)
+
+
+def test_share_film_summary_rejects_when_not_completed(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    app.supabase_get_film_summary = AsyncMock(return_value={"id": "fs-1", "status": "awaiting_review"})
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/film-summaries/fs-1/share",
+            json={"platforms": ["facebook"]},
+            headers=_auth_headers("u1"),
+        )
+    assert resp.status_code == 400
+
+
+def test_share_film_summary_publishes_immediately(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    app.supabase_get_film_summary = AsyncMock(return_value={
+        "id": "fs-1", "status": "completed", "title": "Mon film", "final_s3_key": "final/fs-1.mp4",
+    })
+    monkeypatch.setattr(app, "generate_presigned_url", lambda bucket, key, expiration=3600: "https://s3.example/final/fs-1.mp4")
+    app._get_social_account = AsyncMock(return_value={"id": "acct-1", "platform_user_id": "page-1"})
+    app._insert_publish_job = AsyncMock(return_value="pub-1")
+    app._update_publish_job_status = AsyncMock()
+    published_payloads = []
+
+    async def fake_publish_post(account, content):
+        published_payloads.append(content)
+        return {"id": "post-123"}
+
+    monkeypatch.setattr(app, "publish_post", fake_publish_post)
+    app._debit_publish_credits_after_share = AsyncMock()
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/film-summaries/fs-1/share",
+            json={"platforms": ["facebook"], "description": "Regardez ce resume !"},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["success"] is True
+    assert payload["results"]["facebook"]["success"] is True
+    assert len(published_payloads) == 1
+    assert published_payloads[0].video_url == "https://s3.example/final/fs-1.mp4"
+    assert published_payloads[0].description == "Regardez ce resume !"
+
+
+def test_share_film_summary_schedules_future_post(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    app.supabase_get_film_summary = AsyncMock(return_value={
+        "id": "fs-1", "status": "completed", "title": "Mon film", "final_s3_key": "final/fs-1.mp4",
+    })
+    monkeypatch.setattr(app, "generate_presigned_url", lambda bucket, key, expiration=3600: "https://s3.example/final/fs-1.mp4")
+    schedule_mock = AsyncMock(return_value={"success": True, "scheduled": True, "publish_job_id": "pub-1"})
+    app._schedule_share_publish_job = schedule_mock
+
+    future_date = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M")
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/film-summaries/fs-1/share",
+            json={"platforms": ["youtube"], "scheduled_date": future_date, "timezone": "UTC"},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["results"]["youtube"]["scheduled"] is True
+    schedule_mock.assert_awaited_once()
+    assert schedule_mock.await_args.args[2] == "film_summary"
+    assert schedule_mock.await_args.args[3] == "fs-1"
 
 
 def test_film_summary_voice_preview_rejects_unknown_voice(monkeypatch):

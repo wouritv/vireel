@@ -1,13 +1,15 @@
 import { useEffect, useState } from "react";
-import { AlertCircle, ArrowLeft, Ban, Download, Loader2, RefreshCw, Trash2 } from "lucide-react";
+import { AlertCircle, ArrowLeft, Ban, Download, Loader2, RefreshCw, Share2, Trash2 } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
 import { getApiUrl, fetchAppConfig } from "../config";
 import { getAuthHeaders } from "../lib/apiAuth";
 import { useAuth } from "../state/AuthContext";
 import { useTranslation } from "../state/LanguageContext";
 import { errorMessageForCode } from "../lib/filmSummary";
+import { getConnectedPlatforms } from "../lib/platforms";
 import FilmSummaryProcessingPanel from "../components/FilmSummaryProcessingPanel";
 import FilmSummaryReviewPanel from "../components/FilmSummaryReviewPanel";
+import SharePostModal from "../components/SharePostModal";
 
 // Statuses for which the film summary's own job_id is still meaningful to
 // poll via the generic /api/status/{job_id} endpoint -- "rendering" reuses
@@ -37,6 +39,15 @@ export default function FilmSummaryProjectDetailPage() {
     const [deleting, setDeleting] = useState(false);
     const [allowedVoices, setAllowedVoices] = useState([]);
     const [defaultVoice, setDefaultVoice] = useState("cedar");
+
+    const [showShareModal, setShowShareModal] = useState(false);
+    const [shareTitle, setShareTitle] = useState("");
+    const [shareDescription, setShareDescription] = useState("");
+    const [sharePlatforms, setSharePlatforms] = useState({});
+    const [isScheduling, setIsScheduling] = useState(false);
+    const [scheduleDate, setScheduleDate] = useState("");
+    const [sharing, setSharing] = useState(false);
+    const [shareResult, setShareResult] = useState(null);
 
     useEffect(() => {
         let active = true;
@@ -209,6 +220,71 @@ export default function FilmSummaryProjectDetailPage() {
         }
     };
 
+    const handleOpenShare = () => {
+        setShareTitle(filmSummary?.title || "");
+        setShareDescription("");
+        const connected = getConnectedPlatforms();
+        setSharePlatforms(Object.fromEntries(connected.map((platform) => [platform, true])));
+        setIsScheduling(false);
+        setScheduleDate("");
+        setShareResult(null);
+        setShowShareModal(true);
+    };
+
+    const handlePlatformChange = (platform, checked) => {
+        setSharePlatforms((prev) => ({ ...prev, [platform]: checked }));
+    };
+
+    const handleShare = async () => {
+        if (!filmSummary?.id || !user?.id) return;
+        const selectedPlatforms = Object.keys(sharePlatforms).filter((key) => sharePlatforms[key]);
+        if (selectedPlatforms.length === 0) {
+            setShareResult({ success: false, msg: t("reels.selectAtLeastOnePlatform", "Select at least one platform.") });
+            return;
+        }
+        if (isScheduling && !scheduleDate) {
+            setShareResult({ success: false, msg: t("reels.selectDateTime", "Please select a date and time.") });
+            return;
+        }
+
+        setSharing(true);
+        setShareResult(null);
+        try {
+            const payload = {
+                platforms: selectedPlatforms,
+                title: shareTitle,
+                description: shareDescription,
+            };
+            if (isScheduling && scheduleDate) {
+                payload.scheduled_date = new Date(scheduleDate).toISOString();
+                payload.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            }
+
+            const response = await fetch(getApiUrl(`/api/film-summaries/${filmSummary.id}/share`), {
+                method: "POST",
+                headers: { "Content-Type": "application/json", ...getAuthHeaders(user.id) },
+                body: JSON.stringify(payload),
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                setShareResult({ success: false, msg: typeof data?.detail === "string" ? data.detail : t("filmSummary.genericError", "Une erreur est survenue.") });
+                return;
+            }
+            setShareResult({
+                success: true,
+                msg: isScheduling ? t("reels.scheduledSuccessfully", "Scheduled successfully!") : t("reels.postedSuccessfully", "Posted successfully!"),
+            });
+            setTimeout(() => {
+                setShowShareModal(false);
+                setShareResult(null);
+            }, 3000);
+        } catch (err) {
+            setShareResult({ success: false, msg: err.message || t("filmSummary.genericError", "Une erreur est survenue.") });
+        } finally {
+            setSharing(false);
+        }
+    };
+
     if (loading && !filmSummary) {
         return (
             <div className="flex flex-1 items-center justify-center p-8">
@@ -355,13 +431,10 @@ export default function FilmSummaryProjectDetailPage() {
                     {status === "completed" ? (
                         <div className="space-y-4">
                             <h3 className="text-lg font-bold text-white">{t("filmSummary.completedTitle", "Ton resume de film est pret")}</h3>
-                            <div className="grid gap-4 md:grid-cols-2">
-                                {filmSummary.final_url ? (
-                                    <div className="space-y-2">
-                                        <label className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-400 dark:text-zinc-500">
-                                            {t("filmSummary.finalVideoLabel", "Video finale")}
-                                        </label>
-                                        <video src={filmSummary.final_url} controls preload="metadata" className="w-full rounded-xl bg-black" />
+                            {filmSummary.final_url ? (
+                                <div className="space-y-3">
+                                    <video src={filmSummary.final_url} controls preload="metadata" className="w-full rounded-xl bg-black" />
+                                    <div className="flex flex-wrap gap-2">
                                         <a
                                             href={filmSummary.final_url}
                                             download
@@ -369,21 +442,39 @@ export default function FilmSummaryProjectDetailPage() {
                                         >
                                             <Download size={14} /> {t("filmSummary.downloadButton", "Telecharger")}
                                         </a>
+                                        <button
+                                            type="button"
+                                            onClick={handleOpenShare}
+                                            className="inline-flex items-center gap-2 rounded-xl bg-primary px-4 py-2.5 text-sm font-semibold text-white hover:bg-blue-500"
+                                        >
+                                            <Share2 size={14} /> {t("filmSummary.shareButton", "Partager")}
+                                        </button>
                                     </div>
-                                ) : null}
-                                {filmSummary.preview_url ? (
-                                    <div className="space-y-2">
-                                        <label className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-400 dark:text-zinc-500">
-                                            {t("filmSummary.previewLabel", "Apercu")}
-                                        </label>
-                                        <video src={filmSummary.preview_url} controls preload="metadata" className="w-full rounded-xl bg-black" />
-                                    </div>
-                                ) : null}
-                            </div>
+                                </div>
+                            ) : null}
                         </div>
                     ) : null}
                 </>
             )}
+
+            <SharePostModal
+                isOpen={showShareModal}
+                onClose={() => setShowShareModal(false)}
+                title={shareTitle}
+                onTitleChange={setShareTitle}
+                description={shareDescription}
+                onDescriptionChange={setShareDescription}
+                isScheduling={isScheduling}
+                onSchedulingChange={setIsScheduling}
+                scheduleDate={scheduleDate}
+                onScheduleDateChange={setScheduleDate}
+                platforms={sharePlatforms}
+                onPlatformChange={handlePlatformChange}
+                connectedPlatforms={getConnectedPlatforms()}
+                isSubmitting={sharing}
+                result={shareResult}
+                onSubmit={handleShare}
+            />
         </div>
     );
 }

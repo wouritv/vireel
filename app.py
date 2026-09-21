@@ -10227,6 +10227,88 @@ async def delete_film_summary_endpoint(film_summary_id: str, user_id: Annotated[
     return {"deleted": True}
 
 
+async def _publish_film_summary_now(
+    user_id: str, platform_name: str, publish_priority: int, final_title: str, final_description: str, media_url: str,
+) -> Dict[str, Any]:
+    """Same immediate-publish flow as _publish_caption_now/_publish_reel_now
+    (share_caption/share_reel) -- the only thing that differs per feature is
+    where media_url/title/description come from, so this mirrors them
+    exactly rather than introducing a fourth, subtly different variant."""
+    publish_job_id = await _insert_publish_job(
+        user_id=user_id, platform=platform_name, external_id="n/a", status="queued", priority=publish_priority,
+    )
+    try:
+        await _update_publish_job_status(publish_job_id, "processing")
+        account = await _get_social_account(user_id, platform_name)
+        if not account:
+            raise HTTPException(status_code=404, detail=f"No connected {platform_name} account found")
+
+        publish_payload = PublishRequest(
+            user_id=user_id, title=final_title, description=final_description,
+            text=final_description, caption=final_description, video_url=media_url,
+        )
+        platform_result = await publish_post(account, publish_payload)
+        external_id = str(platform_result.get("publish_id") or platform_result.get("id") or platform_result.get("video_id") or "n/a")
+        post_url = _build_social_post_url(platform_name, platform_result)
+        await _update_publish_job_status(publish_job_id, "done", external_id=external_id, post_url=post_url)
+        return {"success": True, "result": platform_result, "publish_job_id": publish_job_id}
+    except Exception as exc:
+        err_msg = str(exc)
+        await _update_publish_job_status(publish_job_id, "failed", error_message=err_msg)
+        return {"success": False, "error": err_msg, "publish_job_id": publish_job_id}
+
+
+@app.post("/api/film-summaries/{film_summary_id}/share", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def share_film_summary(film_summary_id: str, payload: ReelShareRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
+    await _assert_user_has_required_credits(user_id, 0.0)
+
+    row = await supabase_get_film_summary(film_summary_id, user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
+    if row.get("status") != film_summary.FilmSummaryStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="Film summary is not completed yet")
+
+    final_s3_key = row.get("final_s3_key")
+    if not final_s3_key:
+        raise HTTPException(status_code=400, detail="No media URL available")
+    bucket_name = os.environ.get("AWS_S3_BUCKET", "my-clips-bucket")
+    media_url = generate_presigned_url(bucket_name, final_s3_key, expiration=3600)
+    if not media_url:
+        raise HTTPException(status_code=400, detail="No media URL available")
+
+    final_title = payload.title or row.get("title") or "Resume de film"
+    final_description = payload.description or ""
+    selected_platforms = _resolve_social_platforms(payload.platforms)
+    publish_priority = await _resolve_user_job_priority(user_id)
+    scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
+    if payload.scheduled_date and not scheduled_for:
+        raise HTTPException(status_code=400, detail=_INVALID_SCHEDULED_DATE)
+    is_scheduled = bool(scheduled_for and scheduled_for > _utcnow())
+
+    results: Dict[str, Any] = {}
+    overall_success = True
+    for platform_name in selected_platforms:
+        if is_scheduled:
+            results[platform_name] = await _schedule_share_publish_job(
+                user_id, platform_name, "film_summary", film_summary_id, publish_priority,
+                scheduled_for, payload.timezone, final_title, final_description, media_url,
+            )
+            continue
+
+        result = await _publish_film_summary_now(user_id, platform_name, publish_priority, final_title, final_description, media_url)
+        results[platform_name] = result
+        if not result["success"]:
+            overall_success = False
+
+    if not is_scheduled:
+        await _debit_publish_credits_after_share(user_id, film_summary_id, results)
+
+    return {
+        "success": overall_success,
+        "results": results,
+    }
+
+
 # --------------------------------------------------------------------------
 # Projects Endpoints
 # --------------------------------------------------------------------------
