@@ -783,6 +783,25 @@ async def classify_media_type(
     return verdict
 
 
+def _call_planning_model(client, model_name: str, messages: List[Dict[str, Any]]):
+    return client.chat.completions.create(
+        model=model_name, messages=messages, temperature=0.6, max_tokens=8000,
+        response_format={"type": "json_object"},
+    )
+
+
+def _build_planning_correction_message(validation_report: Dict[str, Any]) -> Dict[str, str]:
+    errors = "; ".join(validation_report.get("errors") or [])
+    return {
+        "role": "user",
+        "content": (
+            "Your previous plan failed automated validation with these blocking errors: "
+            f"{errors}. Return a corrected full plan (same OUTPUT SCHEMA, JSON only) that fixes "
+            "every one of these issues while preserving everything else that was already correct."
+        ),
+    }
+
+
 async def generate_edit_plan(
     *, movie_metadata: Dict[str, Any], target_duration_ms: int, narration_language: str, narration_style: str,
     transcript_segments: List[Dict[str, Any]], scene_index: List[Dict[str, Any]],
@@ -790,9 +809,21 @@ async def generate_edit_plan(
 ) -> Dict[str, Any]:
     """Single consolidated planning call producing the edit-plan JSON
     contract (see module docstring). Raises FilmSummaryValidationError on a
-    malformed/insufficient-evidence response."""
+    malformed/insufficient-evidence response.
+
+    Self-corrects once on a blocking validation failure (duration outside
+    tolerance, non-contiguous sequence numbers, overlapping dialogue, ...):
+    LLM-produced plans occasionally violate a numeric/structural constraint
+    even when the prompt states it clearly, since keeping a running total
+    consistent across many segments is a self-consistency task models don't
+    reliably get right in one pass. Feeding the exact validation errors back
+    as a corrective follow-up turn (keeping the model's own prior answer in
+    context, rather than starting over) converges far more often than a
+    fresh independent attempt would, at the cost of a second call only when
+    the first one actually failed."""
     client = _get_openai_client()
     model_name = os.environ.get("FILM_SUMMARY_PLANNING_MODEL", os.environ.get("OPENAI_MODEL", "gpt-4o"))
+    max_attempts = int(os.environ.get("FILM_SUMMARY_PLANNING_MAX_ATTEMPTS", "2"))
 
     payload = {
         "movie_metadata": movie_metadata,
@@ -803,30 +834,42 @@ async def generate_edit_plan(
         "scene_index": scene_index,
         "generation_constraints": generation_constraints,
     }
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": PLANNING_SYSTEM_PROMPT},
+        {"role": "system", "content": PLANNING_CONSOLIDATION_NOTE},
+        {"role": "user", "content": json.dumps(payload)},
+    ]
+    valid_scene_ids = [s.get("scene_id") for s in scene_index]
+    source_duration_ms = int(movie_metadata.get("source_duration_ms") or 0)
+    duration_tolerance_ratio = float(generation_constraints.get("duration_tolerance_ratio", 0.15))
 
-    def _call():
-        return client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": PLANNING_SYSTEM_PROMPT},
-                {"role": "system", "content": PLANNING_CONSOLIDATION_NOTE},
-                {"role": "user", "content": json.dumps(payload)},
-            ],
-            temperature=0.6,
-            max_tokens=8000,
-            response_format={"type": "json_object"},
+    total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    plan: Dict[str, Any] = {}
+    validation_report: Dict[str, Any] = {"valid": False, "errors": [], "warnings": []}
+
+    for attempt in range(max(1, max_attempts)):
+        response = await asyncio.to_thread(_call_planning_model, client, model_name, messages)
+        raw_text = response.choices[0].message.content
+        try:
+            raw = json.loads(raw_text)
+        except (TypeError, ValueError) as exc:
+            raise FilmSummaryValidationError(FilmSummaryErrorCode.PLAN_INVALID, f"Invalid JSON from planning model: {exc}") from exc
+
+        plan = validate_edit_plan_schema(raw, movie_metadata=movie_metadata, target_duration_ms=target_duration_ms)
+        usage = _usage_dict(response, model_name)
+        total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
+        total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+
+        validation_report = validate_edit_plan_content(
+            plan, source_duration_ms=source_duration_ms, valid_scene_ids=valid_scene_ids,
+            duration_tolerance_ratio=duration_tolerance_ratio,
         )
+        if validation_report["valid"] or attempt == max_attempts - 1:
+            break
+        messages.append({"role": "assistant", "content": raw_text})
+        messages.append(_build_planning_correction_message(validation_report))
 
-    response = await asyncio.to_thread(_call)
-    raw_text = response.choices[0].message.content
-    try:
-        raw = json.loads(raw_text)
-    except (TypeError, ValueError) as exc:
-        raise FilmSummaryValidationError(FilmSummaryErrorCode.PLAN_INVALID, f"Invalid JSON from planning model: {exc}") from exc
-
-    plan = validate_edit_plan_schema(raw, movie_metadata=movie_metadata, target_duration_ms=target_duration_ms)
-    usage = _usage_dict(response, model_name)
-    return {"plan": plan, "usage": usage}
+    return {"plan": plan, "usage": total_usage}
 
 
 def _build_utterance_segments(transcript: Any) -> List[Dict[str, Any]]:

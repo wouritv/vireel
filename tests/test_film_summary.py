@@ -466,13 +466,18 @@ def test_generate_edit_plan_returns_validated_plan_and_usage(monkeypatch):
     monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
 
     movie_metadata = {"title": "M", "source_duration_ms": 3600000, "source_language": "en", "narration_language": "en"}
+    # target_duration_ms matches _valid_raw_plan()'s own total (26000 + 3000)
+    # so this plan passes content validation on the first attempt -- this
+    # test is about the schema/usage plumbing, not the retry-on-failure
+    # path (see the dedicated tests below for that).
     result = asyncio.run(fs.generate_edit_plan(
-        movie_metadata=movie_metadata, target_duration_ms=600000, narration_language="en", narration_style="cinematic",
+        movie_metadata=movie_metadata, target_duration_ms=29000, narration_language="en", narration_style="cinematic",
         transcript_segments=[], scene_index=[], generation_constraints={},
     ))
 
     assert result["plan"]["movie"] == movie_metadata
     assert result["usage"]["prompt_tokens"] == 10
+    fake_client.chat.completions.create.assert_called_once()
 
 
 def test_generate_edit_plan_raises_on_bad_json(monkeypatch):
@@ -488,6 +493,55 @@ def test_generate_edit_plan_raises_on_bad_json(monkeypatch):
     with pytest.raises(fs.FilmSummaryValidationError) as exc_info:
         asyncio.run(coro)
     assert exc_info.value.code == fs.FilmSummaryErrorCode.PLAN_INVALID
+
+
+def test_generate_edit_plan_retries_once_and_converges_on_correction(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    invalid_plan = _valid_raw_plan()  # total duration (29000ms) far below the 600000ms target below
+    corrected_plan = _valid_raw_plan()
+    corrected_plan["segments"][0]["estimated_duration_ms"] = 597000  # brings the total within tolerance
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.side_effect = [
+        _fake_openai_response(json.dumps(invalid_plan), prompt_tokens=10, completion_tokens=5),
+        _fake_openai_response(json.dumps(corrected_plan), prompt_tokens=20, completion_tokens=8),
+    ]
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    movie_metadata = {"title": "M", "source_duration_ms": 3600000, "source_language": "en", "narration_language": "en"}
+    result = asyncio.run(fs.generate_edit_plan(
+        movie_metadata=movie_metadata, target_duration_ms=600000, narration_language="en", narration_style="cinematic",
+        transcript_segments=[], scene_index=[], generation_constraints={},
+    ))
+
+    assert fake_client.chat.completions.create.call_count == 2
+    assert result["plan"]["total_estimated_duration_ms"] == 597000 + 3000
+    assert result["usage"] == {"prompt_tokens": 30, "completion_tokens": 13}
+    # The corrective follow-up must reference the earlier response so the
+    # model can patch it rather than starting from a blank slate.
+    sent_messages = fake_client.chat.completions.create.call_args_list[1].kwargs["messages"]
+    assert sent_messages[-2]["role"] == "assistant"
+    assert "blocking errors" in sent_messages[-1]["content"]
+
+
+def test_generate_edit_plan_gives_up_after_max_attempts(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    still_invalid_plan = _valid_raw_plan()
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = _fake_openai_response(json.dumps(still_invalid_plan))
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    movie_metadata = {"title": "M", "source_duration_ms": 3600000, "source_language": "en", "narration_language": "en"}
+    result = asyncio.run(fs.generate_edit_plan(
+        movie_metadata=movie_metadata, target_duration_ms=600000, narration_language="en", narration_style="cinematic",
+        transcript_segments=[], scene_index=[], generation_constraints={},
+    ))
+
+    # Default max attempts is 2 -- gives up and returns the last (still
+    # invalid) plan rather than looping or raising, matching the existing
+    # "surface the validation report to the user" behavior.
+    assert fake_client.chat.completions.create.call_count == 2
+    assert result["plan"]["total_estimated_duration_ms"] == 29000
 
 
 # ---------------------------------------------------------------------------
