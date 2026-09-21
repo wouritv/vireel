@@ -429,7 +429,7 @@ def _validate_voice_over_segment(
 
 def _validate_timed_segment(
     seg: Dict[str, Any], source_duration_ms: int, known_character_ids: set,
-) -> Tuple[List[str], List[str], Optional[Tuple[int, int]]]:
+) -> Tuple[List[str], List[str], Optional[Tuple[int, int, str]]]:
     errors: List[str] = []
     warnings: List[str] = []
     start_ms, end_ms = seg.get("start_ms"), seg.get("end_ms")
@@ -437,7 +437,7 @@ def _validate_timed_segment(
     if start_ms is None or end_ms is None or start_ms < 0 or end_ms <= start_ms or end_ms > source_duration_ms:
         errors.append(f"Segment {seg.get('id')} has an out-of-bounds timecode")
     else:
-        valid_range = (start_ms, end_ms)
+        valid_range = (start_ms, end_ms, str(seg.get("id")))
     for speaker_id in seg.get("speaker_ids") or []:
         if known_character_ids and speaker_id not in known_character_ids:
             warnings.append(f"Segment {seg.get('id')} references unknown character {speaker_id}")
@@ -446,7 +446,7 @@ def _validate_timed_segment(
 
 def _validate_segments(
     segments: List[Dict[str, Any]], source_duration_ms: int, known_scene_ids: set, known_character_ids: set,
-) -> Tuple[List[str], List[str], List[Tuple[int, int]], Dict[Tuple[Any, int, int], int]]:
+) -> Tuple[List[str], List[str], List[Tuple[int, int, str]], Dict[Tuple[Any, int, int], int]]:
     """Per-segment checks (type, clip/timecode bounds, scene/character
     references), collecting the shared state (dialogue ranges, clip
     signatures) the overlap/repetition checks need afterwards. Split out
@@ -454,7 +454,7 @@ def _validate_segments(
     these concerns was the bulk of that function's cognitive complexity."""
     errors: List[str] = []
     warnings: List[str] = []
-    dialogue_ranges: List[Tuple[int, int]] = []
+    dialogue_ranges: List[Tuple[int, int, str]] = []
     clip_signatures: Dict[Tuple[Any, int, int], int] = {}
 
     for seg in segments:
@@ -473,11 +473,22 @@ def _validate_segments(
     return errors, warnings, dialogue_ranges, clip_signatures
 
 
-def _validate_dialogue_overlap(dialogue_ranges: List[Tuple[int, int]]) -> List[str]:
+def _validate_dialogue_overlap(dialogue_ranges: List[Tuple[int, int, str]]) -> List[str]:
+    """Named after the pair of segment ids and their exact timecodes,
+    instead of a bare generic message -- this is fed back verbatim to the
+    planning model as corrective context on a retry (see generate_edit_
+    plan), and a model can only fix the specific pair it's told about."""
     ranges = sorted(dialogue_ranges)
     for i in range(1, len(ranges)):
-        if ranges[i][0] < ranges[i - 1][1]:
-            return ["Two original_dialogue/breathing segments overlap in source time"]
+        prev_start, prev_end, prev_id = ranges[i - 1]
+        cur_start, cur_end, cur_id = ranges[i]
+        if cur_start < prev_end:
+            return [
+                f"Segments {prev_id} ({prev_start}-{prev_end}ms) and {cur_id} ({cur_start}-{cur_end}ms) "
+                "are both original_dialogue/breathing and overlap in source time -- each source time range "
+                "may be used by at most one such segment; keep only one of the two, or move the later one "
+                "to a non-overlapping range"
+            ]
     return []
 
 

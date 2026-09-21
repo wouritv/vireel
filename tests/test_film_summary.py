@@ -306,7 +306,10 @@ def test_validate_edit_plan_content_flags_overlapping_dialogue_segments():
         plan, source_duration_ms=3600000, valid_scene_ids=["scene_001"], duration_tolerance_ratio=0.5,
     )
     assert report["valid"] is False
-    assert any("overlap" in e for e in report["errors"])
+    # Names both segment ids and their exact timecodes -- fed back verbatim
+    # to the planning model as corrective context on a retry, a bare
+    # generic message gives it nothing to act on.
+    assert any("seg_002" in e and "seg_003" in e and "9000-12000ms" in e and "10000-11000ms" in e for e in report["errors"])
 
 
 def test_validate_edit_plan_content_flags_duration_outside_tolerance():
