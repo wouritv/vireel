@@ -7938,6 +7938,193 @@ async def get_souscription_history(
     return {"items": filtered}
 
 
+class ChangeSubscriptionPlanRequest(BaseModel):
+    plan_id: str
+
+
+async def _get_active_stripe_souscription(user_id: str) -> Dict[str, Any]:
+    """The active souscription row for a user, guaranteed to carry a
+    stripe_subscription_id -- shared by cancel/reactivate/pause/resume/
+    change-plan, which all need one to act on. A row without it predates
+    Stripe recurring billing (a one-off "payment" mode checkout from before
+    mode="subscription") and has nothing on Stripe to manage."""
+    subscription = await get_user_abonnement(user_id)
+    if not subscription:
+        raise HTTPException(status_code=404, detail="No active subscription")
+    if not subscription.get("stripe_subscription_id"):
+        raise HTTPException(
+            status_code=400,
+            detail="This subscription has no associated Stripe subscription to manage.",
+        )
+    return subscription
+
+
+@app.post("/api/souscription/cancel", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def cancel_souscription(user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Stop the subscription from auto-renewing -- access continues until
+    the current period's payment_end_date, matching Stripe's own
+    cancel_at_period_end semantics (no refund, no early cutoff)."""
+    _require_stripe_ready()
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    subscription = await _get_active_stripe_souscription(user_id)
+    try:
+        stripe.Subscription.modify(subscription["stripe_subscription_id"], cancel_at_period_end=True)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
+
+    return await supabase_update_souscription_row(
+        str(subscription["id"]),
+        {"auto_renew": False, "canceled_at": datetime.now(timezone.utc).isoformat()},
+        user_id=user_id,
+    )
+
+
+@app.post("/api/souscription/reactivate", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def reactivate_souscription(user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Undo a pending cancellation while the subscription is still within
+    its current paid period -- the mirror of cancel_souscription."""
+    _require_stripe_ready()
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    subscription = await _get_active_stripe_souscription(user_id)
+    try:
+        stripe.Subscription.modify(subscription["stripe_subscription_id"], cancel_at_period_end=False)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
+
+    return await supabase_update_souscription_row(
+        str(subscription["id"]),
+        {"auto_renew": True, "canceled_at": None, "reactivated_at": datetime.now(timezone.utc).isoformat()},
+        user_id=user_id,
+    )
+
+
+@app.post("/api/souscription/pause", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def pause_souscription(user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Pause billing: Stripe still generates invoices on schedule but voids
+    them immediately, so the customer is never charged while paused."""
+    _require_stripe_ready()
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    subscription = await _get_active_stripe_souscription(user_id)
+    try:
+        stripe.Subscription.modify(subscription["stripe_subscription_id"], pause_collection={"behavior": "void"})
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
+
+    return await supabase_update_souscription_row(
+        str(subscription["id"]),
+        {"paused_at": datetime.now(timezone.utc).isoformat()},
+        user_id=user_id,
+    )
+
+
+@app.post("/api/souscription/resume", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def resume_souscription(user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Undo pause_souscription -- billing resumes on the next scheduled invoice."""
+    _require_stripe_ready()
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    subscription = await _get_active_stripe_souscription(user_id)
+    try:
+        # Stripe clears pause_collection only when explicitly set to "" --
+        # omitting the field or passing None leaves the existing pause in place.
+        stripe.Subscription.modify(subscription["stripe_subscription_id"], pause_collection="")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
+
+    return await supabase_update_souscription_row(
+        str(subscription["id"]),
+        {"resumed_at": datetime.now(timezone.utc).isoformat()},
+        user_id=user_id,
+    )
+
+
+@app.post("/api/souscription/change-plan", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def change_souscription_plan(
+    payload: ChangeSubscriptionPlanRequest, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Swap the subscription's price for a different plan's, effective
+    immediately (with Stripe proration), and reset credit/storage to the
+    new plan's allowance the same way a fresh purchase would -- mirrors
+    _allocate_plan_resources's existing "a changed plan resets monthly
+    allowances" behavior, just triggered synchronously here instead of via
+    a webhook."""
+    _require_stripe_ready()
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    subscription = await _get_active_stripe_souscription(user_id)
+    new_plan = await supabase_get_abonnement(payload.plan_id)
+    if not new_plan:
+        raise HTTPException(status_code=404, detail="Subscription plan not found")
+
+    try:
+        unit_amount = int(round(float(new_plan.get("price") or 0) * 100))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid plan price")
+    if unit_amount <= 0:
+        raise HTTPException(status_code=400, detail="Invalid plan price")
+
+    try:
+        stripe_subscription = stripe.Subscription.retrieve(subscription["stripe_subscription_id"])
+        item_id = stripe_subscription["items"]["data"][0]["id"]
+        existing_metadata = stripe_subscription.metadata.to_dict() if stripe_subscription.metadata else {}
+        # The next auto-renewal invoice reads abonnement off the
+        # Subscription's own metadata (_handle_subscription_renewal_invoice)
+        # -- without updating it here, the following month would still
+        # credit the OLD plan even though this call charged for the new one.
+        new_metadata = {
+            **existing_metadata,
+            "abonnement": str(new_plan.get("id")),
+            "plan_name": str(new_plan.get("name") or ""),
+        }
+        updated_stripe_subscription = stripe.Subscription.modify(
+            subscription["stripe_subscription_id"],
+            items=[{
+                "id": item_id,
+                "price_data": {
+                    "currency": STRIPE_CURRENCY,
+                    "unit_amount": unit_amount,
+                    "recurring": {"interval": "month"},
+                    "product_data": {"name": str(new_plan.get("name") or "Abonnement")},
+                },
+            }],
+            proration_behavior="create_prorations",
+            metadata=new_metadata,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
+
+    current_period_end = updated_stripe_subscription.get("current_period_end")
+    period_end = datetime.fromtimestamp(current_period_end, tz=timezone.utc) if current_period_end else None
+
+    new_souscription = await supabase_insert_souscription(
+        user_id=user_id,
+        abonnement=str(new_plan.get("id")),
+        payment_mode="stripe",
+        payment_amount=float(new_plan.get("price") or 0),
+        payment_reference=f"planchange_{subscription['stripe_subscription_id']}_{int(datetime.now(timezone.utc).timestamp())}",
+        payment_status="completed",
+        payment_comment=f"Plan changed to {new_plan.get('name')}",
+        period_end_date=period_end,
+        stripe_subscription_id=subscription["stripe_subscription_id"],
+        stripe_customer_id=subscription.get("stripe_customer_id"),
+    )
+    await _allocate_plan_resources(
+        user_id=user_id,
+        abonnement=str(new_plan.get("id")),
+        payment_reference=str(new_souscription.get("id") or ""),
+        souscription_id=str(new_souscription.get("id") or ""),
+    )
+    return new_souscription
+
+
 # ---------------------------------------------------------------------------
 # User credits & history
 # ---------------------------------------------------------------------------

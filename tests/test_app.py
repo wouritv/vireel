@@ -3298,3 +3298,157 @@ def test_stripe_webhook_dispatches_subscription_cycle_invoice_to_renewal_handler
 
     assert result == {"received": True}
     renewal_mock.assert_awaited_once_with(invoice)
+
+
+# ---------------------------------------------------------------------------
+# Subscription lifecycle actions: cancel / reactivate / pause / resume / change-plan
+# ---------------------------------------------------------------------------
+
+_DEFAULT_LIFECYCLE_SUBSCRIPTION = object()  # sentinel: None is a valid, meaningful test input (no active subscription)
+
+
+def _stub_subscription_lifecycle_prereqs(monkeypatch, app, subscription=_DEFAULT_LIFECYCLE_SUBSCRIPTION):
+    if subscription is _DEFAULT_LIFECYCLE_SUBSCRIPTION:
+        subscription = {"id": "sous-1", "stripe_subscription_id": "sub_123", "stripe_customer_id": "cus_456"}
+    fake_stripe = MagicMock()
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=subscription))
+    update_mock = AsyncMock(return_value={"id": "sous-1"})
+    monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
+    return fake_stripe, update_mock
+
+
+def test_cancel_souscription_sets_cancel_at_period_end(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe, update_mock = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+
+    asyncio.run(app.cancel_souscription(user_id="u1"))
+
+    fake_stripe.Subscription.modify.assert_called_once_with("sub_123", cancel_at_period_end=True)
+    update_mock.assert_awaited_once()
+    args, kwargs = update_mock.await_args
+    assert args[0] == "sous-1"
+    assert args[1]["auto_renew"] is False
+    assert kwargs["user_id"] == "u1"
+
+
+def test_cancel_souscription_404_without_active_subscription(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    _stub_subscription_lifecycle_prereqs(monkeypatch, app, subscription=None)
+
+    with pytest.raises(Exception) as exc_info:
+        asyncio.run(app.cancel_souscription(user_id="u1"))
+    assert getattr(exc_info.value, "status_code", None) == 404
+
+
+def test_cancel_souscription_400_without_stripe_subscription_id(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    _stub_subscription_lifecycle_prereqs(monkeypatch, app, subscription={"id": "sous-legacy"})
+
+    with pytest.raises(Exception) as exc_info:
+        asyncio.run(app.cancel_souscription(user_id="u1"))
+    assert getattr(exc_info.value, "status_code", None) == 400
+
+
+def test_reactivate_souscription_clears_cancel_at_period_end(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe, update_mock = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+
+    asyncio.run(app.reactivate_souscription(user_id="u1"))
+
+    fake_stripe.Subscription.modify.assert_called_once_with("sub_123", cancel_at_period_end=False)
+    args, _ = update_mock.await_args
+    assert args[1]["auto_renew"] is True
+    assert args[1]["canceled_at"] is None
+
+
+def test_pause_souscription_voids_pause_collection(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe, update_mock = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+
+    asyncio.run(app.pause_souscription(user_id="u1"))
+
+    fake_stripe.Subscription.modify.assert_called_once_with("sub_123", pause_collection={"behavior": "void"})
+    args, _ = update_mock.await_args
+    assert "paused_at" in args[1]
+
+
+def test_resume_souscription_clears_pause_collection(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe, update_mock = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+
+    asyncio.run(app.resume_souscription(user_id="u1"))
+
+    fake_stripe.Subscription.modify.assert_called_once_with("sub_123", pause_collection="")
+    args, _ = update_mock.await_args
+    assert "resumed_at" in args[1]
+
+
+class _FakeStripeSubscriptionObject(dict):
+    """Supports both dict-style item access (subscription["items"]) and
+    attribute access (subscription.metadata), matching how the real
+    stripe.StripeObject behaves and how change_souscription_plan reads it."""
+
+    def __init__(self, data, metadata):
+        super().__init__(data)
+        self.metadata = metadata
+
+
+def test_change_souscription_plan_swaps_price_and_resets_resources(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe, _ = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    fake_stripe.Subscription.retrieve.return_value = _FakeStripeSubscriptionObject(
+        {"items": {"data": [{"id": "si_123"}]}},
+        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
+    )
+    fake_stripe.Subscription.modify.return_value = {"current_period_end": 1700000000}
+
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "new-plan", "name": "Premium", "price": 49.99}))
+    insert_mock = AsyncMock(return_value={"id": "sous-2"})
+    monkeypatch.setattr(app, "supabase_insert_souscription", insert_mock)
+    allocate_mock = AsyncMock()
+    monkeypatch.setattr(app, "_allocate_plan_resources", allocate_mock)
+
+    result = asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="new-plan"), user_id="u1",
+    ))
+
+    assert result == {"id": "sous-2"}
+    fake_stripe.Subscription.retrieve.assert_called_once_with("sub_123")
+    _, modify_kwargs = fake_stripe.Subscription.modify.call_args
+    assert modify_kwargs["items"] == [{
+        "id": "si_123",
+        "price_data": {
+            "currency": app.STRIPE_CURRENCY, "unit_amount": 4999, "recurring": {"interval": "month"},
+            "product_data": {"name": "Premium"},
+        },
+    }]
+    assert modify_kwargs["proration_behavior"] == "create_prorations"
+    assert modify_kwargs["metadata"]["abonnement"] == "new-plan"
+    assert modify_kwargs["metadata"]["userid"] == "u1"  # preserved from the existing subscription metadata
+
+    insert_mock.assert_awaited_once()
+    insert_kwargs = insert_mock.await_args.kwargs
+    assert insert_kwargs["abonnement"] == "new-plan"
+    assert insert_kwargs["stripe_subscription_id"] == "sub_123"
+    assert insert_kwargs["stripe_customer_id"] == "cus_456"
+    assert insert_kwargs["period_end_date"] == datetime.fromtimestamp(1700000000, tz=timezone.utc)
+
+    allocate_mock.assert_awaited_once()
+    allocate_kwargs = allocate_mock.await_args.kwargs
+    assert allocate_kwargs["abonnement"] == "new-plan"
+    assert allocate_kwargs["souscription_id"] == "sous-2"
+
+
+def test_change_souscription_plan_404_for_unknown_plan(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value=None))
+
+    with pytest.raises(Exception) as exc_info:
+        asyncio.run(app.change_souscription_plan(
+            payload=app.ChangeSubscriptionPlanRequest(plan_id="missing-plan"), user_id="u1",
+        ))
+    assert getattr(exc_info.value, "status_code", None) == 404
