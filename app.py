@@ -9044,6 +9044,13 @@ def _estimate_film_summary_analysis_required_credits(duration_seconds: float, si
     return float(calculate_credits_for_operation(breakdown)["final_credits"])
 
 
+def _plan_target_duration_seconds(plan: Dict[str, Any]) -> int:
+    # target_duration_seconds is stored as an integer column -- Postgres's
+    # integer input parser rejects fractional text ("367.0") outright, so
+    # this must round rather than just cast plan["target_duration_ms"] / 1000.
+    return int(round((plan.get("target_duration_ms") or 0) / 1000.0))
+
+
 def _estimate_film_summary_render_required_credits(target_duration_seconds: float, narration_character_count: float) -> float:
     breakdown = estimate_film_summary_render_cost_usd(
         target_duration_minutes=max(1.0, float(target_duration_seconds or 0.0) / 60.0),
@@ -9629,7 +9636,7 @@ async def _finalize_film_summary_analysis(
             # plan_patch never trusts the plan's own copy) -- keep it in
             # sync with plan["target_duration_ms"], which realign_plan_
             # target_duration may just have moved.
-            "target_duration_seconds": (plan.get("target_duration_ms") or 0) / 1000.0,
+            "target_duration_seconds": _plan_target_duration_seconds(plan),
             "billing_details": cost_breakdown,
             "total_cost_usd": cost_breakdown.get("total_usd", 0.0),
         })
@@ -9753,7 +9760,7 @@ async def update_film_summary_plan_endpoint(
 
     updated = await supabase_update_film_summary(film_summary_id, user_id, {
         "edit_plan": normalized_plan, "validation_report": validation_report,
-        "target_duration_seconds": (normalized_plan.get("target_duration_ms") or 0) / 1000.0,
+        "target_duration_seconds": _plan_target_duration_seconds(normalized_plan),
     })
     return _normalize_film_summary_row(updated, include_content=True)
 
@@ -9775,7 +9782,7 @@ async def validate_film_summary_plan_endpoint(film_summary_id: str, user_id: Ann
     )
     await supabase_update_film_summary(film_summary_id, user_id, {
         "edit_plan": plan, "validation_report": validation_report,
-        "target_duration_seconds": (plan.get("target_duration_ms") or 0) / 1000.0,
+        "target_duration_seconds": _plan_target_duration_seconds(plan),
     })
     return validation_report
 
@@ -9804,7 +9811,7 @@ async def render_film_summary_endpoint(
     if plan is not row.get("edit_plan"):
         await supabase_update_film_summary(film_summary_id, user_id, {
             "edit_plan": plan, "validation_report": validation_report,
-            "target_duration_seconds": (plan.get("target_duration_ms") or 0) / 1000.0,
+            "target_duration_seconds": _plan_target_duration_seconds(plan),
         })
 
     await _enforce_job_concurrency_limit(user_id)
@@ -9814,7 +9821,7 @@ async def render_film_summary_endpoint(
     # Use the (possibly just-realigned) target so credits reflect the video's
     # actual planned length rather than a stale pre-alignment number.
     render_required_credits = _estimate_film_summary_render_required_credits(
-        (plan.get("target_duration_ms") or 0) / 1000.0, character_count,
+        _plan_target_duration_seconds(plan), character_count,
     )
     await _reserve_job_credits(user_id, render_required_credits)
 
