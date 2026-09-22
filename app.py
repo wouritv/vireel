@@ -174,6 +174,8 @@ _SUPABASE_PROJECTS_NOT_CONFIGURED = "Supabase projects is not configured"
 _PROJECT_NOT_FOUND = "Project not found"
 _REEL_NOT_FOUND = "Reel not found"
 _UNSUPPORTED_PLATFORM = "Unsupported platform"
+_INVALID_PLAN_PRICE = "Invalid plan price"
+_NO_MEDIA_URL_AVAILABLE = "No media URL available"
 
 
 def _generic_error(
@@ -7500,10 +7502,10 @@ async def create_stripe_checkout_session(
     try:
         unit_amount = int(round(float(plan.get("price") or 0) * 100))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Invalid plan price")
+        raise HTTPException(status_code=400, detail=_INVALID_PLAN_PRICE)
 
     if unit_amount <= 0:
-        raise HTTPException(status_code=400, detail="Invalid plan price")
+        raise HTTPException(status_code=400, detail=_INVALID_PLAN_PRICE)
 
     default_base_url = _frontend_base_url(request)
     success_url = (payload.success_url or STRIPE_SUCCESS_URL or f"{default_base_url}/dashboard/abonnement?payment=success").strip()
@@ -8067,9 +8069,9 @@ async def change_souscription_plan(
     try:
         unit_amount = int(round(float(new_plan.get("price") or 0) * 100))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Invalid plan price")
+        raise HTTPException(status_code=400, detail=_INVALID_PLAN_PRICE)
     if unit_amount <= 0:
-        raise HTTPException(status_code=400, detail="Invalid plan price")
+        raise HTTPException(status_code=400, detail=_INVALID_PLAN_PRICE)
 
     try:
         stripe_subscription = stripe.Subscription.retrieve(subscription["stripe_subscription_id"])
@@ -9239,7 +9241,7 @@ async def share_caption(caption_id: str, payload: ReelShareRequest, user_id: Ann
     item = _normalize_caption_row(row)
     media_url = item.get("media_url")
     if not media_url:
-        raise HTTPException(status_code=400, detail="No media URL available")
+        raise HTTPException(status_code=400, detail=_NO_MEDIA_URL_AVAILABLE)
 
     final_title = payload.title or row.get("caption_title") or "Sous-titres"
     final_description = payload.description or row.get("caption_description") or ""
@@ -10594,11 +10596,11 @@ async def share_film_summary(film_summary_id: str, payload: ReelShareRequest, us
 
     final_s3_key = row.get("final_s3_key")
     if not final_s3_key:
-        raise HTTPException(status_code=400, detail="No media URL available")
+        raise HTTPException(status_code=400, detail=_NO_MEDIA_URL_AVAILABLE)
     bucket_name = os.environ.get("AWS_S3_BUCKET", "my-clips-bucket")
     media_url = generate_presigned_url(bucket_name, final_s3_key, expiration=3600)
     if not media_url:
-        raise HTTPException(status_code=400, detail="No media URL available")
+        raise HTTPException(status_code=400, detail=_NO_MEDIA_URL_AVAILABLE)
 
     final_title = payload.title or row.get("title") or "Resume de film"
     final_description = payload.description or ""
@@ -11046,7 +11048,7 @@ async def share_reel(reel_id: str, payload: ReelShareRequest, user_id: Annotated
     item = _normalize_reel_row(row)
     media_url = item.get("media_url")
     if not media_url:
-        raise HTTPException(status_code=400, detail="No media URL available")
+        raise HTTPException(status_code=400, detail=_NO_MEDIA_URL_AVAILABLE)
 
     final_title = payload.title or row.get("reel_title") or "Vireel"
     final_description = payload.description or row.get("reel_description") or ""

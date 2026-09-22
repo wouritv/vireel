@@ -3338,18 +3338,18 @@ def test_cancel_souscription_404_without_active_subscription(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     _stub_subscription_lifecycle_prereqs(monkeypatch, app, subscription=None)
 
-    with pytest.raises(Exception) as exc_info:
+    with pytest.raises(app.HTTPException) as exc_info:
         asyncio.run(app.cancel_souscription(user_id="u1"))
-    assert getattr(exc_info.value, "status_code", None) == 404
+    assert exc_info.value.status_code == 404
 
 
 def test_cancel_souscription_400_without_stripe_subscription_id(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     _stub_subscription_lifecycle_prereqs(monkeypatch, app, subscription={"id": "sous-legacy"})
 
-    with pytest.raises(Exception) as exc_info:
+    with pytest.raises(app.HTTPException) as exc_info:
         asyncio.run(app.cancel_souscription(user_id="u1"))
-    assert getattr(exc_info.value, "status_code", None) == 400
+    assert exc_info.value.status_code == 400
 
 
 def test_reactivate_souscription_clears_cancel_at_period_end(monkeypatch):
@@ -3447,8 +3447,8 @@ def test_change_souscription_plan_404_for_unknown_plan(monkeypatch):
     _stub_subscription_lifecycle_prereqs(monkeypatch, app)
     monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value=None))
 
-    with pytest.raises(Exception) as exc_info:
+    with pytest.raises(app.HTTPException) as exc_info:
         asyncio.run(app.change_souscription_plan(
             payload=app.ChangeSubscriptionPlanRequest(plan_id="missing-plan"), user_id="u1",
         ))
-    assert getattr(exc_info.value, "status_code", None) == 404
+    assert exc_info.value.status_code == 404

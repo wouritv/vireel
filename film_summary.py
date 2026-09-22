@@ -353,6 +353,14 @@ def estimate_narration_duration_ms(narration: str) -> int:
     return max(1000, round(word_count / _NARRATION_WORDS_PER_MINUTE * 60000))
 
 
+def _resolve_voice_over_estimated_duration_ms(
+    raw: Any, narration: str, recompute_narration_estimates: bool,
+) -> int:
+    if recompute_narration_estimates:
+        return estimate_narration_duration_ms(narration)
+    return _safe_int(raw.get("estimated_duration_ms"))
+
+
 def _normalize_segment(raw: Any, *, recompute_narration_estimates: bool = False) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raise FilmSummaryValidationError(FilmSummaryErrorCode.PLAN_INVALID, "Segment must be a JSON object")
@@ -368,10 +376,9 @@ def _normalize_segment(raw: Any, *, recompute_narration_estimates: bool = False)
     }
     if seg_type == SEGMENT_TYPE_VOICE_OVER:
         segment["narration"] = str(raw.get("narration") or "").strip()
-        if recompute_narration_estimates:
-            segment["estimated_duration_ms"] = estimate_narration_duration_ms(segment["narration"])
-        else:
-            segment["estimated_duration_ms"] = _safe_int(raw.get("estimated_duration_ms"))
+        segment["estimated_duration_ms"] = _resolve_voice_over_estimated_duration_ms(
+            raw, segment["narration"], recompute_narration_estimates,
+        )
         segment["actual_duration_ms"] = _safe_int(raw.get("actual_duration_ms")) or None
         segment["clips"] = [_normalize_clip(c) for c in (raw.get("clips") or []) if isinstance(c, dict)]
         segment["source_event_ids"] = [str(e) for e in (raw.get("source_event_ids") or [])]
