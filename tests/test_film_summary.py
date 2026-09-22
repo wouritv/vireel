@@ -367,6 +367,45 @@ def test_validate_edit_plan_content_warns_on_repeated_clip():
 
 
 # ---------------------------------------------------------------------------
+# realign_plan_target_duration
+# ---------------------------------------------------------------------------
+
+def test_realign_plan_target_duration_snaps_target_to_actual_total_when_outside_tolerance():
+    # total is 29000 (26000 + 3000); a target of 1ms is hopelessly outside
+    # any tolerance -- the user has no direct way to hit it, so the target
+    # itself should move to match what was actually produced instead of
+    # leaving the plan permanently invalid.
+    plan = _built_plan(target_duration_ms=1)
+    realigned, report = fs.realign_plan_target_duration(
+        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001"], duration_tolerance_ratio=0.15,
+    )
+    assert realigned["target_duration_ms"] == 29000
+    assert report["valid"] is True
+    assert report["errors"] == []
+
+
+def test_realign_plan_target_duration_leaves_plan_untouched_within_tolerance():
+    plan = _built_plan(target_duration_ms=29000)
+    realigned, report = fs.realign_plan_target_duration(
+        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001"], duration_tolerance_ratio=0.15,
+    )
+    assert realigned is plan
+    assert realigned["target_duration_ms"] == 29000
+    assert report["valid"] is True
+
+
+def test_realign_plan_target_duration_does_not_mask_other_errors():
+    plan = _built_plan(target_duration_ms=1)
+    plan["segments"][1]["sequence"] = 5  # unrelated, still-blocking error
+    _, report = fs.realign_plan_target_duration(
+        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001"], duration_tolerance_ratio=0.15,
+    )
+    assert report["valid"] is False
+    assert any("sequence" in e for e in report["errors"])
+    assert not any("tolerance" in e for e in report["errors"])
+
+
+# ---------------------------------------------------------------------------
 # apply_actual_tts_durations / compute_total_estimated_duration_ms
 # ---------------------------------------------------------------------------
 

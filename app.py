@@ -9552,7 +9552,12 @@ async def _run_planning_and_validation_stages(
     await reel_job_manager.update_progress(job_id, 90, film_summary.FilmSummaryStage.VALIDATING_PLAN)
 
     valid_scene_ids = [s.get("scene_id") for s in scene_index]
-    validation_report = film_summary.validate_edit_plan_content(
+    # The corrective retry inside generate_edit_plan already gave the model
+    # its best shot at the requested target -- if segmentation still landed
+    # outside tolerance, realign the target to what was actually produced
+    # rather than presenting the user a plan they're blocked from ever
+    # generating (see realign_plan_target_duration).
+    plan, validation_report = film_summary.realign_plan_target_duration(
         plan, source_duration_ms=duration_ms, valid_scene_ids=valid_scene_ids,
         duration_tolerance_ratio=FILM_SUMMARY_DURATION_TOLERANCE_RATIO,
     )
@@ -9619,6 +9624,12 @@ async def _finalize_film_summary_analysis(
             "stage": film_summary.FilmSummaryStage.AWAITING_USER_REVIEW,
             "edit_plan": plan,
             "validation_report": validation_report,
+            # target_duration_seconds is the authoritative target the PATCH
+            # /plan endpoint rebuilds from (film_summary.validate_edited_
+            # plan_patch never trusts the plan's own copy) -- keep it in
+            # sync with plan["target_duration_ms"], which realign_plan_
+            # target_duration may just have moved.
+            "target_duration_seconds": (plan.get("target_duration_ms") or 0) / 1000.0,
             "billing_details": cost_breakdown,
             "total_cost_usd": cost_breakdown.get("total_usd", 0.0),
         })
@@ -9732,13 +9743,17 @@ async def update_film_summary_plan_endpoint(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     valid_scene_ids = [s.get("scene_id") for s in (row.get("scene_index") or [])]
-    validation_report = film_summary.validate_edit_plan_content(
+    # A narration edit can move the total enough to fall outside tolerance
+    # around the original target -- realign rather than block the user on a
+    # number their edit doesn't give them a direct way to hit exactly.
+    normalized_plan, validation_report = film_summary.realign_plan_target_duration(
         normalized_plan, source_duration_ms=int((row.get("source_duration_seconds") or 0) * 1000),
         valid_scene_ids=valid_scene_ids, duration_tolerance_ratio=FILM_SUMMARY_DURATION_TOLERANCE_RATIO,
     )
 
     updated = await supabase_update_film_summary(film_summary_id, user_id, {
         "edit_plan": normalized_plan, "validation_report": validation_report,
+        "target_duration_seconds": (normalized_plan.get("target_duration_ms") or 0) / 1000.0,
     })
     return _normalize_film_summary_row(updated, include_content=True)
 
@@ -9751,11 +9766,17 @@ async def validate_film_summary_plan_endpoint(film_summary_id: str, user_id: Ann
 
     plan = row.get("edit_plan") or {}
     valid_scene_ids = [s.get("scene_id") for s in (row.get("scene_index") or [])]
-    validation_report = film_summary.validate_edit_plan_content(
+    # Realigns the target to the actual total when it's still outside
+    # tolerance (e.g. a plan generated before this existed) instead of
+    # leaving "Revalider" report the same unfixable duration mismatch.
+    plan, validation_report = film_summary.realign_plan_target_duration(
         plan, source_duration_ms=int((row.get("source_duration_seconds") or 0) * 1000),
         valid_scene_ids=valid_scene_ids, duration_tolerance_ratio=FILM_SUMMARY_DURATION_TOLERANCE_RATIO,
     )
-    await supabase_update_film_summary(film_summary_id, user_id, {"validation_report": validation_report})
+    await supabase_update_film_summary(film_summary_id, user_id, {
+        "edit_plan": plan, "validation_report": validation_report,
+        "target_duration_seconds": (plan.get("target_duration_ms") or 0) / 1000.0,
+    })
     return validation_report
 
 
@@ -9774,19 +9795,26 @@ async def render_film_summary_endpoint(
 
     plan = row.get("edit_plan") or {}
     valid_scene_ids = [s.get("scene_id") for s in (row.get("scene_index") or [])]
-    validation_report = film_summary.validate_edit_plan_content(
+    plan, validation_report = film_summary.realign_plan_target_duration(
         plan, source_duration_ms=int((row.get("source_duration_seconds") or 0) * 1000),
         valid_scene_ids=valid_scene_ids, duration_tolerance_ratio=FILM_SUMMARY_DURATION_TOLERANCE_RATIO,
     )
     if not validation_report["valid"]:
         raise HTTPException(status_code=400, detail={"validation_report": validation_report})
+    if plan is not row.get("edit_plan"):
+        await supabase_update_film_summary(film_summary_id, user_id, {
+            "edit_plan": plan, "validation_report": validation_report,
+            "target_duration_seconds": (plan.get("target_duration_ms") or 0) / 1000.0,
+        })
 
     await _enforce_job_concurrency_limit(user_id)
 
     voice_id = film_summary.resolve_tts_voice(payload.voice_id or row.get("voice_id"), FILM_SUMMARY_TTS_DEFAULT_VOICE)
     character_count = _total_narration_character_count(plan)
+    # Use the (possibly just-realigned) target so credits reflect the video's
+    # actual planned length rather than a stale pre-alignment number.
     render_required_credits = _estimate_film_summary_render_required_credits(
-        row.get("target_duration_seconds") or 0, character_count,
+        (plan.get("target_duration_ms") or 0) / 1000.0, character_count,
     )
     await _reserve_job_credits(user_id, render_required_credits)
 

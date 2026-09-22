@@ -588,6 +588,33 @@ def validate_edit_plan_content(
     }
 
 
+def realign_plan_target_duration(
+    plan: Dict[str, Any], *, source_duration_ms: int, valid_scene_ids: Optional[List[str]] = None,
+    duration_tolerance_ratio: float = 0.15,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """The target duration is a goal handed to the planning model for the
+    cut, not a contract the end user must personally satisfy afterwards --
+    they have no direct way to hit an exact millisecond total, and
+    generate_edit_plan's own corrective retry already gave the model its
+    best shot at converging during planning. So once segmentation is done
+    (fresh out of generate_edit_plan, after a user's narration edit in
+    validate_edited_plan_patch, or on a plan generated before this existed),
+    if the actual total still lands outside the tolerance band, the target
+    is snapped to that total instead of leaving the plan permanently stuck
+    on a duration mismatch. Returns (plan, validation_report); the plan is
+    the same object, unchanged, when already within tolerance."""
+    total_ms = compute_total_estimated_duration_ms(plan.get("segments") or [])
+    target_ms = int(plan.get("target_duration_ms") or 0)
+    if target_ms > 0 and abs(total_ms - target_ms) > target_ms * duration_tolerance_ratio:
+        plan = dict(plan)
+        plan["target_duration_ms"] = total_ms
+    validation_report = validate_edit_plan_content(
+        plan, source_duration_ms=source_duration_ms, valid_scene_ids=valid_scene_ids,
+        duration_tolerance_ratio=duration_tolerance_ratio,
+    )
+    return plan, validation_report
+
+
 def validate_edited_plan_patch(raw: Any, *, movie_metadata: Dict[str, Any], target_duration_ms: int) -> Dict[str, Any]:
     """Validate a user-submitted plan edit (PATCH body) before persisting --
     reuses the same schema validator the AI output goes through, so an
