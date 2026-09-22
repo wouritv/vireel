@@ -793,7 +793,7 @@ SOUSCRIPTION_COLUMNS = (
 	"id, created_at, userid, abonnement, payment_mode, payment_amount, payment_reference, "
 	"payment_start_date, payment_end_date, payment_status, payment_comment, "
 	"auto_renew, canceled_at, reactivated_at, paused_at, resumed_at, "
-	"retention_deadline_at, account_disabled_at"
+	"retention_deadline_at, account_disabled_at, stripe_subscription_id, stripe_customer_id"
 )
 
 async def list_abonnements() -> List[Dict[str, Any]]:
@@ -842,13 +842,24 @@ async def insert_souscription(
 	payment_status: str = "confirmed",
 	payment_comment: str = "",
 	payment_date: Optional[datetime] = None,
+	period_end_date: Optional[datetime] = None,
+	stripe_subscription_id: Optional[str] = None,
+	stripe_customer_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-	"""Create a subscription row after a confirmed payment."""
+	"""Create a subscription row after a confirmed payment.
+
+	period_end_date overrides the default +1-calendar-month end date -- a
+	Stripe subscription renewal invoice carries its own authoritative
+	billing period (see _handle_subscription_renewal_invoice in app.py),
+	which must be used as-is instead of recomputed, so the stored period
+	stays exactly in sync with what Stripe actually billed."""
 	client = await get_client()
 	start_date = payment_date or datetime.now(timezone.utc)
 	if start_date.tzinfo is None:
 		start_date = start_date.replace(tzinfo=timezone.utc)
-	end_date = _add_one_month(start_date)
+	end_date = period_end_date or _add_one_month(start_date)
+	if end_date.tzinfo is None:
+		end_date = end_date.replace(tzinfo=timezone.utc)
 
 	payload = {
 		"userid": user_id,
@@ -861,6 +872,10 @@ async def insert_souscription(
 		"payment_status": payment_status,
 		"payment_comment": payment_comment,
 	}
+	if stripe_subscription_id:
+		payload["stripe_subscription_id"] = stripe_subscription_id
+	if stripe_customer_id:
+		payload["stripe_customer_id"] = stripe_customer_id
 
 	response = await client.table(SUPABASE_SOUSCRIPTION_TABLE).insert(payload).execute()
 	rows = response.data or []

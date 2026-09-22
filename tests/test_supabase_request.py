@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import sys
 import types
+from datetime import datetime, timezone
 
 
 class _FakeResponse:
@@ -809,6 +810,36 @@ def test_insert_souscription_builds_payload_with_dates(monkeypatch):
     assert result["abonnement"] == "plan-pro"
     assert "payment_start_date" in result
     assert "payment_end_date" in result
+
+
+def test_insert_souscription_uses_explicit_period_end_date_and_stripe_ids(monkeypatch):
+    # A Stripe subscription renewal invoice carries its own authoritative
+    # billing period and IDs -- period_end_date must override the default
+    # +1-calendar-month rule, and the stripe_* columns must be persisted so
+    # a later renewal invoice can be traced back to it.
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_SOUSCRIPTION_TABLE: [_FakeResponse(data=[])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    period_end = datetime(2026, 11, 3, tzinfo=timezone.utc)
+    result = asyncio.run(
+        supabase_request.insert_souscription(
+            user_id="u1",
+            abonnement="plan-pro",
+            payment_mode="stripe",
+            payment_amount=99.99,
+            payment_reference="in_renewal_1",
+            payment_status="completed",
+            period_end_date=period_end,
+            stripe_subscription_id="sub_123",
+            stripe_customer_id="cus_456",
+        )
+    )
+    assert result["payment_end_date"] == period_end.isoformat()
+    assert result["stripe_subscription_id"] == "sub_123"
+    assert result["stripe_customer_id"] == "cus_456"
 
 
 def test_get_souscription_by_reference_returns_none_for_empty(monkeypatch):

@@ -3057,3 +3057,244 @@ def test_film_summary_voice_preview_skips_synthesis_when_cached(monkeypatch, tmp
     assert resp.status_code == 200
     assert resp.json() == {"preview_url": "/voice-previews/nova.mp3"}
     synth.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Stripe subscriptions: mode="subscription" + auto-renewal via invoice.paid
+# ---------------------------------------------------------------------------
+
+class _FakeStripeMetadata:
+    """Mimics the .to_dict() surface _extract_session_context / the renewal
+    handler rely on -- the real stripe.StripeObject supports it too, but a
+    plain dict/SimpleNamespace doesn't."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def to_dict(self):
+        return dict(self._data)
+
+
+class _FakeCheckoutRequest:
+    def __init__(self, headers=None):
+        self.headers = headers or {}
+
+
+def test_create_stripe_checkout_session_uses_subscription_mode(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    fake_session = MagicMock(url="https://checkout.stripe.com/pay/cs_test_123", id="cs_test_123")
+    fake_stripe.checkout.Session.create.return_value = fake_session
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "plan-1", "name": "Pro", "price": 29.99}))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value=None))
+
+    payload = app.StripeCheckoutRequest(plan_id="plan-1")
+    result = asyncio.run(app.create_stripe_checkout_session(
+        request=_FakeCheckoutRequest(headers={"X-User-Email": "user@example.com"}),
+        payload=payload, user_id="u1",
+    ))
+
+    assert result == {"checkout_url": fake_session.url, "session_id": fake_session.id}
+    _, kwargs = fake_stripe.checkout.Session.create.call_args
+    assert kwargs["mode"] == "subscription"
+    assert kwargs["line_items"][0]["price_data"]["recurring"] == {"interval": "month"}
+    assert kwargs["subscription_data"] == {"metadata": kwargs["metadata"]}
+    assert kwargs["metadata"]["userid"] == "u1"
+    assert kwargs["customer_email"] == "user@example.com"
+    assert "customer" not in kwargs
+
+
+def test_create_stripe_checkout_session_reuses_existing_stripe_customer(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    fake_session = MagicMock(url="https://checkout.stripe.com/pay/cs_test_456", id="cs_test_456")
+    fake_stripe.checkout.Session.create.return_value = fake_session
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "plan-1", "name": "Pro", "price": 29.99}))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value={"stripe_customer_id": "cus_existing"}))
+
+    payload = app.StripeCheckoutRequest(plan_id="plan-1")
+    asyncio.run(app.create_stripe_checkout_session(
+        request=_FakeCheckoutRequest(), payload=payload, user_id="u1",
+    ))
+
+    _, kwargs = fake_stripe.checkout.Session.create.call_args
+    assert kwargs["customer"] == "cus_existing"
+    assert "customer_email" not in kwargs
+
+
+def test_extract_session_context_captures_stripe_subscription_and_customer_ids(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    session = types.SimpleNamespace(
+        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "plan-1", "payment_mode": "stripe"}),
+        created=1700000000,
+        amount_total=2999,
+        payment_intent=None,
+        id="cs_test_789",
+        customer_details=None,
+        customer_email="user@example.com",
+        subscription="sub_abc",
+        customer="cus_abc",
+    )
+
+    ctx = app._extract_session_context(session)
+
+    assert ctx["stripe_subscription_id"] == "sub_abc"
+    assert ctx["stripe_customer_id"] == "cus_abc"
+    assert ctx["payment_reference"] == "cs_test_789"  # no payment_intent in subscription mode
+
+
+def test_invoice_line_period_reads_stripe_period(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    period = types.SimpleNamespace(start=1700000000, end=1702592000)
+    invoice = types.SimpleNamespace(lines=types.SimpleNamespace(data=[types.SimpleNamespace(period=period)]))
+
+    start, end = app._invoice_line_period(invoice)
+
+    assert start == datetime.fromtimestamp(1700000000, tz=timezone.utc)
+    assert end == datetime.fromtimestamp(1702592000, tz=timezone.utc)
+
+
+def test_invoice_line_period_missing_lines_returns_none(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    invoice = types.SimpleNamespace(lines=types.SimpleNamespace(data=[]))
+
+    assert app._invoice_line_period(invoice) == (None, None)
+
+
+def test_handle_subscription_renewal_invoice_credits_plan_and_persists_period(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_subscription = types.SimpleNamespace(metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "plan-1"}))
+    fake_stripe = MagicMock()
+    fake_stripe.Subscription.retrieve.return_value = fake_subscription
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    insert_mock = AsyncMock(return_value={"id": "sous-1"})
+    monkeypatch.setattr(app, "supabase_insert_souscription", insert_mock)
+    allocate_mock = AsyncMock()
+    monkeypatch.setattr(app, "_allocate_plan_resources", allocate_mock)
+    email_mock = MagicMock()
+    monkeypatch.setattr(app, "_send_payment_confirmation_email", email_mock)
+
+    period = types.SimpleNamespace(start=1700000000, end=1702592000)
+    invoice = types.SimpleNamespace(
+        subscription="sub_123",
+        payment_intent="pi_renewal_1",
+        id="in_renewal_1",
+        lines=types.SimpleNamespace(data=[types.SimpleNamespace(period=period)]),
+        created=1700000000,
+        amount_paid=2999,
+        customer="cus_456",
+        customer_email="user@example.com",
+    )
+
+    result = asyncio.run(app._handle_subscription_renewal_invoice(invoice))
+
+    assert result == {"received": True}
+    fake_stripe.Subscription.retrieve.assert_called_once_with("sub_123")
+    insert_mock.assert_awaited_once()
+    kwargs = insert_mock.await_args.kwargs
+    assert kwargs["user_id"] == "u1"
+    assert kwargs["abonnement"] == "plan-1"
+    assert kwargs["payment_reference"] == "pi_renewal_1"
+    assert kwargs["stripe_subscription_id"] == "sub_123"
+    assert kwargs["stripe_customer_id"] == "cus_456"
+    assert kwargs["period_end_date"] == datetime.fromtimestamp(1702592000, tz=timezone.utc)
+    assert kwargs["payment_amount"] == 29.99
+    allocate_mock.assert_awaited_once()
+    email_mock.assert_called_once()
+
+
+def test_handle_subscription_renewal_invoice_is_idempotent_on_duplicate_reference(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value={"id": "existing"}))
+    insert_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_souscription", insert_mock)
+
+    invoice = types.SimpleNamespace(
+        subscription="sub_123", payment_intent="pi_dup", id="in_dup",
+        lines=types.SimpleNamespace(data=[]), created=1700000000, amount_paid=2999,
+        customer="cus_456", customer_email="user@example.com",
+    )
+
+    result = asyncio.run(app._handle_subscription_renewal_invoice(invoice))
+
+    assert result == {"received": True, "duplicate": True}
+    insert_mock.assert_not_awaited()
+
+
+def test_handle_subscription_renewal_invoice_ignores_invoice_without_subscription(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    invoice = types.SimpleNamespace(subscription=None)
+
+    result = asyncio.run(app._handle_subscription_renewal_invoice(invoice))
+
+    assert result == {"received": True, "ignored": "no_subscription_on_invoice"}
+
+
+def test_handle_subscription_renewal_invoice_ignores_missing_metadata(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    fake_subscription = types.SimpleNamespace(metadata=_FakeStripeMetadata({}))
+    fake_stripe = MagicMock()
+    fake_stripe.Subscription.retrieve.return_value = fake_subscription
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+
+    invoice = types.SimpleNamespace(
+        subscription="sub_999", payment_intent=None, id="in_999",
+        lines=types.SimpleNamespace(data=[]), created=1700000000, amount_paid=0,
+        customer=None, customer_email=None,
+    )
+
+    result = asyncio.run(app._handle_subscription_renewal_invoice(invoice))
+
+    assert result == {"received": True, "ignored": "missing_subscription_metadata"}
+
+
+class _FakeWebhookRequest:
+    headers = {"stripe-signature": "sig"}
+
+    async def body(self):
+        return b"{}"
+
+
+def test_stripe_webhook_ignores_non_renewal_invoice_paid(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "STRIPE_WEBHOOK_SECRET", "whsec_test")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "stripe", MagicMock())
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    invoice = types.SimpleNamespace(billing_reason="subscription_create")
+    fake_event = types.SimpleNamespace(type="invoice.paid", data=types.SimpleNamespace(object=invoice))
+    monkeypatch.setattr(app, "_verify_and_parse_event", lambda payload, signature: fake_event)
+    renewal_mock = AsyncMock()
+    monkeypatch.setattr(app, "_handle_subscription_renewal_invoice", renewal_mock)
+
+    result = asyncio.run(app.stripe_webhook(_FakeWebhookRequest()))
+
+    assert result == {"received": True, "ignored": "invoice.paid:subscription_create"}
+    renewal_mock.assert_not_awaited()
+
+
+def test_stripe_webhook_dispatches_subscription_cycle_invoice_to_renewal_handler(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "STRIPE_WEBHOOK_SECRET", "whsec_test")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "stripe", MagicMock())
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    invoice = types.SimpleNamespace(billing_reason="subscription_cycle")
+    fake_event = types.SimpleNamespace(type="invoice.paid", data=types.SimpleNamespace(object=invoice))
+    monkeypatch.setattr(app, "_verify_and_parse_event", lambda payload, signature: fake_event)
+    renewal_mock = AsyncMock(return_value={"received": True})
+    monkeypatch.setattr(app, "_handle_subscription_renewal_invoice", renewal_mock)
+
+    result = asyncio.run(app.stripe_webhook(_FakeWebhookRequest()))
+
+    assert result == {"received": True}
+    renewal_mock.assert_awaited_once_with(invoice)

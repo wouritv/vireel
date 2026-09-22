@@ -7516,27 +7516,46 @@ async def create_stripe_checkout_session(
         "payment_mode": "stripe",
     }
 
+    # Reuse the Stripe Customer from a previous plan purchase when we have
+    # one on file, instead of always passing customer_email -- otherwise
+    # every re-subscription (change of plan, resubscribing after a lapse)
+    # creates a brand new Stripe Customer with no history of the last one.
+    existing_customer_id = None
+    previous_subscription = await supabase_get_latest_user_paid_subscription(user_id)
+    if previous_subscription:
+        existing_customer_id = previous_subscription.get("stripe_customer_id")
+
     try:
         session = stripe.checkout.Session.create(
-            mode="payment",
+            mode="subscription",
             success_url=success_url,
             cancel_url=cancel_url,
-            customer_email=request.headers.get("X-User-Email") or None,
+            **(
+                {"customer": existing_customer_id}
+                if existing_customer_id
+                else {"customer_email": request.headers.get("X-User-Email") or None}
+            ),
             line_items=[
                 {
                     "quantity": 1,
                     "price_data": {
                         "currency": STRIPE_CURRENCY,
                         "unit_amount": unit_amount,
+                        "recurring": {"interval": "month"},
                         "product_data": {
                             "name": str(plan.get("name") or "Abonnement"),
-                            "description": "Abonnement mensuel (1 mois)",
+                            "description": "Abonnement mensuel, renouvele automatiquement chaque mois",
                             "tax_code": "txcd_10103001",
                         },
                     },
                 }
             ],
             metadata=metadata,
+            # Copied onto every invoice this subscription raises (including
+            # renewals), so _handle_subscription_renewal_invoice can read
+            # userid/abonnement straight off the subscription without a
+            # separate lookup table mapping Stripe subscriptions to users.
+            subscription_data={"metadata": metadata},
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Stripe checkout error: {exc}")
@@ -7577,6 +7596,8 @@ def _extract_session_context(session: "stripe.checkout.Session") -> dict:
             (session.customer_details.email if session.customer_details else None)
             or session.customer_email
         ),
+        "stripe_subscription_id": session.subscription or None,
+        "stripe_customer_id": session.customer or None,
     }
 
 
@@ -7723,6 +7744,8 @@ async def _handle_subscription_purchase(ctx: dict) -> dict:
         payment_status="completed",
         payment_comment=f"Stripe checkout session {ctx['session_id']}".strip(),
         payment_date=ctx["payment_date"],
+        stripe_subscription_id=ctx.get("stripe_subscription_id"),
+        stripe_customer_id=ctx.get("stripe_customer_id"),
     )
 
     await _allocate_plan_resources(
@@ -7739,13 +7762,83 @@ async def _handle_subscription_purchase(ctx: dict) -> dict:
     return {"received": True}
 
 
+def _invoice_line_period(invoice: "stripe.Invoice") -> Tuple[Optional[datetime], Optional[datetime]]:
+    """The billing period a subscription renewal invoice actually covers,
+    straight from Stripe rather than recomputed -- Stripe is the source of
+    truth for the exact anniversary date (leap months, plan changes
+    mid-cycle, etc.), so the stored payment_end_date must match it exactly
+    instead of drifting from a locally-reapplied +1-month rule."""
+    lines = (invoice.lines.data if invoice.lines else None) or []
+    if not lines or not lines[0].period:
+        return None, None
+    period = lines[0].period
+    start = datetime.fromtimestamp(period.start, tz=timezone.utc) if period.start else None
+    end = datetime.fromtimestamp(period.end, tz=timezone.utc) if period.end else None
+    return start, end
+
+
+async def _handle_subscription_renewal_invoice(invoice: "stripe.Invoice") -> dict:
+    """Credit a subscription's automatic monthly renewal. Stripe raises this
+    invoice itself on the subscription's billing anniversary -- the first
+    invoice (billing_reason "subscription_create") is instead handled by
+    checkout.session.completed, which has already run by the time it fires,
+    so only "subscription_cycle" reaches here (see the dispatch in
+    stripe_webhook)."""
+    subscription_id = invoice.subscription
+    if not subscription_id:
+        return {"received": True, "ignored": "no_subscription_on_invoice"}
+
+    payment_reference = str(invoice.payment_intent or invoice.id or subscription_id)
+    if await supabase_get_souscription_by_reference(payment_reference):
+        return {"received": True, "duplicate": True}
+
+    subscription = stripe.Subscription.retrieve(subscription_id)
+    metadata = subscription.metadata.to_dict() if subscription.metadata else {}
+    user_id = metadata.get("userid")
+    abonnement = metadata.get("abonnement")
+    if not user_id or not abonnement:
+        logger.warning("Stripe subscription %s renewal invoice is missing userid/abonnement metadata", subscription_id)
+        return {"received": True, "ignored": "missing_subscription_metadata"}
+
+    period_start, period_end = _invoice_line_period(invoice)
+    payment_date = period_start or datetime.fromtimestamp(invoice.created, tz=timezone.utc)
+    amount_total = (invoice.amount_paid or 0) / 100
+
+    new_souscription = await supabase_insert_souscription(
+        user_id=user_id,
+        abonnement=abonnement,
+        payment_mode="stripe",
+        payment_amount=amount_total,
+        payment_reference=payment_reference,
+        payment_status="completed",
+        payment_comment=f"Stripe subscription renewal {subscription_id}",
+        payment_date=payment_date,
+        period_end_date=period_end,
+        stripe_subscription_id=subscription_id,
+        stripe_customer_id=invoice.customer or None,
+    )
+    await _allocate_plan_resources(
+        user_id=user_id,
+        abonnement=abonnement,
+        payment_reference=payment_reference,
+        souscription_id=str(new_souscription.get("id") or payment_reference),
+    )
+    _send_payment_confirmation_email(
+        to_email=invoice.customer_email,
+        amount_total=amount_total,
+        label=f"le renouvellement de l'abonnement {abonnement}",
+    )
+    return {"received": True}
+
+
 # ---------------------------------------------------------------------------
 # Route
 # ---------------------------------------------------------------------------
 
 @app.post("/api/stripe/webhook", responses={400: {"description": "Bad Request"}, 503: {"description": "Service Unavailable"}})
 async def stripe_webhook(request: Request):
-    """Handle Stripe checkout.session.completed events and persist the result."""
+    """Handle Stripe checkout.session.completed (new purchase/subscription)
+    and invoice.paid (automatic subscription renewal) events."""
     _require_stripe_ready()
     if not STRIPE_WEBHOOK_SECRET:
         raise HTTPException(status_code=503, detail="Stripe webhook secret is not configured")
@@ -7755,6 +7848,15 @@ async def stripe_webhook(request: Request):
     payload = await request.body()
     signature = request.headers.get("stripe-signature", "")
     event = _verify_and_parse_event(payload, signature)
+
+    if event.type == "invoice.paid":
+        invoice = event.data.object
+        if invoice.billing_reason != "subscription_cycle":
+            # "subscription_create" (the very first invoice) is handled by
+            # checkout.session.completed instead; anything else (a manual
+            # invoice, a one-off proration, ...) isn't a renewal.
+            return {"received": True, "ignored": f"invoice.paid:{invoice.billing_reason}"}
+        return await _handle_subscription_renewal_invoice(invoice)
 
     if event.type != "checkout.session.completed":
         return {"received": True, "ignored": event.type}
