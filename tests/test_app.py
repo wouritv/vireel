@@ -2850,8 +2850,9 @@ def test_scene_detection_timeout_fails_job_instead_of_hanging(monkeypatch):
 
     monkeypatch.setattr(app.film_summary, "detect_scenes", _hangs_forever)
 
+    coro = app._run_transcription_and_scene_detection_stages("job-1", "u1", None, "/tmp/input.mp4")
     with pytest.raises(app.film_summary.FilmSummaryValidationError) as exc:
-        asyncio.run(app._run_transcription_and_scene_detection_stages("job-1", "u1", None, "/tmp/input.mp4"))
+        asyncio.run(coro)
     assert exc.value.code == app.film_summary.FilmSummaryErrorCode.SCENE_DETECTION_FAILED
 
 
@@ -3338,8 +3339,9 @@ def test_cancel_souscription_404_without_active_subscription(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     _stub_subscription_lifecycle_prereqs(monkeypatch, app, subscription=None)
 
+    coro = app.cancel_souscription(user_id="u1")
     with pytest.raises(app.HTTPException) as exc_info:
-        asyncio.run(app.cancel_souscription(user_id="u1"))
+        asyncio.run(coro)
     assert exc_info.value.status_code == 404
 
 
@@ -3347,8 +3349,9 @@ def test_cancel_souscription_400_without_stripe_subscription_id(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     _stub_subscription_lifecycle_prereqs(monkeypatch, app, subscription={"id": "sous-legacy"})
 
+    coro = app.cancel_souscription(user_id="u1")
     with pytest.raises(app.HTTPException) as exc_info:
-        asyncio.run(app.cancel_souscription(user_id="u1"))
+        asyncio.run(coro)
     assert exc_info.value.status_code == 400
 
 
@@ -3447,8 +3450,9 @@ def test_change_souscription_plan_404_for_unknown_plan(monkeypatch):
     _stub_subscription_lifecycle_prereqs(monkeypatch, app)
     monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value=None))
 
+    coro = app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="missing-plan"), user_id="u1",
+    )
     with pytest.raises(app.HTTPException) as exc_info:
-        asyncio.run(app.change_souscription_plan(
-            payload=app.ChangeSubscriptionPlanRequest(plan_id="missing-plan"), user_id="u1",
-        ))
+        asyncio.run(coro)
     assert exc_info.value.status_code == 404
