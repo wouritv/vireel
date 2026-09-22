@@ -337,7 +337,23 @@ def _normalize_clip(raw_clip: Any) -> Dict[str, Any]:
     }
 
 
-def _normalize_segment(raw: Any) -> Dict[str, Any]:
+_NARRATION_WORDS_PER_MINUTE = 135  # matches TTS_INSTRUCTIONS_TEMPLATE's stated narration pace
+
+
+def estimate_narration_duration_ms(narration: str) -> int:
+    """Formulaic duration estimate from a voice_over segment's narration text,
+    at the same ~135 wpm pace given to the TTS model. Used to keep a user's
+    edited plan (validate_edited_plan_patch) honest: the planning model's own
+    estimated_duration_ms guess would otherwise stay frozen the moment the
+    review UI lets someone shorten/lengthen the narration text, so the
+    duration-tolerance check would never reflect their edit."""
+    word_count = len(narration.split())
+    if word_count == 0:
+        return 0
+    return max(1000, round(word_count / _NARRATION_WORDS_PER_MINUTE * 60000))
+
+
+def _normalize_segment(raw: Any, *, recompute_narration_estimates: bool = False) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raise FilmSummaryValidationError(FilmSummaryErrorCode.PLAN_INVALID, "Segment must be a JSON object")
     seg_type = str(raw.get("type") or "").strip()
@@ -352,7 +368,10 @@ def _normalize_segment(raw: Any) -> Dict[str, Any]:
     }
     if seg_type == SEGMENT_TYPE_VOICE_OVER:
         segment["narration"] = str(raw.get("narration") or "").strip()
-        segment["estimated_duration_ms"] = _safe_int(raw.get("estimated_duration_ms"))
+        if recompute_narration_estimates:
+            segment["estimated_duration_ms"] = estimate_narration_duration_ms(segment["narration"])
+        else:
+            segment["estimated_duration_ms"] = _safe_int(raw.get("estimated_duration_ms"))
         segment["actual_duration_ms"] = _safe_int(raw.get("actual_duration_ms")) or None
         segment["clips"] = [_normalize_clip(c) for c in (raw.get("clips") or []) if isinstance(c, dict)]
         segment["source_event_ids"] = [str(e) for e in (raw.get("source_event_ids") or [])]
@@ -364,12 +383,20 @@ def _normalize_segment(raw: Any) -> Dict[str, Any]:
     return segment
 
 
-def validate_edit_plan_schema(raw: Any, *, movie_metadata: Dict[str, Any], target_duration_ms: int) -> Dict[str, Any]:
+def validate_edit_plan_schema(
+    raw: Any, *, movie_metadata: Dict[str, Any], target_duration_ms: int, recompute_narration_estimates: bool = False,
+) -> Dict[str, Any]:
     """Validate and normalize the planning model's JSON output against the
     contract in spec section 10. Never trusts the model's own copy of
     `movie`/`target_duration_ms` -- those are always rebuilt backend-side
     from the authoritative values passed in, same principle as
-    anonymous_stories.build_final_text."""
+    anonymous_stories.build_final_text.
+
+    recompute_narration_estimates replaces each voice_over segment's
+    estimated_duration_ms with a word-count-based estimate instead of
+    trusting the caller's copy -- set by validate_edited_plan_patch so a
+    user's narration edits actually move the validated total (see
+    estimate_narration_duration_ms)."""
     if not isinstance(raw, dict):
         raise FilmSummaryValidationError(FilmSummaryErrorCode.PLAN_INVALID, "Plan output is not a JSON object")
 
@@ -382,7 +409,7 @@ def validate_edit_plan_schema(raw: Any, *, movie_metadata: Dict[str, Any], targe
     segments_raw = raw.get("segments")
     if not isinstance(segments_raw, list) or not segments_raw:
         raise FilmSummaryValidationError(FilmSummaryErrorCode.PLAN_INVALID, "Plan has no segments")
-    segments = [_normalize_segment(s) for s in segments_raw]
+    segments = [_normalize_segment(s, recompute_narration_estimates=recompute_narration_estimates) for s in segments_raw]
 
     characters = [c for c in (raw.get("characters") or []) if isinstance(c, dict)]
     normalized_characters = [{
@@ -564,8 +591,13 @@ def validate_edit_plan_content(
 def validate_edited_plan_patch(raw: Any, *, movie_metadata: Dict[str, Any], target_duration_ms: int) -> Dict[str, Any]:
     """Validate a user-submitted plan edit (PATCH body) before persisting --
     reuses the same schema validator the AI output goes through, so an
-    edited plan can never drift out of the contract shape."""
-    return validate_edit_plan_schema(raw, movie_metadata=movie_metadata, target_duration_ms=target_duration_ms)
+    edited plan can never drift out of the contract shape. Recomputes
+    voice_over estimated_duration_ms from the (possibly just-edited)
+    narration text so shortening/lengthening a segment in the review UI
+    actually changes the validated total instead of being silently ignored."""
+    return validate_edit_plan_schema(
+        raw, movie_metadata=movie_metadata, target_duration_ms=target_duration_ms, recompute_narration_estimates=True,
+    )
 
 
 def tts_cache_key(text: str, model: str, voice: str, instructions: str) -> str:

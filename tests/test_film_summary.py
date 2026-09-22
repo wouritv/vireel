@@ -260,6 +260,32 @@ def test_validate_edit_plan_schema_rejects_unknown_segment_type():
 
 
 # ---------------------------------------------------------------------------
+# estimate_narration_duration_ms / validate_edited_plan_patch
+# ---------------------------------------------------------------------------
+
+def test_estimate_narration_duration_ms_uses_135_wpm():
+    text = " ".join(["word"] * 135)
+    assert fs.estimate_narration_duration_ms(text) == 60000
+
+
+def test_estimate_narration_duration_ms_empty_text_is_zero():
+    assert fs.estimate_narration_duration_ms("") == 0
+
+
+def test_validate_edited_plan_patch_recomputes_estimate_from_edited_narration():
+    # The AI-provided estimated_duration_ms (26000) would normally be
+    # trusted as-is, but a user editing narration in the review UI has no
+    # way to update that field themselves -- validate_edited_plan_patch
+    # must recompute it from the new text so the total actually moves.
+    raw = _valid_raw_plan()
+    raw["segments"][0]["narration"] = " ".join(["word"] * 270)  # -> 120000ms at 135 wpm
+    plan = fs.validate_edited_plan_patch(raw, movie_metadata={}, target_duration_ms=600000)
+    voice_over = next(s for s in plan["segments"] if s["type"] == "voice_over")
+    assert voice_over["estimated_duration_ms"] == 120000
+    assert plan["total_estimated_duration_ms"] == 120000 + 3000
+
+
+# ---------------------------------------------------------------------------
 # validate_edit_plan_content
 # ---------------------------------------------------------------------------
 
