@@ -183,6 +183,50 @@ def test_verify_supabase_jwt_accepts_valid_hs256_token(monkeypatch):
     assert app._verify_supabase_jwt(token) == "user-hs256"
 
 
+def test_verify_supabase_jwt_allows_any_email_when_demo_allowlist_unset(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    import jwt as pyjwt
+
+    assert app.DEMO_ALLOWED_EMAILS == set()
+    token = pyjwt.encode(
+        {"sub": "user-1", "email": "anyone@example.com", "aud": "authenticated", "exp": 9999999999},
+        "unit-test-supabase-jwt-secret",
+        algorithm="HS256",
+    )
+
+    assert app._verify_supabase_jwt(token) == "user-1"
+
+
+def test_verify_supabase_jwt_rejects_email_not_on_demo_allowlist(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "DEMO_ALLOWED_EMAILS", {"allowed@example.com"})
+    import jwt as pyjwt
+
+    token = pyjwt.encode(
+        {"sub": "user-1", "email": "someone-else@example.com", "aud": "authenticated", "exp": 9999999999},
+        "unit-test-supabase-jwt-secret",
+        algorithm="HS256",
+    )
+
+    with pytest.raises(app.HTTPException) as exc_info:
+        app._verify_supabase_jwt(token)
+    assert exc_info.value.status_code == 403
+
+
+def test_verify_supabase_jwt_accepts_email_on_demo_allowlist_case_insensitively(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "DEMO_ALLOWED_EMAILS", {"allowed@example.com"})
+    import jwt as pyjwt
+
+    token = pyjwt.encode(
+        {"sub": "user-1", "email": "Allowed@Example.com", "aud": "authenticated", "exp": 9999999999},
+        "unit-test-supabase-jwt-secret",
+        algorithm="HS256",
+    )
+
+    assert app._verify_supabase_jwt(token) == "user-1"
+
+
 def test_verify_supabase_jwt_rejects_bad_hs256_signature(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     import jwt as pyjwt

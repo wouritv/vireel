@@ -416,6 +416,17 @@ _oauth_serializer = URLSafeTimedSerializer(SECRET_KEY)
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
 SUPABASE_URL_FOR_JWKS = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 
+# Lets a single deployment (the demo instance) restrict itself to a fixed
+# list of emails without touching Supabase Auth's own sign-up settings or
+# forking the codebase -- unset/empty (the expected production
+# configuration) makes _enforce_demo_allowlist a complete no-op, so the
+# exact same image can run as both the open production deployment and a
+# gated demo one, differing only by this env var.
+DEMO_ALLOWED_EMAILS = {
+    e.strip().lower() for e in os.environ.get("DEMO_ALLOWED_EMAILS", "").split(",") if e.strip()
+}
+_DEMO_ACCOUNT_NOT_AUTHORIZED = "This account is not authorized on this deployment."
+
 
 def _validate_supabase_jwt_config() -> None:
     if not SUPABASE_JWT_SECRET and not SUPABASE_URL_FOR_JWKS:
@@ -654,6 +665,12 @@ def _verify_supabase_jwt(token: str) -> str:
     user_id = str(payload.get("sub") or "").strip()
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid session token: missing subject")
+
+    if DEMO_ALLOWED_EMAILS:
+        email = str(payload.get("email") or "").strip().lower()
+        if email not in DEMO_ALLOWED_EMAILS:
+            raise HTTPException(status_code=403, detail=_DEMO_ACCOUNT_NOT_AUTHORIZED)
+
     return user_id
 
 
