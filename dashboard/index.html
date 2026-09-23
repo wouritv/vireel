@@ -68,11 +68,6 @@
 
 <body>
   <div id="root"></div>
-  <!-- Runtime config, overwritten per-deployment by the Docker entrypoint
-       before nginx starts -- see public/env.js and Dockerfile. Must load
-       before the app bundle so window.__ENV__ is set when
-       supabase-browser.js first runs. -->
-  <script src="/env.js"></script>
   <script type="module" src="/src/main.jsx"></script>
 </body>
 

@@ -17,10 +17,6 @@ services:
       - /var/apps/secrets/cookies.txt:/app/cookies.txt
     environment:
       - NODE_ENV=production
-      # Marks this deployment as the gated demo -- required (alongside
-      # DEMO_ALLOWED_EMAILS in .env, left unset here by default) for the
-      # email allowlist in app.py's _demo_allowlist_is_active to activate.
-      - APP_ENV=staging
     env_file:
       - .env
     restart: unless-stopped
@@ -37,11 +33,6 @@ services:
     container_name: vireel-frontend
     ports:
       - "4001:8080"
-    # VITE_SUPABASE_URL/VITE_SUPABASE_ANON_KEY come from this VPS's own
-    # .env (its own Supabase project) and are injected into env.js by the
-    # image's entrypoint at container start -- see dashboard/Dockerfile.
-    env_file:
-      - .env
     restart: unless-stopped
     depends_on:
       - backend

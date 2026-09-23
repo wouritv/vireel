@@ -78,10 +78,10 @@ jobs:
       - name: Build JS
         if: matrix.service != 'backend'
         working-directory: ${{ matrix.path }}
-        # No VITE_SUPABASE_* here: the frontend now reads its Supabase
-        # config at container runtime (see dashboard/Dockerfile), not at
-        # build time -- this is just a sanity build/lint check.
         run: npm run build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
 
       # ---------------------------------------------------
       # PARTIE PYTHON (backend, à la racine)
@@ -203,10 +203,9 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
-          # No VITE_SUPABASE_* build-args: the frontend image now reads its
-          # Supabase config from the deploying VPS's own env vars at
-          # container startup instead (dashboard/Dockerfile's entrypoint),
-          # so the exact same image works for both demo and production.
+          build-args: |
+            VITE_SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+            VITE_SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
