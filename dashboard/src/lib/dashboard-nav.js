@@ -1,4 +1,5 @@
 import {
+    Clapperboard,
     CreditCardIcon,
     Home,
     LayoutGrid,
@@ -56,6 +57,18 @@ export const DASHBOARD_SIDEBAR_ITEMS = [
         badge: "Projets",
         category: "service",
         path: "/dashboard/anonymous-stories",
+    },
+    {
+        key: "film-summaries",
+        title: "Resume de film",
+        sidebarLabel: "Resume de film",
+        icon: Clapperboard,
+        activeClassName: "bg-teal-500/10 text-teal-400",
+        inactiveClassName: "text-slate-500 dark:text-zinc-400 hover:text-white hover:bg-white/5",
+        description: "Transforme un film complet en resume monte et narre, pret a revoir avant generation.",
+        badge: "Projets",
+        category: "service",
+        path: "/dashboard/film-summaries",
     },
     {
         key: "social-publications",

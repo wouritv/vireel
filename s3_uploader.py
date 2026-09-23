@@ -112,6 +112,23 @@ def delete_s3_object(bucket_name, object_key):
         return False
 
 
+def download_s3_object(bucket_name, object_key, local_path):
+    """Download an S3 object to a local path. Used when a later processing
+    stage (e.g. Film Summary's render phase) needs the source file back on
+    disk after an earlier stage already cleaned up its own working
+    directory."""
+    s3_client = get_s3_client()
+    if not s3_client or not bucket_name or not object_key:
+        return False
+    try:
+        s3_client.download_file(bucket_name, object_key, local_path)
+        return True
+    except ClientError:
+        return False
+    except Exception:
+        return False
+
+
 def get_s3_object_size(bucket_name, object_key):
     """Return object size in bytes, or 0 if unknown."""
     s3_client = get_s3_client()

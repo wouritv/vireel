@@ -16,6 +16,10 @@ export default function DashboardLayout() {
         return window.matchMedia("(min-width: 1024px), ((min-width: 768px) and (orientation: landscape))").matches;
     });
     const [hideSocialPlatforms, setHideSocialPlatforms] = useState(getDefaultHideSocialPlatforms());
+    // Defaults to visible (matches the backend's own FILM_SUMMARY_ENABLED
+    // default of true) until /api/config resolves, same optimistic-then-
+    // confirm pattern as hideSocialPlatforms above.
+    const [filmSummaryEnabled, setFilmSummaryEnabled] = useState(true);
     const displayName =
         user?.user_metadata?.full_name ||
         user?.user_metadata?.name ||
@@ -26,8 +30,9 @@ export default function DashboardLayout() {
         let active = true;
         fetchAppConfig()
             .then((cfg) => {
-                if (!active || !cfg || typeof cfg.hideSocialPlatforms !== "boolean") return;
-                setHideSocialPlatforms(cfg.hideSocialPlatforms);
+                if (!active || !cfg) return;
+                if (typeof cfg.hideSocialPlatforms === "boolean") setHideSocialPlatforms(cfg.hideSocialPlatforms);
+                if (typeof cfg.filmSummaryEnabled === "boolean") setFilmSummaryEnabled(cfg.filmSummaryEnabled);
             })
             .catch(() => {});
         return () => {
@@ -70,8 +75,12 @@ export default function DashboardLayout() {
     }, [isDesktopLike, isSidebarOpen]);
 
     const sidebarItems = useMemo(
-        () => DASHBOARD_SIDEBAR_ITEMS.filter((item) => !(hideSocialPlatforms && item.key === "social-publications")),
-        [hideSocialPlatforms]
+        () => DASHBOARD_SIDEBAR_ITEMS.filter((item) => {
+            if (hideSocialPlatforms && item.key === "social-publications") return false;
+            if (!filmSummaryEnabled && item.key === "film-summaries") return false;
+            return true;
+        }),
+        [hideSocialPlatforms, filmSummaryEnabled]
     );
 
     const labelClassName = isDesktopLike ? "font-medium hidden lg:block" : "font-medium";

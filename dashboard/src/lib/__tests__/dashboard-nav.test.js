@@ -32,6 +32,7 @@ describe('DASHBOARD_SIDEBAR_ITEMS', () => {
             'reels',
             'captions',
             'anonymous-stories',
+            'film-summaries',
             'social-publications',
             'abonnements',
             'settings',

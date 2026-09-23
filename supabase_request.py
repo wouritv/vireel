@@ -28,6 +28,7 @@ SUPABASE_USER_CREDIT_BANK_TABLE = os.environ.get("SUPABASE_USER_CREDIT_BANK_TABL
 SUPABASE_TRANSCRIPTIONS_TABLE = os.environ.get("SUPABASE_TRANSCRIPTIONS_TABLE", "transcriptions")
 SUPABASE_STYLE_EDIT_VERSIONS_TABLE = os.environ.get("SUPABASE_STYLE_EDIT_VERSIONS_TABLE", "style_edit_versions")
 SUPABASE_ANONYMOUS_STORIES_TABLE = os.environ.get("SUPABASE_ANONYMOUS_STORIES_TABLE", "anonymous_stories")
+SUPABASE_FILM_SUMMARIES_TABLE = os.environ.get("SUPABASE_FILM_SUMMARIES_TABLE", "film_summaries")
 STORAGE_OVERAGE_TOLERANCE_PERCENT = max(0.0, float(os.environ.get("STORAGE_OVERAGE_TOLERANCE_PERCENT", "10") or "10"))
 
 
@@ -486,6 +487,20 @@ async def get_anonymous_stories_by_project(project_id: str) -> List[Dict[str, An
 	return response.data or []
 
 
+async def get_film_summaries_by_project(project_id: str) -> List[Dict[str, Any]]:
+	"""Get all film summaries associated with a project."""
+	if not project_id:
+		return []
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_FILM_SUMMARIES_TABLE)
+		.select("*")
+		.eq("project_id", project_id)
+		.execute()
+	)
+	return response.data or []
+
+
 # --------------------------------------------------------------------------
 # IA Captions
 # --------------------------------------------------------------------------
@@ -778,7 +793,7 @@ SOUSCRIPTION_COLUMNS = (
 	"id, created_at, userid, abonnement, payment_mode, payment_amount, payment_reference, "
 	"payment_start_date, payment_end_date, payment_status, payment_comment, "
 	"auto_renew, canceled_at, reactivated_at, paused_at, resumed_at, "
-	"retention_deadline_at, account_disabled_at"
+	"retention_deadline_at, account_disabled_at, stripe_subscription_id, stripe_customer_id"
 )
 
 async def list_abonnements() -> List[Dict[str, Any]]:
@@ -827,13 +842,24 @@ async def insert_souscription(
 	payment_status: str = "confirmed",
 	payment_comment: str = "",
 	payment_date: Optional[datetime] = None,
+	period_end_date: Optional[datetime] = None,
+	stripe_subscription_id: Optional[str] = None,
+	stripe_customer_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-	"""Create a subscription row after a confirmed payment."""
+	"""Create a subscription row after a confirmed payment.
+
+	period_end_date overrides the default +1-calendar-month end date -- a
+	Stripe subscription renewal invoice carries its own authoritative
+	billing period (see _handle_subscription_renewal_invoice in app.py),
+	which must be used as-is instead of recomputed, so the stored period
+	stays exactly in sync with what Stripe actually billed."""
 	client = await get_client()
 	start_date = payment_date or datetime.now(timezone.utc)
 	if start_date.tzinfo is None:
 		start_date = start_date.replace(tzinfo=timezone.utc)
-	end_date = _add_one_month(start_date)
+	end_date = period_end_date or _add_one_month(start_date)
+	if end_date.tzinfo is None:
+		end_date = end_date.replace(tzinfo=timezone.utc)
 
 	payload = {
 		"userid": user_id,
@@ -846,6 +872,10 @@ async def insert_souscription(
 		"payment_status": payment_status,
 		"payment_comment": payment_comment,
 	}
+	if stripe_subscription_id:
+		payload["stripe_subscription_id"] = stripe_subscription_id
+	if stripe_customer_id:
+		payload["stripe_customer_id"] = stripe_customer_id
 
 	response = await client.table(SUPABASE_SOUSCRIPTION_TABLE).insert(payload).execute()
 	rows = response.data or []
@@ -1853,6 +1883,100 @@ async def soft_delete_anonymous_story(story_id: str, user_id: str) -> bool:
 		await client.table(SUPABASE_ANONYMOUS_STORIES_TABLE)
 		.update({"deleted_at": now_iso, "updated_at": now_iso})
 		.eq("id", story_id)
+		.eq("user_id", user_id)
+		.is_("deleted_at", "null")
+		.execute()
+	)
+	return bool(response.data)
+
+
+# ---------------------------------------------------------------------------
+# Film Summary ("Resume de film") CRUD -- mirrors the anonymous_stories
+# block above.
+# ---------------------------------------------------------------------------
+
+async def insert_film_summary(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+	if not row:
+		return None
+	client = await get_client()
+	response = await client.table(SUPABASE_FILM_SUMMARIES_TABLE).insert(row).execute()
+	rows = response.data or []
+	return rows[0] if rows else None
+
+
+async def list_film_summaries(
+	user_id: str,
+	page: int,
+	page_size: int,
+	status: Optional[str] = None,
+	query: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
+	page = max(page, 1)
+	page_size = min(max(page_size, 1), 100)
+	offset = (page - 1) * page_size
+
+	client = await get_client()
+	q = (
+		client.table(SUPABASE_FILM_SUMMARIES_TABLE)
+		.select("*", count="exact")
+		.eq("user_id", user_id)
+		.is_("deleted_at", "null")
+		.order("created_at", desc=True)
+		.range(offset, offset + page_size - 1)
+	)
+
+	if status:
+		q = q.eq("status", status)
+	if query:
+		q = q.or_(_build_ilike_or_filter(query, ["title"]))
+
+	response = await q.execute()
+	return response.data or [], response.count or 0
+
+
+async def get_film_summary(film_summary_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+	if not film_summary_id or not user_id:
+		return None
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_FILM_SUMMARIES_TABLE)
+		.select("*")
+		.eq("id", film_summary_id)
+		.eq("user_id", user_id)
+		.is_("deleted_at", "null")
+		.limit(1)
+		.execute()
+	)
+	rows = response.data or []
+	return rows[0] if rows else None
+
+
+async def update_film_summary(film_summary_id: str, user_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+	if not film_summary_id or not user_id:
+		return None
+	client = await get_client()
+	payload = dict(updates or {})
+	payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+	await (
+		client.table(SUPABASE_FILM_SUMMARIES_TABLE)
+		.update(payload)
+		.eq("id", film_summary_id)
+		.eq("user_id", user_id)
+		.is_("deleted_at", "null")
+		.execute()
+	)
+	return await get_film_summary(film_summary_id, user_id)
+
+
+async def soft_delete_film_summary(film_summary_id: str, user_id: str) -> bool:
+	if not film_summary_id or not user_id:
+		return False
+	client = await get_client()
+	now_iso = datetime.now(timezone.utc).isoformat()
+	response = (
+		await client.table(SUPABASE_FILM_SUMMARIES_TABLE)
+		.update({"deleted_at": now_iso, "updated_at": now_iso})
+		.eq("id", film_summary_id)
 		.eq("user_id", user_id)
 		.is_("deleted_at", "null")
 		.execute()
