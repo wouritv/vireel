@@ -309,7 +309,7 @@ def test_validate_edit_plan_content_flags_unknown_scene_id():
         plan, source_duration_ms=3600000, valid_scene_ids=["scene_999"], duration_tolerance_ratio=0.5,
     )
     assert report["valid"] is False
-    assert any("unknown scene_id" in e for e in report["errors"])
+    assert any("scene_id inconnu" in e for e in report["errors"])
 
 
 def test_validate_edit_plan_content_flags_out_of_bounds_clip():
@@ -319,7 +319,7 @@ def test_validate_edit_plan_content_flags_out_of_bounds_clip():
         plan, source_duration_ms=3600000, valid_scene_ids=["scene_001"], duration_tolerance_ratio=0.5,
     )
     assert report["valid"] is False
-    assert any("out-of-bounds" in e for e in report["errors"])
+    assert any("hors limites" in e for e in report["errors"])
 
 
 def test_validate_edit_plan_content_flags_overlapping_dialogue_segments():
@@ -363,7 +363,7 @@ def test_validate_edit_plan_content_warns_on_repeated_clip():
     report = fs.validate_edit_plan_content(
         plan, source_duration_ms=3600000, valid_scene_ids=["scene_001"], duration_tolerance_ratio=0.5,
     )
-    assert any("reused" in w for w in report["warnings"])
+    assert any("reutilise" in w for w in report["warnings"])
 
 
 # ---------------------------------------------------------------------------
@@ -540,14 +540,18 @@ def test_describe_duration_gap_suggests_removing_segments_when_over():
     assert "remove or shorten approximately 4" in message
 
 
-def test_build_planning_correction_message_includes_duration_hint_only_for_duration_errors():
-    duration_report = {"errors": ["Total estimated duration 240679ms is outside the 15% tolerance around the 401000ms target"]}
-    plan = {"total_estimated_duration_ms": 240679}
-    message = fs._build_planning_correction_message(duration_report, plan, 401000)
+def test_build_planning_correction_message_includes_duration_hint_only_when_out_of_tolerance():
+    # duration_hint is now recomputed from plan/target/ratio directly rather
+    # than sniffed from the (translated, French) error text -- see
+    # _build_planning_correction_message.
+    duration_report = {"errors": ["La duree totale estimee de 240679ms est en dehors de la tolerance de 15% autour de la cible de 401000ms"]}
+    out_of_tolerance_plan = {"total_estimated_duration_ms": 240679}
+    message = fs._build_planning_correction_message(duration_report, out_of_tolerance_plan, 401000, 0.15)
     assert "short of the target" in message["content"]
 
-    other_report = {"errors": ["Segment sequence numbers must be contiguous, starting at 1, in playback order"]}
-    other_message = fs._build_planning_correction_message(other_report, plan, 401000)
+    other_report = {"errors": ["Les numeros de sequence des segments doivent etre continus, en commencant a 1, dans l'ordre de lecture"]}
+    within_tolerance_plan = {"total_estimated_duration_ms": 401000}
+    other_message = fs._build_planning_correction_message(other_report, within_tolerance_plan, 401000, 0.15)
     assert "short of the target" not in other_message["content"]
 
 

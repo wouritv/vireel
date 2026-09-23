@@ -452,7 +452,7 @@ def _validate_segment_sequence_numbers(segments: List[Dict[str, Any]]) -> List[s
     sequences = [seg.get("sequence") for seg in segments]
     if sequences == sorted(sequences) and sequences == list(range(1, len(segments) + 1)):
         return []
-    return ["Segment sequence numbers must be contiguous, starting at 1, in playback order"]
+    return ["Les numeros de sequence des segments doivent etre continus, en commencant a 1, dans l'ordre de lecture"]
 
 
 def _validate_voice_over_segment(
@@ -463,10 +463,10 @@ def _validate_voice_over_segment(
     for clip in seg.get("clips") or []:
         start_ms, end_ms = clip.get("start_ms"), clip.get("end_ms")
         if start_ms is None or end_ms is None or start_ms < 0 or end_ms <= start_ms or end_ms > source_duration_ms:
-            errors.append(f"Segment {seg.get('id')} has an out-of-bounds clip timecode")
+            errors.append(f"Le segment {seg.get('id')} a un timecode de clip hors limites")
             continue
         if known_scene_ids and clip.get("scene_id") not in known_scene_ids:
-            errors.append(f"Segment {seg.get('id')} references unknown scene_id {clip.get('scene_id')}")
+            errors.append(f"Le segment {seg.get('id')} reference un scene_id inconnu {clip.get('scene_id')}")
         signature = (clip.get("scene_id"), start_ms, end_ms)
         clip_signatures[signature] = clip_signatures.get(signature, 0) + 1
     return errors
@@ -480,12 +480,12 @@ def _validate_timed_segment(
     start_ms, end_ms = seg.get("start_ms"), seg.get("end_ms")
     valid_range = None
     if start_ms is None or end_ms is None or start_ms < 0 or end_ms <= start_ms or end_ms > source_duration_ms:
-        errors.append(f"Segment {seg.get('id')} has an out-of-bounds timecode")
+        errors.append(f"Le segment {seg.get('id')} a un timecode hors limites")
     else:
         valid_range = (start_ms, end_ms, str(seg.get("id")))
     for speaker_id in seg.get("speaker_ids") or []:
         if known_character_ids and speaker_id not in known_character_ids:
-            warnings.append(f"Segment {seg.get('id')} references unknown character {speaker_id}")
+            warnings.append(f"Le segment {seg.get('id')} reference un personnage inconnu {speaker_id}")
     return errors, warnings, valid_range
 
 
@@ -505,7 +505,7 @@ def _validate_segments(
     for seg in segments:
         seg_type = seg.get("type")
         if seg_type not in SEGMENT_TYPES:
-            errors.append(f"Segment {seg.get('id')} has unknown type {seg_type}")
+            errors.append(f"Le segment {seg.get('id')} a un type inconnu {seg_type}")
         elif seg_type == SEGMENT_TYPE_VOICE_OVER:
             errors.extend(_validate_voice_over_segment(seg, source_duration_ms, known_scene_ids, clip_signatures))
         else:
@@ -529,10 +529,10 @@ def _validate_dialogue_overlap(dialogue_ranges: List[Tuple[int, int, str]]) -> L
         cur_start, cur_end, cur_id = ranges[i]
         if cur_start < prev_end:
             return [
-                f"Segments {prev_id} ({prev_start}-{prev_end}ms) and {cur_id} ({cur_start}-{cur_end}ms) "
-                "are both original_dialogue/breathing and overlap in source time -- each source time range "
-                "may be used by at most one such segment; keep only one of the two, or move the later one "
-                "to a non-overlapping range"
+                f"Les segments {prev_id} ({prev_start}-{prev_end}ms) et {cur_id} ({cur_start}-{cur_end}ms) "
+                "sont tous les deux de type original_dialogue/breathing et se chevauchent dans le temps source "
+                "-- chaque plage temporelle source ne peut etre utilisee que par un seul segment de ce type ; "
+                "conservez un seul des deux, ou deplacez le plus tardif vers une plage non chevauchante"
             ]
     return []
 
@@ -541,7 +541,7 @@ def _validate_repeated_clips(clip_signatures: Dict[Tuple[Any, int, int], int]) -
     repeated = [sig for sig, count in clip_signatures.items() if count > 1]
     if not repeated:
         return []
-    return [f"{len(repeated)} clip(s) reused more than once without justification"]
+    return [f"{len(repeated)} clip(s) reutilise(s) plus d'une fois sans justification"]
 
 
 def _validate_duration_tolerance(total_ms: int, target_ms: int, duration_tolerance_ratio: float) -> List[str]:
@@ -551,8 +551,8 @@ def _validate_duration_tolerance(total_ms: int, target_ms: int, duration_toleran
     if abs(total_ms - target_ms) <= tolerance_ms:
         return []
     return [
-        f"Total estimated duration {total_ms}ms is outside the {duration_tolerance_ratio:.0%} "
-        f"tolerance around the {target_ms}ms target"
+        f"La duree totale estimee de {total_ms}ms est en dehors de la tolerance de {duration_tolerance_ratio:.0%} "
+        f"autour de la cible de {target_ms}ms"
     ]
 
 
@@ -572,7 +572,7 @@ def validate_edit_plan_content(
     known_character_ids = {c.get("id") for c in (plan.get("characters") or [])}
     segments = plan.get("segments") or []
 
-    errors: List[str] = [] if segments else ["Plan has no segments"]
+    errors: List[str] = [] if segments else ["Le plan ne contient aucun segment"]
     errors.extend(_validate_segment_sequence_numbers(segments))
 
     segment_errors, warnings, dialogue_ranges, clip_signatures = _validate_segments(
@@ -901,9 +901,18 @@ def _describe_duration_gap(plan: Dict[str, Any], target_duration_ms: int) -> str
     )
 
 
-def _build_planning_correction_message(validation_report: Dict[str, Any], plan: Dict[str, Any], target_duration_ms: int) -> Dict[str, str]:
+def _build_planning_correction_message(
+    validation_report: Dict[str, Any], plan: Dict[str, Any], target_duration_ms: int, duration_tolerance_ratio: float,
+) -> Dict[str, str]:
     errors = "; ".join(validation_report.get("errors") or [])
-    duration_hint = _describe_duration_gap(plan, target_duration_ms) if "duration" in errors.lower() else ""
+    # Recomputed directly instead of sniffing the (now user-facing, French)
+    # error text for the word "duration" -- that substring match broke the
+    # moment _validate_duration_tolerance's message got translated.
+    total_ms = int(plan.get("total_estimated_duration_ms") or 0)
+    duration_out_of_tolerance = (
+        target_duration_ms > 0 and abs(total_ms - target_duration_ms) > target_duration_ms * duration_tolerance_ratio
+    )
+    duration_hint = _describe_duration_gap(plan, target_duration_ms) if duration_out_of_tolerance else ""
     return {
         "role": "user",
         "content": (
@@ -979,7 +988,7 @@ async def generate_edit_plan(
         if validation_report["valid"] or attempt == max_attempts - 1:
             break
         messages.append({"role": "assistant", "content": raw_text})
-        messages.append(_build_planning_correction_message(validation_report, plan, target_duration_ms))
+        messages.append(_build_planning_correction_message(validation_report, plan, target_duration_ms, duration_tolerance_ratio))
 
     return {"plan": plan, "usage": total_usage}
 
