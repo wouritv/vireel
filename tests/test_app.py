@@ -2940,6 +2940,83 @@ def test_finalize_film_summary_render_debits_output_storage(monkeypatch):
     assert debit_mock.await_args.kwargs["storage_delta"] == pytest.approx(-0.5)
 
 
+# ---------------------------------------------------------------------------
+# Storage debiting per service: reels and captions must debit for the video
+# they produce, anonymous stories must not (film summaries are covered by
+# the two tests directly above).
+# ---------------------------------------------------------------------------
+
+def test_finalize_completed_reel_billing_sums_and_debits_clip_storage(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    app.jobs["job-reel-1"] = {"logs": []}
+
+    consumption_mock = MagicMock(return_value={
+        "actual_credit": 2.0, "actual_storage_gb": 0.75, "actual_cost_usd": 0.1,
+        "processing_ratio": 1.0, "cost_breakdown": {},
+    })
+    monkeypatch.setattr(app, "_estimate_reel_job_consumption", consumption_mock)
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+    app.reel_job_manager.complete_job = AsyncMock()
+
+    # Each saved reel row carries its own clip's real file size --
+    # _finalize_completed_reel_billing must sum all of them before pricing
+    # the job's actual storage consumption.
+    saved_rows = [
+        {"reel_size_bytes": 300 * 1024 * 1024},
+        {"reel_size_bytes": 500 * 1024 * 1024},
+    ]
+    asyncio.run(app._finalize_completed_reel_billing(
+        job_id="job-reel-1", job_data={"reel_required_credits": 2.0}, user_id="u1", source_is_url=False,
+        start_ts=time.time(), enriched_clips=[{}, {}], cost_analysis={}, saved_rows=saved_rows,
+    ))
+
+    consumption_mock.assert_called_once()
+    assert consumption_mock.call_args.kwargs["storage_bytes"] == 800 * 1024 * 1024
+
+    debit_mock.assert_awaited_once()
+    assert debit_mock.await_args.kwargs["storage_delta"] == pytest.approx(-0.75)
+    assert debit_mock.await_args.kwargs["operation_type"] == "generation_reel"
+
+
+def test_save_caption_row_and_debit_debits_video_storage(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_insert_captions", AsyncMock(return_value=[{"id": "cap-1"}]))
+    monkeypatch.setattr(app, "_normalize_caption_row", lambda row: row)
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+
+    asyncio.run(app._save_caption_row_and_debit(
+        row_payload={"id": "row-1"}, job_id="job-cap-1", user_id="u1",
+        caption_required_credits=3.0, caption_storage_gb=0.25,
+    ))
+
+    debit_mock.assert_awaited_once()
+    assert debit_mock.await_args.kwargs["storage_delta"] == pytest.approx(-0.25)
+    assert debit_mock.await_args.kwargs["operation_type"] == "sous_titre"
+
+
+def test_settle_anonymous_story_row_never_debits_storage(monkeypatch):
+    # Anonymous stories deliberately carry no storage cost (spec: they
+    # don't produce a billable video the way reels/captions/film summaries
+    # do) -- this call must never pass storage_delta at all.
+    app = _import_app_with_stubs(monkeypatch)
+    app.supabase_update_anonymous_story = AsyncMock()
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+
+    asyncio.run(app._settle_anonymous_story_row(
+        job_id="job-story-1", user_id="u1", story_id="story-1", source_s3_key="key.mp4",
+        story_content={"full_text": "hello"}, cost_breakdown={"total_usd": 0.1}, final_credits=4.0,
+        story_required_credits=4.0, generated_title="Title", now_iso="2026-01-01T00:00:00+00:00",
+    ))
+
+    debit_mock.assert_awaited_once()
+    assert "storage_delta" not in debit_mock.await_args.kwargs
+
+
 def test_delete_film_summary_endpoint_frees_storage(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setenv("AWS_S3_BUCKET", "test-bucket")
