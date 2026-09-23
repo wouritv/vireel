@@ -117,6 +117,7 @@ from supabase_request import (
 	get_film_summaries_by_project as supabase_get_film_summaries_by_project,
 )
 import anonymous_stories
+import email_templates
 import film_summary
 import film_summary_render
 from billing import (
@@ -197,7 +198,6 @@ def _generic_error(
 
 BREVO_API_KEY = os.getenv("BREVO_API_KEY")
 BREVO_FROM_EMAIL = os.getenv("BREVO_FROM_EMAIL", "noreply@vireel.co")
-BREVO_PAYMENT_CONFIRMATION_TEMPLATE_ID = os.getenv("BREVO_PAYMENT_CONFIRMATION_TEMPLATE_ID")
 
 load_dotenv()
 
@@ -7620,14 +7620,22 @@ def _extract_session_context(session: "stripe.checkout.Session") -> dict:
     }
 
 
-def _send_payment_confirmation_email(to_email: str, amount_total: float, label: str) -> None:
-    """Send a payment confirmation email via Brevo. Never raises — a failed email
-    must not fail the webhook (Stripe would retry it forever otherwise)."""
+def _send_transactional_email(to_email: str, template_key: str, **context: Any) -> None:
+    """Render and send one of email_templates.EMAIL_TEMPLATES via Brevo.
+    Never raises -- a failed email must not fail the webhook (Stripe would
+    retry it forever otherwise), and a bad template/context is a code bug
+    to fix, not something that should ever take down billing."""
     if not to_email:
-        logger.warning("Skipping payment confirmation email: no customer email on session")
+        logger.warning("Skipping %s email: no customer email on session", template_key)
         return
     if not BREVO_API_KEY:
-        logger.warning("Skipping payment confirmation email: BREVO_API_KEY is not configured")
+        logger.warning("Skipping %s email: BREVO_API_KEY is not configured", template_key)
+        return
+
+    try:
+        template = email_templates.render_email(template_key, **context)
+    except Exception:
+        logger.exception("Failed to render %s email template for %s", template_key, to_email)
         return
 
     configuration = sib_api_v3_sdk.Configuration()
@@ -7635,35 +7643,19 @@ def _send_payment_confirmation_email(to_email: str, amount_total: float, label: 
     api_instance = sib_api_v3_sdk.TransactionalEmailsApi(
         sib_api_v3_sdk.ApiClient(configuration)
     )
-
-    if BREVO_PAYMENT_CONFIRMATION_TEMPLATE_ID:
-        send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
-            to=[{"email": to_email}],
-            template_id=int(BREVO_PAYMENT_CONFIRMATION_TEMPLATE_ID),
-            params={
-                "amount_total": f"{amount_total:.2f}",
-                "label": label,
-            },
-        )
-    else:
-        send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
-            to=[{"email": to_email}],
-            sender={"email": BREVO_FROM_EMAIL},
-            subject="Confirmation de votre paiement",
-            html_content=(
-                f"<p>Bonjour,</p>"
-                f"<p>Nous confirmons la réception de votre paiement de "
-                f"<strong>{amount_total:.2f} €</strong> pour : {label}.</p>"
-                f"<p>Merci pour votre confiance !</p>"
-            ),
-        )
+    send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
+        to=[{"email": to_email}],
+        sender={"email": BREVO_FROM_EMAIL},
+        subject=template.subject,
+        html_content=template.html,
+    )
 
     try:
         api_instance.send_transac_email(send_smtp_email)
     except ApiException:
         # Log and swallow: email failure should never turn a successful payment
         # into a 500, which would make Stripe retry the whole webhook.
-        logger.exception("Failed to send payment confirmation email to %s", to_email)
+        logger.exception("Failed to send %s email to %s", template_key, to_email)
 
 
 async def _handle_credit_purchase(ctx: dict) -> dict:
@@ -7708,10 +7700,9 @@ async def _handle_credit_purchase(ctx: dict) -> dict:
         operation_type="credit_purchase",
         operation_id=ctx["payment_reference"],
     )
-    _send_payment_confirmation_email(
-        to_email=ctx["customer_email"],
-        amount_total=ctx["amount_total"],
-        label=f"{credits_to_add:.0f} crédits",
+    _send_transactional_email(
+        ctx["customer_email"], "credit_purchase",
+        amount=ctx["amount_total"], credits=credits_to_add,
     )
     return {"received": True, "credits_added": credits_to_add}
 
@@ -7773,10 +7764,9 @@ async def _handle_subscription_purchase(ctx: dict) -> dict:
         payment_reference=ctx["payment_reference"],
         souscription_id=str(new_souscription.get("id") or ctx["payment_reference"]),
     )
-    _send_payment_confirmation_email(
-        to_email=ctx["customer_email"],
-        amount_total=ctx["amount_total"],
-        label=f"l'abonnement {abonnement}",
+    _send_transactional_email(
+        ctx["customer_email"], "subscription_purchase",
+        amount=ctx["amount_total"], plan_name=ctx["metadata"].get("plan_name") or abonnement,
     )
     return {"received": True}
 
@@ -7842,10 +7832,43 @@ async def _handle_subscription_renewal_invoice(invoice: "stripe.Invoice") -> dic
         payment_reference=payment_reference,
         souscription_id=str(new_souscription.get("id") or payment_reference),
     )
-    _send_payment_confirmation_email(
-        to_email=invoice.customer_email,
-        amount_total=amount_total,
-        label=f"le renouvellement de l'abonnement {abonnement}",
+    _send_transactional_email(
+        invoice.customer_email, "subscription_renewal",
+        amount=amount_total, plan_name=metadata.get("plan_name") or abonnement,
+    )
+    return {"received": True}
+
+
+async def _handle_subscription_payment_failed(invoice: "stripe.Invoice") -> dict:
+    """Notify the customer when Stripe's automatic monthly renewal charge
+    fails (expired/declined card, insufficient funds, ...). Stripe keeps
+    retrying the charge on its own schedule (Smart Retries) independently
+    of this handler -- it only sends the heads-up email; it never touches
+    local credit/storage/subscription state, since nothing actually
+    changes here until Stripe gives up retrying (customer.subscription.
+    deleted or .updated to past_due/canceled, not handled by this webhook
+    today)."""
+    subscription_id = invoice.subscription
+    if not subscription_id:
+        return {"received": True, "ignored": "no_subscription_on_invoice"}
+
+    subscription = stripe.Subscription.retrieve(subscription_id)
+    metadata = subscription.metadata.to_dict() if subscription.metadata else {}
+    plan_name = metadata.get("plan_name") or metadata.get("abonnement") or "Vireel"
+
+    if invoice.next_payment_attempt:
+        retry_date = datetime.fromtimestamp(invoice.next_payment_attempt, tz=timezone.utc).strftime("%d/%m/%Y")
+        retry_message = f"Une nouvelle tentative de prélèvement aura lieu automatiquement le {retry_date}."
+    else:
+        retry_message = (
+            "Aucune nouvelle tentative automatique n'est prévue -- merci de mettre à jour votre "
+            "moyen de paiement dès que possible pour conserver l'accès à votre abonnement."
+        )
+
+    _send_transactional_email(
+        invoice.customer_email, "payment_failed",
+        amount=(invoice.amount_due or 0) / 100, plan_name=plan_name,
+        retry_message=retry_message, update_payment_url=invoice.hosted_invoice_url or "",
     )
     return {"received": True}
 
@@ -7856,8 +7879,9 @@ async def _handle_subscription_renewal_invoice(invoice: "stripe.Invoice") -> dic
 
 @app.post("/api/stripe/webhook", responses={400: {"description": "Bad Request"}, 503: {"description": "Service Unavailable"}})
 async def stripe_webhook(request: Request):
-    """Handle Stripe checkout.session.completed (new purchase/subscription)
-    and invoice.paid (automatic subscription renewal) events."""
+    """Handle Stripe checkout.session.completed (new purchase/subscription),
+    invoice.paid (automatic subscription renewal) and invoice.payment_failed
+    (failed automatic renewal charge) events."""
     _require_stripe_ready()
     if not STRIPE_WEBHOOK_SECRET:
         raise HTTPException(status_code=503, detail="Stripe webhook secret is not configured")
@@ -7876,6 +7900,9 @@ async def stripe_webhook(request: Request):
             # invoice, a one-off proration, ...) isn't a renewal.
             return {"received": True, "ignored": f"invoice.paid:{invoice.billing_reason}"}
         return await _handle_subscription_renewal_invoice(invoice)
+
+    if event.type == "invoice.payment_failed":
+        return await _handle_subscription_payment_failed(event.data.object)
 
     if event.type != "checkout.session.completed":
         return {"received": True, "ignored": event.type}

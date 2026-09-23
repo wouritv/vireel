@@ -3354,7 +3354,7 @@ def test_handle_subscription_renewal_invoice_credits_plan_and_persists_period(mo
     allocate_mock = AsyncMock()
     monkeypatch.setattr(app, "_allocate_plan_resources", allocate_mock)
     email_mock = MagicMock()
-    monkeypatch.setattr(app, "_send_payment_confirmation_email", email_mock)
+    monkeypatch.setattr(app, "_send_transactional_email", email_mock)
 
     period = types.SimpleNamespace(start=1700000000, end=1702592000)
     invoice = types.SimpleNamespace(
@@ -3472,6 +3472,137 @@ def test_stripe_webhook_dispatches_subscription_cycle_invoice_to_renewal_handler
 
     assert result == {"received": True}
     renewal_mock.assert_awaited_once_with(invoice)
+
+
+def test_stripe_webhook_dispatches_payment_failed_invoice(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "STRIPE_WEBHOOK_SECRET", "whsec_test")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "stripe", MagicMock())
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    invoice = types.SimpleNamespace()
+    fake_event = types.SimpleNamespace(type="invoice.payment_failed", data=types.SimpleNamespace(object=invoice))
+    monkeypatch.setattr(app, "_verify_and_parse_event", lambda payload, signature: fake_event)
+    failed_mock = AsyncMock(return_value={"received": True})
+    monkeypatch.setattr(app, "_handle_subscription_payment_failed", failed_mock)
+
+    result = asyncio.run(app.stripe_webhook(_FakeWebhookRequest()))
+
+    assert result == {"received": True}
+    failed_mock.assert_awaited_once_with(invoice)
+
+
+# ---------------------------------------------------------------------------
+# Transactional emails: templated sends via Brevo, and the failed-renewal
+# notification (invoice.payment_failed).
+# ---------------------------------------------------------------------------
+
+def test_send_transactional_email_sends_rendered_template_via_brevo(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "BREVO_API_KEY", "test-key")
+    monkeypatch.setattr(app, "BREVO_FROM_EMAIL", "noreply@vireel.co")
+    fake_sib = MagicMock()
+    fake_api_instance = MagicMock()
+    fake_sib.TransactionalEmailsApi.return_value = fake_api_instance
+    monkeypatch.setattr(app, "sib_api_v3_sdk", fake_sib)
+
+    app._send_transactional_email("user@example.com", "credit_purchase", amount=9.99, credits=100)
+
+    fake_api_instance.send_transac_email.assert_called_once()
+    sent_kwargs = fake_sib.SendSmtpEmail.call_args.kwargs
+    assert sent_kwargs["to"] == [{"email": "user@example.com"}]
+    assert sent_kwargs["sender"] == {"email": "noreply@vireel.co"}
+    assert "100" in sent_kwargs["html_content"]
+
+
+def test_send_transactional_email_skips_without_recipient(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "BREVO_API_KEY", "test-key")
+    fake_sib = MagicMock()
+    monkeypatch.setattr(app, "sib_api_v3_sdk", fake_sib)
+
+    app._send_transactional_email("", "credit_purchase", amount=9.99, credits=100)
+
+    fake_sib.TransactionalEmailsApi.assert_not_called()
+
+
+def test_send_transactional_email_skips_without_api_key(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "BREVO_API_KEY", None)
+    fake_sib = MagicMock()
+    monkeypatch.setattr(app, "sib_api_v3_sdk", fake_sib)
+
+    app._send_transactional_email("user@example.com", "credit_purchase", amount=9.99, credits=100)
+
+    fake_sib.TransactionalEmailsApi.assert_not_called()
+
+
+def test_send_transactional_email_swallows_bad_template_context(monkeypatch):
+    # A missing placeholder (here: "credits") must never propagate out of
+    # this function -- it's called from webhook handlers where an
+    # exception would turn a successful payment into a failed webhook.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "BREVO_API_KEY", "test-key")
+    fake_sib = MagicMock()
+    monkeypatch.setattr(app, "sib_api_v3_sdk", fake_sib)
+
+    app._send_transactional_email("user@example.com", "credit_purchase", amount=9.99)
+
+    fake_sib.TransactionalEmailsApi.assert_not_called()
+
+
+def test_handle_subscription_payment_failed_sends_email_with_retry_date(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_subscription = types.SimpleNamespace(metadata=_FakeStripeMetadata({"userid": "u1", "plan_name": "Pro"}))
+    fake_stripe = MagicMock()
+    fake_stripe.Subscription.retrieve.return_value = fake_subscription
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    email_mock = MagicMock()
+    monkeypatch.setattr(app, "_send_transactional_email", email_mock)
+
+    invoice = types.SimpleNamespace(
+        subscription="sub_123", customer_email="user@example.com",
+        amount_due=2999, next_payment_attempt=1700000000, hosted_invoice_url="https://billing.stripe.com/x",
+    )
+    result = asyncio.run(app._handle_subscription_payment_failed(invoice))
+
+    assert result == {"received": True}
+    email_mock.assert_called_once()
+    args, kwargs = email_mock.call_args
+    assert args[0] == "user@example.com"
+    assert args[1] == "payment_failed"
+    assert kwargs["plan_name"] == "Pro"
+    assert kwargs["amount"] == pytest.approx(29.99)
+    assert "aura lieu automatiquement" in kwargs["retry_message"]
+    assert kwargs["update_payment_url"] == "https://billing.stripe.com/x"
+
+
+def test_handle_subscription_payment_failed_no_retry_scheduled(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_subscription = types.SimpleNamespace(metadata=_FakeStripeMetadata({"plan_name": "Pro"}))
+    fake_stripe = MagicMock()
+    fake_stripe.Subscription.retrieve.return_value = fake_subscription
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    email_mock = MagicMock()
+    monkeypatch.setattr(app, "_send_transactional_email", email_mock)
+
+    invoice = types.SimpleNamespace(
+        subscription="sub_123", customer_email="user@example.com",
+        amount_due=2999, next_payment_attempt=None, hosted_invoice_url="https://billing.stripe.com/x",
+    )
+    asyncio.run(app._handle_subscription_payment_failed(invoice))
+
+    kwargs = email_mock.call_args.kwargs
+    assert "Aucune nouvelle tentative" in kwargs["retry_message"]
+
+
+def test_handle_subscription_payment_failed_ignores_invoice_without_subscription(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    invoice = types.SimpleNamespace(subscription=None)
+
+    result = asyncio.run(app._handle_subscription_payment_failed(invoice))
+
+    assert result == {"received": True, "ignored": "no_subscription_on_invoice"}
 
 
 # ---------------------------------------------------------------------------
