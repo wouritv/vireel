@@ -9948,9 +9948,13 @@ async def _finalize_film_summary_analysis(
             "billing_details": cost_breakdown,
             "total_cost_usd": cost_breakdown.get("total_usd", 0.0),
         })
+        # No storage_delta here: the source video is transient (deleted once
+        # the render finishes -- see _run_film_summary_render_pipeline_stages),
+        # so it must never count against the user's persistent storage quota.
+        # Only the preview/final outputs the user actually keeps are billed
+        # for storage (_finalize_film_summary_render).
         debit_ok = await reel_job_manager.debit_credits_for_job(
             job_id=job_id, user_id=user_id, credits=final_credits,
-            storage_delta=-_bytes_to_gb(float(size_bytes or 0.0)),
             operation_type=film_summary.CREDIT_OPERATION_TYPE, reserved_credits=analysis_required_credits,
         )
         if not debit_ok:
@@ -10291,12 +10295,14 @@ async def _run_film_summary_render_pipeline_stages(
     await _finalize_film_summary_render(
         job_id, user_id, film_summary_id, project_id, plan_with_actual_durations,
         preview_s3_key, final_s3_key, render_result, output_storage_bytes,
+        source_s3_key=source_s3_key, bucket_name=bucket_name,
     )
 
 
 async def _finalize_film_summary_render(
     job_id: str, user_id: str, film_summary_id: str, project_id: Optional[str], plan: Dict[str, Any],
     preview_s3_key: str, final_s3_key: str, render_result: Dict[str, Any], output_storage_bytes: float = 0.0,
+    source_s3_key: Optional[str] = None, bucket_name: str = "",
 ) -> None:
     character_count = _total_narration_character_count(plan)
     final_duration_seconds = float(render_result.get("final_duration_seconds") or 0.0)
@@ -10317,7 +10323,16 @@ async def _finalize_film_summary_render(
             "preview_s3_key": preview_s3_key,
             "final_s3_key": final_s3_key,
             "completed_at": now_iso,
+            # The source is only ever read again by /render (requires
+            # awaiting_review) or /retry (requires failed) -- neither is
+            # reachable once the summary is completed, so it can't be
+            # needed again. It must never count against the user's
+            # persistent storage: only the preview/final they actually
+            # keep does (billed below).
+            "source_s3_key": None,
         })
+        if source_s3_key and bucket_name:
+            delete_s3_object(bucket_name, source_s3_key)
         debit_ok = await reel_job_manager.debit_credits_for_job(
             job_id=job_id, user_id=user_id, credits=final_credits,
             storage_delta=-_bytes_to_gb(float(output_storage_bytes or 0.0)),

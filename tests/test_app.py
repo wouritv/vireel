@@ -2900,7 +2900,11 @@ def test_scene_detection_timeout_fails_job_instead_of_hanging(monkeypatch):
     assert exc.value.code == app.film_summary.FilmSummaryErrorCode.SCENE_DETECTION_FAILED
 
 
-def test_finalize_film_summary_analysis_debits_source_storage(monkeypatch):
+def test_finalize_film_summary_analysis_never_debits_source_storage(monkeypatch):
+    # The source video is transient (deleted once the render finishes -- see
+    # test_finalize_film_summary_render_deletes_transient_source below), so
+    # it must never be counted against the user's persistent storage quota,
+    # regardless of how large size_bytes (used only for cost estimation) is.
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     app.supabase_update_film_summary = AsyncMock()
@@ -2916,7 +2920,7 @@ def test_finalize_film_summary_analysis_debits_source_storage(monkeypatch):
     ))
 
     debit_mock.assert_awaited_once()
-    assert debit_mock.await_args.kwargs["storage_delta"] == pytest.approx(-1.0)
+    assert "storage_delta" not in debit_mock.await_args.kwargs
 
 
 def test_finalize_film_summary_render_debits_output_storage(monkeypatch):
@@ -2938,6 +2942,54 @@ def test_finalize_film_summary_render_debits_output_storage(monkeypatch):
 
     debit_mock.assert_awaited_once()
     assert debit_mock.await_args.kwargs["storage_delta"] == pytest.approx(-0.5)
+
+
+def test_finalize_film_summary_render_deletes_transient_source(monkeypatch):
+    # Once a render succeeds, the source is never read again (/render
+    # requires awaiting_review, /retry requires failed -- neither is
+    # reachable from completed), so it's deleted and cleared from the row
+    # instead of sitting there billed or not against the user forever.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    update_mock = AsyncMock()
+    app.supabase_update_film_summary = update_mock
+    app.supabase_get_job_record = AsyncMock(return_value={"reserved_quota": 0.0})
+    app.supabase_update_project_status = AsyncMock()
+    app.supabase_update_project = AsyncMock()
+    app.reel_job_manager.complete_job = AsyncMock()
+    app.reel_job_manager.debit_credits_for_job = AsyncMock(return_value=True)
+    delete_mock = MagicMock(return_value=True)
+    app.delete_s3_object = delete_mock
+
+    asyncio.run(app._finalize_film_summary_render(
+        "job-1", "u1", "fs-1", "proj-1", {"segments": []},
+        "preview/key.mp4", "final/key.mp4", {"final_duration_seconds": 60.0}, 0.0,
+        source_s3_key="source/key.mp4", bucket_name="test-bucket",
+    ))
+
+    update_mock.assert_awaited_once()
+    assert update_mock.await_args.args[2]["source_s3_key"] is None
+    delete_mock.assert_called_once_with("test-bucket", "source/key.mp4")
+
+
+def test_finalize_film_summary_render_skips_source_deletion_without_key(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    app.supabase_update_film_summary = AsyncMock()
+    app.supabase_get_job_record = AsyncMock(return_value={"reserved_quota": 0.0})
+    app.supabase_update_project_status = AsyncMock()
+    app.supabase_update_project = AsyncMock()
+    app.reel_job_manager.complete_job = AsyncMock()
+    app.reel_job_manager.debit_credits_for_job = AsyncMock(return_value=True)
+    delete_mock = MagicMock()
+    app.delete_s3_object = delete_mock
+
+    asyncio.run(app._finalize_film_summary_render(
+        "job-1", "u1", "fs-1", "proj-1", {"segments": []},
+        "preview/key.mp4", "final/key.mp4", {"final_duration_seconds": 60.0}, 0.0,
+    ))
+
+    delete_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
