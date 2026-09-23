@@ -416,16 +416,28 @@ _oauth_serializer = URLSafeTimedSerializer(SECRET_KEY)
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
 SUPABASE_URL_FOR_JWKS = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 
-# Lets a single deployment (the demo instance) restrict itself to a fixed
-# list of emails without touching Supabase Auth's own sign-up settings or
-# forking the codebase -- unset/empty (the expected production
-# configuration) makes _enforce_demo_allowlist a complete no-op, so the
-# exact same image can run as both the open production deployment and a
-# gated demo one, differing only by this env var.
+# APP_ENV names which deployment this process is: "staging" (the gated
+# demo), "production", or "development" (the default -- this project has
+# no production deployment yet, and local/dev must never be blocking).
+APP_ENV = os.environ.get("APP_ENV", "development").strip().lower()
+
+# Lets the staging/demo deployment restrict itself to a fixed list of
+# emails without touching Supabase Auth's own sign-up settings or forking
+# the codebase. Gated on APP_ENV == "staging" as well as this being
+# non-empty -- deliberately not enough on its own -- so that DEMO_ALLOWED_
+# EMAILS being set (e.g. left over in a copied .env, or set on the wrong
+# deployment by mistake) can never lock anyone out anywhere except the one
+# environment explicitly flagged as staging. The exact same image/config
+# otherwise runs fully open, which matches every other deployment today
+# (there is no production yet, and dev must never be blocking).
 DEMO_ALLOWED_EMAILS = {
     e.strip().lower() for e in os.environ.get("DEMO_ALLOWED_EMAILS", "").split(",") if e.strip()
 }
 _DEMO_ACCOUNT_NOT_AUTHORIZED = "This account is not authorized on this deployment."
+
+
+def _demo_allowlist_is_active() -> bool:
+    return APP_ENV == "staging" and bool(DEMO_ALLOWED_EMAILS)
 
 
 def _validate_supabase_jwt_config() -> None:
@@ -666,7 +678,7 @@ def _verify_supabase_jwt(token: str) -> str:
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid session token: missing subject")
 
-    if DEMO_ALLOWED_EMAILS:
+    if _demo_allowlist_is_active():
         email = str(payload.get("email") or "").strip().lower()
         if email not in DEMO_ALLOWED_EMAILS:
             raise HTTPException(status_code=403, detail=_DEMO_ACCOUNT_NOT_AUTHORIZED)

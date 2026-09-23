@@ -18,6 +18,10 @@ services:
       - /var/apps/secrets/cookies.txt:/app/cookies.txt
     environment:
       - NODE_ENV=production
+      # Keeps app.py's demo email allowlist (_demo_allowlist_is_active)
+      # inert here even if DEMO_ALLOWED_EMAILS were ever accidentally set
+      # in this VPS's .env -- only APP_ENV=staging can activate it.
+      - APP_ENV=production
     env_file:
       - .env
     restart: unless-stopped

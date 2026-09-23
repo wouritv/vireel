@@ -188,6 +188,7 @@ def test_verify_supabase_jwt_allows_any_email_when_demo_allowlist_unset(monkeypa
     import jwt as pyjwt
 
     assert app.DEMO_ALLOWED_EMAILS == set()
+    assert app.APP_ENV == "development"
     token = pyjwt.encode(
         {"sub": "user-1", "email": "anyone@example.com", "aud": "authenticated", "exp": 9999999999},
         "unit-test-supabase-jwt-secret",
@@ -197,9 +198,28 @@ def test_verify_supabase_jwt_allows_any_email_when_demo_allowlist_unset(monkeypa
     assert app._verify_supabase_jwt(token) == "user-1"
 
 
-def test_verify_supabase_jwt_rejects_email_not_on_demo_allowlist(monkeypatch):
+def test_verify_supabase_jwt_ignores_demo_allowlist_outside_staging(monkeypatch):
+    # DEMO_ALLOWED_EMAILS alone must never be enough to block anyone -- it
+    # only takes effect when APP_ENV is explicitly "staging", so a leftover
+    # or accidentally-copied value can't lock out dev/production.
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "DEMO_ALLOWED_EMAILS", {"allowed@example.com"})
+    monkeypatch.setattr(app, "APP_ENV", "development")
+    import jwt as pyjwt
+
+    token = pyjwt.encode(
+        {"sub": "user-1", "email": "someone-else@example.com", "aud": "authenticated", "exp": 9999999999},
+        "unit-test-supabase-jwt-secret",
+        algorithm="HS256",
+    )
+
+    assert app._verify_supabase_jwt(token) == "user-1"
+
+
+def test_verify_supabase_jwt_rejects_email_not_on_demo_allowlist_when_staging(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "DEMO_ALLOWED_EMAILS", {"allowed@example.com"})
+    monkeypatch.setattr(app, "APP_ENV", "staging")
     import jwt as pyjwt
 
     token = pyjwt.encode(
@@ -213,9 +233,10 @@ def test_verify_supabase_jwt_rejects_email_not_on_demo_allowlist(monkeypatch):
     assert exc_info.value.status_code == 403
 
 
-def test_verify_supabase_jwt_accepts_email_on_demo_allowlist_case_insensitively(monkeypatch):
+def test_verify_supabase_jwt_accepts_email_on_demo_allowlist_case_insensitively_when_staging(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "DEMO_ALLOWED_EMAILS", {"allowed@example.com"})
+    monkeypatch.setattr(app, "APP_ENV", "staging")
     import jwt as pyjwt
 
     token = pyjwt.encode(
