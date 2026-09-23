@@ -538,10 +538,20 @@ def _validate_dialogue_overlap(dialogue_ranges: List[Tuple[int, int, str]]) -> L
 
 
 def _validate_repeated_clips(clip_signatures: Dict[Tuple[Any, int, int], int]) -> List[str]:
-    repeated = [sig for sig, count in clip_signatures.items() if count > 1]
+    """Named after the exact repeated (scene_id, start_ms, end_ms) triples,
+    instead of a bare count -- this is fed back verbatim to the planning
+    model as corrective context on a retry (see generate_edit_plan), same
+    principle as _validate_dialogue_overlap: a model can only fix the
+    specific clip(s) it's told about. Blocking (not a warning): the same
+    source footage must never illustrate two different segments."""
+    repeated = sorted(sig for sig, count in clip_signatures.items() if count > 1)
     if not repeated:
         return []
-    return [f"{len(repeated)} clip(s) reutilise(s) plus d'une fois sans justification"]
+    named = ", ".join(f"{scene_id} ({start_ms}-{end_ms}ms)" for scene_id, start_ms, end_ms in repeated)
+    return [
+        f"Le(s) clip(s) suivant(s) sont utilises plus d'une fois : {named} -- chaque extrait de la "
+        "video source ne doit illustrer qu'un seul segment du plan"
+    ]
 
 
 def _validate_duration_tolerance(total_ms: int, target_ms: int, duration_tolerance_ratio: float) -> List[str]:
@@ -581,7 +591,7 @@ def validate_edit_plan_content(
     errors.extend(segment_errors)
 
     errors.extend(_validate_dialogue_overlap(dialogue_ranges))
-    warnings.extend(_validate_repeated_clips(clip_signatures))
+    errors.extend(_validate_repeated_clips(clip_signatures))
 
     total_ms = compute_total_estimated_duration_ms(segments)
     target_ms = int(plan.get("target_duration_ms") or 0)
@@ -721,7 +731,7 @@ VISUAL MATCHING RULES
 3. Match images to the narrated action, reaction, relationship, location or consequence. A generic shot of a mentioned character is not sufficient when a more specific confirmed scene exists.
 4. Prefer several short, relevant clips over one excessively long range. Avoid black frames, credits, slates, blurred frames and transition frames when quality flags identify them.
 5. Preserve source chronology unless a clearly justified hook briefly previews a later confirmed event. After the hook, return to the natural beginning.
-6. Avoid reusing the same exact clip unless it is narratively essential and no equivalent exists.
+6. Never reuse the same exact clip (same scene_id and start_ms/end_ms) in more than one segment, even when it feels narratively essential -- pick a different confirmed moment from the same scene, or a different scene entirely, instead. This is validated mechanically; a repeated clip fails the plan outright.
 7. The cumulative clip duration for a voice-over block must be compatible with that block's estimated narration duration. Small backend-adjustable differences are acceptable.
 8. Never fabricate visual information based only on transcript dialogue. Use keyframe and scene evidence to confirm visual claims.
 
@@ -773,7 +783,7 @@ Before returning the JSON, silently verify:
 - no clips overlap incompatibly;
 - narration length agrees with estimated duration;
 - original dialogue and breathing contain no simultaneous voice-over;
-- repeated clips and repeated facts are minimized;
+- no clip (same scene_id and start_ms/end_ms) is used in more than one segment, and repeated facts are minimized;
 - the target duration tolerance is respected;
 - the hook, main progression, climax, resolution and conclusion are present when supported by the movie;
 - the result can be executed by an automated FFmpeg pipeline."""
