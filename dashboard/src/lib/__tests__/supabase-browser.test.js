@@ -11,6 +11,49 @@ describe('getSupabaseBrowserClient', () => {
         vi.resetModules();
         vi.clearAllMocks();
         vi.unstubAllEnvs();
+        delete window.__ENV__;
+    });
+
+    it('prefers window.__ENV__ (runtime config) over the build-time env var', async () => {
+        // window.__ENV__ is what the Docker entrypoint injects at container
+        // startup (see dashboard/Dockerfile) so one built image can serve
+        // demo and production against their own separate Supabase projects.
+        vi.stubEnv('VITE_SUPABASE_URL', 'https://build-time.example.co');
+        vi.stubEnv('VITE_SUPABASE_ANON_KEY', 'build-time-key');
+        window.__ENV__ = {
+            VITE_SUPABASE_URL: 'https://runtime.example.co',
+            VITE_SUPABASE_ANON_KEY: 'runtime-key',
+        };
+
+        const fakeClient = { id: 'client-runtime' };
+        createClientMock.mockReturnValue(fakeClient);
+
+        const { getSupabaseBrowserClient } = await import('../supabase-browser');
+        getSupabaseBrowserClient();
+
+        expect(createClientMock).toHaveBeenCalledWith(
+            'https://runtime.example.co',
+            'runtime-key',
+            expect.any(Object),
+        );
+    });
+
+    it('falls back to the build-time env var when window.__ENV__ has no value', async () => {
+        vi.stubEnv('VITE_SUPABASE_URL', 'https://build-time.example.co');
+        vi.stubEnv('VITE_SUPABASE_ANON_KEY', 'build-time-key');
+        window.__ENV__ = {};
+
+        const fakeClient = { id: 'client-build-time' };
+        createClientMock.mockReturnValue(fakeClient);
+
+        const { getSupabaseBrowserClient } = await import('../supabase-browser');
+        getSupabaseBrowserClient();
+
+        expect(createClientMock).toHaveBeenCalledWith(
+            'https://build-time.example.co',
+            'build-time-key',
+            expect.any(Object),
+        );
     });
 
     it('throws when required env vars are missing', async () => {

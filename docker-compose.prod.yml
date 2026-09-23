@@ -34,6 +34,14 @@ services:
     container_name: vireel-prod-frontend
     ports:
       - "5001:8080"
+    # VITE_SUPABASE_URL/VITE_SUPABASE_ANON_KEY come from this VPS's own
+    # .env (its own Supabase project) and are injected into env.js by the
+    # image's entrypoint at container start -- see dashboard/Dockerfile.
+    # This is what lets the exact same :release image (promoted, never
+    # rebuilt) serve production against a different Supabase project than
+    # demo/staging.
+    env_file:
+      - .env
     restart: unless-stopped
     depends_on:
       - backend

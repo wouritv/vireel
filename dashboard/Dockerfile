@@ -9,6 +9,13 @@
 # the CSP's script-src (index.html; no 'unsafe-inline', no blob:) correctly
 # refused to load. A real production build emits neither: no HMR client,
 # and worker/module chunks as real same-origin hashed files.
+#
+# VITE_SUPABASE_URL/VITE_SUPABASE_ANON_KEY are deliberately NOT build args
+# here anymore -- they're read at container startup instead (see
+# docker-entrypoint.sh and src/lib/supabase-browser.js), so this one image
+# can be promoted byte-for-byte from staging/demo to production (see
+# promote-release.yml) and still connect each deployment to its own
+# Supabase project via that container's own env vars.
 
 # ============================================================
 # Stage 1: build the static production bundle
@@ -16,11 +23,6 @@
 FROM node:22-alpine AS builder
 
 WORKDIR /app
-
-ARG VITE_SUPABASE_URL=http://localhost:3000
-ARG VITE_SUPABASE_ANON_KEY=supabase_key
-ENV VITE_SUPABASE_URL=$VITE_SUPABASE_URL
-ENV VITE_SUPABASE_ANON_KEY=$VITE_SUPABASE_ANON_KEY
 
 COPY package.json package-lock.json* ./
 RUN npm ci
@@ -40,7 +42,14 @@ FROM nginxinc/nginx-unprivileged:1.27-alpine
 
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=builder /app/dist /usr/share/nginx/html
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+# The image runs as a non-root, not-necessarily-101 UID at container
+# startup (e.g. an arbitrary UID under Kubernetes/OpenShift) -- the
+# entrypoint needs to overwrite this one file, so it's made world-writable
+# rather than assuming a specific owning UID/GID will match.
+RUN chmod +x /docker-entrypoint.sh && chmod o+w /usr/share/nginx/html/env.js
 
 EXPOSE 8080
 
+ENTRYPOINT ["/docker-entrypoint.sh"]
 CMD ["nginx", "-g", "daemon off;"]
