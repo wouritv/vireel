@@ -14,17 +14,26 @@ export function normalizeFrontendStatus(status) {
 
 // ── Reel / item status helpers (used by ReelsPage + GeneratedMediaPage) ─────
 
+// The project-list pages (ReelsProjectsPage, CaptionProjectsPage,
+// AnonymousStoriesProjectsPage, FilmSummariesProjectsPage) filter/display
+// project-level status using this second set of raw backend values
+// ("processing"/"completed"/"failed"/"cancelled") alongside the older
+// "termine"/"en_cours"/"echec" ones used for individual reel/caption items
+// -- both need a French label here, since neither call site routes through
+// the i18n t() function for this.
 export function statusLabel(status) {
-    if (status === 'termine') return 'Terminé';
-    if (status === 'en_cours') return 'En cours';
-    if (status === 'echec') return 'Échec';
+    if (status === 'termine' || status === 'completed') return 'Terminé';
+    if (status === 'en_cours' || status === 'processing') return 'En cours';
+    if (status === 'echec' || status === 'failed') return 'Échec';
+    if (status === 'cancelled') return 'Annulé';
     return status || '-';
 }
 
 export function statusClass(status) {
-    if (status === 'termine') return 'bg-emerald-100 border-emerald-300 text-emerald-800 dark:bg-green-500/10 dark:border-green-500/30 dark:text-green-300';
-    if (status === 'en_cours') return 'bg-sky-100 border-sky-300 text-sky-800 dark:bg-blue-500/10 dark:border-blue-500/30 dark:text-blue-300';
-    if (status === 'echec') return 'bg-rose-100 border-rose-300 text-rose-800 dark:bg-red-500/10 dark:border-red-500/30 dark:text-red-300';
+    if (status === 'termine' || status === 'completed') return 'bg-emerald-100 border-emerald-300 text-emerald-800 dark:bg-green-500/10 dark:border-green-500/30 dark:text-green-300';
+    if (status === 'en_cours' || status === 'processing') return 'bg-sky-100 border-sky-300 text-sky-800 dark:bg-blue-500/10 dark:border-blue-500/30 dark:text-blue-300';
+    if (status === 'echec' || status === 'failed') return 'bg-rose-100 border-rose-300 text-rose-800 dark:bg-red-500/10 dark:border-red-500/30 dark:text-red-300';
+    if (status === 'cancelled') return 'bg-slate-200 border-slate-400 text-slate-700 dark:bg-white/10 dark:border-white/20 dark:text-zinc-300';
     return 'bg-white/5 border-slate-300 dark:border-white/10 text-slate-700 dark:text-zinc-300';
 }
 
