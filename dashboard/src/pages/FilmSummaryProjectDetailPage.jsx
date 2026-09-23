@@ -432,20 +432,20 @@ export default function FilmSummaryProjectDetailPage() {
                         <div className="space-y-4">
                             <h3 className="text-lg font-bold text-white">{t("filmSummary.completedTitle", "Ton resume de film est pret")}</h3>
                             {filmSummary.final_url ? (
-                                <div className="space-y-3">
+                                <div className="grid gap-4 md:grid-cols-[7fr_3fr]">
                                     <video src={filmSummary.final_url} controls preload="metadata" className="w-full rounded-xl bg-black" />
-                                    <div className="flex flex-wrap gap-2">
+                                    <div className="flex flex-row flex-wrap gap-2 md:flex-col md:items-stretch">
                                         <a
                                             href={filmSummary.final_url}
                                             download
-                                            className="inline-flex items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
+                                            className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
                                         >
                                             <Download size={14} /> {t("filmSummary.downloadButton", "Telecharger")}
                                         </a>
                                         <button
                                             type="button"
                                             onClick={handleOpenShare}
-                                            className="inline-flex items-center gap-2 rounded-xl bg-primary px-4 py-2.5 text-sm font-semibold text-white hover:bg-blue-500"
+                                            className="inline-flex items-center justify-center gap-2 rounded-xl bg-primary px-4 py-2.5 text-sm font-semibold text-white hover:bg-blue-500"
                                         >
                                             <Share2 size={14} /> {t("filmSummary.shareButton", "Partager")}
                                         </button>
