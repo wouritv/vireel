@@ -12,7 +12,12 @@
     - script-src has no remote origins and no 'unsafe-inline'/'unsafe-eval';
       'wasm-unsafe-eval' is required by Remotion's in-browser web renderer.
     - connect-src covers same-origin API calls (the backend is reverse-proxied
-      under this origin in production) plus Supabase (REST + Realtime). If
+      under this origin in production) plus Supabase (REST + Realtime) and
+      Remotion's own usage-tracking endpoint (renderMediaOnWeb/@remotion/
+      web-renderer calls home to register free/licensed usage on every
+      in-browser render -- without this, the browser silently blocks that
+      call, which the render then retries several times before giving up,
+      adding real delay to every caption/reel render that uses it). If
       VITE_API_URL is ever configured to point at a different origin, add
       that origin here too.
     - img-src/media-src allow any https origin because reel/caption media
@@ -25,7 +30,7 @@
       actual clickjacking protection. Enforce it at the reverse proxy/server
       level instead if that protection is needed.
   -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' blob: https://*.supabase.co wss://*.supabase.co; worker-src 'self' blob:; frame-src https://www.youtube.com; object-src 'none'; base-uri 'self'; form-action 'self';" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' blob: https://*.supabase.co wss://*.supabase.co https://www.remotion.pro; worker-src 'self' blob:; frame-src https://www.youtube.com; object-src 'none'; base-uri 'self'; form-action 'self';" />
 
   <!-- Primary SEO Meta Tags -->
   <title>Vireel – Créez des Reels avec l’IA</title>
