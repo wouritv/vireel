@@ -2307,7 +2307,7 @@ async def _close_proxy_stream(upstream, client):
         await client.aclose()
 
 
-@app.get("/api/media/proxy", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}})
+@app.get("/api/media/proxy", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
 async def proxy_media(request: Request, url: str, user_id: Annotated[str, Depends(get_user_id_header_or_query_token)]):
     """Proxy remote media through the backend so browser-side Remotion can fetch it same-origin.
 
@@ -4495,7 +4495,7 @@ def _attach_partial_clips_if_processing(target: Dict[str, Any], status: Optional
         pass
 
 
-@app.get("/api/status/{job_id}", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.get("/api/status/{job_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def get_status(job_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     # Best effort read of in-memory runtime state, but the *authorization*
     # scope always comes from the verified caller identity above -- never
@@ -4785,7 +4785,7 @@ async def _debit_edit_credits_and_log(user_id: str, req: "EditRequest", edit_req
     )
 
 
-@app.post("/api/edit", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 404: {"description": "Not Found"}})
+@app.post("/api/edit", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def edit_clip(
     request: Request,
     req: EditRequest,
@@ -4954,7 +4954,7 @@ async def _enqueue_caption_endpoint_job(
     await enqueue_reel_job(caption_job_id, priority=job_priority)
 
 
-@app.post("/api/captions/process", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 413: {"description": "Payload Too Large"}, 429: {"description": "Too Many Requests"}})
+@app.post("/api/captions/process", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 413: {"description": "Payload Too Large"}, 429: {"description": "Too Many Requests"}})
 async def process_caption_endpoint(
     file: Annotated[UploadFile, File()],
     user_id: Annotated[str, Depends(get_user_id_header)],
@@ -5105,7 +5105,7 @@ async def get_clip_transcript(job_id: str, clip_index: int, request: Request):
     }
 
 
-@app.get("/api/clip/{job_id}/{clip_index}/preview-image/ensure", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}})
+@app.get("/api/clip/{job_id}/{clip_index}/preview-image/ensure", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
 async def ensure_clip_preview_image(
     job_id: str,
     clip_index: int,
@@ -5427,7 +5427,7 @@ async def _assert_credits_or_cleanup_output(user_id: str, caption_required_credi
         raise
 
 
-@app.post("/api/reels/{job_id}/{clip_index}/captions/persist", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 404: {"description": "Not Found"}, 500: {"description": "Internal Server Error"}})
+@app.post("/api/reels/{job_id}/{clip_index}/captions/persist", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 500: {"description": "Internal Server Error"}})
 async def persist_captioned_reel(
     job_id: str,
     clip_index: int,
@@ -5517,7 +5517,7 @@ if not RENDER_SERVICE_API_KEY and not _is_pytest_runtime():
 _RENDER_SERVICE_HEADERS = {"x-internal-api-key": RENDER_SERVICE_API_KEY or "unit-test-render-key"}
 
 
-@app.post("/api/render", responses={401: {"description": "Unauthorized"}})
+@app.post("/api/render", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
 async def proxy_render(request: Request, user_id: Annotated[str, Depends(get_user_id_header)]):
     """Proxy render requests to the Node.js Remotion render service.
 
@@ -5541,7 +5541,7 @@ async def proxy_render(request: Request, user_id: Annotated[str, Depends(get_use
             detail="Le service de rendu est indisponible.",
         )
 
-@app.get("/api/render/{render_id}", responses={401: {"description": "Unauthorized"}})
+@app.get("/api/render/{render_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
 async def proxy_render_status(render_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     """Proxy render status polling to the Node.js Remotion render service."""
     import httpx
@@ -5638,7 +5638,7 @@ def _run_effects_generation(final_api_key: str, job_id: str, input_path: str):
             os.remove(safe_input_path)
 
 
-@app.post("/api/effects/generate", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 404: {"description": "Not Found"}, 500: {"description": "Internal Server Error"}})
+@app.post("/api/effects/generate", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 500: {"description": "Internal Server Error"}})
 async def generate_effects_config(
     req: EffectsGenerateRequest,
     user_id: Annotated[str, Depends(get_user_id_header)],
@@ -5906,7 +5906,7 @@ async def _debit_subtitle_credits_and_persist_version(
             print(f"⚠️ Failed to persist style edit version: {e}")
 
 
-@app.post("/api/subtitle", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 404: {"description": "Not Found"}})
+@app.post("/api/subtitle", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def add_subtitles(req: SubtitleRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
     await _require_job_ownership(req.job_id, user_id)
     subtitle_required_credits = 0.0
@@ -6023,7 +6023,7 @@ def _reset_clip_metadata_to_original(metadata_path: str, data: Dict[str, Any], c
     return original_video_url
 
 
-@app.post("/api/reels/{job_id}/{clip_index}/captions/reset", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.post("/api/reels/{job_id}/{clip_index}/captions/reset", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def reset_caption_style_history(
     job_id: str,
     clip_index: int,
@@ -6050,7 +6050,7 @@ async def reset_caption_style_history(
     }
 
 
-@app.get("/api/reels/{job_id}/{clip_index}/style-history", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.get("/api/reels/{job_id}/{clip_index}/style-history", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def get_caption_style_history_debug(
     job_id: str,
     clip_index: int,
@@ -6121,7 +6121,7 @@ def _persist_new_video_url_to_clip(job: Optional[Dict[str, Any]], clip_index: in
         print(f"⚠️ Failed to update metadata.json: {e}")
 
 
-@app.post("/api/hook", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 404: {"description": "Not Found"}})
+@app.post("/api/hook", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def add_hook(req: HookRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
     await _require_job_ownership(req.job_id, user_id)
 
@@ -6625,7 +6625,7 @@ async def _persist_translation_usage_billing(
     )
 
 
-@app.post("/api/translate/captions", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 500: {"description": "Internal Server Error"}})
+@app.post("/api/translate/captions", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 500: {"description": "Internal Server Error"}})
 async def translate_captions(req: TranslateRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
     """Translate reel transcript into Remotion-friendly timed word captions."""
     await _require_job_ownership(req.job_id, user_id)
@@ -6757,7 +6757,7 @@ def _update_clip_after_translation(job: Optional[Dict[str, Any]], job_id: str, c
         print(f"⚠️ Failed to update metadata.json: {e}")
 
 
-@app.post("/api/translate", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 500: {"description": "Internal Server Error"}})
+@app.post("/api/translate", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 500: {"description": "Internal Server Error"}})
 async def translate_clip(req: TranslateRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
     """
     Translate subtitles only (OpenAI first, Gemini fallback),
@@ -6989,7 +6989,7 @@ async def _publish_social_post_now(
         }
 
 
-@app.post("/api/social/post", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+@app.post("/api/social/post", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def post_to_socials(req: SocialPostRequest, request: Request, user_id_header: Annotated[str, Depends(get_user_id_header)]):
     selected_platforms = _resolve_social_platforms(req.platforms)
     user_id = _resolve_request_user_id(req.user_id, user_id_header)
@@ -7036,7 +7036,7 @@ async def post_to_socials(req: SocialPostRequest, request: Request, user_id_head
 
 # --- Thumbnail Studio Endpoints ---
 
-@app.post("/api/thumbnail/upload", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}})
+@app.post("/api/thumbnail/upload", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
 async def thumbnail_upload(
     user_id: Annotated[str, Depends(get_user_id_header)],
     file: Annotated[Optional[UploadFile], File()] = None,
@@ -7148,7 +7148,7 @@ async def _create_thumbnail_session_from_input(url: Optional[str], file: Optiona
     return session_id, video_path
 
 
-@app.post("/api/thumbnail/analyze", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 500: {"description": "Internal Server Error"}})
+@app.post("/api/thumbnail/analyze", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 500: {"description": "Internal Server Error"}})
 async def thumbnail_analyze(
     request: Request,
     user_id: Annotated[str, Depends(get_user_id_header)],
@@ -7207,7 +7207,7 @@ class ThumbnailTitlesRequest(BaseModel):
     message: Optional[str] = None
     title: Optional[str] = None
 
-@app.post("/api/thumbnail/titles", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.post("/api/thumbnail/titles", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def thumbnail_titles(
     req: ThumbnailTitlesRequest,
     user_id: Annotated[str, Depends(get_user_id_header)],
@@ -7264,7 +7264,7 @@ async def thumbnail_titles(
         raise _generic_error("Thumbnail Titles Error", e)
 
 
-@app.post("/api/thumbnail/generate", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 500: {"description": "Internal Server Error"}})
+@app.post("/api/thumbnail/generate", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 500: {"description": "Internal Server Error"}})
 async def thumbnail_generate(
     request: Request,
     session_id: Annotated[str, Form()],
@@ -7345,7 +7345,7 @@ class ThumbnailDescribeRequest(BaseModel):
     session_id: str
     title: str
 
-@app.post("/api/thumbnail/describe", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.post("/api/thumbnail/describe", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def thumbnail_describe(
     req: ThumbnailDescribeRequest,
     user_id: Annotated[str, Depends(get_user_id_header)],
@@ -7382,7 +7382,7 @@ async def thumbnail_describe(
         raise _generic_error("Thumbnail Describe Error", e)
 
 
-@app.post("/api/thumbnail/publish", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.post("/api/thumbnail/publish", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 def thumbnail_publish(
     background_tasks: BackgroundTasks,
     session_id: Annotated[str, Form()],
@@ -7451,7 +7451,7 @@ def thumbnail_publish(
     return {"publish_id": publish_id, "status": "uploading"}
 
 
-@app.get("/api/thumbnail/publish/status/{publish_id}", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.get("/api/thumbnail/publish/status/{publish_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 def thumbnail_publish_status(publish_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     """Poll the status of a background publish job."""
     job = publish_jobs.get(publish_id)
@@ -7500,7 +7500,7 @@ def _frontend_base_url(request: Request) -> str:
     return "http://localhost:5175"
 
 
-@app.post("/api/stripe/checkout-session", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+@app.post("/api/stripe/checkout-session", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def create_stripe_checkout_session(
     request: Request,
     payload: StripeCheckoutRequest,
@@ -7839,7 +7839,7 @@ async def _handle_subscription_renewal_invoice(invoice: "stripe.Invoice") -> dic
     return {"received": True}
 
 
-async def _handle_subscription_payment_failed(invoice: "stripe.Invoice") -> dict:
+def _handle_subscription_payment_failed(invoice: "stripe.Invoice") -> dict:
     """Notify the customer when Stripe's automatic monthly renewal charge
     fails (expired/declined card, insufficient funds, ...). Stripe keeps
     retrying the charge on its own schedule (Smart Retries) independently
@@ -7902,7 +7902,7 @@ async def stripe_webhook(request: Request):
         return await _handle_subscription_renewal_invoice(invoice)
 
     if event.type == "invoice.payment_failed":
-        return await _handle_subscription_payment_failed(event.data.object)
+        return _handle_subscription_payment_failed(event.data.object)
 
     if event.type != "checkout.session.completed":
         return {"received": True, "ignored": event.type}
@@ -7926,7 +7926,7 @@ async def list_abonnements():
     return {"plans": plans}
 
 
-@app.get("/api/souscription", responses={401: {"description": "Unauthorized"}})
+@app.get("/api/souscription", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
 async def get_current_souscription(
     request: Request,
     user_id: Annotated[str, Depends(get_user_id_header)],
@@ -7950,7 +7950,7 @@ async def get_current_souscription(
     return subscription
 
 
-@app.get("/api/souscription/history", responses={401: {"description": "Unauthorized"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/souscription/history", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
 async def get_souscription_history(
     request: Request,
     user_id: Annotated[str, Depends(get_user_id_header)],
@@ -8005,7 +8005,7 @@ async def _get_active_stripe_souscription(user_id: str) -> Dict[str, Any]:
     return subscription
 
 
-@app.post("/api/souscription/cancel", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+@app.post("/api/souscription/cancel", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def cancel_souscription(user_id: Annotated[str, Depends(get_user_id_header)]):
     """Stop the subscription from auto-renewing -- access continues until
     the current period's payment_end_date, matching Stripe's own
@@ -8027,7 +8027,7 @@ async def cancel_souscription(user_id: Annotated[str, Depends(get_user_id_header
     )
 
 
-@app.post("/api/souscription/reactivate", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+@app.post("/api/souscription/reactivate", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def reactivate_souscription(user_id: Annotated[str, Depends(get_user_id_header)]):
     """Undo a pending cancellation while the subscription is still within
     its current paid period -- the mirror of cancel_souscription."""
@@ -8048,7 +8048,7 @@ async def reactivate_souscription(user_id: Annotated[str, Depends(get_user_id_he
     )
 
 
-@app.post("/api/souscription/pause", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+@app.post("/api/souscription/pause", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def pause_souscription(user_id: Annotated[str, Depends(get_user_id_header)]):
     """Pause billing: Stripe still generates invoices on schedule but voids
     them immediately, so the customer is never charged while paused."""
@@ -8069,7 +8069,7 @@ async def pause_souscription(user_id: Annotated[str, Depends(get_user_id_header)
     )
 
 
-@app.post("/api/souscription/resume", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+@app.post("/api/souscription/resume", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def resume_souscription(user_id: Annotated[str, Depends(get_user_id_header)]):
     """Undo pause_souscription -- billing resumes on the next scheduled invoice."""
     _require_stripe_ready()
@@ -8091,7 +8091,7 @@ async def resume_souscription(user_id: Annotated[str, Depends(get_user_id_header
     )
 
 
-@app.post("/api/souscription/change-plan", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+@app.post("/api/souscription/change-plan", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def change_souscription_plan(
     payload: ChangeSubscriptionPlanRequest, user_id: Annotated[str, Depends(get_user_id_header)],
 ):
@@ -8175,7 +8175,7 @@ async def change_souscription_plan(
 # User credits & history
 # ---------------------------------------------------------------------------
 
-@app.get("/api/user/credits", responses={401: {"description": "Unauthorized"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/user/credits", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
 async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get_user_id_header)]):
     """Return the credit/storage balance for the authenticated user."""
     if not is_supabase_configured():
@@ -8236,7 +8236,7 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
     }
 
 
-@app.get("/api/user/history", responses={401: {"description": "Unauthorized"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/user/history", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
 async def get_user_history(
     request: Request,
     user_id: Annotated[str, Depends(get_user_id_header)],
@@ -8336,7 +8336,7 @@ async def buy_credits_checkout(
     }
 
 
-@app.get("/api/captions", responses={401: {"description": "Unauthorized"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/captions", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
 async def list_captions(
     user_id: Annotated[str, Depends(get_user_id_header)],
     page: Annotated[int, Query(ge=1)] = 1,
@@ -8356,7 +8356,7 @@ async def list_captions(
     }
 
 
-@app.get("/api/captions/{caption_id}/media-url", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.get("/api/captions/{caption_id}/media-url", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def caption_media_url(caption_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     row = await supabase_get_caption(caption_id, user_id)
     if not row:
@@ -8365,7 +8365,7 @@ async def caption_media_url(caption_id: str, user_id: Annotated[str, Depends(get
     return {"media_url": item.get("media_url")}
 
 
-@app.delete("/api/captions/{caption_id}", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.delete("/api/captions/{caption_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def delete_caption(caption_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     deleted = await supabase_soft_delete_caption(caption_id, user_id)
     if not deleted:
@@ -8840,7 +8840,7 @@ async def _finalize_anonymous_story_job(
     )
 
 
-@app.get("/api/anonymous-stories", responses={401: {"description": "Unauthorized"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/anonymous-stories", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
 async def list_anonymous_stories_endpoint(
     user_id: Annotated[str, Depends(get_user_id_header)],
     page: Annotated[int, Query(ge=1)] = 1,
@@ -8860,7 +8860,7 @@ async def list_anonymous_stories_endpoint(
     }
 
 
-@app.get("/api/anonymous-stories/backgrounds", responses={401: {"description": "Unauthorized"}})
+@app.get("/api/anonymous-stories/backgrounds", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
 async def list_anonymous_story_backgrounds(user_id: Annotated[str, Depends(get_user_id_header)]):
     items = [
         {"id": preset["id"], "name": preset["name"], "colors": preset["colors"], "text_color": preset["text_color"]}
@@ -8878,7 +8878,7 @@ async def list_anonymous_story_backgrounds(user_id: Annotated[str, Depends(get_u
 # gets swallowed by {story_id}="backgrounds" and 500s trying to look up a
 # story with that as its id (see production incident: postgrest rejects
 # "backgrounds" as an invalid uuid).
-@app.get("/api/anonymous-stories/{story_id}", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.get("/api/anonymous-stories/{story_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def get_anonymous_story_endpoint(story_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     row = await supabase_get_anonymous_story(story_id, user_id)
     if not row:
@@ -8886,7 +8886,7 @@ async def get_anonymous_story_endpoint(story_id: str, user_id: Annotated[str, De
     return _normalize_anonymous_story_row(row, include_content=True)
 
 
-@app.patch("/api/anonymous-stories/{story_id}", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.patch("/api/anonymous-stories/{story_id}", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def update_anonymous_story_endpoint(
     story_id: str, payload: AnonymousStoryUpdateRequest, user_id: Annotated[str, Depends(get_user_id_header)],
 ):
@@ -8919,7 +8919,7 @@ async def update_anonymous_story_endpoint(
     return _normalize_anonymous_story_row(updated, include_content=True)
 
 
-@app.delete("/api/anonymous-stories/{story_id}", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.delete("/api/anonymous-stories/{story_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def delete_anonymous_story_endpoint(story_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     row = await supabase_get_anonymous_story(story_id, user_id)
     if not row:
@@ -9017,7 +9017,7 @@ async def _finalize_regenerated_story(
     return updated
 
 
-@app.post("/api/anonymous-stories/{story_id}/regenerate", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 404: {"description": "Not Found"}, 429: {"description": "Too Many Requests"}})
+@app.post("/api/anonymous-stories/{story_id}/regenerate", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 429: {"description": "Too Many Requests"}})
 async def regenerate_anonymous_story_endpoint(story_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     if not ANONYMOUS_STORIES_ENABLED:
         raise HTTPException(status_code=404, detail=_ANONYMOUS_STORIES_DISABLED)
@@ -9143,7 +9143,7 @@ async def _dispatch_anonymous_story_publish(
     return results
 
 
-@app.post("/api/anonymous-stories/{story_id}/publish", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+@app.post("/api/anonymous-stories/{story_id}/publish", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def publish_anonymous_story_endpoint(
     story_id: str, payload: AnonymousStoryPublishRequest, user_id: Annotated[str, Depends(get_user_id_header)],
 ):
@@ -9274,7 +9274,7 @@ async def _publish_caption_now(user_id: str, platform_name: str, publish_priorit
         }
 
 
-@app.post("/api/captions/{caption_id}/share", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+@app.post("/api/captions/{caption_id}/share", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def share_caption(caption_id: str, payload: ReelShareRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
     await _assert_user_has_required_credits(user_id, 0.0)
 
@@ -9593,7 +9593,7 @@ async def _persist_film_summary_row(
     })
 
 
-@app.post("/api/film-summaries", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 404: {"description": "Not Found"}, 413: {"description": "Payload Too Large"}, 429: {"description": "Too Many Requests"}})
+@app.post("/api/film-summaries", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 413: {"description": "Payload Too Large"}, 429: {"description": "Too Many Requests"}})
 async def create_film_summary(
     request: Request,
     user_id: Annotated[str, Depends(get_user_id_header)],
@@ -10002,7 +10002,7 @@ async def _finalize_film_summary_analysis(
     )
 
 
-@app.get("/api/film-summaries", responses={401: {"description": "Unauthorized"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/film-summaries", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
 async def list_film_summaries_endpoint(
     user_id: Annotated[str, Depends(get_user_id_header)],
     page: Annotated[int, Query(ge=1)] = 1,
@@ -10022,7 +10022,7 @@ async def list_film_summaries_endpoint(
     }
 
 
-@app.get("/api/film-summaries/voice-previews/{voice_id}", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 502: {"description": "Bad Gateway"}})
+@app.get("/api/film-summaries/voice-previews/{voice_id}", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 502: {"description": "Bad Gateway"}})
 async def get_film_summary_voice_preview_endpoint(voice_id: str, _user_id: Annotated[str, Depends(get_user_id_header)]):
     """Returns a cached URL to a short demo line spoken by `voice_id`, so the
     create-form can let the user listen before choosing a narrator voice.
@@ -10049,7 +10049,7 @@ async def get_film_summary_voice_preview_endpoint(voice_id: str, _user_id: Annot
     return {"preview_url": f"/voice-previews/{resolved_voice}.mp3"}
 
 
-@app.get("/api/film-summaries/{film_summary_id}", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.get("/api/film-summaries/{film_summary_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def get_film_summary_endpoint(film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     row = await supabase_get_film_summary(film_summary_id, user_id)
     if not row:
@@ -10057,7 +10057,7 @@ async def get_film_summary_endpoint(film_summary_id: str, user_id: Annotated[str
     return _normalize_film_summary_row(row, include_content=True)
 
 
-@app.get("/api/film-summaries/{film_summary_id}/plan", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.get("/api/film-summaries/{film_summary_id}/plan", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def get_film_summary_plan_endpoint(film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     row = await supabase_get_film_summary(film_summary_id, user_id)
     if not row:
@@ -10069,7 +10069,7 @@ async def get_film_summary_plan_endpoint(film_summary_id: str, user_id: Annotate
     }
 
 
-@app.patch("/api/film-summaries/{film_summary_id}/plan", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
+@app.patch("/api/film-summaries/{film_summary_id}/plan", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
 async def update_film_summary_plan_endpoint(
     film_summary_id: str, payload: FilmSummaryPlanUpdateRequest, user_id: Annotated[str, Depends(get_user_id_header)],
 ):
@@ -10104,7 +10104,7 @@ async def update_film_summary_plan_endpoint(
     return _normalize_film_summary_row(updated, include_content=True)
 
 
-@app.post("/api/film-summaries/{film_summary_id}/validate", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.post("/api/film-summaries/{film_summary_id}/validate", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def validate_film_summary_plan_endpoint(film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     row = await supabase_get_film_summary(film_summary_id, user_id)
     if not row:
@@ -10126,7 +10126,7 @@ async def validate_film_summary_plan_endpoint(film_summary_id: str, user_id: Ann
     return validation_report
 
 
-@app.post("/api/film-summaries/{film_summary_id}/render", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
+@app.post("/api/film-summaries/{film_summary_id}/render", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
 async def render_film_summary_endpoint(
     film_summary_id: str, payload: FilmSummaryRenderRequest, user_id: Annotated[str, Depends(get_user_id_header)],
 ):
@@ -10384,7 +10384,7 @@ async def _finalize_film_summary_render(
     )
 
 
-@app.post("/api/film-summaries/{film_summary_id}/cancel", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
+@app.post("/api/film-summaries/{film_summary_id}/cancel", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
 async def cancel_film_summary_endpoint(film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     row = await supabase_get_film_summary(film_summary_id, user_id)
     if not row:
@@ -10415,7 +10415,7 @@ async def cancel_film_summary_endpoint(film_summary_id: str, user_id: Annotated[
     return {"cancelled": True}
 
 
-@app.post("/api/film-summaries/{film_summary_id}/retry", responses={401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
+@app.post("/api/film-summaries/{film_summary_id}/retry", responses={401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
 async def retry_film_summary_endpoint(film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     if not FILM_SUMMARY_ENABLED:
         raise HTTPException(status_code=404, detail=_FILM_SUMMARY_DISABLED)
@@ -10586,7 +10586,7 @@ async def _run_film_summary_retry_job(
             shutil.rmtree(output_dir, ignore_errors=True)
 
 
-@app.delete("/api/film-summaries/{film_summary_id}", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.delete("/api/film-summaries/{film_summary_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def delete_film_summary_endpoint(film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     row = await supabase_get_film_summary(film_summary_id, user_id)
     if not row:
@@ -10643,7 +10643,7 @@ async def _publish_film_summary_now(
         return {"success": False, "error": err_msg, "publish_job_id": publish_job_id}
 
 
-@app.post("/api/film-summaries/{film_summary_id}/share", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+@app.post("/api/film-summaries/{film_summary_id}/share", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def share_film_summary(film_summary_id: str, payload: ReelShareRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
     await _assert_user_has_required_credits(user_id, 0.0)
 
@@ -10698,7 +10698,7 @@ async def share_film_summary(film_summary_id: str, payload: ReelShareRequest, us
 # Projects Endpoints
 # --------------------------------------------------------------------------
 
-@app.get("/api/projects", responses={401: {"description": "Unauthorized"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/projects", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
 async def list_projects(
 	user_id: Annotated[str, Depends(get_user_id_header)],
 	page: Annotated[int, Query(ge=1)] = 1,
@@ -10726,7 +10726,7 @@ async def list_projects(
 	}
 
 
-@app.get("/api/projects/{project_id}", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/projects/{project_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
 async def get_project_endpoint(project_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
 	if not is_supabase_configured():
 		raise HTTPException(status_code=503, detail=_SUPABASE_PROJECTS_NOT_CONFIGURED)
@@ -10743,7 +10743,7 @@ class ProjectUpdateRequest(BaseModel):
 	description: Optional[str] = None
 
 
-@app.put("/api/projects/{project_id}", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+@app.put("/api/projects/{project_id}", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
 async def update_project_endpoint(
 	project_id: str,
 	payload: ProjectUpdateRequest,
@@ -10863,7 +10863,7 @@ async def _free_user_storage_after_project_deletion(user_id: str, total_storage_
         logger.warning(f"Failed to update user storage quota after project deletion: {str(e)}")
 
 
-@app.delete("/api/projects/{project_id}", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 500: {"description": "Internal Server Error"}, 503: {"description": "Service Unavailable"}})
+@app.delete("/api/projects/{project_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 500: {"description": "Internal Server Error"}, 503: {"description": "Service Unavailable"}})
 async def delete_project_endpoint(project_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     if not is_supabase_configured():
         raise HTTPException(status_code=503, detail=_SUPABASE_PROJECTS_NOT_CONFIGURED)
@@ -10891,7 +10891,7 @@ async def delete_project_endpoint(project_id: str, user_id: Annotated[str, Depen
     return {"deleted": True}
 
 
-@app.get("/api/projects/{project_id}/source-url", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 500: {"description": "Internal Server Error"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/projects/{project_id}/source-url", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 500: {"description": "Internal Server Error"}, 503: {"description": "Service Unavailable"}})
 async def get_project_source_url(project_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
 	if not is_supabase_configured():
 		raise HTTPException(status_code=503, detail=_SUPABASE_PROJECTS_NOT_CONFIGURED)
@@ -10914,7 +10914,7 @@ async def get_project_source_url(project_id: str, user_id: Annotated[str, Depend
 	return {"source_url": source_url}
 
 
-@app.get("/api/projects/{project_id}/job", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/projects/{project_id}/job", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
 async def get_project_job(project_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
   if not is_supabase_configured():
     raise HTTPException(status_code=503, detail=_SUPABASE_PROJECTS_NOT_CONFIGURED)
@@ -10940,7 +10940,7 @@ async def get_project_job(project_id: str, user_id: Annotated[str, Depends(get_u
   }
 
 
-@app.get("/api/projects/{project_id}/reels", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/projects/{project_id}/reels", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
 async def get_project_reels(project_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
 	"""Get all reels for a specific project."""
 	if not is_supabase_configured():
@@ -10959,7 +10959,7 @@ async def get_project_reels(project_id: str, user_id: Annotated[str, Depends(get
 	}
 
 
-@app.get("/api/projects/{project_id}/captions", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/projects/{project_id}/captions", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
 async def get_project_captions(project_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
 	"""Get all captions for a specific project."""
 	if not is_supabase_configured():
@@ -10978,7 +10978,7 @@ async def get_project_captions(project_id: str, user_id: Annotated[str, Depends(
 	}
 
 
-@app.get("/api/projects/{project_id}/anonymous-stories", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/projects/{project_id}/anonymous-stories", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
 async def get_project_anonymous_stories(project_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
 	"""Get the anonymous story generated for a specific project."""
 	if not is_supabase_configured():
@@ -10996,7 +10996,7 @@ async def get_project_anonymous_stories(project_id: str, user_id: Annotated[str,
 	}
 
 
-@app.get("/api/projects/{project_id}/film-summaries", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/projects/{project_id}/film-summaries", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
 async def get_project_film_summaries(project_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
 	"""Get the film summary generated for a specific project."""
 	if not is_supabase_configured():
@@ -11027,7 +11027,7 @@ async def list_reels(user_id: Annotated[str, Depends(get_user_id_header)], page:
     }
 
 
-@app.get("/api/reels/{reel_id}/media-url", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.get("/api/reels/{reel_id}/media-url", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def reel_media_url(reel_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     row = await supabase_get_reel(reel_id, user_id)
     if not row:
@@ -11036,7 +11036,7 @@ async def reel_media_url(reel_id: str, user_id: Annotated[str, Depends(get_user_
     return {"media_url": item.get("media_url")}
 
 
-@app.get("/api/reels/{reel_id}/thumbnail-url", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.get("/api/reels/{reel_id}/thumbnail-url", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def reel_thumbnail_url(reel_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     row = await supabase_get_reel(reel_id, user_id)
     if not row:
@@ -11045,7 +11045,7 @@ async def reel_thumbnail_url(reel_id: str, user_id: Annotated[str, Depends(get_u
     return {"thumbnail_url": item.get("reel_thumbnail_url")}
 
 
-@app.get("/api/reels/{reel_id}/preview-url", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.get("/api/reels/{reel_id}/preview-url", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def reel_preview_url(reel_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     row = await supabase_get_reel(reel_id, user_id)
     if not row:
@@ -11054,7 +11054,7 @@ async def reel_preview_url(reel_id: str, user_id: Annotated[str, Depends(get_use
     return {"preview_url": item.get("reel_preview_url")}
 
 
-@app.delete("/api/reels/{reel_id}", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.delete("/api/reels/{reel_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def delete_reel(reel_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     deleted = await supabase_soft_delete_reel(reel_id, user_id)
     if not deleted:
@@ -11096,7 +11096,7 @@ async def _publish_reel_now(user_id: str, platform_name: str, publish_priority: 
         }
 
 
-@app.post("/api/reels/{reel_id}/share", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+@app.post("/api/reels/{reel_id}/share", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def share_reel(reel_id: str, payload: ReelShareRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
     await _assert_user_has_required_credits(user_id, 0.0)
 
@@ -11596,7 +11596,7 @@ async def _update_publish_job_status(
     await client.table(SUPABASE_SOCIAL_PUBLISH_JOBS_TABLE).update(payload).eq("id", publish_job_id).execute()
 
 
-@app.get("/api/social/accounts", responses={401: {"description": "Unauthorized"}})
+@app.get("/api/social/accounts", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
 async def list_social_accounts(user_id: Annotated[str, Depends(get_user_id_header)]):
     client = await supabase_get_client()
     response = (
@@ -11617,7 +11617,7 @@ async def list_social_accounts(user_id: Annotated[str, Depends(get_user_id_heade
     return {"accounts": accounts}
 
 
-@app.delete("/api/social/accounts/{platform}", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
+@app.delete("/api/social/accounts/{platform}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def disconnect_social_account(platform: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     key = (platform or "").strip().lower()
     if key not in PLATFORM_CONFIG:
@@ -11681,7 +11681,7 @@ def _filter_publish_jobs_by_search(items: List[Dict[str, Any]], total: int, sear
     return filtered, len(filtered)
 
 
-@app.get("/api/social/publish-jobs", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 500: {"description": "Internal Server Error"}})
+@app.get("/api/social/publish-jobs", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 500: {"description": "Internal Server Error"}})
 async def list_publish_jobs(
     user_id: Annotated[str, Depends(get_user_id_header)],
     page: Annotated[int, Query(ge=1)] = 1,
@@ -11753,7 +11753,7 @@ async def list_publish_jobs(
         raise HTTPException(status_code=500, detail=f"Erreur serveur: {str(e)}")
 
 
-@app.delete("/api/social/publish-jobs/{publish_job_id}", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+@app.delete("/api/social/publish-jobs/{publish_job_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
 async def delete_publish_job(
     publish_job_id: str,
     user_id: Annotated[str, Depends(get_user_id_header)],
@@ -11824,7 +11824,7 @@ async def select_facebook_page(payload: SelectFacebookPageRequest):
     }
 
 
-@app.get("/api/auth/{platform}/connect", responses={401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/auth/{platform}/connect", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
 def connect(platform: str, request: Request, user_id: Annotated[str, Depends(get_user_id_header)]):
     # Security: `user_id` MUST come from the verified session (get_user_id_header),
     # never from an unauthenticated query parameter -- otherwise an attacker

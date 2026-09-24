@@ -3483,13 +3483,13 @@ def test_stripe_webhook_dispatches_payment_failed_invoice(monkeypatch):
     invoice = types.SimpleNamespace()
     fake_event = types.SimpleNamespace(type="invoice.payment_failed", data=types.SimpleNamespace(object=invoice))
     monkeypatch.setattr(app, "_verify_and_parse_event", lambda payload, signature: fake_event)
-    failed_mock = AsyncMock(return_value={"received": True})
+    failed_mock = MagicMock(return_value={"received": True})
     monkeypatch.setattr(app, "_handle_subscription_payment_failed", failed_mock)
 
     result = asyncio.run(app.stripe_webhook(_FakeWebhookRequest()))
 
     assert result == {"received": True}
-    failed_mock.assert_awaited_once_with(invoice)
+    failed_mock.assert_called_once_with(invoice)
 
 
 # ---------------------------------------------------------------------------
@@ -3564,7 +3564,7 @@ def test_handle_subscription_payment_failed_sends_email_with_retry_date(monkeypa
         subscription="sub_123", customer_email="user@example.com",
         amount_due=2999, next_payment_attempt=1700000000, hosted_invoice_url="https://billing.stripe.com/x",
     )
-    result = asyncio.run(app._handle_subscription_payment_failed(invoice))
+    result = app._handle_subscription_payment_failed(invoice)
 
     assert result == {"received": True}
     email_mock.assert_called_once()
@@ -3590,7 +3590,7 @@ def test_handle_subscription_payment_failed_no_retry_scheduled(monkeypatch):
         subscription="sub_123", customer_email="user@example.com",
         amount_due=2999, next_payment_attempt=None, hosted_invoice_url="https://billing.stripe.com/x",
     )
-    asyncio.run(app._handle_subscription_payment_failed(invoice))
+    app._handle_subscription_payment_failed(invoice)
 
     kwargs = email_mock.call_args.kwargs
     assert "Aucune nouvelle tentative" in kwargs["retry_message"]
@@ -3600,7 +3600,7 @@ def test_handle_subscription_payment_failed_ignores_invoice_without_subscription
     app = _import_app_with_stubs(monkeypatch)
     invoice = types.SimpleNamespace(subscription=None)
 
-    result = asyncio.run(app._handle_subscription_payment_failed(invoice))
+    result = app._handle_subscription_payment_failed(invoice)
 
     assert result == {"received": True, "ignored": "no_subscription_on_invoice"}
 
