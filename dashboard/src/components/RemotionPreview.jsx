@@ -73,6 +73,10 @@ const RemotionPreview = forwardRef(function RemotionPreview({
                 controls
                 autoPlay
                 loop
+                // Vireel qualifies for Remotion's free license (see
+                // https://remotion.dev/license) -- without this, <Player>
+                // logs a licensing notice to the console on every mount.
+                acknowledgeRemotionLicense
             />
         </div>
     );
