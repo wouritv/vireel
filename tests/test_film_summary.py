@@ -358,12 +358,23 @@ def test_validate_edit_plan_content_flags_bad_sequence_numbers():
 
 
 def test_validate_edit_plan_content_warns_on_repeated_clip():
+    # A clip reused across segments (same scene_id/start_ms/end_ms) is only
+    # a warning -- the planning prompt asks the model to avoid it, but the
+    # user must never be blocked from generating their video over it.
     plan = _built_plan(target_duration_ms=32000)
     plan["segments"][0]["clips"].append(dict(plan["segments"][0]["clips"][0]))
     report = fs.validate_edit_plan_content(
         plan, source_duration_ms=3600000, valid_scene_ids=["scene_001"], duration_tolerance_ratio=0.5,
     )
-    assert any("reutilise" in w for w in report["warnings"])
+    assert report["valid"] is True
+    # Names the exact repeated clip instead of a bare count, in case this
+    # is ever surfaced as corrective context the way the dialogue-overlap
+    # error already is.
+    assert any(
+        "utilises plus d'une fois" in w and "scene_001" in w and "1000-8000ms" in w
+        for w in report["warnings"]
+    )
+    assert report["errors"] == []
 
 
 # ---------------------------------------------------------------------------

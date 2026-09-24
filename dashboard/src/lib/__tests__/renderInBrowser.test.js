@@ -58,6 +58,7 @@ describe('renderInBrowser', () => {
         expect(params.inputProps.videoUrl).toBe('https://safe.example/video.mp4');
         expect(params.inputProps.subtitles).toEqual({ enabled: true });
         expect(params.signal).toBe(controller.signal);
+        expect(params.licenseKey).toBe('free-license');
 
         params.onProgress({ progress: 0.42 });
         expect(onProgress).toHaveBeenCalledWith(0.42);

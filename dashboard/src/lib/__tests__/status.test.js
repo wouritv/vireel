@@ -38,6 +38,26 @@ describe('statusLabel', () => {
     it('passes through unrecognized statuses', () => {
         expect(statusLabel('custom')).toBe('custom');
     });
+
+    // The project-list pages (Reels/Captions/AnonymousStories/FilmSummaries
+    // ProjectsPage) use this raw backend status set, distinct from the
+    // termine/en_cours/echec one used for individual reel/caption items --
+    // both need to resolve to a French label here.
+    it('returns "Terminé" for completed', () => {
+        expect(statusLabel('completed')).toBe('Terminé');
+    });
+
+    it('returns "En cours" for processing', () => {
+        expect(statusLabel('processing')).toBe('En cours');
+    });
+
+    it('returns "Échec" for failed', () => {
+        expect(statusLabel('failed')).toBe('Échec');
+    });
+
+    it('returns "Annulé" for cancelled', () => {
+        expect(statusLabel('cancelled')).toBe('Annulé');
+    });
 });
 
 describe('statusClass', () => {
@@ -55,6 +75,25 @@ describe('statusClass', () => {
 
     it('returns a neutral fallback class for unknown status', () => {
         const cls = statusClass('unknown');
+        expect(cls).not.toContain('green');
+        expect(cls).not.toContain('red');
+        expect(cls).not.toContain('blue');
+    });
+
+    it('returns green classes for completed', () => {
+        expect(statusClass('completed')).toContain('green');
+    });
+
+    it('returns blue classes for processing', () => {
+        expect(statusClass('processing')).toContain('blue');
+    });
+
+    it('returns red classes for failed', () => {
+        expect(statusClass('failed')).toContain('red');
+    });
+
+    it('returns a distinct neutral class for cancelled', () => {
+        const cls = statusClass('cancelled');
         expect(cls).not.toContain('green');
         expect(cls).not.toContain('red');
         expect(cls).not.toContain('blue');

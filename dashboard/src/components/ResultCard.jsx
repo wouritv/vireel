@@ -353,6 +353,66 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
     };
 
 
+    // Server-side fallback for handleCaptions: when the browser-side Remotion
+    // render (WebCodecs via renderInBrowser) fails -- e.g. CSP blocking
+    // remotion.pro, no WebCodecs support, an out-of-memory tab -- burn the
+    // captions with the legacy FFmpeg /api/subtitle endpoint instead of
+    // leaving the user with an error and no processed video at all. That
+    // endpoint re-derives the caption text from the job's stored transcript
+    // server-side, so it only needs the style, not captionLayer.captions.
+    const applyCaptionsViaServerFallback = async (captionLayer) => {
+        const style = captionLayer?.style || {};
+        const effectiveInputUrl = currentVideoUrl?.startsWith('blob:') ? originalVideoUrl : currentVideoUrl;
+
+        const res = await fetch(getApiUrl('/api/subtitle'), {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                ...getAuthHeaders(user?.id),
+            },
+            body: JSON.stringify({
+                job_id: jobId,
+                clip_index: clipIndexForApi,
+                input_filename: inputFilenameFromVideoUrl(currentVideoUrl),
+                input_url: effectiveInputUrl,
+                position_x: style.positionX,
+                position_y: style.positionY,
+                font_size: style.fontSize,
+                font_name: style.fontFamily,
+                font_color: style.fontColor,
+                highlight_color: style.highlightColor,
+                border_color: style.borderColor,
+                border_width: style.borderWidth,
+                text_shadow_color: style.textShadowColor,
+                shadow_blur: style.shadowBlur,
+                shadow_offset_x: style.shadowOffsetX,
+                shadow_offset_y: style.shadowOffsetY,
+                bg_color: style.bgColor,
+                bg_opacity: style.bgOpacity,
+                text_case: style.textCase,
+                bold: style.bold,
+                italic: style.italic,
+                words_per_line: style.wordsPerLine,
+                animation: style.animation,
+            }),
+        });
+
+        if (!res.ok) {
+            const errText = await res.text();
+            throw new Error(parseApiErrorText(errText));
+        }
+
+        const data = await res.json();
+        if (data?.new_video_url) {
+            if (currentVideoUrl?.startsWith('blob:')) {
+                URL.revokeObjectURL(currentVideoUrl);
+            }
+            setCurrentVideoUrl(getApiUrl(data.new_video_url));
+            if (videoRef.current) videoRef.current.load();
+        }
+        setShowCaptionsModal(false);
+    };
+
     const handleCaptions = async (options) => {
         if (!hasAnyEditingCredit) {
             setEditError(insufficientCreditsMessage());
@@ -383,13 +443,21 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
             const newLayers = { ...activeLayers, captions: captionLayer, subtitles: null };
             setActiveLayers(newLayers);
             setClipDuration(nextDurationSec);
-            const blobUrl = await renderInBrowser({
-                videoUrl: originalVideoUrl,
-                durationInSeconds: nextDurationSec,
-                subtitles: resolveTextLayer(newLayers),
-                hook: newLayers.hook,
-                effects: newLayers.effects,
-            });
+
+            let blobUrl;
+            try {
+                blobUrl = await renderInBrowser({
+                    videoUrl: originalVideoUrl,
+                    durationInSeconds: nextDurationSec,
+                    subtitles: resolveTextLayer(newLayers),
+                    hook: newLayers.hook,
+                    effects: newLayers.effects,
+                });
+            } catch (renderError) {
+                console.warn('Client-side captions render failed, falling back to server-side rendering:', renderError);
+                await applyCaptionsViaServerFallback(captionLayer);
+                return;
+            }
             setCurrentVideoUrl(blobUrl);
             if (videoRef.current) videoRef.current.load();
 

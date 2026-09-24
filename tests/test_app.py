@@ -183,6 +183,50 @@ def test_verify_supabase_jwt_accepts_valid_hs256_token(monkeypatch):
     assert app._verify_supabase_jwt(token) == "user-hs256"
 
 
+def test_verify_supabase_jwt_allows_any_email_when_demo_allowlist_unset(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    import jwt as pyjwt
+
+    assert app.DEMO_ALLOWED_EMAILS == set()
+    token = pyjwt.encode(
+        {"sub": "user-1", "email": "anyone@example.com", "aud": "authenticated", "exp": 9999999999},
+        "unit-test-supabase-jwt-secret",
+        algorithm="HS256",
+    )
+
+    assert app._verify_supabase_jwt(token) == "user-1"
+
+
+def test_verify_supabase_jwt_rejects_email_not_on_demo_allowlist(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "DEMO_ALLOWED_EMAILS", {"allowed@example.com"})
+    import jwt as pyjwt
+
+    token = pyjwt.encode(
+        {"sub": "user-1", "email": "someone-else@example.com", "aud": "authenticated", "exp": 9999999999},
+        "unit-test-supabase-jwt-secret",
+        algorithm="HS256",
+    )
+
+    with pytest.raises(app.HTTPException) as exc_info:
+        app._verify_supabase_jwt(token)
+    assert exc_info.value.status_code == 403
+
+
+def test_verify_supabase_jwt_accepts_email_on_demo_allowlist_case_insensitively(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "DEMO_ALLOWED_EMAILS", {"allowed@example.com"})
+    import jwt as pyjwt
+
+    token = pyjwt.encode(
+        {"sub": "user-1", "email": "Allowed@Example.com", "aud": "authenticated", "exp": 9999999999},
+        "unit-test-supabase-jwt-secret",
+        algorithm="HS256",
+    )
+
+    assert app._verify_supabase_jwt(token) == "user-1"
+
+
 def test_verify_supabase_jwt_rejects_bad_hs256_signature(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     import jwt as pyjwt
@@ -2856,7 +2900,11 @@ def test_scene_detection_timeout_fails_job_instead_of_hanging(monkeypatch):
     assert exc.value.code == app.film_summary.FilmSummaryErrorCode.SCENE_DETECTION_FAILED
 
 
-def test_finalize_film_summary_analysis_debits_source_storage(monkeypatch):
+def test_finalize_film_summary_analysis_never_debits_source_storage(monkeypatch):
+    # The source video is transient (deleted once the render finishes -- see
+    # test_finalize_film_summary_render_deletes_transient_source below), so
+    # it must never be counted against the user's persistent storage quota,
+    # regardless of how large size_bytes (used only for cost estimation) is.
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     app.supabase_update_film_summary = AsyncMock()
@@ -2872,7 +2920,7 @@ def test_finalize_film_summary_analysis_debits_source_storage(monkeypatch):
     ))
 
     debit_mock.assert_awaited_once()
-    assert debit_mock.await_args.kwargs["storage_delta"] == pytest.approx(-1.0)
+    assert "storage_delta" not in debit_mock.await_args.kwargs
 
 
 def test_finalize_film_summary_render_debits_output_storage(monkeypatch):
@@ -2894,6 +2942,131 @@ def test_finalize_film_summary_render_debits_output_storage(monkeypatch):
 
     debit_mock.assert_awaited_once()
     assert debit_mock.await_args.kwargs["storage_delta"] == pytest.approx(-0.5)
+
+
+def test_finalize_film_summary_render_deletes_transient_source(monkeypatch):
+    # Once a render succeeds, the source is never read again (/render
+    # requires awaiting_review, /retry requires failed -- neither is
+    # reachable from completed), so it's deleted and cleared from the row
+    # instead of sitting there billed or not against the user forever.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    update_mock = AsyncMock()
+    app.supabase_update_film_summary = update_mock
+    app.supabase_get_job_record = AsyncMock(return_value={"reserved_quota": 0.0})
+    app.supabase_update_project_status = AsyncMock()
+    app.supabase_update_project = AsyncMock()
+    app.reel_job_manager.complete_job = AsyncMock()
+    app.reel_job_manager.debit_credits_for_job = AsyncMock(return_value=True)
+    delete_mock = MagicMock(return_value=True)
+    app.delete_s3_object = delete_mock
+
+    asyncio.run(app._finalize_film_summary_render(
+        "job-1", "u1", "fs-1", "proj-1", {"segments": []},
+        "preview/key.mp4", "final/key.mp4", {"final_duration_seconds": 60.0}, 0.0,
+        source_s3_key="source/key.mp4", bucket_name="test-bucket",
+    ))
+
+    update_mock.assert_awaited_once()
+    assert update_mock.await_args.args[2]["source_s3_key"] is None
+    delete_mock.assert_called_once_with("test-bucket", "source/key.mp4")
+
+
+def test_finalize_film_summary_render_skips_source_deletion_without_key(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    app.supabase_update_film_summary = AsyncMock()
+    app.supabase_get_job_record = AsyncMock(return_value={"reserved_quota": 0.0})
+    app.supabase_update_project_status = AsyncMock()
+    app.supabase_update_project = AsyncMock()
+    app.reel_job_manager.complete_job = AsyncMock()
+    app.reel_job_manager.debit_credits_for_job = AsyncMock(return_value=True)
+    delete_mock = MagicMock()
+    app.delete_s3_object = delete_mock
+
+    asyncio.run(app._finalize_film_summary_render(
+        "job-1", "u1", "fs-1", "proj-1", {"segments": []},
+        "preview/key.mp4", "final/key.mp4", {"final_duration_seconds": 60.0}, 0.0,
+    ))
+
+    delete_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Storage debiting per service: reels and captions must debit for the video
+# they produce, anonymous stories must not (film summaries are covered by
+# the two tests directly above).
+# ---------------------------------------------------------------------------
+
+def test_finalize_completed_reel_billing_sums_and_debits_clip_storage(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    app.jobs["job-reel-1"] = {"logs": []}
+
+    consumption_mock = MagicMock(return_value={
+        "actual_credit": 2.0, "actual_storage_gb": 0.75, "actual_cost_usd": 0.1,
+        "processing_ratio": 1.0, "cost_breakdown": {},
+    })
+    monkeypatch.setattr(app, "_estimate_reel_job_consumption", consumption_mock)
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+    app.reel_job_manager.complete_job = AsyncMock()
+
+    # Each saved reel row carries its own clip's real file size --
+    # _finalize_completed_reel_billing must sum all of them before pricing
+    # the job's actual storage consumption.
+    saved_rows = [
+        {"reel_size_bytes": 300 * 1024 * 1024},
+        {"reel_size_bytes": 500 * 1024 * 1024},
+    ]
+    asyncio.run(app._finalize_completed_reel_billing(
+        job_id="job-reel-1", job_data={"reel_required_credits": 2.0}, user_id="u1", source_is_url=False,
+        start_ts=time.time(), enriched_clips=[{}, {}], cost_analysis={}, saved_rows=saved_rows,
+    ))
+
+    consumption_mock.assert_called_once()
+    assert consumption_mock.call_args.kwargs["storage_bytes"] == 800 * 1024 * 1024
+
+    debit_mock.assert_awaited_once()
+    assert debit_mock.await_args.kwargs["storage_delta"] == pytest.approx(-0.75)
+    assert debit_mock.await_args.kwargs["operation_type"] == "generation_reel"
+
+
+def test_save_caption_row_and_debit_debits_video_storage(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_insert_captions", AsyncMock(return_value=[{"id": "cap-1"}]))
+    monkeypatch.setattr(app, "_normalize_caption_row", lambda row: row)
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+
+    asyncio.run(app._save_caption_row_and_debit(
+        row_payload={"id": "row-1"}, job_id="job-cap-1", user_id="u1",
+        caption_required_credits=3.0, caption_storage_gb=0.25,
+    ))
+
+    debit_mock.assert_awaited_once()
+    assert debit_mock.await_args.kwargs["storage_delta"] == pytest.approx(-0.25)
+    assert debit_mock.await_args.kwargs["operation_type"] == "sous_titre"
+
+
+def test_settle_anonymous_story_row_never_debits_storage(monkeypatch):
+    # Anonymous stories deliberately carry no storage cost (spec: they
+    # don't produce a billable video the way reels/captions/film summaries
+    # do) -- this call must never pass storage_delta at all.
+    app = _import_app_with_stubs(monkeypatch)
+    app.supabase_update_anonymous_story = AsyncMock()
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+
+    asyncio.run(app._settle_anonymous_story_row(
+        job_id="job-story-1", user_id="u1", story_id="story-1", source_s3_key="key.mp4",
+        story_content={"full_text": "hello"}, cost_breakdown={"total_usd": 0.1}, final_credits=4.0,
+        story_required_credits=4.0, generated_title="Title", now_iso="2026-01-01T00:00:00+00:00",
+    ))
+
+    debit_mock.assert_awaited_once()
+    assert "storage_delta" not in debit_mock.await_args.kwargs
 
 
 def test_delete_film_summary_endpoint_frees_storage(monkeypatch):
@@ -3181,7 +3354,7 @@ def test_handle_subscription_renewal_invoice_credits_plan_and_persists_period(mo
     allocate_mock = AsyncMock()
     monkeypatch.setattr(app, "_allocate_plan_resources", allocate_mock)
     email_mock = MagicMock()
-    monkeypatch.setattr(app, "_send_payment_confirmation_email", email_mock)
+    monkeypatch.setattr(app, "_send_transactional_email", email_mock)
 
     period = types.SimpleNamespace(start=1700000000, end=1702592000)
     invoice = types.SimpleNamespace(
@@ -3299,6 +3472,137 @@ def test_stripe_webhook_dispatches_subscription_cycle_invoice_to_renewal_handler
 
     assert result == {"received": True}
     renewal_mock.assert_awaited_once_with(invoice)
+
+
+def test_stripe_webhook_dispatches_payment_failed_invoice(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "STRIPE_WEBHOOK_SECRET", "whsec_test")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "stripe", MagicMock())
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    invoice = types.SimpleNamespace()
+    fake_event = types.SimpleNamespace(type="invoice.payment_failed", data=types.SimpleNamespace(object=invoice))
+    monkeypatch.setattr(app, "_verify_and_parse_event", lambda payload, signature: fake_event)
+    failed_mock = MagicMock(return_value={"received": True})
+    monkeypatch.setattr(app, "_handle_subscription_payment_failed", failed_mock)
+
+    result = asyncio.run(app.stripe_webhook(_FakeWebhookRequest()))
+
+    assert result == {"received": True}
+    failed_mock.assert_called_once_with(invoice)
+
+
+# ---------------------------------------------------------------------------
+# Transactional emails: templated sends via Brevo, and the failed-renewal
+# notification (invoice.payment_failed).
+# ---------------------------------------------------------------------------
+
+def test_send_transactional_email_sends_rendered_template_via_brevo(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "BREVO_API_KEY", "test-key")
+    monkeypatch.setattr(app, "BREVO_FROM_EMAIL", "noreply@vireel.co")
+    fake_sib = MagicMock()
+    fake_api_instance = MagicMock()
+    fake_sib.TransactionalEmailsApi.return_value = fake_api_instance
+    monkeypatch.setattr(app, "sib_api_v3_sdk", fake_sib)
+
+    app._send_transactional_email("user@example.com", "credit_purchase", amount=9.99, credits=100)
+
+    fake_api_instance.send_transac_email.assert_called_once()
+    sent_kwargs = fake_sib.SendSmtpEmail.call_args.kwargs
+    assert sent_kwargs["to"] == [{"email": "user@example.com"}]
+    assert sent_kwargs["sender"] == {"email": "noreply@vireel.co"}
+    assert "100" in sent_kwargs["html_content"]
+
+
+def test_send_transactional_email_skips_without_recipient(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "BREVO_API_KEY", "test-key")
+    fake_sib = MagicMock()
+    monkeypatch.setattr(app, "sib_api_v3_sdk", fake_sib)
+
+    app._send_transactional_email("", "credit_purchase", amount=9.99, credits=100)
+
+    fake_sib.TransactionalEmailsApi.assert_not_called()
+
+
+def test_send_transactional_email_skips_without_api_key(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "BREVO_API_KEY", None)
+    fake_sib = MagicMock()
+    monkeypatch.setattr(app, "sib_api_v3_sdk", fake_sib)
+
+    app._send_transactional_email("user@example.com", "credit_purchase", amount=9.99, credits=100)
+
+    fake_sib.TransactionalEmailsApi.assert_not_called()
+
+
+def test_send_transactional_email_swallows_bad_template_context(monkeypatch):
+    # A missing placeholder (here: "credits") must never propagate out of
+    # this function -- it's called from webhook handlers where an
+    # exception would turn a successful payment into a failed webhook.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "BREVO_API_KEY", "test-key")
+    fake_sib = MagicMock()
+    monkeypatch.setattr(app, "sib_api_v3_sdk", fake_sib)
+
+    app._send_transactional_email("user@example.com", "credit_purchase", amount=9.99)
+
+    fake_sib.TransactionalEmailsApi.assert_not_called()
+
+
+def test_handle_subscription_payment_failed_sends_email_with_retry_date(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_subscription = types.SimpleNamespace(metadata=_FakeStripeMetadata({"userid": "u1", "plan_name": "Pro"}))
+    fake_stripe = MagicMock()
+    fake_stripe.Subscription.retrieve.return_value = fake_subscription
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    email_mock = MagicMock()
+    monkeypatch.setattr(app, "_send_transactional_email", email_mock)
+
+    invoice = types.SimpleNamespace(
+        subscription="sub_123", customer_email="user@example.com",
+        amount_due=2999, next_payment_attempt=1700000000, hosted_invoice_url="https://billing.stripe.com/x",
+    )
+    result = app._handle_subscription_payment_failed(invoice)
+
+    assert result == {"received": True}
+    email_mock.assert_called_once()
+    args, kwargs = email_mock.call_args
+    assert args[0] == "user@example.com"
+    assert args[1] == "payment_failed"
+    assert kwargs["plan_name"] == "Pro"
+    assert kwargs["amount"] == pytest.approx(29.99)
+    assert "aura lieu automatiquement" in kwargs["retry_message"]
+    assert kwargs["update_payment_url"] == "https://billing.stripe.com/x"
+
+
+def test_handle_subscription_payment_failed_no_retry_scheduled(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_subscription = types.SimpleNamespace(metadata=_FakeStripeMetadata({"plan_name": "Pro"}))
+    fake_stripe = MagicMock()
+    fake_stripe.Subscription.retrieve.return_value = fake_subscription
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    email_mock = MagicMock()
+    monkeypatch.setattr(app, "_send_transactional_email", email_mock)
+
+    invoice = types.SimpleNamespace(
+        subscription="sub_123", customer_email="user@example.com",
+        amount_due=2999, next_payment_attempt=None, hosted_invoice_url="https://billing.stripe.com/x",
+    )
+    app._handle_subscription_payment_failed(invoice)
+
+    kwargs = email_mock.call_args.kwargs
+    assert "Aucune nouvelle tentative" in kwargs["retry_message"]
+
+
+def test_handle_subscription_payment_failed_ignores_invoice_without_subscription(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    invoice = types.SimpleNamespace(subscription=None)
+
+    result = app._handle_subscription_payment_failed(invoice)
+
+    assert result == {"received": True, "ignored": "no_subscription_on_invoice"}
 
 
 # ---------------------------------------------------------------------------

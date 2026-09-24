@@ -53,6 +53,10 @@ export async function renderInBrowser({
         videoCodec: 'h264',
         videoBitrate: 'high',
         audioCodec: 'aac',
+        // Vireel qualifies for Remotion's free license (see
+        // https://remotion.dev/license) -- without this, renderMediaOnWeb
+        // logs a licensing warning on every render.
+        licenseKey: 'free-license',
         onProgress: onProgress
             ? ({ progress }) => onProgress(progress)
             : undefined,
