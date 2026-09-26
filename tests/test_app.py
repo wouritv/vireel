@@ -732,6 +732,50 @@ def test_run_caption_job_missing_input_fails_and_retries(monkeypatch):
     assert create_task_mock.call_count == 1
 
 
+def test_process_and_complete_caption_job_auto_captions_and_uploads_original(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    job_id = "caption-auto-1"
+    app.jobs[job_id] = {"logs": [], "result": None, "status": "processing"}
+    output_dir = str(tmp_path)
+    input_path = os.path.join(output_dir, "source.mp4")
+    Path(input_path).write_bytes(b"raw-source-bytes")
+
+    async def _fake_burn(input_path_, output_path, transcript, clip_start, clip_end, job_id_, clip_index):
+        Path(output_path).write_bytes(b"captioned-source-bytes-longer")
+        return True
+
+    monkeypatch.setattr(app, "_burn_default_captions_for_clip", _fake_burn)
+    monkeypatch.setattr(app, "_build_and_persist_caption_metadata", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app, "_generate_reel_thumbnail_from_video", lambda *args, **kwargs: "")
+    monkeypatch.setattr(app, "_caption_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}")
+    upload_calls = []
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda path, bucket, key: upload_calls.append(key) or True)
+    monkeypatch.setenv("AWS_S3_BUCKET", "test-bucket")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+    monkeypatch.setattr(app, "_normalize_caption_row", lambda row: row)
+    app.reel_job_manager.complete_job = AsyncMock()
+    monkeypatch.setattr(app, "_update_project_on_caption_completion", AsyncMock())
+    monkeypatch.setattr(app, "_persist_transcription_cache", AsyncMock())
+
+    class _Pipeline:
+        async def persisting(self):
+            return None
+
+        async def rendering(self):
+            return None
+
+    asyncio.run(app._process_and_complete_caption_job(
+        job_id, {}, "user-1", _Pipeline(), input_path, "source.mp4", 10.0,
+        {"segments": [{"words": [{"word": "hi", "start": 0, "end": 1}]}]},
+        0.0, output_dir,
+    ))
+
+    assert any(key.startswith("captions/user-1/caption-auto-1/original_") for key in upload_calls)
+    saved_row = app.jobs[job_id]["result"]["item"]
+    assert saved_row["generation_inputs"]["original_s3_key"]
+    assert saved_row["caption_duration"] == 10
+
+
 def test_run_caption_job_insufficient_balance_marks_failed(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     job_id = "caption-insufficient"
@@ -3030,6 +3074,219 @@ def test_finalize_completed_reel_billing_sums_and_debits_clip_storage(monkeypatc
     debit_mock.assert_awaited_once()
     assert debit_mock.await_args.kwargs["storage_delta"] == pytest.approx(-0.75)
     assert debit_mock.await_args.kwargs["operation_type"] == "generation_reel"
+
+
+def test_finalize_completed_reel_billing_debits_auto_caption_credits(monkeypatch):
+    # Auto-captioned clips (default subtitles burned in at generation time)
+    # carry their own credit cost, additive to the reel generation charge
+    # and billed under "sous_titre" -- the same category the manual
+    # captions-persist flow already uses.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    app.jobs["job-reel-2"] = {"logs": []}
+
+    monkeypatch.setattr(app, "_estimate_reel_job_consumption", lambda **kwargs: {
+        "actual_credit": 2.0, "actual_storage_gb": 0.5, "actual_cost_usd": 0.1,
+        "processing_ratio": 1.0, "cost_breakdown": {},
+    })
+    app.reel_job_manager.debit_credits_for_job = AsyncMock(return_value=True)
+    app.reel_job_manager.complete_job = AsyncMock()
+    deduct_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_deduct_user_credits", deduct_mock)
+    history_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", history_mock)
+
+    saved_rows = [
+        {"reel_size_bytes": 100, "billing_details": {"auto_caption": {"applied": True, "credit_cost": 1.5}}},
+        {"reel_size_bytes": 100, "billing_details": {"auto_caption": {"applied": False, "credit_cost": 0.0}}},
+    ]
+    asyncio.run(app._finalize_completed_reel_billing(
+        job_id="job-reel-2", job_data={"reel_required_credits": 2.0}, user_id="u1", source_is_url=False,
+        start_ts=time.time(), enriched_clips=[{}, {}], cost_analysis={}, saved_rows=saved_rows,
+    ))
+
+    deduct_mock.assert_awaited_once_with("u1", pytest.approx(1.5), 0.0)
+    history_mock.assert_awaited_once()
+    assert history_mock.await_args.kwargs["operation_type"] == "sous_titre"
+    assert history_mock.await_args.kwargs["credit"] == pytest.approx(1.5)
+
+
+def test_finalize_completed_reel_billing_skips_auto_caption_debit_when_none_applied(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    app.jobs["job-reel-3"] = {"logs": []}
+
+    monkeypatch.setattr(app, "_estimate_reel_job_consumption", lambda **kwargs: {
+        "actual_credit": 2.0, "actual_storage_gb": 0.5, "actual_cost_usd": 0.1,
+        "processing_ratio": 1.0, "cost_breakdown": {},
+    })
+    app.reel_job_manager.debit_credits_for_job = AsyncMock(return_value=True)
+    app.reel_job_manager.complete_job = AsyncMock()
+    deduct_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_deduct_user_credits", deduct_mock)
+
+    saved_rows = [{"reel_size_bytes": 100}]
+    asyncio.run(app._finalize_completed_reel_billing(
+        job_id="job-reel-3", job_data={"reel_required_credits": 2.0}, user_id="u1", source_is_url=False,
+        start_ts=time.time(), enriched_clips=[{}], cost_analysis={}, saved_rows=saved_rows,
+    ))
+
+    deduct_mock.assert_not_awaited()
+
+
+def test_burn_default_captions_for_clip_returns_false_without_transcript(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    result = asyncio.run(app._burn_default_captions_for_clip(
+        "/tmp/in.mp4", "/tmp/out.mp4", None, 0.0, 10.0, "job-1", 0,
+    ))
+    assert result is False
+
+
+def test_burn_default_captions_for_clip_returns_false_when_no_words_in_range(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "generate_srt", lambda *args, **kwargs: False)
+    burn_mock = MagicMock()
+    monkeypatch.setattr(app, "_burn_subtitles_for_request", burn_mock)
+
+    result = asyncio.run(app._burn_default_captions_for_clip(
+        "/tmp/in.mp4", "/tmp/out.mp4", {"segments": []}, 0.0, 10.0, "job-1", 0,
+    ))
+
+    assert result is False
+    burn_mock.assert_not_called()
+
+
+def test_burn_default_captions_for_clip_burns_and_returns_true(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "generate_srt", lambda *args, **kwargs: True)
+    burn_mock = MagicMock()
+    monkeypatch.setattr(app, "_burn_subtitles_for_request", burn_mock)
+    monkeypatch.setattr(app.os.path, "exists", lambda p: True)
+    monkeypatch.setattr(app.os.path, "getsize", lambda p: 4096)
+    monkeypatch.setattr(app.os, "remove", lambda p: None)
+
+    result = asyncio.run(app._burn_default_captions_for_clip(
+        "/tmp/in.mp4", "/tmp/out.mp4", {"segments": [{"words": [{"word": "hi", "start": 0, "end": 1}]}]},
+        0.0, 10.0, "job-1", 2,
+    ))
+
+    assert result is True
+    burn_mock.assert_called_once()
+    burn_req = burn_mock.call_args.args[0]
+    assert burn_req.job_id == "job-1"
+    assert burn_req.clip_index == 2
+    assert burn_req.font_size == 52
+    assert burn_req.animation == "word-highlight"
+
+
+def test_burn_default_captions_for_clip_returns_false_on_exception(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("ffmpeg exploded")
+
+    monkeypatch.setattr(app, "generate_srt", lambda *args, **kwargs: True)
+    monkeypatch.setattr(app, "_burn_subtitles_for_request", _boom)
+    monkeypatch.setattr(app.os.path, "exists", lambda p: False)
+    monkeypatch.setattr(app.os, "remove", lambda p: None)
+
+    result = asyncio.run(app._burn_default_captions_for_clip(
+        "/tmp/in.mp4", "/tmp/out.mp4", {"segments": [{"words": [{"word": "hi", "start": 0, "end": 1}]}]},
+        0.0, 10.0, "job-1", 0,
+    ))
+
+    assert result is False
+
+
+def test_normalize_reel_row_exposes_original_url_from_billing_details(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_reel_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}")
+    monkeypatch.setattr(app, "_extract_s3_key_from_thumbnail_ref", lambda ref: "")
+    monkeypatch.setattr(app, "_reel_thumbnail_url_from_s3_key", lambda key: "")
+
+    row = {
+        "reel_s3_key": "reels/u1/job1/reel.mp4",
+        "billing_details": {"original_s3_key": "reels/u1/job1/original_reel.mp4"},
+    }
+    result = app._normalize_reel_row(row)
+
+    assert result["reel_original_url"] == "https://cdn.example/reels/u1/job1/original_reel.mp4"
+
+
+def test_normalize_reel_row_falls_back_to_media_url_without_original(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_reel_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}" if key else "")
+    monkeypatch.setattr(app, "_extract_s3_key_from_thumbnail_ref", lambda ref: "")
+    monkeypatch.setattr(app, "_reel_thumbnail_url_from_s3_key", lambda key: "")
+
+    row = {"reel_s3_key": "reels/u1/job1/reel.mp4", "billing_details": {}}
+    result = app._normalize_reel_row(row)
+
+    assert result["reel_original_url"] == result["media_url"]
+
+
+def test_normalize_caption_row_exposes_original_url_from_generation_inputs(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_caption_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}")
+
+    row = {
+        "caption_s3_key": "captions/u1/job1/cap.mp4",
+        "generation_inputs": {"original_s3_key": "captions/u1/job1/original_cap.mp4"},
+    }
+    result = app._normalize_caption_row(row)
+
+    assert result["caption_original_url"] == "https://cdn.example/captions/u1/job1/original_cap.mp4"
+
+
+def test_build_reel_row_for_clip_auto_captions_and_uploads_original(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    output_dir = str(tmp_path)
+    clip_path = os.path.join(output_dir, "base_clip_1.mp4")
+    Path(clip_path).write_bytes(b"raw-clip-bytes")
+
+    async def _fake_burn(input_path, output_path, transcript, clip_start, clip_end, job_id, clip_index):
+        Path(output_path).write_bytes(b"captioned-bytes-longer")
+        return True
+
+    monkeypatch.setattr(app, "_burn_default_captions_for_clip", _fake_burn)
+    upload_calls = []
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda path, bucket, key: upload_calls.append(key) or True)
+    monkeypatch.setattr(app, "_reel_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}")
+    monkeypatch.setattr(app, "_upload_reel_clip_thumbnail", lambda *args, **kwargs: "")
+    monkeypatch.setattr(app, "_estimate_reel_cost_breakdown", lambda **kwargs: {})
+
+    row = asyncio.run(app._build_reel_row_for_clip(
+        "job-1", "user-1", output_dir, "bucket", "base", {"start": 0.0, "end": 10.0}, 1,
+        "2024-01-01T00:00:00Z", False, None, transcript={"segments": [{"words": []}]},
+    ))
+
+    assert row is not None
+    assert any(key.startswith("reels/user-1/job-1/original_") for key in upload_calls)
+    assert row["billing_details"]["auto_caption"]["applied"] is True
+    assert row["billing_details"]["auto_caption"]["credit_cost"] > 0
+    assert row["reel_size_bytes"] == len(b"captioned-bytes-longer")
+
+
+def test_build_reel_row_for_clip_skips_captioning_without_transcript(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    output_dir = str(tmp_path)
+    clip_path = os.path.join(output_dir, "base_clip_1.mp4")
+    Path(clip_path).write_bytes(b"raw-clip-bytes")
+
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda path, bucket, key: True)
+    monkeypatch.setattr(app, "_reel_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}")
+    monkeypatch.setattr(app, "_upload_reel_clip_thumbnail", lambda *args, **kwargs: "")
+    monkeypatch.setattr(app, "_estimate_reel_cost_breakdown", lambda **kwargs: {})
+
+    row = asyncio.run(app._build_reel_row_for_clip(
+        "job-1", "user-1", output_dir, "bucket", "base", {"start": 0.0, "end": 10.0}, 1,
+        "2024-01-01T00:00:00Z", False, None, transcript=None,
+    ))
+
+    assert row is not None
+    assert row["billing_details"]["auto_caption"]["applied"] is False
+    assert row["billing_details"]["original_s3_key"] == ""
+    assert row["reel_size_bytes"] == len(b"raw-clip-bytes")
 
 
 def test_save_caption_row_and_debit_debits_video_storage(monkeypatch):

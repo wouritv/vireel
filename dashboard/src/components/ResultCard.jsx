@@ -58,6 +58,19 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
     const videoRef = React.useRef(null);
     const originalVideoUrl = rawVideoUrl ? getApiUrl(rawVideoUrl) : '';
     const [currentVideoUrl, setCurrentVideoUrl] = useState(originalVideoUrl);
+    // Backend clips generated after the "default captions" feature are
+    // captioned by default (see _burn_default_captions_for_clip in app.py):
+    // reel_playback_url/caption_playback_url already show burned-in
+    // captions. reel_original_url/caption_original_url point at the clean,
+    // pre-caption source (falling back to the same playback URL when no
+    // separate original exists, e.g. older clips or ones with no speech to
+    // caption) -- handleCaptions renders from this clean source so a manual
+    // restyle replaces the default captions instead of stacking a second
+    // caption layer on top of them.
+    const rawCaptionSourceUrl = typeof (safeClip.reel_original_url || safeClip.caption_original_url) === 'string'
+        ? (safeClip.reel_original_url || safeClip.caption_original_url)
+        : '';
+    const captionSourceVideoUrl = rawCaptionSourceUrl ? getApiUrl(rawCaptionSourceUrl) : originalVideoUrl;
 
     const [platforms, setPlatforms] = useState({
         tiktok: defaultPlatforms.includes('tiktok'),
@@ -362,7 +375,10 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
     // server-side, so it only needs the style, not captionLayer.captions.
     const applyCaptionsViaServerFallback = async (captionLayer) => {
         const style = captionLayer?.style || {};
-        const effectiveInputUrl = currentVideoUrl?.startsWith('blob:') ? originalVideoUrl : currentVideoUrl;
+        // Burn onto the clean pre-caption source, not whatever's currently
+        // displayed -- otherwise FFmpeg would burn these new captions right
+        // on top of the default ones already baked into currentVideoUrl.
+        const effectiveInputUrl = captionSourceVideoUrl;
 
         const res = await fetch(getApiUrl('/api/subtitle'), {
             method: 'POST',
@@ -373,7 +389,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
             body: JSON.stringify({
                 job_id: jobId,
                 clip_index: clipIndexForApi,
-                input_filename: inputFilenameFromVideoUrl(currentVideoUrl),
+                input_filename: inputFilenameFromVideoUrl(captionSourceVideoUrl),
                 input_url: effectiveInputUrl,
                 position_x: style.positionX,
                 position_y: style.positionY,
@@ -447,7 +463,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
             let blobUrl;
             try {
                 blobUrl = await renderInBrowser({
-                    videoUrl: originalVideoUrl,
+                    videoUrl: captionSourceVideoUrl,
                     durationInSeconds: nextDurationSec,
                     subtitles: resolveTextLayer(newLayers),
                     hook: newLayers.hook,

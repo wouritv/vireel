@@ -1367,6 +1367,11 @@ def _normalize_caption_row(row: Dict[str, Any]) -> Dict[str, Any]:
     thumbnail_url = _caption_media_url_from_s3_key(thumbnail_ref) if thumbnail_ref.startswith(_CAPTIONS_PREFIX) else thumbnail_ref
     preview_url = thumbnail_url or media_url
 
+    # See _normalize_reel_row's reel_original_url -- same idea, for the
+    # dedicated captions job's own default caption burn-in.
+    original_s3_key = str((row.get("generation_inputs") or {}).get("original_s3_key") or "")
+    original_media_url = _caption_media_url_from_s3_key(original_s3_key) if original_s3_key else ""
+
     return {
         **row,
         "caption_url": media_url or row.get("caption_url") or "",
@@ -1375,6 +1380,7 @@ def _normalize_caption_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "caption_playback_url": media_url,
         "caption_download_url": media_url,
         "caption_preview_url": preview_url,
+        "caption_original_url": original_media_url or media_url,
         "media_url": media_url,
     }
 
@@ -1926,6 +1932,15 @@ def _normalize_reel_row(row: Dict[str, Any]) -> Dict[str, Any]:
     thumbnail_url = _reel_thumbnail_url_from_s3_key(thumbnail_s3_key) or thumbnail_ref or ""
     preview_url = thumbnail_url or media_url
 
+    # When the reel was auto-captioned at generation time (see
+    # _burn_default_captions_for_clip), reel_url/media_url point at the
+    # captioned video -- reel_original_url is the pre-caption clip, kept so
+    # the dashboard can render manual edits (Sous-titres/Hook/Auto-edit) from
+    # a clean source instead of stacking a second caption layer on top of
+    # the default one.
+    original_s3_key = str((row.get("billing_details") or {}).get("original_s3_key") or "")
+    original_media_url = _reel_media_url_from_s3_key(original_s3_key) if original_s3_key else ""
+
     return {
         **row,
         "reel_url": media_url or row.get("reel_url") or "",
@@ -1933,6 +1948,7 @@ def _normalize_reel_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "reel_preview_url": preview_url,
         "reel_playback_url": media_url,
         "reel_download_url": media_url,
+        "reel_original_url": original_media_url or media_url,
         "media_url": media_url,
     }
 
@@ -1974,7 +1990,62 @@ def _compute_clip_duration_seconds(clip: Dict[str, Any]) -> int:
         return 0
 
 
-def _build_reel_row_for_clip(
+# Matches CaptionsModal.jsx's own DEFAULT_STYLE (dashboard/src/components/
+# CaptionsModal.jsx) so a clip's default captions -- burned in automatically,
+# server-side, before the user ever opens the editor -- look identical to
+# what they'd get by opening "Sous-titres" and accepting the defaults.
+_DEFAULT_AUTO_CAPTION_STYLE_KWARGS: Dict[str, Any] = dict(
+    position="bottom", position_x=50.0, position_y=82.0,
+    font_size=52, font_name="Arial", font_color="#FFFFFF",
+    highlight_color="#FFDD00", border_color="#000000", border_width=3,
+    text_shadow_color="#000000", shadow_blur=8, shadow_offset_x=0, shadow_offset_y=2,
+    bg_color="#000000", bg_opacity=0.0, text_case="none", bold=True, italic=False,
+    words_per_line=4, animation="word-highlight",
+)
+
+
+async def _burn_default_captions_for_clip(
+    input_path: str, output_path: str, transcript: Optional[Dict[str, Any]],
+    clip_start: float, clip_end: float, job_id: str, clip_index: int,
+) -> bool:
+    """Burn default subtitles into a freshly produced clip so reels/captions
+    come out captioned without the user opening the manual editor first.
+
+    Reuses the same FFmpeg burn-in as the manual /api/subtitle endpoint
+    (_burn_subtitles_for_request) and the same default style as
+    CaptionsModal's own DEFAULT_STYLE, so a later manual restyle can be
+    pointed at the untouched original (kept alongside, never overwritten)
+    instead of stacking a second caption layer on top of this one.
+
+    Returns False (leaving the source clip untouched) when there's no
+    transcript or no words fall inside this clip's time range -- a silent
+    clip has nothing to caption.
+    """
+    if not transcript:
+        return False
+    srt_path = f"{output_path}.srt"
+    try:
+        has_words = generate_srt(
+            transcript, clip_start, clip_end, srt_path,
+            max_words_per_line=_DEFAULT_AUTO_CAPTION_STYLE_KWARGS["words_per_line"],
+        )
+        if not has_words:
+            return False
+        req = SubtitleRequest(job_id=job_id, clip_index=clip_index, **_DEFAULT_AUTO_CAPTION_STYLE_KWARGS)
+        await asyncio.to_thread(_burn_subtitles_for_request, req, input_path, srt_path, output_path)
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except Exception as exc:
+        logger.warning("Default caption burn failed for job %s clip %s: %s", job_id, clip_index, exc)
+        return False
+    finally:
+        try:
+            if os.path.exists(srt_path):
+                os.remove(srt_path)
+        except Exception:
+            pass
+
+
+async def _build_reel_row_for_clip(
     job_id: str,
     user_id: str,
     output_dir: str,
@@ -1985,20 +2056,52 @@ def _build_reel_row_for_clip(
     now_iso: str,
     uses_youtube_source: bool,
     project_id: Optional[str],
+    transcript: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     clip_filename = f"{base_name}_clip_{i}.mp4"
     clip_path = os.path.join(output_dir, clip_filename)
     if not os.path.exists(clip_path):
         return None
 
+    clip_index = i - 1
+    captioned_path = os.path.join(output_dir, f"{base_name}_clip_{i}_captioned.mp4")
+    auto_captioned = await _burn_default_captions_for_clip(
+        clip_path, captioned_path, transcript,
+        float(clip.get("start", 0) or 0), float(clip.get("end", 0) or 0),
+        job_id, clip_index,
+    )
+    primary_path = captioned_path if auto_captioned else clip_path
+
     s3_key = f"reels/{user_id}/{job_id}/{clip_filename}"
-    uploaded = upload_file_to_s3(clip_path, bucket, s3_key)
+    uploaded = upload_file_to_s3(primary_path, bucket, s3_key)
     if not uploaded:
         raise RuntimeError(f"Failed to upload clip to S3: {clip_filename}")
-    clip_size_bytes = int(os.path.getsize(clip_path) or 0)
+    clip_size_bytes = int(os.path.getsize(primary_path) or 0)
+
+    original_s3_key = ""
+    caption_credit_cost = 0.0
+    auto_caption_cost_breakdown: Dict[str, Any] = {}
+    if auto_captioned:
+        original_s3_key = f"reels/{user_id}/{job_id}/original_{clip_filename}"
+        if not upload_file_to_s3(clip_path, bucket, original_s3_key):
+            # Best-effort: the reel itself is already captioned and uploaded
+            # above -- losing the pre-caption original only means a later
+            # manual restyle rebuilds from the captioned version instead.
+            original_s3_key = ""
+        clip_duration_for_caption_cost = _compute_clip_duration_seconds(clip)
+        auto_caption_cost_breakdown = _estimate_caption_cost_breakdown(
+            duration_seconds=float(clip_duration_for_caption_cost or 0),
+            size_bytes=float(clip_size_bytes),
+            uses_assembly=False, uses_openai=False, uses_gemini=False,
+        )
+        caption_credit_cost = _estimate_caption_required_credits(
+            duration_seconds=float(clip_duration_for_caption_cost or 0),
+            size_bytes=float(clip_size_bytes),
+            uses_assembly=False, uses_openai=False, uses_gemini=False,
+        )
 
     media_url = _reel_media_url_from_s3_key(s3_key)
-    thumbnail_s3_key = _upload_reel_clip_thumbnail(clip, clip_path, output_dir, job_id, i - 1, user_id, bucket)
+    thumbnail_s3_key = _upload_reel_clip_thumbnail(clip, primary_path, output_dir, job_id, clip_index, user_id, bucket)
 
     duration = _compute_clip_duration_seconds(clip)
     reel_cost_breakdown = _estimate_reel_cost_breakdown(
@@ -2020,12 +2123,20 @@ def _build_reel_row_for_clip(
         "reel_size_bytes": clip_size_bytes,
         "reel_s3_key": s3_key,
         "reel_job_id": job_id,
-        "reel_clip_index": i - 1,
+        "reel_clip_index": clip_index,
         "billing_details": _build_billing_details(
             "generation_reel",
             reel_cost_breakdown,
             actual_storage_gb=_bytes_to_gb(clip_size_bytes),
-            extra={"clip_index": i - 1},
+            extra={
+                "clip_index": clip_index,
+                "original_s3_key": original_s3_key,
+                "auto_caption": {
+                    "applied": auto_captioned,
+                    "credit_cost": caption_credit_cost,
+                    "cost_breakdown": auto_caption_cost_breakdown,
+                },
+            },
         ),
         "total_cost_usd": 0,
     }
@@ -2044,6 +2155,7 @@ async def _persist_reels_for_job(
     clips: List[Dict[str, Any]],
     uses_youtube_source: bool = False,
     project_id: Optional[str] = None,
+    transcript: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     if not user_id:
         raise RuntimeError("Missing app user id for reel persistence")
@@ -2059,8 +2171,8 @@ async def _persist_reels_for_job(
     rows: List[Dict[str, Any]] = []
 
     for i, clip in enumerate(clips, start=1):
-        reel_row = _build_reel_row_for_clip(
-            job_id, user_id, output_dir, bucket, base_name, clip, i, now_iso, uses_youtube_source, project_id,
+        reel_row = await _build_reel_row_for_clip(
+            job_id, user_id, output_dir, bucket, base_name, clip, i, now_iso, uses_youtube_source, project_id, transcript,
         )
         if reel_row:
             rows.append(reel_row)
@@ -2483,6 +2595,7 @@ def _find_completed_job_metadata_path(job_id: str, output_dir: str) -> Optional[
 async def _persist_completed_reel_job_or_fail(
     job_id: str, job_data: Dict[str, Any], output_dir: str, user_id: Optional[str],
     source_is_url: bool, target_json: str, clips: List[Dict[str, Any]], start_ts: float,
+    transcript: Optional[Dict[str, Any]] = None,
 ):
     try:
         project_id = job_data.get("project_id") if job_data else None
@@ -2494,6 +2607,7 @@ async def _persist_completed_reel_job_or_fail(
             clips=clips,
             uses_youtube_source=source_is_url,
             project_id=project_id,
+            transcript=transcript,
         )
     except Exception as persist_error:
         jobs[job_id]['status'] = 'failed'
@@ -2563,6 +2677,32 @@ async def _finalize_completed_reel_billing(
         except Exception as billing_error:
             logger.exception("Billing update failed")
             jobs[job_id]['logs'].append(f"Billing update failed: {billing_error}")
+
+    # Auto-captioned clips (see _burn_default_captions_for_clip) carry their
+    # own credit cost per clip, billed the same way the manual captions
+    # persist flow already bills captioning (_debit_caption_persist_credits)
+    # -- additive to the reel generation charge above, never folded into it,
+    # since its storage side is already counted in total_reel_size_bytes
+    # (reel_size_bytes is the post-burn, captioned file size).
+    auto_caption_credit_total = sum(
+        float(((row.get("billing_details") or {}).get("auto_caption") or {}).get("credit_cost") or 0.0)
+        for row in saved_rows
+    )
+    if is_supabase_configured() and user_id and auto_caption_credit_total > 0:
+        try:
+            caption_debited = await supabase_deduct_user_credits(user_id, auto_caption_credit_total, 0.0)
+            if caption_debited:
+                await supabase_insert_user_data_history(
+                    user_id=user_id,
+                    credit=auto_caption_credit_total,
+                    storage=0.0,
+                    operation="output",
+                    operation_type="sous_titre",
+                    operation_id=f"{job_id}:auto_captions",
+                )
+        except Exception as caption_billing_error:
+            logger.exception("Auto-caption billing update failed for job %s", job_id)
+            jobs[job_id]['logs'].append(f"Auto-caption billing update failed: {caption_billing_error}")
 
     result_payload = {
         'clips': enriched_clips,
@@ -2656,6 +2796,7 @@ async def _handle_completed_reel_job_with_metadata(
     await pipeline.uploading_reels(len(clips))
     saved_rows = await _persist_completed_reel_job_or_fail(
         job_id, job_data, output_dir, user_id, source_is_url, target_json, clips, start_ts,
+        transcript=data.get("transcript"),
     )
     if saved_rows is None:
         return
@@ -2837,11 +2978,23 @@ def _build_and_persist_caption_metadata(job_id: str, output_dir: str, source_nam
     _persist_metadata_json(metadata_path, metadata)
 
 
-def _upload_caption_source_and_thumbnail(input_path: str, user_id: Optional[str], job_id: str, bucket: str, local_video_ref: str):
+def _upload_caption_source_and_thumbnail(
+    input_path: str, user_id: Optional[str], job_id: str, bucket: str, local_video_ref: str,
+    original_path: Optional[str] = None,
+):
     caption_s3_key = f"captions/{user_id}/{job_id}/{os.path.basename(input_path)}"
     if not upload_file_to_s3(input_path, bucket, caption_s3_key):
         raise RuntimeError("Failed to upload caption source video to S3")
     media_url = _caption_media_url_from_s3_key(caption_s3_key) or local_video_ref
+
+    original_s3_key = ""
+    if original_path and os.path.exists(original_path):
+        original_s3_key = f"captions/{user_id}/{job_id}/original_{os.path.basename(original_path)}"
+        if not upload_file_to_s3(original_path, bucket, original_s3_key):
+            # Best-effort: the job's own (already captioned) output is
+            # already uploaded above -- losing the pre-caption original
+            # only means a later manual restyle rebuilds from it instead.
+            original_s3_key = ""
 
     thumbnail_ref = ""
     thumb_local = _generate_reel_thumbnail_from_video(input_path, OUTPUT_DIR, job_id, 0)
@@ -2855,13 +3008,14 @@ def _upload_caption_source_and_thumbnail(input_path: str, user_id: Optional[str]
         except Exception:
             pass
 
-    return caption_s3_key, media_url, thumbnail_ref
+    return caption_s3_key, media_url, thumbnail_ref, original_s3_key
 
 
 def _build_caption_row_payload(
     job_id: str, job_data: Dict[str, Any], user_id: Optional[str], source_name: str, title: str,
     duration_sec: float, media_url: str, thumbnail_ref: str, caption_s3_key: str,
     caption_required_credits: float, caption_storage_gb: float, caption_cost_breakdown: Dict[str, Any],
+    original_s3_key: str = "",
 ) -> Dict[str, Any]:
     now_iso = datetime.now(timezone.utc).isoformat()
     row_payload: Dict[str, Any] = {
@@ -2883,6 +3037,7 @@ def _build_caption_row_payload(
             "caption_max_duration_minutes": CAPTION_MAX_DURATION_MINUTES,
             "caption_max_storage_gb": CAPTION_MAX_STORAGE_GB,
             "duration_seconds": duration_sec,
+            "original_s3_key": original_s3_key,
         },
         "input_source_type": "file",
         "input_source_value": source_name,
@@ -3006,27 +3161,38 @@ async def _process_and_complete_caption_job(
 ) -> None:
     await pipeline.persisting()
     duration_sec = max(0.5, float(local_duration) or _estimate_transcript_duration_seconds(transcript))
-    caption_storage_gb = _bytes_to_gb(float(os.path.getsize(input_path) if os.path.exists(input_path) else 0))
+
+    captioned_path = os.path.join(output_dir, f"captioned_{os.path.basename(input_path)}")
+    auto_captioned = await _burn_default_captions_for_clip(
+        input_path, captioned_path, transcript, 0.0, duration_sec, job_id, 0,
+    )
+    primary_path = captioned_path if auto_captioned else input_path
+
+    caption_storage_gb = _bytes_to_gb(float(os.path.getsize(primary_path) if os.path.exists(primary_path) else 0))
     caption_cost_breakdown = _estimate_caption_cost_breakdown(
         duration_seconds=duration_sec,
-        size_bytes=float(os.path.getsize(input_path) if os.path.exists(input_path) else 0),
+        size_bytes=float(os.path.getsize(primary_path) if os.path.exists(primary_path) else 0),
         uses_assembly=True,
         uses_openai=True,
         uses_gemini=False,
     )
     title = os.path.splitext(source_name)[0] or "Sous-titres"
-    local_video_ref = f"/videos/{job_id}/{os.path.basename(input_path)}"
+    local_video_ref = f"/videos/{job_id}/{os.path.basename(primary_path)}"
 
     _build_and_persist_caption_metadata(job_id, output_dir, source_name, title, duration_sec, local_video_ref, transcript)
 
     bucket = os.environ.get("AWS_S3_BUCKET", "")
     if not bucket:
         raise RuntimeError("AWS_S3_BUCKET is required for caption persistence")
-    caption_s3_key, media_url, thumbnail_ref = _upload_caption_source_and_thumbnail(input_path, user_id, job_id, bucket, local_video_ref)
+    caption_s3_key, media_url, thumbnail_ref, original_s3_key = _upload_caption_source_and_thumbnail(
+        primary_path, user_id, job_id, bucket, local_video_ref,
+        original_path=input_path if auto_captioned else None,
+    )
 
     row_payload = _build_caption_row_payload(
         job_id, job_data, user_id, source_name, title, duration_sec, media_url, thumbnail_ref,
         caption_s3_key, caption_required_credits, caption_storage_gb, caption_cost_breakdown,
+        original_s3_key=original_s3_key,
     )
     normalized_item = await _save_caption_row_and_debit(row_payload, job_id, user_id, caption_required_credits, caption_storage_gb)
 
