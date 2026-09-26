@@ -187,13 +187,27 @@ def test_pad_or_trim_pads_when_too_short(monkeypatch, tmp_path):
 # duck_and_mix_narration / normalize_audio_loudness / encode_preview
 # ---------------------------------------------------------------------------
 
-def test_duck_and_mix_narration_builds_amix_filter(monkeypatch):
+def test_duck_and_mix_narration_mutes_original_audio_by_default(monkeypatch):
+    # The film's own dialogue must not remain audible under the narration:
+    # by default (original_volume=0), the segment's audio is fully replaced
+    # by the narration track instead of being mixed/ducked underneath it.
     calls = _capture_ffmpeg_calls(monkeypatch)
     render.duck_and_mix_narration("/tmp/visual.mp4", "/tmp/narration.mp3", "/tmp/out.mp4")
     cmd = calls[0]
+    assert "-filter_complex" not in cmd
+    assert cmd[cmd.index("-map") + 1] == "0:v"
+    assert cmd[cmd.index("-map", cmd.index("-map") + 1) + 1] == "1:a"
+    assert "-shortest" in cmd
+
+
+def test_duck_and_mix_narration_builds_amix_filter_when_volume_above_zero(monkeypatch):
+    calls = _capture_ffmpeg_calls(monkeypatch)
+    render.duck_and_mix_narration("/tmp/visual.mp4", "/tmp/narration.mp3", "/tmp/out.mp4", original_volume=0.15)
+    cmd = calls[0]
     filter_complex = cmd[cmd.index("-filter_complex") + 1]
     assert "amix=inputs=2" in filter_complex
-    assert f"volume={render.ORIGINAL_AUDIO_DUCK_VOLUME}" in filter_complex
+    assert "volume=0.15" in filter_complex
+    assert "normalize=0" in filter_complex
 
 
 def test_normalize_audio_loudness_uses_loudnorm_filter(monkeypatch):

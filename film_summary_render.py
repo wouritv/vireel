@@ -24,7 +24,13 @@ logger = logging.getLogger(__name__)
 FFMPEG_STEP_TIMEOUT_SECONDS = int(os.environ.get("FFMPEG_STEP_TIMEOUT_SECONDS", str(2 * 3600)))
 EXPORT_VIDEO_PRESET = os.environ.get("VIREEL_EXPORT_PRESET", "veryfast")
 EXPORT_VIDEO_CRF = os.environ.get("VIREEL_EXPORT_CRF", "20")
-ORIGINAL_AUDIO_DUCK_VOLUME = float(os.environ.get("FILM_SUMMARY_ORIGINAL_AUDIO_DUCK_VOLUME", "0.15"))
+# The film's own dialogue must not remain audible under the AI voice-over
+# -- only the narration should be heard during voice_over segments (the
+# movie's own audio is meant to be heard only in original_dialogue/breathing
+# segments, which never go through this ducking path at all). Default fully
+# mutes the original track; set this above 0 to duck it under the narration
+# instead of silencing it outright.
+ORIGINAL_AUDIO_DUCK_VOLUME = float(os.environ.get("FILM_SUMMARY_ORIGINAL_AUDIO_DUCK_VOLUME", "0.0"))
 PREVIEW_HEIGHT = int(os.environ.get("FILM_SUMMARY_PREVIEW_HEIGHT", "480"))
 
 
@@ -149,13 +155,27 @@ def duck_and_mix_narration(
     visual_with_audio_path: str, narration_audio_path: str, output_path: str,
     original_volume: float = ORIGINAL_AUDIO_DUCK_VOLUME,
 ) -> None:
-    """Mix the segment's own (ducked) original audio with the narration
-    track (spec 7.10: "reduit automatiquement l'audio source sous la voix
-    off"). `duration=first` keeps the mix locked to the visual track's
-    length, which pad_or_trim_to_duration already matched to the narration."""
+    """Put the narration track on this voice-over segment. By default
+    (original_volume=0.0) the segment's own audio is fully replaced by the
+    narration -- the viewer must hear only the voice-over here, never the
+    film's original dialogue underneath it. If original_volume is raised
+    above 0 (FILM_SUMMARY_ORIGINAL_AUDIO_DUCK_VOLUME), the original audio is
+    instead ducked to that level and mixed under the narration rather than
+    silenced outright. `duration=first`/`-shortest` keep the result locked
+    to the visual track's length, which pad_or_trim_to_duration already
+    matched to the narration."""
+    if original_volume <= 0:
+        cmd = [
+            "ffmpeg", "-y", "-i", visual_with_audio_path, "-i", narration_audio_path,
+            "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac",
+            "-shortest", output_path,
+        ]
+        _run_ffmpeg(cmd)
+        return
+
     filter_complex = (
         f"[0:a]volume={original_volume}[a0];[1:a]volume=1.0[a1];"
-        f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+        f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
     )
     cmd = [
         "ffmpeg", "-y", "-i", visual_with_audio_path, "-i", narration_audio_path,
