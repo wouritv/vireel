@@ -3490,6 +3490,26 @@ def test_film_summary_voice_preview_skips_synthesis_when_cached(monkeypatch, tmp
     synth.assert_not_awaited()
 
 
+def test_film_summary_voice_preview_regenerates_empty_cached_file(monkeypatch, tmp_path):
+    # Regression test: a previous request that failed partway through
+    # streaming (see synthesize_tts_segment) could leave a zero-byte file
+    # behind under the old direct-write implementation. The cache check
+    # must not treat that as "already generated" -- it must regenerate
+    # instead of permanently serving a broken preview for that voice.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "FILM_SUMMARY_VOICE_PREVIEWS_DIR", str(tmp_path))
+    (tmp_path / "sage.mp3").write_bytes(b"")
+    synth = AsyncMock(side_effect=lambda **kwargs: Path(kwargs["output_path"]).write_bytes(b"fake-mp3") or 1.5)
+    monkeypatch.setattr(app.film_summary, "synthesize_tts_segment", synth)
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/film-summaries/voice-previews/sage", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    synth.assert_awaited_once()
+    assert (tmp_path / "sage.mp3").read_bytes() == b"fake-mp3"
+
+
 # ---------------------------------------------------------------------------
 # Stripe subscriptions: mode="subscription" + auto-renewal via invoice.paid
 # ---------------------------------------------------------------------------

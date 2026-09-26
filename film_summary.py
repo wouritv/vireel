@@ -1228,20 +1228,36 @@ async def synthesize_tts_segment(
     """Generate one voice-over segment's audio with OpenAI TTS (spec
     section 14: "genere chaque bloc separement"). Returns the real audio
     duration in seconds (probed with ffprobe) so the caller can re-inject
-    it into the plan (see apply_actual_tts_durations)."""
-    client = _get_openai_client()
+    it into the plan (see apply_actual_tts_durations).
 
-    def _call():
-        with client.audio.speech.with_streaming_response.create(
-            model=model, voice=voice, input=text, instructions=instructions,
-        ) as response:
-            response.stream_to_file(output_path)
-
+    Writes to a temporary path first and only moves it to output_path on
+    full success. get_film_summary_voice_preview_endpoint caches its output
+    by checking whether output_path already exists -- writing directly to
+    it meant a request that failed partway through streaming (a dropped
+    connection, a timeout, a missing API key) could still leave a partial
+    or empty file there, which the cache check would then treat as a valid
+    preview forever, breaking that voice's preview permanently until
+    someone deleted the file by hand on the server."""
+    tmp_path = f"{output_path}.tmp-{uuid.uuid4().hex[:8]}"
     try:
+        client = _get_openai_client()
+
+        def _call():
+            with client.audio.speech.with_streaming_response.create(
+                model=model, voice=voice, input=text, instructions=instructions,
+            ) as response:
+                response.stream_to_file(tmp_path)
+
         await asyncio.to_thread(_call)
     except Exception as exc:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
         raise FilmSummaryValidationError(FilmSummaryErrorCode.TTS_FAILED, str(exc)) from exc
 
+    os.replace(tmp_path, output_path)
     return probe_media_duration_seconds(output_path)
 
 

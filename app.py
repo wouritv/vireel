@@ -10203,7 +10203,11 @@ async def get_film_summary_voice_preview_endpoint(voice_id: str, _user_id: Annot
         raise HTTPException(status_code=400, detail="Unknown voice")
 
     preview_path = os.path.join(FILM_SUMMARY_VOICE_PREVIEWS_DIR, f"{resolved_voice}.mp3")
-    if not os.path.exists(preview_path):
+    # An empty/missing file is treated as "not cached yet" so a previous
+    # generation that failed partway through (see synthesize_tts_segment)
+    # and left nothing playable behind gets regenerated instead of being
+    # served -- and permanently broken -- forever.
+    if not os.path.exists(preview_path) or os.path.getsize(preview_path) == 0:
         try:
             await film_summary.synthesize_tts_segment(
                 text=FILM_SUMMARY_VOICE_PREVIEW_TEXT, voice=resolved_voice, model=FILM_SUMMARY_TTS_MODEL,
