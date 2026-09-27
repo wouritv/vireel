@@ -257,6 +257,7 @@
     "error": "Error",
     "success": "Success",
     "cancel": "Cancel",
+    "remove": "Remove",
     "editing": "Editing...",
     "autoEdit": "Auto-edit",
     "adding": "Adding...",
@@ -512,9 +513,9 @@
     "postComposerAddComment": "Add a comment",
     "postComposerNoComments": "No comments yet.",
     "postComposerCommentN": "Comment {{n}}",
-    "postComposerCommentTextPlaceholder": "Comment text, #hashtags...",
-    "postComposerCommentLinkPlaceholder": "Link (optional)",
-    "postComposerCommentImagePlaceholder": "Image URL (optional, Facebook only)"
+    "postComposerCommentTextPlaceholder": "Comment text, paste a link or add #hashtags...",
+    "postComposerCommentImagePlaceholder": "Paste the image URL...",
+    "postComposerAddImage": "Add an image"
   },
   "abonnement": {
     "title": "Subscription",

@@ -27,6 +27,39 @@ function backgroundGradient(preset) {
     return `linear-gradient(135deg, ${gradientColors.join(", ")})`;
 }
 
+// Facebook's own text-background posts show only the first ~130 characters
+// inline behind a "See more" expander (see AnonymousStoryPublishModal) --
+// mirroring that here keeps the preview honest when a background is chosen.
+const PREVIEW_TEXT_LIMIT = 130;
+
+function buildPreviewSnippet(text, seeMoreLabel) {
+    const trimmed = (text || "").trim();
+    if (trimmed.length <= PREVIEW_TEXT_LIMIT) return trimmed;
+    return `${trimmed.slice(0, PREVIEW_TEXT_LIMIT).trimEnd()}… ${seeMoreLabel}`;
+}
+
+// Auto-detects the first URL typed anywhere in a comment's free text so it
+// can be shown as a link preview right below it, instead of asking the user
+// to paste the link into a second field -- the link lives only in the text.
+const URL_REGEX = /(https?:\/\/[^\s]+)/i;
+
+function detectFirstUrl(text) {
+    const match = (text || "").match(URL_REGEX);
+    return match ? match[1] : "";
+}
+
+function urlHostname(url) {
+    try {
+        return new URL(url).hostname;
+    } catch {
+        return url;
+    }
+}
+
+function faviconUrlFor(url) {
+    return `https://www.google.com/s2/favicons?sz=32&domain=${encodeURIComponent(urlHostname(url))}`;
+}
+
 let commentLocalIdSeq = 0;
 function nextCommentLocalId() {
     commentLocalIdSeq += 1;
@@ -34,7 +67,7 @@ function nextCommentLocalId() {
 }
 
 function emptyComment() {
-    return { localId: nextCommentLocalId(), text: "", link: "", imageUrl: "" };
+    return { localId: nextCommentLocalId(), text: "", imageUrl: "", imageDraft: "", addingImage: false };
 }
 
 export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) {
@@ -120,10 +153,10 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
                 platforms: selectedPlatforms,
                 background_id: backgroundId || undefined,
                 comments: comments
-                    .filter((c) => c.text.trim() || c.link.trim() || c.imageUrl.trim())
+                    .filter((c) => c.text.trim() || c.imageUrl.trim())
                     .map((c) => ({
                         text: c.text.trim(),
-                        link: c.link.trim() || undefined,
+                        link: detectFirstUrl(c.text) || undefined,
                         image_url: c.imageUrl.trim() || undefined,
                     })),
             };
@@ -276,16 +309,25 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
                                 );
                             })}
                         </div>
-                        {hasBackground ? (
-                            <div
-                                className="mt-2 min-h-[80px] rounded-xl p-3 flex items-center justify-center text-center"
-                                style={{ background: backgroundGradient(selectedPreset), color: selectedPreset.text_color || "#FFFFFF" }}
-                            >
-                                <p className="text-sm font-semibold whitespace-pre-wrap break-words">
-                                    {text || t("anonymousStories.publishPreviewEmpty", "Le texte de la publication apparaitra ici.")}
-                                </p>
-                            </div>
-                        ) : null}
+                    </div>
+
+                    <div>
+                        <label className="block text-xs font-bold text-slate-500 dark:text-zinc-400 mb-2">
+                            {t("anonymousStories.publishPreviewLabel", "Apercu de la publication")}
+                        </label>
+                        <div
+                            className={`min-h-[120px] rounded-xl p-4 flex items-center justify-center text-center border border-slate-200 dark:border-white/5 ${hasBackground ? "" : "bg-slate-100 dark:bg-white/5"}`}
+                            style={
+                                hasBackground
+                                    ? { background: backgroundGradient(selectedPreset), color: selectedPreset.text_color || "#FFFFFF" }
+                                    : undefined
+                            }
+                        >
+                            <p className={`text-sm font-semibold whitespace-pre-wrap break-words ${hasBackground ? "" : "text-slate-800 dark:text-white"}`}>
+                                {(hasBackground ? buildPreviewSnippet(text, t("anonymousStories.publishPreviewSeeMore", "Voir plus")) : text) ||
+                                    t("anonymousStories.publishPreviewEmpty", "Le texte de la publication apparaitra ici.")}
+                            </p>
+                        </div>
                     </div>
 
                     <div>
@@ -307,47 +349,107 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
                             </p>
                         ) : null}
                         <div className="space-y-3">
-                            {comments.map((comment, index) => (
-                                <div key={comment.localId} className="p-3 rounded-lg border border-slate-200 dark:border-white/10 bg-slate-50 dark:bg-white/5 space-y-2">
-                                    <div className="flex items-center justify-between">
-                                        <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400 dark:text-zinc-500">
-                                            {t("social.postComposerCommentN", "Commentaire {{n}}", { n: index + 1 })}
-                                        </span>
-                                        <button
-                                            type="button"
-                                            onClick={() => removeComment(comment.localId)}
-                                            className="text-rose-500 hover:text-rose-400"
-                                        >
-                                            <Trash2 size={14} />
-                                        </button>
-                                    </div>
-                                    <textarea
-                                        value={comment.text}
-                                        onChange={(e) => updateComment(comment.localId, "text", e.target.value)}
-                                        rows={2}
-                                        placeholder={t("social.postComposerCommentTextPlaceholder", "Texte du commentaire, #hashtags...")}
-                                        className="w-full bg-white dark:bg-black/30 border border-slate-300 dark:border-white/10 rounded-md p-2 text-xs text-slate-900 dark:text-white resize-y"
-                                    />
-                                    <div className="flex items-center gap-2">
-                                        <LinkIcon size={12} className="text-slate-400 dark:text-zinc-500 shrink-0" />
-                                        <input
-                                            value={comment.link}
-                                            onChange={(e) => updateComment(comment.localId, "link", e.target.value)}
-                                            placeholder={t("social.postComposerCommentLinkPlaceholder", "Lien (optionnel)")}
-                                            className="w-full bg-white dark:bg-black/30 border border-slate-300 dark:border-white/10 rounded-md p-2 text-xs text-slate-900 dark:text-white"
+                            {comments.map((comment, index) => {
+                                const detectedLink = detectFirstUrl(comment.text);
+                                return (
+                                    <div key={comment.localId} className="p-3 rounded-lg border border-slate-200 dark:border-white/10 bg-slate-50 dark:bg-white/5 space-y-2">
+                                        <div className="flex items-center justify-between">
+                                            <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400 dark:text-zinc-500">
+                                                {t("social.postComposerCommentN", "Commentaire {{n}}", { n: index + 1 })}
+                                            </span>
+                                            <button
+                                                type="button"
+                                                onClick={() => removeComment(comment.localId)}
+                                                className="text-rose-500 hover:text-rose-400"
+                                            >
+                                                <Trash2 size={14} />
+                                            </button>
+                                        </div>
+                                        <textarea
+                                            value={comment.text}
+                                            onChange={(e) => updateComment(comment.localId, "text", e.target.value)}
+                                            rows={3}
+                                            placeholder={t("social.postComposerCommentTextPlaceholder", "Texte du commentaire, collez un lien ou ajoutez des #hashtags...")}
+                                            className="w-full bg-white dark:bg-black/30 border border-slate-300 dark:border-white/10 rounded-md p-2 text-xs text-slate-900 dark:text-white resize-y"
                                         />
+
+                                        {/* A URL typed anywhere in the text above is picked up automatically
+                                            -- no separate "link" field to fill in. */}
+                                        {detectedLink ? (
+                                            <a
+                                                href={detectedLink}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                className="flex items-center gap-2 p-2 rounded-md border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 hover:bg-slate-100 dark:hover:bg-white/10 transition-colors"
+                                            >
+                                                <img src={faviconUrlFor(detectedLink)} alt="" className="w-4 h-4 shrink-0 rounded-sm" />
+                                                <span className="text-xs text-slate-600 dark:text-zinc-400 truncate">{urlHostname(detectedLink)}</span>
+                                                <LinkIcon size={12} className="ml-auto text-slate-400 dark:text-zinc-500 shrink-0" />
+                                            </a>
+                                        ) : null}
+
+                                        {comment.imageUrl ? (
+                                            <div className="relative inline-block">
+                                                <img
+                                                    src={comment.imageUrl}
+                                                    alt=""
+                                                    className="max-h-28 rounded-md border border-slate-200 dark:border-white/10"
+                                                    onError={(e) => {
+                                                        e.currentTarget.style.display = "none";
+                                                    }}
+                                                />
+                                                <button
+                                                    type="button"
+                                                    onClick={() => updateComment(comment.localId, "imageUrl", "")}
+                                                    className="absolute -top-2 -right-2 bg-rose-500 text-white rounded-full p-0.5 shadow"
+                                                    title={t("common.remove", "Remove")}
+                                                >
+                                                    <X size={12} />
+                                                </button>
+                                            </div>
+                                        ) : comment.addingImage ? (
+                                            <div className="flex items-center gap-2">
+                                                <input
+                                                    autoFocus
+                                                    value={comment.imageDraft}
+                                                    onChange={(e) => updateComment(comment.localId, "imageDraft", e.target.value)}
+                                                    placeholder={t("social.postComposerCommentImagePlaceholder", "Collez l'URL de l'image...")}
+                                                    className="flex-1 bg-white dark:bg-black/30 border border-slate-300 dark:border-white/10 rounded-md p-2 text-xs text-slate-900 dark:text-white"
+                                                />
+                                                <button
+                                                    type="button"
+                                                    onClick={() => {
+                                                        updateComment(comment.localId, "imageUrl", comment.imageDraft.trim());
+                                                        updateComment(comment.localId, "addingImage", false);
+                                                    }}
+                                                    disabled={!comment.imageDraft.trim()}
+                                                    className="px-2 py-2 rounded-md bg-primary text-white disabled:opacity-40"
+                                                >
+                                                    <Check size={14} />
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => {
+                                                        updateComment(comment.localId, "addingImage", false);
+                                                        updateComment(comment.localId, "imageDraft", "");
+                                                    }}
+                                                    className="px-2 py-2 rounded-md bg-slate-200 dark:bg-white/10 text-slate-600 dark:text-zinc-300"
+                                                >
+                                                    <X size={14} />
+                                                </button>
+                                            </div>
+                                        ) : (
+                                            <button
+                                                type="button"
+                                                onClick={() => updateComment(comment.localId, "addingImage", true)}
+                                                className="flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-zinc-300 hover:text-primary"
+                                            >
+                                                <ImageIcon size={14} /> {t("social.postComposerAddImage", "Ajouter une image")}
+                                            </button>
+                                        )}
                                     </div>
-                                    <div className="flex items-center gap-2">
-                                        <ImageIcon size={12} className="text-slate-400 dark:text-zinc-500 shrink-0" />
-                                        <input
-                                            value={comment.imageUrl}
-                                            onChange={(e) => updateComment(comment.localId, "imageUrl", e.target.value)}
-                                            placeholder={t("social.postComposerCommentImagePlaceholder", "URL d'image (optionnel, Facebook uniquement)")}
-                                            className="w-full bg-white dark:bg-black/30 border border-slate-300 dark:border-white/10 rounded-md p-2 text-xs text-slate-900 dark:text-white"
-                                        />
-                                    </div>
-                                </div>
-                            ))}
+                                );
+                            })}
                         </div>
                     </div>
 
