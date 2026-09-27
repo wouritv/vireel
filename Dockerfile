@@ -81,10 +81,11 @@ RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
 # Security (docker:S6504): owned by root, not by the appuser the process
 # runs as, and shipped without the write bit -- if an attacker ever gets
 # code execution as appuser they can't tamper with the application code
-# itself. appuser only needs read (+ traverse for fonts/) access, granted
-# via the group bit, never write.
+# itself. appuser only needs read (+ traverse for fonts/, music/) access,
+# granted via the group bit, never write.
 COPY --chown=root:appuser --chmod=750 *.py ./
 COPY --chown=root:appuser --chmod=750 fonts/ ./fonts/
+COPY --chown=root:appuser --chmod=750 music/ ./music/
 
 # Pré-télécharger les modèles MediaPipe Tasks (face detector + face
 # landmarker, voir main.py's _ensure_mediapipe_model) pendant le build,

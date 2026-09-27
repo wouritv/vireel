@@ -108,6 +108,14 @@ SEGMENT_TYPE_ORIGINAL_DIALOGUE = "original_dialogue"
 SEGMENT_TYPE_BREATHING = "breathing"
 SEGMENT_TYPES = (SEGMENT_TYPE_VOICE_OVER, SEGMENT_TYPE_ORIGINAL_DIALOGUE, SEGMENT_TYPE_BREATHING)
 
+# Dominant mood for the whole film, used only to pick an optional
+# instrumental background bed mixed under narration (voice_over) segments --
+# see PLANNING_SYSTEM_PROMPT's BACKGROUND MUSIC MOOD section and
+# film_summary_render.resolve_background_music_track. Never affects
+# original_dialogue/breathing segments, where the film's own audio plays.
+MUSIC_MOODS = ("tense", "dark", "hopeful", "romantic", "melancholic", "triumphant", "comedic", "neutral")
+DEFAULT_MUSIC_MOOD = "neutral"
+
 EDIT_PLAN_SCHEMA_VERSION = "1.0"
 
 
@@ -426,6 +434,8 @@ def validate_edit_plan_schema(
         "role": str(c.get("role") or "").strip(),
     } for i, c in enumerate(characters)]
 
+    requested_mood = str(raw.get("music_mood") or "").strip().lower()
+
     plan = {
         "schema_version": EDIT_PLAN_SCHEMA_VERSION,
         "movie": dict(movie_metadata),
@@ -434,6 +444,9 @@ def validate_edit_plan_schema(
         "segments": segments,
         "total_estimated_duration_ms": compute_total_estimated_duration_ms(segments),
         "unresolved_ambiguities": [str(a) for a in (raw.get("unresolved_ambiguities") or [])],
+        # Non-blocking: an unknown/missing mood just means no music, never a
+        # plan failure -- see MUSIC_MOODS.
+        "music_mood": requested_mood if requested_mood in MUSIC_MOODS else DEFAULT_MUSIC_MOOD,
     }
     return plan
 
@@ -749,6 +762,9 @@ The total duration includes voice-over, original dialogue and breathing segments
 EVIDENCE AND UNCERTAINTY
 Every narrated segment must include source_event_ids. Every clip must reference a valid scene_id. When names are uncertain, use the canonical identity from character_bible or neutral wording. Add unresolved issues to unresolved_ambiguities. If the evidence cannot support a coherent summary, return status="insufficient_evidence" and explain the blocking evidence gaps without generating fake content.
 
+BACKGROUND MUSIC MOOD
+An optional, low-volume instrumental music bed (no lyrics) may be mixed under voice-over narration -- never under original_dialogue or breathing segments, where the film's own audio must remain the only thing heard. Pick exactly one dominant mood for the whole film from: tense, dark, hopeful, romantic, melancholic, triumphant, comedic, neutral. Base it on the film's actual confirmed tone, not a guess -- a thriller with a betrayal at its core is "tense" or "dark," a story ending in reconciliation is "hopeful," and so on. Use "neutral" only when no other mood clearly fits. This choice only selects which instrumental track (if any is available) may play under narration; it has no effect on the narration text or segment selection.
+
 OUTPUT SCHEMA
 Return exactly this JSON shape -- every field below is required unless marked optional, and no other top-level or segment field names are read:
 {
@@ -757,6 +773,7 @@ Return exactly this JSON shape -- every field below is required unless marked op
   "characters": [ { "id": string, "canonical_name": string, "aliases": [string], "role": string } ],
   "segments": [ <segment, see below> ],
   "total_estimated_duration_ms": integer   (your own best-effort sum, backend recomputes the authoritative value),
+  "music_mood": "tense" | "dark" | "hopeful" | "romantic" | "melancholic" | "triumphant" | "comedic" | "neutral"   (optional, default "neutral", see BACKGROUND MUSIC MOOD),
   "unresolved_ambiguities": [string]
 }
 Every segment is a JSON object with these fields:
@@ -790,6 +807,7 @@ Before returning the JSON, silently verify:
 - the hook, main progression, climax, resolution and conclusion are present when supported by the movie;
 - the setup, inciting incident, rising complications, midpoint turn, climax and resolution are each identifiable in at least one segment;
 - every segment names its characters, places and objects specifically rather than generically, and no segment is a generic sentence that could describe almost any movie;
+- music_mood is one of the listed moods and genuinely reflects the film's confirmed tone;
 - the result can be executed by an automated FFmpeg pipeline."""
 
 
