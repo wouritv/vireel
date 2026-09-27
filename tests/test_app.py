@@ -4016,6 +4016,221 @@ def test_create_custom_reel_clip_happy_path(monkeypatch, tmp_path):
     assert clip_entry["is_custom"] is True
 
 
+def test_create_custom_reel_clip_uses_explicit_project_id_when_owned(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+    monkeypatch.setattr(app, "supabase_get_project", AsyncMock(return_value={"id": "proj-2", "user_id": "u1"}))
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 1000, "end_ms": 11000, "project_id": "proj-2"},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    build_row_mock = app._build_reel_row_for_clip
+    call_args = build_row_mock.await_args.args
+    assert call_args[9] == "proj-2"
+
+
+def test_create_custom_reel_clip_rejects_unowned_explicit_project_id(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+    monkeypatch.setattr(app, "supabase_get_project", AsyncMock(return_value=None))
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 1000, "end_ms": 11000, "project_id": "someone-elses-project"},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 404
+
+
+def test_ensure_preserved_source_video_available_prefers_local_copy(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    output_dir = tmp_path / "job-1"
+    output_dir.mkdir()
+    (output_dir / "source.mp4").write_bytes(b"local-bytes")
+    download_mock = MagicMock()
+    monkeypatch.setattr(app, "download_s3_object", download_mock)
+
+    result = asyncio.run(app._ensure_preserved_source_video_available("job-1", "u1", str(output_dir)))
+
+    assert result == str(output_dir / "source.mp4")
+    download_mock.assert_not_called()
+
+
+def test_ensure_preserved_source_video_available_downloads_s3_backup_when_local_missing(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    output_dir = tmp_path / "job-1"
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setenv("AWS_S3_BUCKET", "test-bucket")
+    monkeypatch.setattr(app, "get_s3_object_size", lambda bucket, key: 1234 if key.endswith(".mp4") else 0)
+
+    def _fake_download(bucket, key, dest):
+        Path(dest).write_bytes(b"restored-bytes")
+        return True
+
+    monkeypatch.setattr(app, "download_s3_object", _fake_download)
+
+    result = asyncio.run(app._ensure_preserved_source_video_available("job-1", "u1", str(output_dir)))
+
+    assert result == str(output_dir / "source.mp4")
+    assert Path(result).read_bytes() == b"restored-bytes"
+
+
+def test_ensure_preserved_source_video_available_returns_none_when_nothing_found(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    output_dir = tmp_path / "job-1"
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setenv("AWS_S3_BUCKET", "test-bucket")
+    monkeypatch.setattr(app, "get_s3_object_size", lambda bucket, key: 0)
+
+    result = asyncio.run(app._ensure_preserved_source_video_available("job-1", "u1", str(output_dir)))
+
+    assert result is None
+
+
+def test_flatten_transcript_words_extracts_all_words_at_absolute_times():
+    import app as app_module
+    transcript = {
+        "segments": [
+            {"words": [{"word": "Hello", "start": 0.0, "end": 0.4}, {"word": " ", "start": 0.4, "end": 0.4}]},
+            {"words": [{"word": "world", "start": 12.5, "end": 13.0}]},
+        ]
+    }
+    result = app_module._flatten_transcript_words(transcript)
+    assert result == [
+        {"text": "Hello", "startMs": 0, "endMs": 400},
+        {"text": "world", "startMs": 12500, "endMs": 13000},
+    ]
+
+
+def test_flatten_transcript_words_handles_missing_or_malformed_input():
+    import app as app_module
+    assert app_module._flatten_transcript_words(None) == []
+    assert app_module._flatten_transcript_words({}) == []
+    assert app_module._flatten_transcript_words({"segments": [{"words": [{"word": "x", "start": "bad"}]}]}) == []
+
+
+def test_generate_scene_waveform_png_success(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"video")
+
+    def _fake_run(cmd, **kwargs):
+        (tmp_path / "waveform.png").write_bytes(b"png-bytes")
+        return types.SimpleNamespace(returncode=0, stderr=b"")
+
+    monkeypatch.setattr(app.subprocess, "run", _fake_run)
+
+    result = app._generate_scene_waveform_png(str(source_path), str(tmp_path))
+
+    assert result == str(tmp_path / "waveform.png")
+
+
+def test_generate_scene_waveform_png_returns_none_on_ffmpeg_failure(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"video")
+    monkeypatch.setattr(
+        app.subprocess, "run",
+        lambda *a, **k: types.SimpleNamespace(returncode=1, stderr=b"no audio stream"),
+    )
+
+    result = app._generate_scene_waveform_png(str(source_path), str(tmp_path))
+
+    assert result is None
+
+
+def test_generate_scene_waveform_png_reuses_cached_file(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"video")
+    waveform_path = tmp_path / "waveform.png"
+    waveform_path.write_bytes(b"cached-png")
+    # Make sure the cached waveform is not considered stale relative to source.
+    os.utime(waveform_path, (os.path.getmtime(source_path) + 10, os.path.getmtime(source_path) + 10))
+
+    run_mock = MagicMock()
+    monkeypatch.setattr(app.subprocess, "run", run_mock)
+
+    result = app._generate_scene_waveform_png(str(source_path), str(tmp_path))
+
+    assert result == str(waveform_path)
+    run_mock.assert_not_called()
+
+
+def test_get_project_manual_scene_returns_unavailable_without_job(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_project", AsyncMock(return_value={"id": "proj-1", "user_id": "u1"}))
+    monkeypatch.setattr(app, "supabase_get_latest_job_record_by_project", AsyncMock(return_value=None))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/projects/proj-1/manual-scene", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"available": False, "job_id": None}
+
+
+def test_get_project_manual_scene_returns_404_for_unknown_project(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_project", AsyncMock(return_value=None))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/projects/proj-1/manual-scene", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 404
+
+
+def test_get_project_manual_scene_reports_unavailable_without_source(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_project", AsyncMock(return_value={"id": "proj-1", "user_id": "u1"}))
+    monkeypatch.setattr(app, "supabase_get_latest_job_record_by_project", AsyncMock(return_value={"id": "job-1"}))
+    monkeypatch.setattr(app, "_ensure_preserved_source_video_available", AsyncMock(return_value=None))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/projects/proj-1/manual-scene", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"available": False, "job_id": "job-1"}
+
+
+def test_get_project_manual_scene_happy_path(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    output_dir = tmp_path / "job-1"
+    output_dir.mkdir()
+    source_path = output_dir / "source.mp4"
+    source_path.write_bytes(b"video-bytes")
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_project", AsyncMock(return_value={"id": "proj-1", "user_id": "u1"}))
+    monkeypatch.setattr(app, "supabase_get_latest_job_record_by_project", AsyncMock(return_value={"id": "job-1"}))
+    monkeypatch.setattr(app, "_ensure_preserved_source_video_available", AsyncMock(return_value=str(source_path)))
+    monkeypatch.setattr(app, "_probe_local_video_duration_seconds", lambda _p: 42.0)
+    monkeypatch.setattr(app, "_generate_scene_waveform_png", lambda *_a, **_k: str(output_dir / "waveform.png"))
+    transcript = {"segments": [{"words": [{"word": "hi", "start": 0.0, "end": 0.3}]}]}
+    monkeypatch.setattr(app, "_get_or_build_job_metadata", AsyncMock(return_value=("meta.json", {"transcript": transcript})))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/projects/proj-1/manual-scene", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is True
+    assert body["job_id"] == "job-1"
+    assert body["source_url"] == "/videos/job-1/source.mp4"
+    assert body["duration_seconds"] == 42.0
+    assert body["waveform_url"] == "/videos/job-1/waveform.png"
+    assert body["words"] == [{"text": "hi", "startMs": 0, "endMs": 300}]
+
+
 def test_create_custom_reel_clip_requires_supabase(monkeypatch, tmp_path):
     app = _import_app_with_stubs(monkeypatch)
     _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)

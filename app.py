@@ -2927,6 +2927,36 @@ def _resolve_preserved_source_video(output_dir: str) -> Optional[str]:
     return None
 
 
+async def _ensure_preserved_source_video_available(job_id: str, user_id: str, output_dir: str) -> Optional[str]:
+    """Like _resolve_preserved_source_video, but falls back to re-downloading
+    the S3 backup (see _upload_and_bill_preserved_source_video) when the
+    local copy has been swept by the retention cleanup -- so manual clipping
+    (and the project-level "Creation manuelle" scene view) keeps working
+    long after a job's output dir is gone, not just within the first hour."""
+    local_path = _resolve_preserved_source_video(output_dir)
+    if local_path:
+        return local_path
+
+    if not (is_supabase_configured() and user_id):
+        return None
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket:
+        return None
+
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        for ext in _SOURCE_VIDEO_EXTENSIONS:
+            s3_key = f"reels/{user_id}/{job_id}/source{ext}"
+            if get_s3_object_size(bucket, s3_key) <= 0:
+                continue
+            dest = os.path.join(output_dir, f"{_SOURCE_VIDEO_BASENAME}{ext}")
+            if download_s3_object(bucket, s3_key, dest):
+                return dest
+    except Exception as exc:
+        logger.warning("Failed to re-download preserved source video for job %s: %s", job_id, exc)
+    return None
+
+
 async def _handle_completed_reel_job_with_metadata(
     job_id: str, job_data: Dict[str, Any], output_dir: str, user_id: Optional[str],
     source_is_url: bool, start_ts: float, target_json: str, pipeline,
@@ -6477,6 +6507,13 @@ class CustomReelClipRequest(BaseModel):
     start_ms: int
     end_ms: int
     title: Optional[str] = None
+    # Explicit override for callers reaching this endpoint long after the
+    # generation job finished (see the project-level "Creation manuelle"
+    # scene view), when the in-memory `jobs[job_id]` entry this endpoint
+    # would otherwise read project_id from has long since expired/been
+    # dropped by a worker restart -- validated against the caller's own
+    # projects below, never trusted blindly.
+    project_id: Optional[str] = None
 
 
 @app.get("/api/reels/{job_id}/source", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
@@ -6490,7 +6527,7 @@ async def get_reel_job_source_endpoint(job_id: str, user_id: Annotated[str, Depe
     button" rather than an error."""
     await _require_job_ownership(job_id, user_id)
     output_dir = os.path.join(OUTPUT_DIR, job_id)
-    source_path = _resolve_preserved_source_video(output_dir)
+    source_path = await _ensure_preserved_source_video_available(job_id, user_id, output_dir)
     if not source_path:
         return {"available": False}
     return {
@@ -6571,7 +6608,7 @@ async def create_custom_reel_clip_endpoint(
         )
 
     output_dir = os.path.join(OUTPUT_DIR, job_id)
-    source_path = _resolve_preserved_source_video(output_dir)
+    source_path = await _ensure_preserved_source_video_available(job_id, user_id, output_dir)
     if not source_path:
         raise HTTPException(status_code=404, detail="La video source n'est plus disponible pour ce job")
 
@@ -6626,6 +6663,11 @@ async def create_custom_reel_clip_endpoint(
         raise HTTPException(status_code=503, detail="AWS_S3_BUCKET is required for reel persistence")
 
     project_id = job_data.get("project_id")
+    if req.project_id:
+        owned_project = await supabase_get_project(req.project_id, user_id)
+        if not owned_project:
+            raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND)
+        project_id = req.project_id
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     reel_row = await _build_reel_row_for_clip(
         job_id, user_id, output_dir, bucket, base_name, clip_entry, next_index, now_iso,
@@ -6665,6 +6707,96 @@ async def create_custom_reel_clip_endpoint(
         jobs[job_id]["result"].setdefault("reels", []).append(saved_row)
 
     return saved_row
+
+
+def _flatten_transcript_words(transcript: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Flattens a job's whole-source transcript (metadata.json's `transcript`
+    field) into one word list at absolute times, in milliseconds -- unlike
+    _extract_clip_captions_from_transcript, this is not windowed/offset to a
+    single AI-picked clip's range, since the "Creation manuelle" scene view
+    needs every word across the full source video."""
+    words: List[Dict[str, Any]] = []
+    if not isinstance(transcript, dict):
+        return words
+    for segment in (transcript.get("segments") or []):
+        for word_info in (segment.get("words") or []):
+            text = str(word_info.get("word") or "").strip()
+            if not text:
+                continue
+            try:
+                start_ms = int(float(word_info.get("start", 0) or 0) * 1000)
+                end_ms = int(float(word_info.get("end", 0) or 0) * 1000)
+            except (TypeError, ValueError):
+                continue
+            words.append({"text": text, "startMs": start_ms, "endMs": end_ms})
+    return words
+
+
+def _generate_scene_waveform_png(source_path: str, output_dir: str) -> Optional[str]:
+    """Renders a static waveform image for the manual-creation scene view
+    via ffmpeg's showwavespic (a single frame -- fast even for a several-
+    minute source), so the frontend doesn't have to download and decode the
+    whole video client-side with the Web Audio API just to draw one.
+    Cached alongside the source video; regenerated only if missing or
+    older than it. Returns None (no waveform, not a hard failure) if the
+    source has no audio track or ffmpeg otherwise fails."""
+    waveform_path = os.path.join(output_dir, "waveform.png")
+    try:
+        if os.path.exists(waveform_path) and os.path.getmtime(waveform_path) >= os.path.getmtime(source_path):
+            return waveform_path
+        cmd = [
+            "ffmpeg", "-y", "-i", source_path,
+            "-filter_complex", "[0:a]aformat=channel_layouts=mono,showwavespic=s=1600x200:colors=0x10B981",
+            "-frames:v", "1", waveform_path,
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=FFMPEG_STEP_TIMEOUT_SECONDS)
+        if result.returncode != 0 or not os.path.exists(waveform_path):
+            logger.warning("Waveform generation failed for %s: %s", source_path, result.stderr.decode(errors="replace")[-500:])
+            return None
+        return waveform_path
+    except Exception as exc:
+        logger.warning("Waveform generation errored for %s: %s", source_path, exc)
+        return None
+
+
+@app.get("/api/projects/{project_id}/manual-scene", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def get_project_manual_scene(project_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Backs the project-level "Creation manuelle" view: the full source
+    video (or its S3 backup, re-downloaded on demand -- see
+    _ensure_preserved_source_video_available), a waveform image, and the
+    whole-source word-level transcript, so a user can hand-pick a range to
+    cut into a reel straight from the project page instead of only right
+    after a specific generation job completes (see /api/reels/{job_id}/
+    source, the job-scoped equivalent this builds on)."""
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_PROJECTS_NOT_CONFIGURED)
+
+    project = await supabase_get_project(project_id, user_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND)
+
+    job_row = await supabase_get_latest_job_record_by_project(project_id, user_id)
+    job_id = str(job_row.get("id") or "") if job_row else ""
+    if not job_id:
+        return {"available": False, "job_id": None}
+
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    source_path = await _ensure_preserved_source_video_available(job_id, user_id, output_dir)
+    if not source_path:
+        return {"available": False, "job_id": job_id}
+
+    waveform_path = _generate_scene_waveform_png(source_path, output_dir)
+    _, data = await _get_or_build_job_metadata(job_id, 0, user_id=user_id)
+    words = _flatten_transcript_words((data or {}).get("transcript"))
+
+    return {
+        "available": True,
+        "job_id": job_id,
+        "source_url": f"/videos/{job_id}/{os.path.basename(source_path)}",
+        "duration_seconds": _probe_local_video_duration_seconds(source_path),
+        "waveform_url": f"/videos/{job_id}/{os.path.basename(waveform_path)}" if waveform_path else None,
+        "words": words,
+    }
 
 
 def _run_add_hook(input_path: str, text: str, output_path: str, position: str, font_scale: float) -> None:
