@@ -115,6 +115,9 @@ from supabase_request import (
 	update_film_summary as supabase_update_film_summary,
 	soft_delete_film_summary as supabase_soft_delete_film_summary,
 	get_film_summaries_by_project as supabase_get_film_summaries_by_project,
+	list_caption_style_themes as supabase_list_caption_style_themes,
+	upsert_caption_style_theme as supabase_upsert_caption_style_theme,
+	delete_caption_style_theme as supabase_delete_caption_style_theme,
 )
 import anonymous_stories
 import email_templates
@@ -6745,6 +6748,50 @@ def get_languages():
             {"code": "id", "name": "Indonesian"},
         ]
     }
+
+
+class CaptionStyleThemeRequest(BaseModel):
+    name: str
+    style: Dict[str, Any]
+
+
+@app.get("/api/caption-style-themes", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
+async def list_caption_style_themes_endpoint(user_id: Annotated[str, Depends(get_user_id_header)]):
+    """The user's own saved subtitle style presets ("themes") for the
+    CaptionsModal theme picker. Built-in themes are static frontend data
+    (dashboard/src/lib/captionThemes.js) and never appear here -- this only
+    ever returns what the user explicitly saved."""
+    if not is_supabase_configured():
+        return {"themes": []}
+    rows = await supabase_list_caption_style_themes(user_id)
+    return {"themes": [{"id": row.get("id"), "name": row.get("name"), "style": row.get("style") or {}} for row in rows]}
+
+
+@app.post("/api/caption-style-themes", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
+async def save_caption_style_theme_endpoint(req: CaptionStyleThemeRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Saves a custom theme under `name` -- overwrites the caller's own
+    theme of the same name if one already exists (see
+    upsert_caption_style_theme), so re-saving under a name already used is
+    how a saved theme gets updated."""
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Theme name is required")
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+    saved = await supabase_upsert_caption_style_theme(user_id, name, req.style or {})
+    if not saved:
+        raise HTTPException(status_code=503, detail="Failed to save theme")
+    return {"id": saved.get("id"), "name": saved.get("name"), "style": saved.get("style") or {}}
+
+
+@app.delete("/api/caption-style-themes/{theme_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def delete_caption_style_theme_endpoint(theme_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+    deleted = await supabase_delete_caption_style_theme(theme_id, user_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Theme not found")
+    return {"success": True}
 
 
 async def _resolve_translation_cache_and_owner(user_id: str, job_id: str, clip_index: int, translation_cache: Dict[str, Any]):

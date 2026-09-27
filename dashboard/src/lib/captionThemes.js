@@ -1,0 +1,162 @@
+// Built-in caption style presets ("themes") for CaptionsModal's theme
+// picker. Each theme groups a full subtitle style (font, size, colors,
+// position, animation...) under one catchy name so a user can get a
+// finished look in one click instead of tuning every option by hand.
+// Purely static, frontend-only data -- a user's own saved/customized
+// themes are fetched separately from GET /api/caption-style-themes (see
+// app.py's caption_style_themes endpoints) and never live here.
+
+export const BUILTIN_CAPTION_THEMES = [
+  {
+    id: 'punch-viral',
+    name: 'Punch Viral',
+    emoji: '🔥',
+    style: {
+      positionX: 50, positionY: 82,
+      fontFamily: 'Bebas Neue', fontSize: 64,
+      fontColor: '#FFFFFF', highlightColor: '#FFDD00',
+      borderColor: '#000000', borderWidth: 4,
+      textShadowColor: '#000000', shadowBlur: 10, shadowOffsetX: 0, shadowOffsetY: 3,
+      bgColor: '#000000', bgOpacity: 0,
+      textCase: 'uppercase', bold: true, italic: false,
+      wordsPerLine: 3, animation: 'karaoke',
+    },
+  },
+  {
+    id: 'neon-city',
+    name: 'Néon City',
+    emoji: '⚡',
+    style: {
+      positionX: 50, positionY: 80,
+      fontFamily: 'Orbitron', fontSize: 50,
+      fontColor: '#00F0FF', highlightColor: '#FF2FD0',
+      borderColor: '#0A0033', borderWidth: 2,
+      textShadowColor: '#00F0FF', shadowBlur: 18, shadowOffsetX: 0, shadowOffsetY: 0,
+      bgColor: '#000000', bgOpacity: 0.35,
+      textCase: 'uppercase', bold: true, italic: false,
+      wordsPerLine: 4, animation: 'word-highlight',
+    },
+  },
+  {
+    id: 'epure',
+    name: 'Épuré',
+    emoji: '⚪',
+    style: {
+      positionX: 50, positionY: 84,
+      fontFamily: 'Inter', fontSize: 44,
+      fontColor: '#FFFFFF', highlightColor: '#FFFFFF',
+      borderColor: '#000000', borderWidth: 0,
+      textShadowColor: '#000000', shadowBlur: 6, shadowOffsetX: 0, shadowOffsetY: 2,
+      bgColor: '#000000', bgOpacity: 0,
+      textCase: 'none', bold: false, italic: false,
+      wordsPerLine: 5, animation: 'fade-in-out',
+    },
+  },
+  {
+    id: 'conte-du-soir',
+    name: 'Conte du Soir',
+    emoji: '📖',
+    style: {
+      positionX: 50, positionY: 50,
+      fontFamily: 'Caveat', fontSize: 60,
+      fontColor: '#FFF6E5', highlightColor: '#FF9AC1',
+      borderColor: '#3A2A1A', borderWidth: 2,
+      textShadowColor: '#000000', shadowBlur: 10, shadowOffsetX: 0, shadowOffsetY: 2,
+      bgColor: '#000000', bgOpacity: 0,
+      textCase: 'none', bold: false, italic: false,
+      wordsPerLine: 4, animation: 'fade-in-out',
+    },
+  },
+  {
+    id: 'comedie-club',
+    name: 'Comédie Club',
+    emoji: '😂',
+    style: {
+      positionX: 50, positionY: 78,
+      fontFamily: 'Bangers', fontSize: 58,
+      fontColor: '#FFD400', highlightColor: '#FF5A5F',
+      borderColor: '#1A1A1A', borderWidth: 3,
+      textShadowColor: '#000000', shadowBlur: 8, shadowOffsetX: 2, shadowOffsetY: 2,
+      bgColor: '#000000', bgOpacity: 0,
+      textCase: 'uppercase', bold: true, italic: false,
+      wordsPerLine: 3, animation: 'pop',
+    },
+  },
+  {
+    id: 'pro-business',
+    name: 'Pro Business',
+    emoji: '💼',
+    style: {
+      positionX: 50, positionY: 85,
+      fontFamily: 'Poppins', fontSize: 42,
+      fontColor: '#FFFFFF', highlightColor: '#3B82F6',
+      borderColor: '#000000', borderWidth: 0,
+      textShadowColor: '#000000', shadowBlur: 4, shadowOffsetX: 0, shadowOffsetY: 1,
+      bgColor: '#0B1220', bgOpacity: 0.65,
+      textCase: 'none', bold: true, italic: false,
+      wordsPerLine: 6, animation: 'none',
+    },
+  },
+  {
+    id: 'retro-pop',
+    name: 'Rétro Pop',
+    emoji: '🎞️',
+    style: {
+      positionX: 50, positionY: 80,
+      fontFamily: 'Righteous', fontSize: 54,
+      fontColor: '#FFFFFF', highlightColor: '#FF6B35',
+      borderColor: '#7A0C2E', borderWidth: 4,
+      textShadowColor: '#000000', shadowBlur: 6, shadowOffsetX: 3, shadowOffsetY: 3,
+      bgColor: '#000000', bgOpacity: 0,
+      textCase: 'none', bold: true, italic: false,
+      wordsPerLine: 4, animation: 'zoom-in-out',
+    },
+  },
+  {
+    id: 'karaoke-party',
+    name: 'Karaoké Party',
+    emoji: '🎤',
+    style: {
+      positionX: 50, positionY: 82,
+      fontFamily: 'Luckiest Guy', fontSize: 52,
+      fontColor: '#FFFFFF', highlightColor: '#FFDD00',
+      borderColor: '#4B0082', borderWidth: 3,
+      textShadowColor: '#000000', shadowBlur: 8, shadowOffsetX: 0, shadowOffsetY: 2,
+      bgColor: '#1A0B2E', bgOpacity: 0.5,
+      textCase: 'none', bold: true, italic: false,
+      wordsPerLine: 4, animation: 'karaoke',
+    },
+  },
+  {
+    id: 'elegance-doree',
+    name: 'Élégance Dorée',
+    emoji: '✨',
+    style: {
+      positionX: 50, positionY: 86,
+      fontFamily: 'Playfair Display', fontSize: 46,
+      fontColor: '#F5E6C8', highlightColor: '#D4AF37',
+      borderColor: '#000000', borderWidth: 1,
+      textShadowColor: '#000000', shadowBlur: 6, shadowOffsetX: 0, shadowOffsetY: 2,
+      bgColor: '#000000', bgOpacity: 0,
+      textCase: 'none', bold: false, italic: true,
+      wordsPerLine: 5, animation: 'slide-in-out',
+    },
+  },
+  {
+    id: 'cine-classique',
+    name: 'Ciné Classique',
+    emoji: '🎬',
+    style: {
+      positionX: 50, positionY: 88,
+      fontFamily: 'Trebuchet MS', fontSize: 40,
+      fontColor: '#FFFFFF', highlightColor: '#FFFFFF',
+      borderColor: '#000000', borderWidth: 2,
+      textShadowColor: '#000000', shadowBlur: 4, shadowOffsetX: 0, shadowOffsetY: 1,
+      bgColor: '#000000', bgOpacity: 0,
+      textCase: 'none', bold: false, italic: false,
+      wordsPerLine: 6, animation: 'none',
+    },
+  },
+];
+
+export const findBuiltinCaptionTheme = (id) => BUILTIN_CAPTION_THEMES.find((theme) => theme.id === id) || null;

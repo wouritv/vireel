@@ -3511,6 +3511,97 @@ def test_film_summary_voice_preview_regenerates_empty_cached_file(monkeypatch, t
 
 
 # ---------------------------------------------------------------------------
+# Caption style themes (CaptionsModal "Themes" picker, user-saved presets)
+# ---------------------------------------------------------------------------
+
+def test_list_caption_style_themes_returns_empty_without_supabase(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/caption-style-themes", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"themes": []}
+
+
+def test_list_caption_style_themes_returns_user_rows(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    list_mock = AsyncMock(return_value=[{"id": "t1", "name": "Mon Style", "style": {"fontFamily": "Montserrat"}}])
+    monkeypatch.setattr(app, "supabase_list_caption_style_themes", list_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/caption-style-themes", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"themes": [{"id": "t1", "name": "Mon Style", "style": {"fontFamily": "Montserrat"}}]}
+    list_mock.assert_awaited_once_with("u1")
+
+
+def test_save_caption_style_theme_requires_name(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+
+    with TestClient(app.app) as client:
+        resp = client.post("/api/caption-style-themes", json={"name": "  ", "style": {}}, headers=_auth_headers("u1"))
+
+    assert resp.status_code == 400
+
+
+def test_save_caption_style_theme_requires_supabase(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+
+    with TestClient(app.app) as client:
+        resp = client.post("/api/caption-style-themes", json={"name": "Mon Style", "style": {}}, headers=_auth_headers("u1"))
+
+    assert resp.status_code == 503
+
+
+def test_save_caption_style_theme_upserts_and_returns_row(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    upsert_mock = AsyncMock(return_value={"id": "t1", "name": "Mon Style", "style": {"fontFamily": "Bangers"}})
+    monkeypatch.setattr(app, "supabase_upsert_caption_style_theme", upsert_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/caption-style-themes",
+            json={"name": "Mon Style", "style": {"fontFamily": "Bangers"}},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"id": "t1", "name": "Mon Style", "style": {"fontFamily": "Bangers"}}
+    upsert_mock.assert_awaited_once_with("u1", "Mon Style", {"fontFamily": "Bangers"})
+
+
+def test_delete_caption_style_theme_returns_404_when_not_found(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_delete_caption_style_theme", AsyncMock(return_value=False))
+
+    with TestClient(app.app) as client:
+        resp = client.delete("/api/caption-style-themes/does-not-exist", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 404
+
+
+def test_delete_caption_style_theme_succeeds(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    delete_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_delete_caption_style_theme", delete_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.delete("/api/caption-style-themes/t1", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    delete_mock.assert_awaited_once_with("t1", "u1")
+
+
+# ---------------------------------------------------------------------------
 # Stripe subscriptions: mode="subscription" + auto-renewal via invoice.paid
 # ---------------------------------------------------------------------------
 

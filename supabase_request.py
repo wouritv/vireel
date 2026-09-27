@@ -29,6 +29,7 @@ SUPABASE_TRANSCRIPTIONS_TABLE = os.environ.get("SUPABASE_TRANSCRIPTIONS_TABLE", 
 SUPABASE_STYLE_EDIT_VERSIONS_TABLE = os.environ.get("SUPABASE_STYLE_EDIT_VERSIONS_TABLE", "style_edit_versions")
 SUPABASE_ANONYMOUS_STORIES_TABLE = os.environ.get("SUPABASE_ANONYMOUS_STORIES_TABLE", "anonymous_stories")
 SUPABASE_FILM_SUMMARIES_TABLE = os.environ.get("SUPABASE_FILM_SUMMARIES_TABLE", "film_summaries")
+SUPABASE_CAPTION_STYLE_THEMES_TABLE = os.environ.get("SUPABASE_CAPTION_STYLE_THEMES_TABLE", "caption_style_themes")
 STORAGE_OVERAGE_TOLERANCE_PERCENT = max(0.0, float(os.environ.get("STORAGE_OVERAGE_TOLERANCE_PERCENT", "10") or "10"))
 
 
@@ -1979,6 +1980,58 @@ async def soft_delete_film_summary(film_summary_id: str, user_id: str) -> bool:
 		.eq("id", film_summary_id)
 		.eq("user_id", user_id)
 		.is_("deleted_at", "null")
+		.execute()
+	)
+	return bool(response.data)
+
+
+# --------------------------------------------------------------------------
+# Caption style themes (user-saved subtitle style presets)
+# --------------------------------------------------------------------------
+async def list_caption_style_themes(user_id: str) -> List[Dict[str, Any]]:
+	if not user_id:
+		return []
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_CAPTION_STYLE_THEMES_TABLE)
+		.select("*")
+		.eq("user_id", user_id)
+		.order("updated_at", desc=True)
+		.execute()
+	)
+	return response.data or []
+
+
+async def upsert_caption_style_theme(user_id: str, name: str, style: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+	"""Create a custom theme, or overwrite the caller's own theme of the same
+	name (unique on (user_id, name)) -- saving under a name the user already
+	used updates that theme in place instead of erroring on a conflict."""
+	if not user_id or not name:
+		return None
+	client = await get_client()
+	payload = {
+		"user_id": user_id,
+		"name": name,
+		"style": style or {},
+		"updated_at": datetime.now(timezone.utc).isoformat(),
+	}
+	response = await client.table(SUPABASE_CAPTION_STYLE_THEMES_TABLE).upsert(
+		payload,
+		on_conflict="user_id,name",
+	).execute()
+	rows = response.data or []
+	return rows[0] if rows else payload
+
+
+async def delete_caption_style_theme(theme_id: str, user_id: str) -> bool:
+	if not theme_id or not user_id:
+		return False
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_CAPTION_STYLE_THEMES_TABLE)
+		.delete()
+		.eq("id", theme_id)
+		.eq("user_id", user_id)
 		.execute()
 	)
 	return bool(response.data)
