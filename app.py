@@ -2052,6 +2052,42 @@ async def _burn_default_captions_for_clip(
             pass
 
 
+# The version_number a clip's auto-applied default caption style is always
+# recorded under (see _record_default_style_version) -- reset_caption_style_
+# history looks this up specifically so "reset" restores the *styled*
+# default instead of stripping captions back to a bare, uncaptioned clip.
+_DEFAULT_STYLE_VERSION_NUMBER = 1
+
+
+async def _record_default_style_version(
+    user_id: str, job_id: str, clip_index: int, source_video_url: str, output_video_url: str,
+) -> None:
+    """Records the auto-applied default caption style (_DEFAULT_AUTO_CAPTION_
+    STYLE_KWARGS) as a real style_edit_versions row, the same table manual
+    restyles are recorded in -- so the captions editor can treat "the
+    default" as an actual version instead of a hardcoded frontend constant,
+    and so resetting a clip's captions falls back to this properly-styled
+    version instead of a bare, uncaptioned video.
+
+    Best-effort: any failure here must never fail the reel job itself -- it
+    just means reset falls back to the plain original video for this clip."""
+    if not (is_supabase_configured() and user_id):
+        return
+    try:
+        await supabase_insert_style_edit_version({
+            "user_id": user_id,
+            "job_id": job_id,
+            "clip_index": int(clip_index),
+            "version_number": _DEFAULT_STYLE_VERSION_NUMBER,
+            "operation_type": "subtitle_style",
+            "source_video_url": source_video_url,
+            "output_video_url": output_video_url,
+            "style_config": dict(_DEFAULT_AUTO_CAPTION_STYLE_KWARGS),
+        })
+    except Exception as exc:
+        logger.warning("Failed to record default style version for job %s clip %s: %s", job_id, clip_index, exc)
+
+
 async def _build_reel_row_for_clip(
     job_id: str,
     user_id: str,
@@ -2108,6 +2144,12 @@ async def _build_reel_row_for_clip(
         )
 
     media_url = _reel_media_url_from_s3_key(s3_key)
+    if auto_captioned:
+        await _record_default_style_version(
+            user_id, job_id, clip_index,
+            source_video_url=_reel_media_url_from_s3_key(original_s3_key) if original_s3_key else "",
+            output_video_url=media_url,
+        )
     thumbnail_s3_key = _upload_reel_clip_thumbnail(clip, primary_path, output_dir, job_id, clip_index, user_id, bucket)
 
     duration = _compute_clip_duration_seconds(clip)
@@ -6279,7 +6321,9 @@ class HookRequest(BaseModel):
     size: Optional[str] = "M" # S, M, L
 
 
-def _reset_clip_metadata_to_original(metadata_path: str, data: Dict[str, Any], clip_index: int) -> str:
+def _reset_clip_metadata_to_original(
+    metadata_path: str, data: Dict[str, Any], clip_index: int, default_video_url: Optional[str] = None,
+) -> str:
     clips = data.get("shorts") or []
     if clip_index < 0 or clip_index >= len(clips):
         raise HTTPException(status_code=404, detail=_CLIP_NOT_FOUND)
@@ -6289,13 +6333,19 @@ def _reset_clip_metadata_to_original(metadata_path: str, data: Dict[str, Any], c
     history_key = str(int(clip_index))
     entries = history.get(history_key) if isinstance(history, dict) else None
 
-    original_video_url = str(clip.get("original_video_url") or "").strip()
-    if not original_video_url and isinstance(entries, list) and entries:
-        original_video_url = str(entries[0].get("source_video_url") or "").strip()
-    if not original_video_url:
+    # Prefer the clip's recorded default style version (the auto-captioned
+    # video, properly sized/fonted -- see _record_default_style_version)
+    # over the bare, uncaptioned original: "reset" should bring back the
+    # default look, not strip captions off entirely.
+    reset_video_url = str(default_video_url or "").strip()
+    if not reset_video_url:
+        reset_video_url = str(clip.get("original_video_url") or "").strip()
+    if not reset_video_url and isinstance(entries, list) and entries:
+        reset_video_url = str(entries[0].get("source_video_url") or "").strip()
+    if not reset_video_url:
         raise HTTPException(status_code=400, detail="No original video reference found for reset")
 
-    clip["video_url"] = original_video_url
+    clip["video_url"] = reset_video_url
     clips[clip_index] = clip
     data["shorts"] = clips
     if isinstance(history, dict):
@@ -6303,7 +6353,20 @@ def _reset_clip_metadata_to_original(metadata_path: str, data: Dict[str, Any], c
         data["style_history"] = history
     _persist_metadata_json(metadata_path, data)
 
-    return original_video_url
+    return reset_video_url
+
+
+async def _find_default_style_version(job_id: str, clip_index: int, user_id: str) -> Optional[Dict[str, Any]]:
+    if not is_supabase_configured():
+        return None
+    try:
+        versions = await supabase_list_style_edit_versions(job_id, int(clip_index), user_id)
+    except Exception as e:
+        print(f"⚠️ Failed to load default style version: {e}")
+        return None
+    return next(
+        (v for v in versions if int(v.get("version_number") or 0) == _DEFAULT_STYLE_VERSION_NUMBER), None,
+    )
 
 
 @app.post("/api/reels/{job_id}/{clip_index}/captions/reset", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
@@ -6316,19 +6379,36 @@ async def reset_caption_style_history(
     if not metadata_path or not data:
         raise HTTPException(status_code=404, detail=_METADATA_NOT_FOUND)
 
-    original_video_url = _reset_clip_metadata_to_original(metadata_path, data, clip_index)
+    default_version = await _find_default_style_version(job_id, clip_index, user_id)
+    default_video_url = str((default_version or {}).get("output_video_url") or "")
+    reset_video_url = _reset_clip_metadata_to_original(metadata_path, data, clip_index, default_video_url=default_video_url)
 
     if is_supabase_configured():
         try:
+            # Clears every manual restyle, then restores the default version
+            # (rather than leaving the clip with no history row at all) so a
+            # later reset or a captions-editor "history" view still finds it.
             await supabase_delete_style_edit_versions(job_id, int(clip_index), user_id)
+            if default_version:
+                await supabase_insert_style_edit_version({
+                    "user_id": user_id,
+                    "job_id": job_id,
+                    "clip_index": int(clip_index),
+                    "version_number": _DEFAULT_STYLE_VERSION_NUMBER,
+                    "operation_type": default_version.get("operation_type") or "subtitle_style",
+                    "source_video_url": default_version.get("source_video_url") or "",
+                    "output_video_url": default_version.get("output_video_url") or "",
+                    "style_config": default_version.get("style_config") or dict(_DEFAULT_AUTO_CAPTION_STYLE_KWARGS),
+                    "billing_details": default_version.get("billing_details") or {},
+                })
         except Exception as e:
-            print(f"⚠️ Failed to delete style history versions: {e}")
+            print(f"⚠️ Failed to reset style history versions: {e}")
 
     return {
         "success": True,
         "job_id": job_id,
         "clip_index": clip_index,
-        "video_url": original_video_url,
+        "video_url": reset_video_url,
         "history_cleared": True,
     }
 

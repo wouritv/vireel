@@ -2274,6 +2274,107 @@ def test_persist_captioned_reel_rejects_non_video_content_type(monkeypatch):
 
 
 
+def test_reset_clip_metadata_to_original_prefers_default_video_url(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    metadata_path = str(tmp_path / "meta.json")
+    monkeypatch.setattr(app, "_persist_metadata_json", lambda *_a, **_k: None)
+    data = {"shorts": [{"video_url": "custom.mp4", "original_video_url": "bare.mp4"}]}
+
+    result = app._reset_clip_metadata_to_original(metadata_path, data, 0, default_video_url="default-styled.mp4")
+
+    assert result == "default-styled.mp4"
+    assert data["shorts"][0]["video_url"] == "default-styled.mp4"
+
+
+def test_reset_clip_metadata_to_original_falls_back_to_bare_original(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    metadata_path = str(tmp_path / "meta.json")
+    monkeypatch.setattr(app, "_persist_metadata_json", lambda *_a, **_k: None)
+    data = {"shorts": [{"video_url": "custom.mp4", "original_video_url": "bare.mp4"}]}
+
+    result = app._reset_clip_metadata_to_original(metadata_path, data, 0)
+
+    assert result == "bare.mp4"
+    assert data["shorts"][0]["video_url"] == "bare.mp4"
+
+
+def test_find_default_style_version_returns_matching_version(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    versions = [
+        {"version_number": 1, "output_video_url": "default.mp4"},
+        {"version_number": 2, "output_video_url": "manual-edit.mp4"},
+    ]
+    monkeypatch.setattr(app, "supabase_list_style_edit_versions", AsyncMock(return_value=versions))
+
+    result = asyncio.run(app._find_default_style_version("job-1", 0, "u1"))
+
+    assert result == versions[0]
+
+
+def test_find_default_style_version_returns_none_without_supabase(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+    list_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_list_style_edit_versions", list_mock)
+
+    result = asyncio.run(app._find_default_style_version("job-1", 0, "u1"))
+
+    assert result is None
+    list_mock.assert_not_awaited()
+
+
+def test_reset_caption_style_history_restores_default_version(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    data = {"shorts": [{"video_url": "manual-edit.mp4", "original_video_url": "bare.mp4"}]}
+    monkeypatch.setattr(app, "_get_or_build_job_metadata", AsyncMock(return_value=("meta.json", data)))
+    monkeypatch.setattr(app, "_persist_metadata_json", lambda *_a, **_k: None)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+
+    default_version = {
+        "version_number": 1,
+        "operation_type": "subtitle_style",
+        "source_video_url": "bare.mp4",
+        "output_video_url": "default-styled.mp4",
+        "style_config": dict(app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS),
+        "billing_details": {},
+    }
+    monkeypatch.setattr(app, "_find_default_style_version", AsyncMock(return_value=default_version))
+    delete_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_delete_style_edit_versions", delete_mock)
+    insert_mock = AsyncMock(return_value={})
+    monkeypatch.setattr(app, "supabase_insert_style_edit_version", insert_mock)
+
+    result = asyncio.run(app.reset_caption_style_history("job-1", 0, "u1"))
+
+    assert result["video_url"] == "default-styled.mp4"
+    assert data["shorts"][0]["video_url"] == "default-styled.mp4"
+    delete_mock.assert_awaited_once_with("job-1", 0, "u1")
+    insert_mock.assert_awaited_once()
+    reinserted = insert_mock.await_args.args[0]
+    assert reinserted["version_number"] == app._DEFAULT_STYLE_VERSION_NUMBER
+    assert reinserted["output_video_url"] == "default-styled.mp4"
+
+
+def test_reset_caption_style_history_falls_back_without_default_version(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    data = {"shorts": [{"video_url": "manual-edit.mp4", "original_video_url": "bare.mp4"}]}
+    monkeypatch.setattr(app, "_get_or_build_job_metadata", AsyncMock(return_value=("meta.json", data)))
+    monkeypatch.setattr(app, "_persist_metadata_json", lambda *_a, **_k: None)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_find_default_style_version", AsyncMock(return_value=None))
+    delete_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_delete_style_edit_versions", delete_mock)
+    insert_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_style_edit_version", insert_mock)
+
+    result = asyncio.run(app.reset_caption_style_history("job-1", 0, "u1"))
+
+    assert result["video_url"] == "bare.mp4"
+    delete_mock.assert_awaited_once_with("job-1", 0, "u1")
+    insert_mock.assert_not_awaited()
+
+
 def test_resolve_anonymous_story_platforms_filters_to_facebook_and_linkedin(monkeypatch):
     # Anonymous stories may only be published to Facebook/LinkedIn (the
     # user's explicit ask), unlike reels/captions' full platform list --
@@ -3266,6 +3367,40 @@ def test_build_reel_row_for_clip_auto_captions_and_uploads_original(monkeypatch,
     assert row["billing_details"]["auto_caption"]["applied"] is True
     assert row["billing_details"]["auto_caption"]["credit_cost"] > 0
     assert row["reel_size_bytes"] == len(b"captioned-bytes-longer")
+
+
+def test_build_reel_row_for_clip_records_default_style_version(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    output_dir = str(tmp_path)
+    clip_path = os.path.join(output_dir, "base_clip_1.mp4")
+    Path(clip_path).write_bytes(b"raw-clip-bytes")
+
+    async def _fake_burn(input_path, output_path, transcript, clip_start, clip_end, job_id, clip_index):
+        Path(output_path).write_bytes(b"captioned-bytes-longer")
+        return True
+
+    monkeypatch.setattr(app, "_burn_default_captions_for_clip", _fake_burn)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda path, bucket, key: True)
+    monkeypatch.setattr(app, "_reel_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}" if key else "")
+    monkeypatch.setattr(app, "_upload_reel_clip_thumbnail", lambda *args, **kwargs: "")
+    monkeypatch.setattr(app, "_estimate_reel_cost_breakdown", lambda **kwargs: {})
+    insert_mock = AsyncMock(return_value={})
+    monkeypatch.setattr(app, "supabase_insert_style_edit_version", insert_mock)
+
+    asyncio.run(app._build_reel_row_for_clip(
+        "job-1", "user-1", output_dir, "bucket", "base", {"start": 0.0, "end": 10.0}, 1,
+        "2024-01-01T00:00:00Z", False, None, transcript={"segments": [{"words": []}]},
+    ))
+
+    insert_mock.assert_awaited_once()
+    row_arg = insert_mock.await_args.args[0]
+    assert row_arg["job_id"] == "job-1"
+    assert row_arg["clip_index"] == 0
+    assert row_arg["version_number"] == app._DEFAULT_STYLE_VERSION_NUMBER
+    assert row_arg["output_video_url"] == "https://cdn.example/reels/user-1/job-1/base_clip_1.mp4"
+    assert row_arg["source_video_url"] == "https://cdn.example/reels/user-1/job-1/original_base_clip_1.mp4"
+    assert row_arg["style_config"]["font_name"] == "Montserrat"
 
 
 def test_build_reel_row_for_clip_skips_captioning_without_transcript(monkeypatch, tmp_path):

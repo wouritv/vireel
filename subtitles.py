@@ -213,6 +213,23 @@ class SubtitleStyleOptions:
     text_case: str = "none"
 
 
+def _probe_video_resolution(video_path):
+    """Returns (width, height) of video_path's first video stream, or
+    (None, None) if ffprobe fails (missing binary, unreadable file, ...) --
+    burn_subtitles treats that as "can't correct the scale, fall back to
+    ffmpeg's own default" rather than failing the whole burn."""
+    try:
+        probe_cmd = [
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', video_path,
+        ]
+        output = subprocess.check_output(probe_cmd, timeout=30).decode().strip()
+        width, height = map(int, output.split('x'))
+        return width, height
+    except Exception:
+        return None, None
+
+
 def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16, style_options=None):
     """
     Burns subtitles into the video using FFmpeg.
@@ -232,11 +249,21 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16, 
     elif align_lower == 'bottom':
         ass_alignment = 2
 
-    # Font size scaling for ASS virtual resolution (PlayResY=288 default)
-    # For vertical 1080x1920 video, we need larger text for readability
-    final_fontsize = int(fontsize * 0.85)
-    if final_fontsize < 10:
-        final_fontsize = 10
+    # A bare .srt carries no PlayResX/PlayResY of its own, so when ffmpeg's
+    # `subtitles` filter converts it to ASS internally it falls back to a
+    # small built-in virtual canvas (historically 384x288) and then scales
+    # everything up to the real frame size -- on a 1080x1920 vertical reel
+    # that stretches a nominal Fontsize by roughly 1920/288 (~6.7x), wildly
+    # out of proportion with how the same font_size looks in the
+    # Remotion-based manual caption editor, whose composition is sized to
+    # the real output resolution and treats fontSize as literal pixels (see
+    # remotion/src/Root.tsx). Telling libass the subtitle's coordinates
+    # already assume the video's real resolution (original_size=WxH) skips
+    # that scaling entirely, so Fontsize maps 1:1 to real pixels here too.
+    width, height = _probe_video_resolution(video_path)
+    original_size_opt = f":original_size={width}x{height}" if width and height else ""
+
+    final_fontsize = max(10, int(fontsize))
 
     _normalize_subtitle_text_case(srt_path, style.text_case)
 
@@ -291,7 +318,7 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16, 
     cmd = [
         'ffmpeg', '-y',
         '-i', video_path,
-        '-vf', f"subtitles='{safe_srt_path}':force_style='{style_string}'",
+        '-vf', f"subtitles='{safe_srt_path}'{original_size_opt}:force_style='{style_string}'",
         '-c:a', 'copy',
         '-c:v', 'libx264', '-preset', EXPORT_VIDEO_PRESET, '-crf', EXPORT_VIDEO_CRF,
         '-pix_fmt', 'yuv420p',

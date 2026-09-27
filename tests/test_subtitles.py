@@ -122,11 +122,66 @@ def test_burn_subtitles_builds_command_and_returns_true(monkeypatch):
 
     monkeypatch.setattr(subtitles, "_normalize_subtitle_text_case", lambda *args, **kwargs: None)
     monkeypatch.setattr(subtitles.subprocess, "run", fake_run)
+    monkeypatch.setattr(subtitles, "_probe_video_resolution", lambda _path: (None, None))
 
     ok = subtitles.burn_subtitles("in.mp4", "/tmp/sub.srt", "out.mp4", alignment="top", fontsize=20)
     assert ok is True
     assert "ffmpeg" in captured["cmd"][0]
     assert "subtitles='" in captured["cmd"][5]
+    # No *0.85 shrink factor anymore -- the real fix for oversized captions
+    # is telling libass the subtitle's real resolution (original_size),
+    # not fudging the nominal font_size down.
+    assert "Fontsize=20" in captured["cmd"][5]
+
+
+def test_burn_subtitles_includes_original_size_when_probe_succeeds(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, stdout=None, stderr=None, **kwargs):
+        captured["cmd"] = cmd
+        class _Result:
+            returncode = 0
+            stderr = b""
+        return _Result()
+
+    monkeypatch.setattr(subtitles, "_normalize_subtitle_text_case", lambda *args, **kwargs: None)
+    monkeypatch.setattr(subtitles.subprocess, "run", fake_run)
+    monkeypatch.setattr(subtitles, "_probe_video_resolution", lambda _path: (1080, 1920))
+
+    subtitles.burn_subtitles("in.mp4", "/tmp/sub.srt", "out.mp4", fontsize=52)
+
+    assert ":original_size=1080x1920:force_style=" in captured["cmd"][5]
+
+
+def test_burn_subtitles_omits_original_size_when_probe_fails(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, stdout=None, stderr=None, **kwargs):
+        captured["cmd"] = cmd
+        class _Result:
+            returncode = 0
+            stderr = b""
+        return _Result()
+
+    monkeypatch.setattr(subtitles, "_normalize_subtitle_text_case", lambda *args, **kwargs: None)
+    monkeypatch.setattr(subtitles.subprocess, "run", fake_run)
+    monkeypatch.setattr(subtitles, "_probe_video_resolution", lambda _path: (None, None))
+
+    subtitles.burn_subtitles("in.mp4", "/tmp/sub.srt", "out.mp4", fontsize=52)
+
+    assert "original_size" not in captured["cmd"][5]
+
+
+def test_probe_video_resolution_parses_ffprobe_output(monkeypatch):
+    monkeypatch.setattr(subtitles.subprocess, "check_output", lambda *_a, **_k: b"1080x1920\n")
+    assert subtitles._probe_video_resolution("in.mp4") == (1080, 1920)
+
+
+def test_probe_video_resolution_returns_none_on_failure(monkeypatch):
+    def _boom(*_a, **_k):
+        raise OSError("ffprobe not found")
+    monkeypatch.setattr(subtitles.subprocess, "check_output", _boom)
+    assert subtitles._probe_video_resolution("in.mp4") == (None, None)
 
 
 def test_burn_subtitles_raises_on_ffmpeg_error(monkeypatch):
