@@ -3613,7 +3613,7 @@ def test_preserve_source_video_copies_input_path(monkeypatch, tmp_path):
     src = tmp_path / "upload.mp4"
     src.write_bytes(b"video-bytes")
 
-    app._preserve_source_video_for_manual_clipping("job-1", {"input_path": str(src)}, str(tmp_path))
+    asyncio.run(app._preserve_source_video_for_manual_clipping("job-1", {"input_path": str(src)}, str(tmp_path)))
 
     assert (tmp_path / "source.mp4").read_bytes() == b"video-bytes"
 
@@ -3622,7 +3622,7 @@ def test_preserve_source_video_falls_back_to_leftover_scan(monkeypatch, tmp_path
     app = _import_app_with_stubs(monkeypatch)
     (tmp_path / "My Cool Video.mp4").write_bytes(b"downloaded-bytes")
 
-    app._preserve_source_video_for_manual_clipping("job-1", {"input_path": None}, str(tmp_path))
+    asyncio.run(app._preserve_source_video_for_manual_clipping("job-1", {"input_path": None}, str(tmp_path)))
 
     assert (tmp_path / "source.mp4").read_bytes() == b"downloaded-bytes"
 
@@ -3631,7 +3631,7 @@ def test_preserve_source_video_ignores_clip_files_when_scanning(monkeypatch, tmp
     app = _import_app_with_stubs(monkeypatch)
     (tmp_path / "base_clip_1.mp4").write_bytes(b"clip-bytes")
 
-    app._preserve_source_video_for_manual_clipping("job-1", {}, str(tmp_path))
+    asyncio.run(app._preserve_source_video_for_manual_clipping("job-1", {}, str(tmp_path)))
 
     assert not (tmp_path / "source.mp4").exists()
 
@@ -3642,7 +3642,76 @@ def test_preserve_source_video_is_best_effort_on_failure(monkeypatch, tmp_path):
     src.write_bytes(b"video-bytes")
     monkeypatch.setattr(app.shutil, "copyfile", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
 
-    app._preserve_source_video_for_manual_clipping("job-1", {"input_path": str(src)}, str(tmp_path))  # must not raise
+    # must not raise
+    asyncio.run(app._preserve_source_video_for_manual_clipping("job-1", {"input_path": str(src)}, str(tmp_path)))
+
+
+def test_preserve_source_video_uploads_to_s3_and_bills_storage(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    src = tmp_path / "upload.mp4"
+    src.write_bytes(b"video-bytes")
+
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setenv("AWS_S3_BUCKET", "my-bucket")
+    upload_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(app, "upload_file_to_s3", upload_mock)
+    deduct_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_deduct_user_credits", deduct_mock)
+    history_mock = AsyncMock(return_value={})
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", history_mock)
+
+    asyncio.run(app._preserve_source_video_for_manual_clipping(
+        "job-1", {"input_path": str(src)}, str(tmp_path), "user-1",
+    ))
+
+    dest = str(tmp_path / "source.mp4")
+    upload_mock.assert_called_once_with(dest, "my-bucket", "reels/user-1/job-1/source.mp4")
+
+    expected_storage_gb = app._bytes_to_gb(len(b"video-bytes"))
+    deduct_mock.assert_awaited_once_with("user-1", 0.0, -expected_storage_gb)
+    history_mock.assert_awaited_once_with(
+        user_id="user-1",
+        credit=0.0,
+        storage=round(expected_storage_gb, 6),
+        operation="output",
+        operation_type="generation_reel",
+        operation_id="job-1:source_video",
+    )
+
+
+def test_preserve_source_video_skips_billing_without_user_id(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    src = tmp_path / "upload.mp4"
+    src.write_bytes(b"video-bytes")
+
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setenv("AWS_S3_BUCKET", "my-bucket")
+    upload_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(app, "upload_file_to_s3", upload_mock)
+
+    asyncio.run(app._preserve_source_video_for_manual_clipping("job-1", {"input_path": str(src)}, str(tmp_path)))
+
+    upload_mock.assert_not_called()
+
+
+def test_preserve_source_video_is_best_effort_on_s3_failure(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    src = tmp_path / "upload.mp4"
+    src.write_bytes(b"video-bytes")
+
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setenv("AWS_S3_BUCKET", "my-bucket")
+    monkeypatch.setattr(app, "upload_file_to_s3", MagicMock(side_effect=RuntimeError("boom")))
+    deduct_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_deduct_user_credits", deduct_mock)
+
+    # must not raise, and the local copy must still be in place
+    asyncio.run(app._preserve_source_video_for_manual_clipping(
+        "job-1", {"input_path": str(src)}, str(tmp_path), "user-1",
+    ))
+
+    assert (tmp_path / "source.mp4").read_bytes() == b"video-bytes"
+    deduct_mock.assert_not_awaited()
 
 
 def test_get_reel_job_source_endpoint_reports_unavailable_when_missing(monkeypatch, tmp_path):

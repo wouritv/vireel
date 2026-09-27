@@ -2802,14 +2802,52 @@ def _find_leftover_source_video(output_dir: str) -> Optional[str]:
     return None
 
 
-def _preserve_source_video_for_manual_clipping(job_id: str, job_data: Dict[str, Any], output_dir: str) -> None:
+async def _upload_and_bill_preserved_source_video(job_id: str, user_id: Optional[str], local_path: str) -> None:
+    """Backs up the locally preserved source video to S3 and debits the
+    storage it consumes from the user's quota, the same way every other
+    reel artifact's storage is billed (see _build_reel_row_for_clip's
+    original_s3_key). Best-effort: the local copy is what actually powers
+    manual clipping (_resolve_preserved_source_video), so a failure here
+    never affects that -- it only means the backup/billing didn't happen."""
+    if not user_id or not is_supabase_configured():
+        return
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket:
+        return
+    try:
+        ext = os.path.splitext(local_path)[1].lower() or ".mp4"
+        s3_key = f"reels/{user_id}/{job_id}/source{ext}"
+        if not upload_file_to_s3(local_path, bucket, s3_key):
+            return
+        storage_gb = _bytes_to_gb(int(os.path.getsize(local_path) or 0))
+        if storage_gb <= 0:
+            return
+        debited = await supabase_deduct_user_credits(user_id, 0.0, -storage_gb)
+        if debited:
+            await supabase_insert_user_data_history(
+                user_id=user_id,
+                credit=0.0,
+                storage=round(storage_gb, 6),
+                operation="output",
+                operation_type="generation_reel",
+                operation_id=f"{job_id}:source_video",
+            )
+    except Exception as exc:
+        logger.warning("Failed to upload/bill preserved source video for job %s: %s", job_id, exc)
+
+
+async def _preserve_source_video_for_manual_clipping(
+    job_id: str, job_data: Dict[str, Any], output_dir: str, user_id: Optional[str] = None,
+) -> None:
     """Keeps a copy of the full source video after a reel job completes, so
     the user can later pick their own start/end range by hand (see
     POST /api/reels/{job_id}/custom-clip) instead of only the AI-selected
     clips -- even though the AI pipeline itself only ever needed the source
     transiently and normally has it deleted (uploads: run_job's
     _cleanup_job_input_file; plain YouTube URLs: main.py's own end-of-run
-    cleanup, unless --keep-original was passed).
+    cleanup, unless --keep-original was passed). The copy is also backed up
+    to S3 and billed as storage against the user's quota, like any other
+    reel artifact (see _upload_and_bill_preserved_source_video).
 
     Best-effort: any failure here must never fail the job itself -- it just
     means manual clipping won't be available for this particular job."""
@@ -2825,6 +2863,7 @@ def _preserve_source_video_for_manual_clipping(job_id: str, job_data: Dict[str, 
         dest = os.path.join(output_dir, f"{_SOURCE_VIDEO_BASENAME}{ext}")
         if os.path.abspath(candidate) != os.path.abspath(dest):
             shutil.copyfile(candidate, dest)
+        await _upload_and_bill_preserved_source_video(job_id, user_id, dest)
     except Exception as exc:
         logger.warning("Failed to preserve source video for manual clipping (job %s): %s", job_id, exc)
 
@@ -2866,7 +2905,7 @@ async def _handle_completed_reel_job_with_metadata(
     if saved_rows is None:
         return
 
-    _preserve_source_video_for_manual_clipping(job_id, job_data, output_dir)
+    await _preserve_source_video_for_manual_clipping(job_id, job_data, output_dir, user_id)
 
     enriched_clips = _enrich_clips_with_saved_rows(clips, saved_rows, job_id)
 
