@@ -2780,6 +2780,68 @@ async def _update_project_on_reel_completion(
         logger.warning(f"Failed to update project status to completed: {str(e)}")
 
 
+_SOURCE_VIDEO_BASENAME = "source"
+_SOURCE_VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".webm", ".m4v")
+
+
+def _find_leftover_source_video(output_dir: str) -> Optional[str]:
+    """Locates the original video main.py downloaded for a plain YouTube URL
+    job (kept around thanks to --keep-original), when app.py itself never
+    learned its path (see _prepare_process_job_from_url's `-u` branch).
+    Picks the first video file in the job's output dir that isn't a
+    generated reel clip (`..._clip_N.mp4`) or an already-preserved source."""
+    if not os.path.isdir(output_dir):
+        return None
+    for name in sorted(os.listdir(output_dir)):
+        lower = name.lower()
+        if not lower.endswith(_SOURCE_VIDEO_EXTENSIONS):
+            continue
+        if "_clip_" in lower or lower.startswith(f"{_SOURCE_VIDEO_BASENAME}."):
+            continue
+        return os.path.join(output_dir, name)
+    return None
+
+
+def _preserve_source_video_for_manual_clipping(job_id: str, job_data: Dict[str, Any], output_dir: str) -> None:
+    """Keeps a copy of the full source video after a reel job completes, so
+    the user can later pick their own start/end range by hand (see
+    POST /api/reels/{job_id}/custom-clip) instead of only the AI-selected
+    clips -- even though the AI pipeline itself only ever needed the source
+    transiently and normally has it deleted (uploads: run_job's
+    _cleanup_job_input_file; plain YouTube URLs: main.py's own end-of-run
+    cleanup, unless --keep-original was passed).
+
+    Best-effort: any failure here must never fail the job itself -- it just
+    means manual clipping won't be available for this particular job."""
+    try:
+        candidate = str(job_data.get("input_path") or "")
+        if not candidate or not os.path.exists(candidate):
+            candidate = _find_leftover_source_video(output_dir) or ""
+        if not candidate or not os.path.exists(candidate):
+            return
+        ext = os.path.splitext(candidate)[1].lower() or ".mp4"
+        if ext not in _SOURCE_VIDEO_EXTENSIONS:
+            ext = ".mp4"
+        dest = os.path.join(output_dir, f"{_SOURCE_VIDEO_BASENAME}{ext}")
+        if os.path.abspath(candidate) != os.path.abspath(dest):
+            shutil.copyfile(candidate, dest)
+    except Exception as exc:
+        logger.warning("Failed to preserve source video for manual clipping (job %s): %s", job_id, exc)
+
+
+def _resolve_preserved_source_video(output_dir: str) -> Optional[str]:
+    """Finds the source video _preserve_source_video_for_manual_clipping
+    saved for this job, if any (and if the job's output dir hasn't been
+    swept yet by the retention cleanup -- see JOB_RETENTION_SECONDS)."""
+    if not os.path.isdir(output_dir):
+        return None
+    for ext in _SOURCE_VIDEO_EXTENSIONS:
+        candidate = os.path.join(output_dir, f"{_SOURCE_VIDEO_BASENAME}{ext}")
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 async def _handle_completed_reel_job_with_metadata(
     job_id: str, job_data: Dict[str, Any], output_dir: str, user_id: Optional[str],
     source_is_url: bool, start_ts: float, target_json: str, pipeline,
@@ -2803,6 +2865,8 @@ async def _handle_completed_reel_job_with_metadata(
     )
     if saved_rows is None:
         return
+
+    _preserve_source_video_for_manual_clipping(job_id, job_data, output_dir)
 
     enriched_clips = _enrich_clips_with_saved_rows(clips, saved_rows, job_id)
 
@@ -4405,7 +4469,14 @@ async def _prepare_process_job_from_url(url: str, user_id: str, job_id: str, job
     if input_path:
         cmd.extend(["-i", input_path])
     else:
-        cmd.extend(["-u", url])
+        # --keep-original: without it main.py deletes the video it downloads
+        # for a plain URL right after processing (see its __main__ cleanup),
+        # which would make manual custom-clip selection (see
+        # _preserve_source_video_for_manual_clipping) impossible for
+        # anything that went through this branch (i.e. genuine YouTube
+        # links, resolved via yt-dlp inside main.py rather than pre-
+        # downloaded here).
+        cmd.extend(["-u", url, "--keep-original"])
 
     return {
         "input_path": input_path,
@@ -6269,6 +6340,209 @@ async def get_caption_style_history_debug(
             "db_latest_output_is_amazon": _looks_amazon_url(db_last.get("output_video_url")),
         },
     }
+
+
+# --- Custom reels: manual start/end selection on the source video, for
+# when the AI-generated clips aren't satisfying (see _preserve_source_video_
+# for_manual_clipping) ---
+
+_CUSTOM_REEL_CLIP_MIN_SECONDS = float(os.environ.get("CUSTOM_REEL_CLIP_MIN_SECONDS", "3"))
+_CUSTOM_REEL_CLIP_MAX_SECONDS = float(os.environ.get("CUSTOM_REEL_CLIP_MAX_SECONDS", "120"))
+
+
+class CustomReelClipRequest(BaseModel):
+    start_ms: int
+    end_ms: int
+    title: Optional[str] = None
+
+
+@app.get("/api/reels/{job_id}/source", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
+async def get_reel_job_source_endpoint(job_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Tells the frontend whether the full source video is still available
+    for this reel job (see _preserve_source_video_for_manual_clipping), so
+    it can offer the "Reel personnalise" manual-trim option, and if so, the
+    URL/duration to load into the trimmer. Never 404s -- a job whose source
+    was never preserved or has since been swept by the retention cleanup
+    just reports itself unavailable, which the UI treats as "hide the
+    button" rather than an error."""
+    await _require_job_ownership(job_id, user_id)
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    source_path = _resolve_preserved_source_video(output_dir)
+    if not source_path:
+        return {"available": False}
+    return {
+        "available": True,
+        "source_url": f"/videos/{job_id}/{os.path.basename(source_path)}",
+        "duration_seconds": _probe_local_video_duration_seconds(source_path),
+    }
+
+
+async def _cut_and_verticalize_custom_clip(
+    source_path: str, start_seconds: float, end_seconds: float, output_dir: str, clip_filename: str,
+) -> str:
+    """Cuts [start_seconds, end_seconds] out of source_path and reframes it
+    to vertical the exact same way the AI pipeline does for each of its own
+    clips (main.py's process_video_to_vertical, scene-aware face tracking),
+    so a manually-picked reel looks consistent with an AI-generated one
+    instead of a plain center-crop. Both steps are blocking/CPU-bound
+    subprocess work, run off the event loop."""
+    from main import process_video_to_vertical, EXPORT_VIDEO_CRF, EXPORT_VIDEO_PRESET, EXPORT_AUDIO_BITRATE
+
+    temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
+    final_path = os.path.join(output_dir, clip_filename)
+
+    def _cut() -> None:
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start_seconds), "-to", str(end_seconds),
+            "-i", source_path,
+            "-c:v", "libx264", "-crf", EXPORT_VIDEO_CRF, "-preset", EXPORT_VIDEO_PRESET,
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", EXPORT_AUDIO_BITRATE,
+            temp_path,
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=FFMPEG_STEP_TIMEOUT_SECONDS)
+        if result.returncode != 0 or not os.path.exists(temp_path):
+            raise RuntimeError(f"FFmpeg cut failed: {result.stderr.decode(errors='replace')[-1000:]}")
+
+    def _verticalize() -> None:
+        try:
+            success = process_video_to_vertical(temp_path, final_path)
+        finally:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+        if not success or not os.path.exists(final_path):
+            raise RuntimeError("Vertical reframing failed")
+
+    await asyncio.to_thread(_cut)
+    await asyncio.to_thread(_verticalize)
+    return final_path
+
+
+@app.post("/api/reels/{job_id}/custom-clip", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 500: {"description": "Internal Server Error"}, 503: {"description": "Service Unavailable"}})
+async def create_custom_reel_clip_endpoint(
+    job_id: str, req: CustomReelClipRequest, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Cuts a reel clip from the exact start/end range the user picked by
+    hand on the source video, instead of one of the AI-selected scenes --
+    the "Reel personnalise" option for when the AI generation isn't
+    satisfying. Produces and bills the clip the same way an AI-generated
+    one is (same _build_reel_row_for_clip path: S3 upload, thumbnail,
+    default captions, credits/storage debit)."""
+    await _require_job_ownership(job_id, user_id)
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    start_ms = max(0, int(req.start_ms))
+    end_ms = int(req.end_ms)
+    if end_ms <= start_ms:
+        raise HTTPException(status_code=400, detail="end_ms doit etre superieur a start_ms")
+    duration_seconds = (end_ms - start_ms) / 1000.0
+    if duration_seconds < _CUSTOM_REEL_CLIP_MIN_SECONDS or duration_seconds > _CUSTOM_REEL_CLIP_MAX_SECONDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"La duree du clip doit etre comprise entre {_CUSTOM_REEL_CLIP_MIN_SECONDS:.0f} et {_CUSTOM_REEL_CLIP_MAX_SECONDS:.0f} secondes",
+        )
+
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    source_path = _resolve_preserved_source_video(output_dir)
+    if not source_path:
+        raise HTTPException(status_code=404, detail="La video source n'est plus disponible pour ce job")
+
+    start_seconds = start_ms / 1000.0
+    end_seconds = end_ms / 1000.0
+    source_duration = _probe_local_video_duration_seconds(source_path)
+    if source_duration > 0 and end_seconds > source_duration + 0.5:
+        raise HTTPException(status_code=400, detail="La plage selectionnee depasse la duree de la video source")
+
+    metadata_path, data = await _get_or_build_job_metadata(job_id, 0, user_id=user_id)
+    if not metadata_path or not data:
+        raise HTTPException(status_code=404, detail=_METADATA_NOT_FOUND)
+
+    # Rough upfront sanity check (fixed bitrate assumption -- we don't have
+    # a real file yet) before spending CPU on the cut/vertical-reframe
+    # pipeline. The precise charge (base cost + any auto-caption add-on) is
+    # computed and debited below from the actual produced file.
+    job_data = jobs.get(job_id) or {}
+    uses_youtube_source = _job_uses_remote_source(job_data) if job_data else False
+    precheck_credits = _estimate_reel_required_credits(
+        duration_seconds=duration_seconds, size_bytes=duration_seconds * 1_000_000, uses_youtube_source=uses_youtube_source,
+    )
+    await _assert_user_has_required_credits(user_id, precheck_credits)
+
+    clips = data.get("shorts") or []
+    next_index = len(clips) + 1
+    base_name = os.path.basename(metadata_path).replace(_METADATA_JSON_SUFFIX, "")
+    clip_filename = f"{base_name}_clip_{next_index}.mp4"
+
+    try:
+        await _cut_and_verticalize_custom_clip(source_path, start_seconds, end_seconds, output_dir, clip_filename)
+    except Exception as exc:
+        raise _generic_error("Custom reel clip cut failed", exc, detail="Impossible de generer ce reel personnalise.")
+
+    title = (req.title or "").strip() or f"Reel personnalise {next_index}"
+    clip_entry = {
+        "title": title,
+        "start": start_seconds,
+        "end": end_seconds,
+        "duration": duration_seconds,
+        "video_title_for_youtube_short": title,
+        "video_description_for_instagram": "",
+        "video_description_for_tiktok": "",
+        "is_custom": True,
+    }
+    clips.append(clip_entry)
+    data["shorts"] = clips
+    _persist_metadata_json(metadata_path, data)
+
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket:
+        raise HTTPException(status_code=503, detail="AWS_S3_BUCKET is required for reel persistence")
+
+    project_id = job_data.get("project_id")
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    reel_row = await _build_reel_row_for_clip(
+        job_id, user_id, output_dir, bucket, base_name, clip_entry, next_index, now_iso,
+        uses_youtube_source, project_id, data.get("transcript"),
+    )
+    if not reel_row:
+        raise HTTPException(status_code=500, detail="Echec de la creation du reel personnalise")
+
+    saved_rows = await supabase_insert_reels([reel_row])
+    if not saved_rows:
+        raise HTTPException(status_code=500, detail="Echec de l'enregistrement du reel personnalise")
+    saved_row = _normalize_reel_row(saved_rows[0])
+
+    billing_details = reel_row.get("billing_details") or {}
+    total_credits = float(billing_details.get("final_credits") or 0.0) + float((billing_details.get("auto_caption") or {}).get("credit_cost") or 0.0)
+    storage_gb = _bytes_to_gb(float(reel_row.get("reel_size_bytes") or 0))
+    debit_ok = await reel_job_manager.debit_credits_for_job(
+        job_id=job_id, user_id=user_id, credits=total_credits, storage_delta=-storage_gb,
+        operation_type="generation_reel", reserved_credits=0.0,
+    )
+    if not debit_ok:
+        logger.warning("Failed to debit credits for custom reel clip (job %s, user %s)", job_id, user_id)
+
+    if project_id:
+        try:
+            await supabase_increment_project_output_count(project_id, user_id=user_id)
+        except Exception as e:
+            logger.warning("Failed to increment project output count: %s", e)
+
+    if job_id in jobs and isinstance(jobs[job_id].get("result"), dict):
+        jobs[job_id]["result"].setdefault("clips", []).append({
+            **clip_entry,
+            "video_url": saved_row.get("reel_playback_url"),
+            "reel_clip_index": next_index - 1,
+            "reel_job_id": job_id,
+        })
+        jobs[job_id]["result"].setdefault("reels", []).append(saved_row)
+
+    return saved_row
+
 
 def _run_add_hook(input_path: str, text: str, output_path: str, position: str, font_scale: float) -> None:
     add_hook_to_video(input_path, text, output_path, position=position, font_scale=font_scale)

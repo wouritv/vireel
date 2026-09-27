@@ -3602,6 +3602,231 @@ def test_delete_caption_style_theme_succeeds(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Custom reels: manual start/end selection on the preserved source video
+# ---------------------------------------------------------------------------
+
+_CUSTOM_REEL_JOB_ID = "deadbeef1234"
+
+
+def test_preserve_source_video_copies_input_path(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    src = tmp_path / "upload.mp4"
+    src.write_bytes(b"video-bytes")
+
+    app._preserve_source_video_for_manual_clipping("job-1", {"input_path": str(src)}, str(tmp_path))
+
+    assert (tmp_path / "source.mp4").read_bytes() == b"video-bytes"
+
+
+def test_preserve_source_video_falls_back_to_leftover_scan(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    (tmp_path / "My Cool Video.mp4").write_bytes(b"downloaded-bytes")
+
+    app._preserve_source_video_for_manual_clipping("job-1", {"input_path": None}, str(tmp_path))
+
+    assert (tmp_path / "source.mp4").read_bytes() == b"downloaded-bytes"
+
+
+def test_preserve_source_video_ignores_clip_files_when_scanning(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    (tmp_path / "base_clip_1.mp4").write_bytes(b"clip-bytes")
+
+    app._preserve_source_video_for_manual_clipping("job-1", {}, str(tmp_path))
+
+    assert not (tmp_path / "source.mp4").exists()
+
+
+def test_preserve_source_video_is_best_effort_on_failure(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    src = tmp_path / "upload.mp4"
+    src.write_bytes(b"video-bytes")
+    monkeypatch.setattr(app.shutil, "copyfile", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+
+    app._preserve_source_video_for_manual_clipping("job-1", {"input_path": str(src)}, str(tmp_path))  # must not raise
+
+
+def test_get_reel_job_source_endpoint_reports_unavailable_when_missing(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    app.jobs[_CUSTOM_REEL_JOB_ID] = {"user_id": "u1"}
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+
+    with TestClient(app.app) as client:
+        resp = client.get(f"/api/reels/{_CUSTOM_REEL_JOB_ID}/source", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"available": False}
+
+
+def test_get_reel_job_source_endpoint_reports_available(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    app.jobs[_CUSTOM_REEL_JOB_ID] = {"user_id": "u1"}
+    job_dir = tmp_path / _CUSTOM_REEL_JOB_ID
+    job_dir.mkdir()
+    (job_dir / "source.mp4").write_bytes(b"x")
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "_probe_local_video_duration_seconds", lambda path: 42.0)
+
+    with TestClient(app.app) as client:
+        resp = client.get(f"/api/reels/{_CUSTOM_REEL_JOB_ID}/source", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "available": True,
+        "source_url": f"/videos/{_CUSTOM_REEL_JOB_ID}/source.mp4",
+        "duration_seconds": 42.0,
+    }
+
+
+def _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path):
+    app.jobs[_CUSTOM_REEL_JOB_ID] = {"user_id": "u1", "project_id": "proj-1"}
+    job_dir = tmp_path / _CUSTOM_REEL_JOB_ID
+    job_dir.mkdir()
+    (job_dir / "source.mp4").write_bytes(b"source-bytes")
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setenv("AWS_S3_BUCKET", "test-bucket")
+    monkeypatch.setattr(app, "_probe_local_video_duration_seconds", lambda path: 300.0)
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock(return_value=1.0))
+    monkeypatch.setattr(app, "_get_or_build_job_metadata", AsyncMock(return_value=(
+        str(job_dir / f"{_CUSTOM_REEL_JOB_ID}_metadata.json"),
+        {"shorts": [], "transcript": {"segments": []}},
+    )))
+    monkeypatch.setattr(app, "_persist_metadata_json", lambda *a, **k: None)
+    monkeypatch.setattr(app, "_cut_and_verticalize_custom_clip", AsyncMock(return_value=str(job_dir / "clip_1.mp4")))
+    reel_row = {
+        "reel_url": "https://cdn.example/clip.mp4",
+        "reel_size_bytes": 1000,
+        "billing_details": {"final_credits": 2.5, "auto_caption": {"applied": True, "credit_cost": 0.5}},
+    }
+    monkeypatch.setattr(app, "_build_reel_row_for_clip", AsyncMock(return_value=reel_row))
+    monkeypatch.setattr(app, "supabase_insert_reels", AsyncMock(return_value=[{"id": "reel-1", **reel_row}]))
+    monkeypatch.setattr(app, "_normalize_reel_row", lambda row: row)
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+    monkeypatch.setattr(app, "supabase_increment_project_output_count", AsyncMock())
+    return debit_mock
+
+
+def test_create_custom_reel_clip_rejects_end_before_start(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 5000, "end_ms": 4000},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 400
+
+
+def test_create_custom_reel_clip_rejects_too_short_duration(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 0, "end_ms": 500},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 400
+
+
+def test_create_custom_reel_clip_rejects_too_long_duration(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 0, "end_ms": 200000},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 400
+
+
+def test_create_custom_reel_clip_returns_404_without_preserved_source(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+    os.remove(str(tmp_path / _CUSTOM_REEL_JOB_ID / "source.mp4"))
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 0, "end_ms": 10000},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 404
+
+
+def test_create_custom_reel_clip_rejects_range_past_source_duration(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+    monkeypatch.setattr(app, "_probe_local_video_duration_seconds", lambda path: 5.0)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 0, "end_ms": 10000},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 400
+
+
+def test_create_custom_reel_clip_happy_path(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    debit_mock = _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 1000, "end_ms": 11000, "title": "Mon moment prefere"},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == "reel-1"
+
+    # Bills base cost + auto-caption add-on together, no reservation to
+    # reconcile against (this is an ad-hoc, post-job-completion action).
+    debit_mock.assert_awaited_once()
+    assert debit_mock.await_args.kwargs["credits"] == pytest.approx(3.0)
+    assert debit_mock.await_args.kwargs["operation_type"] == "generation_reel"
+    assert debit_mock.await_args.kwargs["reserved_credits"] == 0.0
+
+    build_row_mock = app._build_reel_row_for_clip
+    build_row_mock.assert_awaited_once()
+    call_args = build_row_mock.await_args.args
+    clip_entry = call_args[5]
+    assert clip_entry["title"] == "Mon moment prefere"
+    assert clip_entry["start"] == pytest.approx(1.0)
+    assert clip_entry["end"] == pytest.approx(11.0)
+    assert clip_entry["is_custom"] is True
+
+
+def test_create_custom_reel_clip_requires_supabase(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 0, "end_ms": 10000},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 503
+
+
+# ---------------------------------------------------------------------------
 # Stripe subscriptions: mode="subscription" + auto-renewal via invoice.paid
 # ---------------------------------------------------------------------------
 
