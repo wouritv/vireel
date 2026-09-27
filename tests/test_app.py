@@ -741,7 +741,7 @@ def test_process_and_complete_caption_job_auto_captions_and_uploads_original(mon
     input_path = os.path.join(output_dir, "source.mp4")
     Path(input_path).write_bytes(b"raw-source-bytes")
 
-    async def _fake_burn(input_path_, output_path, transcript, clip_start, clip_end, job_id_, clip_index):
+    async def _fake_burn(input_path_, output_path, transcript, clip_start, clip_end, job_id_, clip_index, style_kwargs):
         Path(output_path).write_bytes(b"captioned-source-bytes-longer")
         return True
 
@@ -3239,7 +3239,7 @@ def test_finalize_completed_reel_billing_skips_auto_caption_debit_when_none_appl
 def test_burn_default_captions_for_clip_returns_false_without_transcript(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     result = asyncio.run(app._burn_default_captions_for_clip(
-        "/tmp/in.mp4", "/tmp/out.mp4", None, 0.0, 10.0, "job-1", 0,
+        "/tmp/in.mp4", "/tmp/out.mp4", None, 0.0, 10.0, "job-1", 0, app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS,
     ))
     assert result is False
 
@@ -3251,7 +3251,7 @@ def test_burn_default_captions_for_clip_returns_false_when_no_words_in_range(mon
     monkeypatch.setattr(app, "_burn_subtitles_for_request", burn_mock)
 
     result = asyncio.run(app._burn_default_captions_for_clip(
-        "/tmp/in.mp4", "/tmp/out.mp4", {"segments": []}, 0.0, 10.0, "job-1", 0,
+        "/tmp/in.mp4", "/tmp/out.mp4", {"segments": []}, 0.0, 10.0, "job-1", 0, app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS,
     ))
 
     assert result is False
@@ -3269,7 +3269,7 @@ def test_burn_default_captions_for_clip_burns_and_returns_true(monkeypatch):
 
     result = asyncio.run(app._burn_default_captions_for_clip(
         "/tmp/in.mp4", "/tmp/out.mp4", {"segments": [{"words": [{"word": "hi", "start": 0, "end": 1}]}]},
-        0.0, 10.0, "job-1", 2,
+        0.0, 10.0, "job-1", 2, app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS,
     ))
 
     assert result is True
@@ -3279,6 +3279,27 @@ def test_burn_default_captions_for_clip_burns_and_returns_true(monkeypatch):
     assert burn_req.clip_index == 2
     assert burn_req.font_size == 52
     assert burn_req.animation == "word-highlight"
+
+
+def test_burn_default_captions_for_clip_uses_given_style_kwargs(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "generate_srt", lambda *args, **kwargs: True)
+    burn_mock = MagicMock()
+    monkeypatch.setattr(app, "_burn_subtitles_for_request", burn_mock)
+    monkeypatch.setattr(app.os.path, "exists", lambda p: True)
+    monkeypatch.setattr(app.os.path, "getsize", lambda p: 4096)
+    monkeypatch.setattr(app.os, "remove", lambda p: None)
+
+    custom_style = dict(app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS, font_size=30, font_name="Poppins")
+    result = asyncio.run(app._burn_default_captions_for_clip(
+        "/tmp/in.mp4", "/tmp/out.mp4", {"segments": [{"words": [{"word": "hi", "start": 0, "end": 1}]}]},
+        0.0, 10.0, "job-1", 0, custom_style,
+    ))
+
+    assert result is True
+    burn_req = burn_mock.call_args.args[0]
+    assert burn_req.font_size == 30
+    assert burn_req.font_name == "Poppins"
 
 
 def test_burn_default_captions_for_clip_returns_false_on_exception(monkeypatch):
@@ -3294,7 +3315,7 @@ def test_burn_default_captions_for_clip_returns_false_on_exception(monkeypatch):
 
     result = asyncio.run(app._burn_default_captions_for_clip(
         "/tmp/in.mp4", "/tmp/out.mp4", {"segments": [{"words": [{"word": "hi", "start": 0, "end": 1}]}]},
-        0.0, 10.0, "job-1", 0,
+        0.0, 10.0, "job-1", 0, app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS,
     ))
 
     assert result is False
@@ -3346,7 +3367,7 @@ def test_build_reel_row_for_clip_auto_captions_and_uploads_original(monkeypatch,
     clip_path = os.path.join(output_dir, "base_clip_1.mp4")
     Path(clip_path).write_bytes(b"raw-clip-bytes")
 
-    async def _fake_burn(input_path, output_path, transcript, clip_start, clip_end, job_id, clip_index):
+    async def _fake_burn(input_path, output_path, transcript, clip_start, clip_end, job_id, clip_index, style_kwargs):
         Path(output_path).write_bytes(b"captioned-bytes-longer")
         return True
 
@@ -3375,7 +3396,7 @@ def test_build_reel_row_for_clip_records_default_style_version(monkeypatch, tmp_
     clip_path = os.path.join(output_dir, "base_clip_1.mp4")
     Path(clip_path).write_bytes(b"raw-clip-bytes")
 
-    async def _fake_burn(input_path, output_path, transcript, clip_start, clip_end, job_id, clip_index):
+    async def _fake_burn(input_path, output_path, transcript, clip_start, clip_end, job_id, clip_index, style_kwargs):
         Path(output_path).write_bytes(b"captioned-bytes-longer")
         return True
 
@@ -3385,6 +3406,7 @@ def test_build_reel_row_for_clip_records_default_style_version(monkeypatch, tmp_
     monkeypatch.setattr(app, "_reel_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}" if key else "")
     monkeypatch.setattr(app, "_upload_reel_clip_thumbnail", lambda *args, **kwargs: "")
     monkeypatch.setattr(app, "_estimate_reel_cost_breakdown", lambda **kwargs: {})
+    monkeypatch.setattr(app, "supabase_list_style_edit_versions", AsyncMock(return_value=[]))
     insert_mock = AsyncMock(return_value={})
     monkeypatch.setattr(app, "supabase_insert_style_edit_version", insert_mock)
 
@@ -3644,6 +3666,127 @@ def test_film_summary_voice_preview_regenerates_empty_cached_file(monkeypatch, t
     assert resp.status_code == 200
     synth.assert_awaited_once()
     assert (tmp_path / "sage.mp3").read_bytes() == b"fake-mp3"
+
+
+# ---------------------------------------------------------------------------
+# User-replaceable default caption style (style_edit_versions, sentinel
+# job_id/clip_index) -- what new reels/captions get auto-captioned with.
+# ---------------------------------------------------------------------------
+
+def test_get_user_default_caption_style_returns_factory_default_without_supabase(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+
+    result = asyncio.run(app._get_user_default_caption_style("u1"))
+
+    assert result == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS
+
+
+def test_get_user_default_caption_style_returns_factory_default_without_user_id(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    list_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_list_style_edit_versions", list_mock)
+
+    result = asyncio.run(app._get_user_default_caption_style(None))
+
+    assert result == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS
+    list_mock.assert_not_awaited()
+
+
+def test_get_user_default_caption_style_returns_latest_saved_version(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    versions = [
+        {"version_number": 1, "style_config": {"font_name": "Montserrat", "font_size": 52}},
+        {"version_number": 2, "style_config": {"font_name": "Poppins", "font_size": 30}},
+    ]
+    monkeypatch.setattr(app, "supabase_list_style_edit_versions", AsyncMock(return_value=versions))
+
+    result = asyncio.run(app._get_user_default_caption_style("u1"))
+
+    assert result == {"font_name": "Poppins", "font_size": 30}
+
+
+def test_get_user_default_caption_style_falls_back_when_query_fails(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_list_style_edit_versions", AsyncMock(side_effect=RuntimeError("boom")))
+
+    result = asyncio.run(app._get_user_default_caption_style("u1"))
+
+    assert result == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS
+
+
+def test_get_default_caption_style_endpoint_returns_current_default(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/caption-style-default", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json()["style"] == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS
+
+
+def test_set_default_caption_style_endpoint_requires_supabase(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+
+    with TestClient(app.app) as client:
+        resp = client.put(
+            "/api/caption-style-default",
+            json={"font_name": "Poppins", "font_size": 30},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 503
+
+
+def test_set_default_caption_style_endpoint_appends_next_version(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(
+        app, "supabase_list_style_edit_versions",
+        AsyncMock(return_value=[{"version_number": 1}, {"version_number": 2}]),
+    )
+    insert_mock = AsyncMock(return_value={})
+    monkeypatch.setattr(app, "supabase_insert_style_edit_version", insert_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.put(
+            "/api/caption-style-default",
+            json={"font_name": "Poppins", "font_size": 30},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True
+    assert body["style"]["font_name"] == "Poppins"
+    assert body["style"]["font_size"] == 30
+
+    insert_mock.assert_awaited_once()
+    inserted = insert_mock.await_args.args[0]
+    assert inserted["job_id"] == app._DEFAULT_STYLE_SENTINEL_JOB_ID
+    assert inserted["clip_index"] == app._DEFAULT_STYLE_SENTINEL_CLIP_INDEX
+    assert inserted["version_number"] == 3
+    assert inserted["user_id"] == "u1"
+    assert inserted["style_config"]["font_name"] == "Poppins"
+
+
+def test_set_default_caption_style_endpoint_rejects_out_of_range_font_size(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+
+    with TestClient(app.app) as client:
+        resp = client.put(
+            "/api/caption-style-default",
+            json={"font_size": 1000},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 422
 
 
 # ---------------------------------------------------------------------------

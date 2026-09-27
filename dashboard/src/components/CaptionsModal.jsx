@@ -244,6 +244,8 @@ export default function CaptionsModal({
   const [saveThemeName, setSaveThemeName] = useState('');
   const [isSavingTheme, setIsSavingTheme] = useState(false);
   const [saveThemeMessage, setSaveThemeMessage] = useState('');
+  const [isSavingDefaultStyle, setIsSavingDefaultStyle] = useState(false);
+  const [saveDefaultStyleMessage, setSaveDefaultStyleMessage] = useState('');
   const [deletingThemeId, setDeletingThemeId] = useState(null);
 
   const [translationEnabled, setTranslationEnabled] = useState(false);
@@ -366,6 +368,57 @@ export default function CaptionsModal({
       setSaveThemeMessage(error.message || t('captionsModal.themeSaveFailed', "Echec de l'enregistrement du theme."));
     } finally {
       setIsSavingTheme(false);
+    }
+  };
+
+  // Replaces what new reels/captions get auto-captioned with, going
+  // forward -- stored server-side as a style_edit_versions row (see
+  // PUT /api/caption-style-default in app.py) rather than only ever living
+  // as this component's own DEFAULT_STYLE constant, so it survives across
+  // sessions/devices and future clips actually pick it up.
+  const handleSetAsDefaultStyle = async () => {
+    setIsSavingDefaultStyle(true);
+    setSaveDefaultStyleMessage('');
+    try {
+      const res = await fetch(getApiUrl('/api/caption-style-default'), {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(user?.id),
+        },
+        body: JSON.stringify({
+          position: 'bottom',
+          position_x: currentStyle.positionX,
+          position_y: currentStyle.positionY,
+          font_size: currentStyle.fontSize,
+          font_name: currentStyle.fontFamily,
+          font_color: currentStyle.fontColor,
+          highlight_color: currentStyle.highlightColor,
+          border_color: currentStyle.borderColor,
+          border_width: currentStyle.borderWidth,
+          text_shadow_color: currentStyle.textShadowColor,
+          shadow_blur: currentStyle.shadowBlur,
+          shadow_offset_x: currentStyle.shadowOffsetX,
+          shadow_offset_y: currentStyle.shadowOffsetY,
+          bg_color: currentStyle.bgColor,
+          bg_opacity: currentStyle.bgOpacity,
+          text_case: currentStyle.textCase,
+          bold: currentStyle.bold,
+          italic: currentStyle.italic,
+          words_per_line: currentStyle.wordsPerLine,
+          animation: currentStyle.animation,
+        }),
+      });
+      if (!res.ok) {
+        const raw = await res.text();
+        throw new Error(parseApiDetail(raw, t('captionsModal.setDefaultFailed', "Echec de la mise a jour du style par defaut.")));
+      }
+      setSaveDefaultStyleMessage(t('captionsModal.setDefaultSuccess', 'Ce style est maintenant le style par defaut.'));
+    } catch (error) {
+      setSaveDefaultStyleMessage(error.message || t('captionsModal.setDefaultFailed', "Echec de la mise a jour du style par defaut."));
+    } finally {
+      setIsSavingDefaultStyle(false);
+      setTimeout(() => setSaveDefaultStyleMessage(''), 3000);
     }
   };
 
@@ -590,11 +643,24 @@ export default function CaptionsModal({
         <div className="w-full md:w-[50%] rounded-xl border border-slate-300 dark:border-white/10 bg-slate-50 dark:bg-black/30 p-4 md:p-5 overflow-y-auto overflow-x-hidden custom-scrollbar">
           {showStyleEditor && lines.length > 0 ? (
             <>
-              <div className="mb-4 flex items-center justify-between gap-2">
+              <div className="mb-2 flex items-center justify-between gap-2">
                 <button onClick={() => setShowStyleEditor(false)} className="inline-flex items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
                   <ArrowLeft size={14} /> {t('captionsModal.back', 'Retour')}
                 </button>
                 <h4 className="text-sm font-bold text-slate-900 dark:text-white">{t('captionsModal.styleEditor', 'Edition de style')}</h4>
+              </div>
+
+              <div className="mb-4 flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={handleSetAsDefaultStyle}
+                  disabled={isSavingDefaultStyle}
+                  className="rounded-lg border border-emerald-400/60 dark:border-emerald-500/40 bg-emerald-50 dark:bg-emerald-500/10 hover:bg-emerald-100 dark:hover:bg-emerald-500/20 px-3 py-1.5 text-xs font-semibold text-emerald-700 dark:text-emerald-200 disabled:opacity-40 inline-flex items-center gap-1"
+                >
+                  {isSavingDefaultStyle ? <Loader2 size={12} className="animate-spin" /> : null}
+                  {t('captionsModal.setAsDefault', 'Definir comme style par defaut')}
+                </button>
+                {saveDefaultStyleMessage ? <p className="text-[11px] text-slate-500 dark:text-slate-400">{saveDefaultStyleMessage}</p> : null}
               </div>
 
               <div className="space-y-4">

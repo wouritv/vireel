@@ -216,8 +216,8 @@ class SubtitleStyleOptions:
 def _probe_video_resolution(video_path):
     """Returns (width, height) of video_path's first video stream, or
     (None, None) if ffprobe fails (missing binary, unreadable file, ...) --
-    burn_subtitles treats that as "can't correct the scale, fall back to
-    ffmpeg's own default" rather than failing the whole burn."""
+    burn_subtitles falls back to a fixed vertical-reel resolution rather
+    than failing the whole burn when this can't be determined."""
     try:
         probe_cmd = [
             'ffprobe', '-v', 'error', '-select_streams', 'v:0',
@@ -228,6 +228,93 @@ def _probe_video_resolution(video_path):
         return width, height
     except Exception:
         return None, None
+
+
+_SRT_TIME_RE = re.compile(r"(\d{2}):(\d{2}):(\d{2}),(\d{3})")
+
+
+def _parse_srt_time(text: str) -> float:
+    match = _SRT_TIME_RE.match(text.strip())
+    if not match:
+        return 0.0
+    hours, minutes, seconds, millis = (int(x) for x in match.groups())
+    return hours * 3600 + minutes * 60 + seconds + millis / 1000.0
+
+
+def _parse_srt_blocks(srt_path):
+    """Parses an .srt file back into (start_seconds, end_seconds, text)
+    tuples, so burn_subtitles can re-emit it as a proper .ass script (see
+    burn_subtitles for why a bare .srt can't be burned directly at a
+    predictable font size)."""
+    with open(srt_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    blocks = []
+    for raw_block in re.split(r"\n\s*\n", content.strip()):
+        lines = [ln for ln in raw_block.splitlines() if ln.strip()]
+        if not lines:
+            continue
+        time_line_index = 1 if len(lines) > 1 and '-->' in lines[1] else 0
+        if time_line_index >= len(lines) or '-->' not in lines[time_line_index]:
+            continue
+        start_str, end_str = (p.strip() for p in lines[time_line_index].split('-->'))
+        text = " ".join(lines[time_line_index + 1:]).strip()
+        if not text:
+            continue
+        blocks.append((_parse_srt_time(start_str), _parse_srt_time(end_str), text))
+    return blocks
+
+
+def _format_ass_time(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    centis = int(round(seconds * 100))
+    hours, remainder = divmod(centis, 360000)
+    minutes, remainder = divmod(remainder, 6000)
+    secs, cs = divmod(remainder, 100)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{cs:02d}"
+
+
+def _escape_ass_text(text: str) -> str:
+    return text.replace('\\', '\\\\').replace('{', '\\{').replace('}', '\\}').replace('\n', '\\N')
+
+
+def _build_ass_document(
+    blocks, width: int, height: int, ass_alignment: int, font_name: str, fontsize: int,
+    primary_colour: str, outline_colour: str, back_colour: str, border_style: int,
+    outline_width: int, shadow: int, bold: int, italic: int,
+) -> str:
+    """Builds a complete .ass script with its own [Script Info] PlayResX/
+    PlayResY set to the video's real resolution -- unlike a bare .srt (which
+    carries no resolution info of its own and makes ffmpeg's `subtitles`
+    filter fall back to a small built-in virtual canvas, historically
+    384x288, then scale everything up to the real frame size -- on a
+    1080x1920 vertical reel that stretches a nominal Fontsize by roughly
+    6.7x), a genuine .ass file's own header is what libass actually reads,
+    so Fontsize maps 1:1 to real pixels here, matching how the same
+    font_size looks in the Remotion-based manual caption editor (whose
+    composition is sized to the real output resolution and treats fontSize
+    as literal CSS pixels -- see remotion/src/Root.tsx)."""
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {width}\n"
+        f"PlayResY: {height}\n"
+        "WrapStyle: 0\n"
+        "ScaledBorderAndShadow: yes\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Default,{font_name},{fontsize},{primary_colour},{primary_colour},{outline_colour},{back_colour},"
+        f"{bold},{italic},0,0,100,100,0,0,{border_style},{outline_width},{shadow},{ass_alignment},10,10,25,1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+    events = "".join(
+        f"Dialogue: 0,{_format_ass_time(start)},{_format_ass_time(end)},Default,,0,0,0,,{_escape_ass_text(text)}\n"
+        for start, end, text in blocks
+    )
+    return header + events
 
 
 def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16, style_options=None):
@@ -249,42 +336,25 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16, 
     elif align_lower == 'bottom':
         ass_alignment = 2
 
-    # A bare .srt carries no PlayResX/PlayResY of its own, so when ffmpeg's
-    # `subtitles` filter converts it to ASS internally it falls back to a
-    # small built-in virtual canvas (historically 384x288) and then scales
-    # everything up to the real frame size -- on a 1080x1920 vertical reel
-    # that stretches a nominal Fontsize by roughly 1920/288 (~6.7x), wildly
-    # out of proportion with how the same font_size looks in the
-    # Remotion-based manual caption editor, whose composition is sized to
-    # the real output resolution and treats fontSize as literal pixels (see
-    # remotion/src/Root.tsx). Telling libass the subtitle's coordinates
-    # already assume the video's real resolution (original_size=WxH) skips
-    # that scaling entirely, so Fontsize maps 1:1 to real pixels here too.
     width, height = _probe_video_resolution(video_path)
-    original_size_opt = f":original_size={width}x{height}" if width and height else ""
+    if not width or not height:
+        # Sane vertical-reel fallback: better than ever letting this fall
+        # through to ffmpeg's own tiny default virtual canvas.
+        width, height = 1080, 1920
 
     final_fontsize = max(10, int(fontsize))
 
     _normalize_subtitle_text_case(srt_path, style.text_case)
 
-    # Path handling for FFmpeg filter syntax. Also escape single quotes so a
-    # path cannot break out of the quoted subtitles='...' filter argument
-    # (defense in depth; job_id is already validated by the caller, but this
-    # keeps the guarantee local to the function that actually builds the
-    # filtergraph string).
-    safe_srt_path = srt_path.replace('\\', '/').replace(':', '\\:').replace("'", "\\'")
-
-    # Font name is the one style field echoed verbatim into the filtergraph
-    # (colors go through hex_to_ass_color below, which only ever emits a
-    # fixed &HAABBGGRR-format string). Restrict it to a safe character set so
-    # a crafted font_name cannot break out of force_style='...' and inject
-    # additional filtergraph syntax.
+    # Font name is the one style field echoed verbatim into the generated
+    # .ass file. Restrict it to a safe character set so a crafted font_name
+    # can't break out of the Style line or inject extra script sections.
     safe_font_name = re.sub(r"[^A-Za-z0-9 _.\-]", "", style.font_name or "")[:64].strip() or "Verdana"
 
     # Convert colors to ASS format and build style
     primary_colour = hex_to_ass_color(style.font_color, 1.0)
     shadow_colour = hex_to_ass_color(style.text_shadow_color, 1.0)
-    _ = (style.shadow_offset_x, style.shadow_offset_y)  # Kept for API compatibility; ASS shadow offset is limited.
+    _ = (shadow_colour, style.shadow_offset_x, style.shadow_offset_y)  # Kept for API compatibility; ASS shadow offset/colour are limited.
 
     if style.bg_opacity > 0:
         # Box mode: opaque background box
@@ -299,43 +369,51 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16, 
 
     back_colour = hex_to_ass_color("#000000", 0.0)
 
-    style_string = (
-        f"Alignment={ass_alignment},"
-        f"Fontname={safe_font_name},"
-        f"Fontsize={final_fontsize},"
-        f"PrimaryColour={primary_colour},"
-        f"OutlineColour={outline_colour},"
-        f"BackColour={back_colour},"
-        f"BorderStyle={border_style},"
-        f"Outline={outline_width},"
-        f"Shadow={max(0, int(style.shadow_blur))},"
-        f"ShadowColour={shadow_colour},"
-        f"MarginV=25,"
-        f"Bold={1 if style.bold else 0},"
-        f"Italic={1 if style.italic else 0}"
+    blocks = _parse_srt_blocks(srt_path)
+    ass_content = _build_ass_document(
+        blocks, width, height, ass_alignment, safe_font_name, final_fontsize,
+        primary_colour, outline_colour, back_colour, border_style, outline_width,
+        max(0, int(style.shadow_blur)), 1 if style.bold else 0, 1 if style.italic else 0,
     )
+    ass_path = f"{os.path.splitext(srt_path)[0]}.ass"
+    with open(ass_path, 'w', encoding='utf-8') as f:
+        f.write(ass_content)
 
-    cmd = [
-        'ffmpeg', '-y',
-        '-i', video_path,
-        '-vf', f"subtitles='{safe_srt_path}'{original_size_opt}:force_style='{style_string}'",
-        '-c:a', 'copy',
-        '-c:v', 'libx264', '-preset', EXPORT_VIDEO_PRESET, '-crf', EXPORT_VIDEO_CRF,
-        '-pix_fmt', 'yuv420p',
-        output_path
-    ]
-
-    print(f"🎬 Burning subtitles: {' '.join(cmd)}")
     try:
-        result = subprocess.run(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=FFMPEG_STEP_TIMEOUT_SECONDS
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"FFmpeg timed out after {FFMPEG_STEP_TIMEOUT_SECONDS}s while burning subtitles") from exc
+        # Escape single quotes so a path cannot break out of the quoted
+        # subtitles='...' filter argument (defense in depth; job_id is
+        # already validated by the caller, but this keeps the guarantee
+        # local to the function that actually builds the filtergraph
+        # string).
+        safe_ass_path = ass_path.replace('\\', '/').replace(':', '\\:').replace("'", "\\'")
 
-    if result.returncode != 0:
-        print(f"❌ FFmpeg Subtitle Error: {result.stderr.decode()}")
-        raise RuntimeError(f"FFmpeg failed: {result.stderr.decode()}")
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', video_path,
+            '-vf', f"subtitles='{safe_ass_path}'",
+            '-c:a', 'copy',
+            '-c:v', 'libx264', '-preset', EXPORT_VIDEO_PRESET, '-crf', EXPORT_VIDEO_CRF,
+            '-pix_fmt', 'yuv420p',
+            output_path
+        ]
 
-    return True
+        print(f"🎬 Burning subtitles: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=FFMPEG_STEP_TIMEOUT_SECONDS
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"FFmpeg timed out after {FFMPEG_STEP_TIMEOUT_SECONDS}s while burning subtitles") from exc
+
+        if result.returncode != 0:
+            print(f"❌ FFmpeg Subtitle Error: {result.stderr.decode()}")
+            raise RuntimeError(f"FFmpeg failed: {result.stderr.decode()}")
+
+        return True
+    finally:
+        try:
+            if os.path.exists(ass_path):
+                os.remove(ass_path)
+        except Exception:
+            pass
 

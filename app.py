@@ -30,7 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, StreamingResponse
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import jwt as pyjwt
 from jwt import PyJWTError
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -2000,7 +2000,9 @@ def _compute_clip_duration_seconds(clip: Dict[str, Any]) -> int:
 # Matches CaptionsModal.jsx's own DEFAULT_STYLE (dashboard/src/components/
 # CaptionsModal.jsx) so a clip's default captions -- burned in automatically,
 # server-side, before the user ever opens the editor -- look identical to
-# what they'd get by opening "Sous-titres" and accepting the defaults.
+# what they'd get by opening "Sous-titres" and accepting the defaults. This
+# is only ever the *factory* fallback now -- see _get_user_default_caption_
+# style, which prefers a user's own saved default when one exists.
 _DEFAULT_AUTO_CAPTION_STYLE_KWARGS: Dict[str, Any] = dict(
     position="bottom", position_x=50.0, position_y=82.0,
     font_size=52, font_name="Montserrat", font_color="#FFFFFF",
@@ -2010,19 +2012,75 @@ _DEFAULT_AUTO_CAPTION_STYLE_KWARGS: Dict[str, Any] = dict(
     words_per_line=4, animation="word-highlight",
 )
 
+# Sentinel (job_id, clip_index) under which a user's own default caption
+# style is stored in style_edit_versions -- not a real job/clip, just a
+# fixed key so "the user's global default" fits the same per-(user_id,
+# job_id, clip_index) row shape everything else in that table uses,
+# instead of needing a separate table. Each save (see
+# set_default_caption_style_endpoint) appends a new version; the latest
+# one wins, so "replacing" the default is just saving another version.
+_DEFAULT_STYLE_SENTINEL_JOB_ID = "__user_default__"
+_DEFAULT_STYLE_SENTINEL_CLIP_INDEX = 0
+
+
+class DefaultCaptionStyleRequest(BaseModel):
+    position: str = "bottom"
+    position_x: float = 50.0
+    position_y: float = 82.0
+    font_size: int = Field(default=52, ge=10, le=200)
+    font_name: str = "Montserrat"
+    font_color: str = "#FFFFFF"
+    highlight_color: str = "#FFDD00"
+    border_color: str = "#000000"
+    border_width: int = 3
+    text_shadow_color: str = "#000000"
+    shadow_blur: int = 8
+    shadow_offset_x: int = 0
+    shadow_offset_y: int = 2
+    bg_color: str = "#000000"
+    bg_opacity: float = 0.0
+    text_case: str = "none"
+    bold: bool = True
+    italic: bool = False
+    words_per_line: int = Field(default=4, ge=1, le=10)
+    animation: str = "word-highlight"
+
+
+async def _get_user_default_caption_style(user_id: Optional[str]) -> Dict[str, Any]:
+    """Resolves the style new clips get auto-captioned with: a user's own
+    saved default when they have one (a readable, replaceable
+    style_edit_versions row -- see set_default_caption_style_endpoint --
+    rather than a value only ever baked into application code), falling
+    back to the factory default (_DEFAULT_AUTO_CAPTION_STYLE_KWARGS)
+    otherwise."""
+    if is_supabase_configured() and user_id:
+        try:
+            versions = await supabase_list_style_edit_versions(
+                _DEFAULT_STYLE_SENTINEL_JOB_ID, _DEFAULT_STYLE_SENTINEL_CLIP_INDEX, user_id,
+            )
+            if versions:
+                style_config = versions[-1].get("style_config")
+                if isinstance(style_config, dict) and style_config:
+                    return style_config
+        except Exception as exc:
+            logger.warning("Failed to load user default caption style for %s: %s", user_id, exc)
+    return dict(_DEFAULT_AUTO_CAPTION_STYLE_KWARGS)
+
 
 async def _burn_default_captions_for_clip(
     input_path: str, output_path: str, transcript: Optional[Dict[str, Any]],
     clip_start: float, clip_end: float, job_id: str, clip_index: int,
+    style_kwargs: Dict[str, Any],
 ) -> bool:
     """Burn default subtitles into a freshly produced clip so reels/captions
     come out captioned without the user opening the manual editor first.
 
     Reuses the same FFmpeg burn-in as the manual /api/subtitle endpoint
-    (_burn_subtitles_for_request) and the same default style as
-    CaptionsModal's own DEFAULT_STYLE, so a later manual restyle can be
-    pointed at the untouched original (kept alongside, never overwritten)
-    instead of stacking a second caption layer on top of this one.
+    (_burn_subtitles_for_request). `style_kwargs` is the resolved style to
+    burn with (the user's own saved default when they have one, else the
+    factory default -- see _get_user_default_caption_style), resolved once
+    by the caller so it can also be recorded alongside the result (see
+    _record_default_style_version) without a second lookup.
 
     Returns False (leaving the source clip untouched) when there's no
     transcript or no words fall inside this clip's time range -- a silent
@@ -2034,11 +2092,11 @@ async def _burn_default_captions_for_clip(
     try:
         has_words = generate_srt(
             transcript, clip_start, clip_end, srt_path,
-            max_words_per_line=_DEFAULT_AUTO_CAPTION_STYLE_KWARGS["words_per_line"],
+            max_words_per_line=style_kwargs["words_per_line"],
         )
         if not has_words:
             return False
-        req = SubtitleRequest(job_id=job_id, clip_index=clip_index, **_DEFAULT_AUTO_CAPTION_STYLE_KWARGS)
+        req = SubtitleRequest(job_id=job_id, clip_index=clip_index, **style_kwargs)
         await asyncio.to_thread(_burn_subtitles_for_request, req, input_path, srt_path, output_path)
         return os.path.exists(output_path) and os.path.getsize(output_path) > 0
     except Exception as exc:
@@ -2061,13 +2119,16 @@ _DEFAULT_STYLE_VERSION_NUMBER = 1
 
 async def _record_default_style_version(
     user_id: str, job_id: str, clip_index: int, source_video_url: str, output_video_url: str,
+    style_config: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Records the auto-applied default caption style (_DEFAULT_AUTO_CAPTION_
-    STYLE_KWARGS) as a real style_edit_versions row, the same table manual
-    restyles are recorded in -- so the captions editor can treat "the
-    default" as an actual version instead of a hardcoded frontend constant,
-    and so resetting a clip's captions falls back to this properly-styled
-    version instead of a bare, uncaptioned video.
+    """Records the style a clip was actually auto-captioned with (the
+    user's own saved default when they have one, else the factory default
+    -- see _get_user_default_caption_style) as a real style_edit_versions
+    row, the same table manual restyles are recorded in -- so the captions
+    editor can treat "the default" as an actual version instead of a value
+    only ever baked into application code, and so resetting a clip's
+    captions falls back to this properly-styled version instead of a bare,
+    uncaptioned video.
 
     Best-effort: any failure here must never fail the reel job itself -- it
     just means reset falls back to the plain original video for this clip."""
@@ -2082,7 +2143,7 @@ async def _record_default_style_version(
             "operation_type": "subtitle_style",
             "source_video_url": source_video_url,
             "output_video_url": output_video_url,
-            "style_config": dict(_DEFAULT_AUTO_CAPTION_STYLE_KWARGS),
+            "style_config": style_config if isinstance(style_config, dict) and style_config else dict(_DEFAULT_AUTO_CAPTION_STYLE_KWARGS),
         })
     except Exception as exc:
         logger.warning("Failed to record default style version for job %s clip %s: %s", job_id, clip_index, exc)
@@ -2108,10 +2169,11 @@ async def _build_reel_row_for_clip(
 
     clip_index = i - 1
     captioned_path = os.path.join(output_dir, f"{base_name}_clip_{i}_captioned.mp4")
+    default_style_kwargs = await _get_user_default_caption_style(user_id)
     auto_captioned = await _burn_default_captions_for_clip(
         clip_path, captioned_path, transcript,
         float(clip.get("start", 0) or 0), float(clip.get("end", 0) or 0),
-        job_id, clip_index,
+        job_id, clip_index, default_style_kwargs,
     )
     primary_path = captioned_path if auto_captioned else clip_path
 
@@ -2149,6 +2211,7 @@ async def _build_reel_row_for_clip(
             user_id, job_id, clip_index,
             source_video_url=_reel_media_url_from_s3_key(original_s3_key) if original_s3_key else "",
             output_video_url=media_url,
+            style_config=default_style_kwargs,
         )
     thumbnail_s3_key = _upload_reel_clip_thumbnail(clip, primary_path, output_dir, job_id, clip_index, user_id, bucket)
 
@@ -3345,8 +3408,9 @@ async def _process_and_complete_caption_job(
     duration_sec = max(0.5, float(local_duration) or _estimate_transcript_duration_seconds(transcript))
 
     captioned_path = os.path.join(output_dir, f"captioned_{os.path.basename(input_path)}")
+    default_style_kwargs = await _get_user_default_caption_style(user_id)
     auto_captioned = await _burn_default_captions_for_clip(
-        input_path, captioned_path, transcript, 0.0, duration_sec, job_id, 0,
+        input_path, captioned_path, transcript, 0.0, duration_sec, job_id, 0, default_style_kwargs,
     )
     primary_path = captioned_path if auto_captioned else input_path
 
@@ -7282,6 +7346,37 @@ def get_languages():
 class CaptionStyleThemeRequest(BaseModel):
     name: str
     style: Dict[str, Any]
+
+
+@app.get("/api/caption-style-default", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
+async def get_default_caption_style_endpoint(user_id: Annotated[str, Depends(get_user_id_header)]):
+    return {"style": await _get_user_default_caption_style(user_id)}
+
+
+@app.put("/api/caption-style-default", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
+async def set_default_caption_style_endpoint(
+    payload: DefaultCaptionStyleRequest, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    existing = await supabase_list_style_edit_versions(
+        _DEFAULT_STYLE_SENTINEL_JOB_ID, _DEFAULT_STYLE_SENTINEL_CLIP_INDEX, user_id,
+    )
+    next_version = max((int(v.get("version_number") or 0) for v in existing), default=0) + 1
+    style_config = payload.model_dump()
+
+    await supabase_insert_style_edit_version({
+        "user_id": user_id,
+        "job_id": _DEFAULT_STYLE_SENTINEL_JOB_ID,
+        "clip_index": _DEFAULT_STYLE_SENTINEL_CLIP_INDEX,
+        "version_number": next_version,
+        "operation_type": "subtitle_style_default",
+        "source_video_url": "",
+        "output_video_url": "",
+        "style_config": style_config,
+    })
+    return {"success": True, "style": style_config}
 
 
 @app.get("/api/caption-style-themes", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})

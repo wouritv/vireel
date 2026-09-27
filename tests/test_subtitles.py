@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 import subtitles
@@ -110,35 +112,26 @@ def test_normalize_subtitle_text_case_upper_and_lower(tmp_path):
     assert "hello world" in srt_path.read_text(encoding="utf-8")
 
 
-def test_burn_subtitles_builds_command_and_returns_true(monkeypatch):
+def _write_sample_srt(tmp_path):
+    srt_path = tmp_path / "sub.srt"
+    srt_path.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nHello world\n\n"
+        "2\n00:00:02,500 --> 00:00:03,000\nAgain\n\n",
+        encoding="utf-8",
+    )
+    return str(srt_path)
+
+
+def test_burn_subtitles_writes_ass_with_real_playres_and_returns_true(monkeypatch, tmp_path):
+    srt_path = _write_sample_srt(tmp_path)
     captured = {}
 
     def fake_run(cmd, stdout=None, stderr=None, **kwargs):
         captured["cmd"] = cmd
-        class _Result:
-            returncode = 0
-            stderr = b""
-        return _Result()
-
-    monkeypatch.setattr(subtitles, "_normalize_subtitle_text_case", lambda *args, **kwargs: None)
-    monkeypatch.setattr(subtitles.subprocess, "run", fake_run)
-    monkeypatch.setattr(subtitles, "_probe_video_resolution", lambda _path: (None, None))
-
-    ok = subtitles.burn_subtitles("in.mp4", "/tmp/sub.srt", "out.mp4", alignment="top", fontsize=20)
-    assert ok is True
-    assert "ffmpeg" in captured["cmd"][0]
-    assert "subtitles='" in captured["cmd"][5]
-    # No *0.85 shrink factor anymore -- the real fix for oversized captions
-    # is telling libass the subtitle's real resolution (original_size),
-    # not fudging the nominal font_size down.
-    assert "Fontsize=20" in captured["cmd"][5]
-
-
-def test_burn_subtitles_includes_original_size_when_probe_succeeds(monkeypatch):
-    captured = {}
-
-    def fake_run(cmd, stdout=None, stderr=None, **kwargs):
-        captured["cmd"] = cmd
+        # The .ass file must still exist on disk when ffmpeg "runs" (it's
+        # cleaned up only after the subprocess call returns).
+        ass_path = cmd[5].split("subtitles='")[1].split("'")[0]
+        captured["ass_content"] = Path(ass_path).read_text(encoding="utf-8")
         class _Result:
             returncode = 0
             stderr = b""
@@ -148,16 +141,33 @@ def test_burn_subtitles_includes_original_size_when_probe_succeeds(monkeypatch):
     monkeypatch.setattr(subtitles.subprocess, "run", fake_run)
     monkeypatch.setattr(subtitles, "_probe_video_resolution", lambda _path: (1080, 1920))
 
-    subtitles.burn_subtitles("in.mp4", "/tmp/sub.srt", "out.mp4", fontsize=52)
+    ok = subtitles.burn_subtitles("in.mp4", srt_path, "out.mp4", alignment="top", fontsize=52)
 
-    assert ":original_size=1080x1920:force_style=" in captured["cmd"][5]
+    assert ok is True
+    assert "ffmpeg" in captured["cmd"][0]
+    assert "subtitles='" in captured["cmd"][5]
+    # No `force_style` anymore -- the style is baked directly into the
+    # generated .ass file's own Style line, along with a PlayResX/PlayResY
+    # matching the video's real resolution, so Fontsize maps 1:1 to real
+    # pixels instead of being scaled by whatever virtual canvas ffmpeg
+    # would otherwise assume for a bare .srt.
+    assert "force_style" not in captured["cmd"][5]
+    assert "PlayResX: 1080" in captured["ass_content"]
+    assert "PlayResY: 1920" in captured["ass_content"]
+    assert "Fontsize" not in captured["ass_content"] or "Style: Default,Verdana,52," in captured["ass_content"]
+    assert "Hello world" in captured["ass_content"]
+    assert "Again" in captured["ass_content"]
+    # The temp .ass file is cleaned up after burning.
+    assert not Path(srt_path.replace(".srt", ".ass")).exists()
 
 
-def test_burn_subtitles_omits_original_size_when_probe_fails(monkeypatch):
+def test_burn_subtitles_falls_back_to_vertical_resolution_when_probe_fails(monkeypatch, tmp_path):
+    srt_path = _write_sample_srt(tmp_path)
     captured = {}
 
     def fake_run(cmd, stdout=None, stderr=None, **kwargs):
-        captured["cmd"] = cmd
+        ass_path = cmd[5].split("subtitles='")[1].split("'")[0]
+        captured["ass_content"] = Path(ass_path).read_text(encoding="utf-8")
         class _Result:
             returncode = 0
             stderr = b""
@@ -167,9 +177,28 @@ def test_burn_subtitles_omits_original_size_when_probe_fails(monkeypatch):
     monkeypatch.setattr(subtitles.subprocess, "run", fake_run)
     monkeypatch.setattr(subtitles, "_probe_video_resolution", lambda _path: (None, None))
 
-    subtitles.burn_subtitles("in.mp4", "/tmp/sub.srt", "out.mp4", fontsize=52)
+    subtitles.burn_subtitles("in.mp4", srt_path, "out.mp4", fontsize=52)
 
-    assert "original_size" not in captured["cmd"][5]
+    assert "PlayResX: 1080" in captured["ass_content"]
+    assert "PlayResY: 1920" in captured["ass_content"]
+
+
+def test_parse_srt_blocks_extracts_times_and_text(tmp_path):
+    srt_path = _write_sample_srt(tmp_path)
+    blocks = subtitles._parse_srt_blocks(srt_path)
+    assert blocks == [
+        (1.0, 2.0, "Hello world"),
+        (2.5, 3.0, "Again"),
+    ]
+
+
+def test_format_ass_time_formats_hours_minutes_seconds_centiseconds():
+    assert subtitles._format_ass_time(3661.256) == "1:01:01.26"
+    assert subtitles._format_ass_time(0) == "0:00:00.00"
+
+
+def test_escape_ass_text_escapes_braces_and_backslashes():
+    assert subtitles._escape_ass_text("100% {great}\\cool") == "100% \\{great\\}\\\\cool"
 
 
 def test_probe_video_resolution_parses_ffprobe_output(monkeypatch):
@@ -184,7 +213,9 @@ def test_probe_video_resolution_returns_none_on_failure(monkeypatch):
     assert subtitles._probe_video_resolution("in.mp4") == (None, None)
 
 
-def test_burn_subtitles_raises_on_ffmpeg_error(monkeypatch):
+def test_burn_subtitles_raises_on_ffmpeg_error(monkeypatch, tmp_path):
+    srt_path = _write_sample_srt(tmp_path)
+
     def fake_run(cmd, stdout=None, stderr=None, **kwargs):
         class _Result:
             returncode = 1
@@ -193,8 +224,12 @@ def test_burn_subtitles_raises_on_ffmpeg_error(monkeypatch):
 
     monkeypatch.setattr(subtitles, "_normalize_subtitle_text_case", lambda *args, **kwargs: None)
     monkeypatch.setattr(subtitles.subprocess, "run", fake_run)
+    monkeypatch.setattr(subtitles, "_probe_video_resolution", lambda _path: (1080, 1920))
 
     with pytest.raises(RuntimeError):
-        subtitles.burn_subtitles("in.mp4", "/tmp/sub.srt", "out.mp4")
+        subtitles.burn_subtitles("in.mp4", srt_path, "out.mp4")
+
+    # Even on failure, the temp .ass file must not be left behind.
+    assert not Path(srt_path.replace(".srt", ".ass")).exists()
 
 
