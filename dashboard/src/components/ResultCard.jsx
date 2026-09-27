@@ -58,15 +58,13 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
     const videoRef = React.useRef(null);
     const originalVideoUrl = rawVideoUrl ? getApiUrl(rawVideoUrl) : '';
     const [currentVideoUrl, setCurrentVideoUrl] = useState(originalVideoUrl);
-    // Backend clips generated after the "default captions" feature are
-    // captioned by default (see _burn_default_captions_for_clip in app.py):
-    // reel_playback_url/caption_playback_url already show burned-in
-    // captions. reel_original_url/caption_original_url point at the clean,
-    // pre-caption source (falling back to the same playback URL when no
-    // separate original exists, e.g. older clips or ones with no speech to
-    // caption) -- handleCaptions renders from this clean source so a manual
-    // restyle replaces the default captions instead of stacking a second
-    // caption layer on top of them.
+    // Reels are no longer auto-captioned by default (standalone captions
+    // jobs still are -- see _burn_default_captions_for_clip in app.py), so
+    // reel_original_url is normally unset and this just falls back to the
+    // plain playback URL. caption_original_url still separates a captions
+    // job's clean pre-caption source from its captioned playback URL, so a
+    // manual restyle there replaces the default captions instead of
+    // stacking a second caption layer on top of them.
     const rawCaptionSourceUrl = typeof (safeClip.reel_original_url || safeClip.caption_original_url) === 'string'
         ? (safeClip.reel_original_url || safeClip.caption_original_url)
         : '';

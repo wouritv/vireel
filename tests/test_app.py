@@ -3361,68 +3361,39 @@ def test_normalize_caption_row_exposes_original_url_from_generation_inputs(monke
     assert result["caption_original_url"] == "https://cdn.example/captions/u1/job1/original_cap.mp4"
 
 
-def test_build_reel_row_for_clip_auto_captions_and_uploads_original(monkeypatch, tmp_path):
+def test_build_reel_row_for_clip_never_auto_captions(monkeypatch, tmp_path):
     app = _import_app_with_stubs(monkeypatch)
     output_dir = str(tmp_path)
     clip_path = os.path.join(output_dir, "base_clip_1.mp4")
     Path(clip_path).write_bytes(b"raw-clip-bytes")
 
-    async def _fake_burn(input_path, output_path, transcript, clip_start, clip_end, job_id, clip_index, style_kwargs):
-        Path(output_path).write_bytes(b"captioned-bytes-longer")
-        return True
-
-    monkeypatch.setattr(app, "_burn_default_captions_for_clip", _fake_burn)
+    burn_mock = MagicMock()
+    monkeypatch.setattr(app, "_burn_default_captions_for_clip", burn_mock)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     upload_calls = []
     monkeypatch.setattr(app, "upload_file_to_s3", lambda path, bucket, key: upload_calls.append(key) or True)
-    monkeypatch.setattr(app, "_reel_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}")
-    monkeypatch.setattr(app, "_upload_reel_clip_thumbnail", lambda *args, **kwargs: "")
-    monkeypatch.setattr(app, "_estimate_reel_cost_breakdown", lambda **kwargs: {})
-
-    row = asyncio.run(app._build_reel_row_for_clip(
-        "job-1", "user-1", output_dir, "bucket", "base", {"start": 0.0, "end": 10.0}, 1,
-        "2024-01-01T00:00:00Z", False, None, transcript={"segments": [{"words": []}]},
-    ))
-
-    assert row is not None
-    assert any(key.startswith("reels/user-1/job-1/original_") for key in upload_calls)
-    assert row["billing_details"]["auto_caption"]["applied"] is True
-    assert row["billing_details"]["auto_caption"]["credit_cost"] > 0
-    assert row["reel_size_bytes"] == len(b"captioned-bytes-longer")
-
-
-def test_build_reel_row_for_clip_records_default_style_version(monkeypatch, tmp_path):
-    app = _import_app_with_stubs(monkeypatch)
-    output_dir = str(tmp_path)
-    clip_path = os.path.join(output_dir, "base_clip_1.mp4")
-    Path(clip_path).write_bytes(b"raw-clip-bytes")
-
-    async def _fake_burn(input_path, output_path, transcript, clip_start, clip_end, job_id, clip_index, style_kwargs):
-        Path(output_path).write_bytes(b"captioned-bytes-longer")
-        return True
-
-    monkeypatch.setattr(app, "_burn_default_captions_for_clip", _fake_burn)
-    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
-    monkeypatch.setattr(app, "upload_file_to_s3", lambda path, bucket, key: True)
     monkeypatch.setattr(app, "_reel_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}" if key else "")
     monkeypatch.setattr(app, "_upload_reel_clip_thumbnail", lambda *args, **kwargs: "")
     monkeypatch.setattr(app, "_estimate_reel_cost_breakdown", lambda **kwargs: {})
-    monkeypatch.setattr(app, "supabase_list_style_edit_versions", AsyncMock(return_value=[]))
-    insert_mock = AsyncMock(return_value={})
-    monkeypatch.setattr(app, "supabase_insert_style_edit_version", insert_mock)
+    insert_version_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_style_edit_version", insert_version_mock)
 
-    asyncio.run(app._build_reel_row_for_clip(
+    # Reels are no longer auto-captioned by default -- a reel with a
+    # perfectly good transcript still comes out exactly as generated,
+    # unchanged, with no "original vs captioned" distinction at all.
+    row = asyncio.run(app._build_reel_row_for_clip(
         "job-1", "user-1", output_dir, "bucket", "base", {"start": 0.0, "end": 10.0}, 1,
-        "2024-01-01T00:00:00Z", False, None, transcript={"segments": [{"words": []}]},
+        "2024-01-01T00:00:00Z", False, None, transcript={"segments": [{"words": [{"word": "hi", "start": 0, "end": 1}]}]},
     ))
 
-    insert_mock.assert_awaited_once()
-    row_arg = insert_mock.await_args.args[0]
-    assert row_arg["job_id"] == "job-1"
-    assert row_arg["clip_index"] == 0
-    assert row_arg["version_number"] == app._DEFAULT_STYLE_VERSION_NUMBER
-    assert row_arg["output_video_url"] == "https://cdn.example/reels/user-1/job-1/base_clip_1.mp4"
-    assert row_arg["source_video_url"] == "https://cdn.example/reels/user-1/job-1/original_base_clip_1.mp4"
-    assert row_arg["style_config"]["font_name"] == "Montserrat"
+    assert row is not None
+    burn_mock.assert_not_called()
+    insert_version_mock.assert_not_awaited()
+    assert not any(key.startswith("reels/user-1/job-1/original_") for key in upload_calls)
+    assert row["billing_details"]["auto_caption"]["applied"] is False
+    assert row["billing_details"]["auto_caption"]["credit_cost"] == 0
+    assert row["billing_details"]["original_s3_key"] == ""
+    assert row["reel_size_bytes"] == len(b"raw-clip-bytes")
 
 
 def test_build_reel_row_for_clip_skips_captioning_without_transcript(monkeypatch, tmp_path):

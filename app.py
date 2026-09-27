@@ -2072,15 +2072,17 @@ async def _burn_default_captions_for_clip(
     clip_start: float, clip_end: float, job_id: str, clip_index: int,
     style_kwargs: Dict[str, Any],
 ) -> bool:
-    """Burn default subtitles into a freshly produced clip so reels/captions
-    come out captioned without the user opening the manual editor first.
+    """Burn default subtitles into a freshly produced standalone captions
+    job's clip, so it comes out captioned without the user opening the
+    manual editor first. Reels no longer go through this -- see
+    _build_reel_row_for_clip -- a reel comes out exactly as generated
+    unless the user manually adds captions afterward.
 
     Reuses the same FFmpeg burn-in as the manual /api/subtitle endpoint
     (_burn_subtitles_for_request). `style_kwargs` is the resolved style to
     burn with (the user's own saved default when they have one, else the
     factory default -- see _get_user_default_caption_style), resolved once
-    by the caller so it can also be recorded alongside the result (see
-    _record_default_style_version) without a second lookup.
+    by the caller.
 
     Returns False (leaving the source clip untouched) when there's no
     transcript or no words fall inside this clip's time range -- a silent
@@ -2110,43 +2112,11 @@ async def _burn_default_captions_for_clip(
             pass
 
 
-# The version_number a clip's auto-applied default caption style is always
-# recorded under (see _record_default_style_version) -- reset_caption_style_
-# history looks this up specifically so "reset" restores the *styled*
-# default instead of stripping captions back to a bare, uncaptioned clip.
+# Historical reel jobs may still carry a version recorded under this number
+# from when reels were auto-captioned by default (reels no longer are --
+# see _build_reel_row_for_clip); reset_caption_style_history still looks
+# this up so "reset" on one of those older reels keeps working.
 _DEFAULT_STYLE_VERSION_NUMBER = 1
-
-
-async def _record_default_style_version(
-    user_id: str, job_id: str, clip_index: int, source_video_url: str, output_video_url: str,
-    style_config: Optional[Dict[str, Any]] = None,
-) -> None:
-    """Records the style a clip was actually auto-captioned with (the
-    user's own saved default when they have one, else the factory default
-    -- see _get_user_default_caption_style) as a real style_edit_versions
-    row, the same table manual restyles are recorded in -- so the captions
-    editor can treat "the default" as an actual version instead of a value
-    only ever baked into application code, and so resetting a clip's
-    captions falls back to this properly-styled version instead of a bare,
-    uncaptioned video.
-
-    Best-effort: any failure here must never fail the reel job itself -- it
-    just means reset falls back to the plain original video for this clip."""
-    if not (is_supabase_configured() and user_id):
-        return
-    try:
-        await supabase_insert_style_edit_version({
-            "user_id": user_id,
-            "job_id": job_id,
-            "clip_index": int(clip_index),
-            "version_number": _DEFAULT_STYLE_VERSION_NUMBER,
-            "operation_type": "subtitle_style",
-            "source_video_url": source_video_url,
-            "output_video_url": output_video_url,
-            "style_config": style_config if isinstance(style_config, dict) and style_config else dict(_DEFAULT_AUTO_CAPTION_STYLE_KWARGS),
-        })
-    except Exception as exc:
-        logger.warning("Failed to record default style version for job %s clip %s: %s", job_id, clip_index, exc)
 
 
 async def _build_reel_row_for_clip(
@@ -2167,15 +2137,16 @@ async def _build_reel_row_for_clip(
     if not os.path.exists(clip_path):
         return None
 
+    # Reels are no longer auto-captioned by default (see history: this used
+    # to burn _get_user_default_caption_style's style in here via
+    # _burn_default_captions_for_clip before upload) -- a reel now comes out
+    # exactly as generated, and captions are only ever added if the user
+    # opens "Sous-titres" and asks for them. billing_details still carries
+    # the same auto_caption/original_s3_key shape (always empty/false now)
+    # so nothing reading it elsewhere has to special-case a missing key.
     clip_index = i - 1
-    captioned_path = os.path.join(output_dir, f"{base_name}_clip_{i}_captioned.mp4")
-    default_style_kwargs = await _get_user_default_caption_style(user_id)
-    auto_captioned = await _burn_default_captions_for_clip(
-        clip_path, captioned_path, transcript,
-        float(clip.get("start", 0) or 0), float(clip.get("end", 0) or 0),
-        job_id, clip_index, default_style_kwargs,
-    )
-    primary_path = captioned_path if auto_captioned else clip_path
+    primary_path = clip_path
+    auto_captioned = False
 
     s3_key = f"reels/{user_id}/{job_id}/{clip_filename}"
     uploaded = upload_file_to_s3(primary_path, bucket, s3_key)
@@ -2186,33 +2157,8 @@ async def _build_reel_row_for_clip(
     original_s3_key = ""
     caption_credit_cost = 0.0
     auto_caption_cost_breakdown: Dict[str, Any] = {}
-    if auto_captioned:
-        original_s3_key = f"reels/{user_id}/{job_id}/original_{clip_filename}"
-        if not upload_file_to_s3(clip_path, bucket, original_s3_key):
-            # Best-effort: the reel itself is already captioned and uploaded
-            # above -- losing the pre-caption original only means a later
-            # manual restyle rebuilds from the captioned version instead.
-            original_s3_key = ""
-        clip_duration_for_caption_cost = _compute_clip_duration_seconds(clip)
-        auto_caption_cost_breakdown = _estimate_caption_cost_breakdown(
-            duration_seconds=float(clip_duration_for_caption_cost or 0),
-            size_bytes=float(clip_size_bytes),
-            uses_assembly=False, uses_openai=False, uses_gemini=False,
-        )
-        caption_credit_cost = _estimate_caption_required_credits(
-            duration_seconds=float(clip_duration_for_caption_cost or 0),
-            size_bytes=float(clip_size_bytes),
-            uses_assembly=False, uses_openai=False, uses_gemini=False,
-        )
 
     media_url = _reel_media_url_from_s3_key(s3_key)
-    if auto_captioned:
-        await _record_default_style_version(
-            user_id, job_id, clip_index,
-            source_video_url=_reel_media_url_from_s3_key(original_s3_key) if original_s3_key else "",
-            output_video_url=media_url,
-            style_config=default_style_kwargs,
-        )
     thumbnail_s3_key = _upload_reel_clip_thumbnail(clip, primary_path, output_dir, job_id, clip_index, user_id, bucket)
 
     duration = _compute_clip_duration_seconds(clip)
@@ -6427,10 +6373,12 @@ def _reset_clip_metadata_to_original(
     history_key = str(int(clip_index))
     entries = history.get(history_key) if isinstance(history, dict) else None
 
-    # Prefer the clip's recorded default style version (the auto-captioned
-    # video, properly sized/fonted -- see _record_default_style_version)
-    # over the bare, uncaptioned original: "reset" should bring back the
-    # default look, not strip captions off entirely.
+    # Prefer the clip's recorded default style version, if one exists (only
+    # true for reels generated before auto-captioning was removed -- see
+    # _build_reel_row_for_clip) over the bare original: for those, "reset"
+    # should bring back that default look rather than strip captions off
+    # entirely. Reels generated since have no such version, so this just
+    # falls through to the plain original below.
     reset_video_url = str(default_video_url or "").strip()
     if not reset_video_url:
         reset_video_url = str(clip.get("original_video_url") or "").strip()
