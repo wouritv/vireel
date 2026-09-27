@@ -1996,7 +1996,7 @@ def _compute_clip_duration_seconds(clip: Dict[str, Any]) -> int:
 # what they'd get by opening "Sous-titres" and accepting the defaults.
 _DEFAULT_AUTO_CAPTION_STYLE_KWARGS: Dict[str, Any] = dict(
     position="bottom", position_x=50.0, position_y=82.0,
-    font_size=52, font_name="Arial", font_color="#FFFFFF",
+    font_size=52, font_name="Montserrat", font_color="#FFFFFF",
     highlight_color="#FFDD00", border_color="#000000", border_width=3,
     text_shadow_color="#000000", shadow_blur=8, shadow_offset_x=0, shadow_offset_y=2,
     bg_color="#000000", bg_opacity=0.0, text_case="none", bold=True, italic=False,

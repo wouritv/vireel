@@ -45,6 +45,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # fails with "OSError: libGLESv2.so.2: cannot open shared object file".
     libgles2 \
     libegl1 \
+    # subtitles.py's FFmpeg subtitle burn (used for the FFmpeg-fallback
+    # caption path and the default-captions auto-burn -- see
+    # _DEFAULT_AUTO_CAPTION_STYLE_KWARGS in app.py) passes Fontname=... to
+    # ffmpeg's libass-based subtitles filter, which resolves it via the
+    # system's fontconfig. Without the actual font installed, "Montserrat"
+    # would silently render as whatever fallback font libass picks instead.
+    fontconfig \
+    fonts-montserrat \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*

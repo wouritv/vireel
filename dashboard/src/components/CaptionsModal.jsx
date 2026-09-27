@@ -10,7 +10,7 @@ import { getAuthHeaders } from '../lib/apiAuth';
 const DEFAULT_STYLE = {
   positionX: 50,
   positionY: 82,
-  fontFamily: 'Arial',
+  fontFamily: 'Montserrat',
   fontSize: 52,
   fontColor: '#FFFFFF',
   highlightColor: '#FFDD00',
