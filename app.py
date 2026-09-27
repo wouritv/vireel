@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from typing import Dict, Optional, List, Any, Annotated, Tuple
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse, unquote, urlencode
+from urllib.parse import urlparse, unquote, urlencode, quote
 from urllib.request import Request as UrlRequest, urlopen, HTTPRedirectHandler, build_opener
 from starlette.background import BackgroundTask
 from fastapi import FastAPI, APIRouter, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks, Query, Depends
@@ -327,7 +327,11 @@ PLATFORM_CONFIG = {
         "token_url": "https://graph.facebook.com/v19.0/oauth/access_token",
         "client_id": os.getenv("FACEBOOK_CLIENT_ID"),
         "client_secret": os.getenv("FACEBOOK_CLIENT_SECRET"),
-        "scopes": ["pages_show_list", "pages_manage_posts", "pages_read_engagement"],
+        # pages_manage_engagement is required for the Page itself to comment
+        # on its own posts (POST /{post_id}/comments with the Page token --
+        # see _post_facebook_comment) -- pages_manage_posts alone only
+        # covers creating the post.
+        "scopes": ["pages_show_list", "pages_manage_posts", "pages_read_engagement", "pages_manage_engagement"],
     },
     "instagram": {
         "auth_url": "https://www.instagram.com/oauth/authorize",
@@ -9759,6 +9763,281 @@ async def _debit_publish_credits_after_share(user_id: str, operation_id: str, re
     )
 
 
+# ---------------------------------------------------------------------------
+# Social posts: a user-authored post (with an optional Facebook background
+# theme, reusing anonymous_stories.BACKGROUND_PRESETS) published together
+# with zero or more follow-up comments, posted by the connected Page/account
+# itself right after the post goes live. Billed the same as any other
+# publication (_debit_publish_credits_after_share / _debit_scheduled_publish_
+# credits) -- comments ride along on the same charge, they don't add their
+# own cost.
+# ---------------------------------------------------------------------------
+
+_SOCIAL_POST_PLATFORMS = {"facebook", "linkedin"}
+
+
+class SocialPostCommentInput(BaseModel):
+    text: str = ""
+    link: Optional[str] = None
+    image_url: Optional[str] = None
+
+
+class CreateSocialPostRequest(BaseModel):
+    text: str
+    platforms: List[str]
+    background_id: Optional[str] = None
+    comments: List[SocialPostCommentInput] = []
+    scheduled_date: Optional[str] = None
+    timezone: Optional[str] = "UTC"
+
+
+def _resolve_social_post_platforms(platforms: Optional[List[str]]) -> List[str]:
+    candidate = [p.strip().lower() for p in (platforms or []) if isinstance(p, str) and p.strip()]
+    result: List[str] = []
+    for p in candidate:
+        if p in _SOCIAL_POST_PLATFORMS and p not in result:
+            result.append(p)
+    if not result:
+        raise HTTPException(status_code=400, detail="platforms must include at least one of: facebook, linkedin")
+    return result
+
+
+def _build_comment_message(comment: "SocialPostCommentInput") -> str:
+    text = (comment.text or "").strip()
+    link = (comment.link or "").strip()
+    if link and link not in text:
+        text = f"{text}\n{link}".strip()
+    return text
+
+
+async def _post_facebook_comment(access_token: str, object_id: str, message: str, attachment_url: Optional[str] = None) -> Dict[str, Any]:
+    if not object_id or object_id == "n/a":
+        raise HTTPException(status_code=400, detail="Missing Facebook post id to comment on")
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Facebook page access token expired or missing")
+
+    data = {"message": message, "access_token": access_token}
+    if attachment_url:
+        data["attachment_url"] = attachment_url
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(f"https://graph.facebook.com/v19.0/{object_id}/comments", data=data)
+    await _raise_for_status_or_502(response, "Facebook")
+    return response.json()
+
+
+async def _post_linkedin_comment(access_token: str, owner_urn: str, share_urn: str, message: str) -> Dict[str, Any]:
+    # LinkedIn's Social Actions comments API is text-only -- unlike Facebook's
+    # /comments, it has no attachment_url equivalent, so a comment's link is
+    # folded into the message text (see _build_comment_message) and any
+    # comment.image_url is simply not usable here.
+    if not share_urn or share_urn == "n/a":
+        raise HTTPException(status_code=400, detail="Missing LinkedIn post id to comment on")
+
+    encoded_urn = quote(share_urn, safe="")
+    payload = {"actor": owner_urn, "message": {"text": message}}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            f"https://api.linkedin.com/rest/socialActions/{encoded_urn}/comments",
+            headers=_linkedin_headers(access_token),
+            json=payload,
+        )
+    await _raise_for_status_or_502(response, "LinkedIn")
+    comment_id = response.headers.get("x-restli-id") or response.headers.get("X-RestLi-Id")
+    return {"id": comment_id}
+
+
+async def _post_platform_comment(
+    platform_name: str, account: Dict[str, Any], token: str, post_external_id: str, comment: "SocialPostCommentInput",
+) -> Dict[str, Any]:
+    message = _build_comment_message(comment)
+    if platform_name == "facebook":
+        return await _post_facebook_comment(token, post_external_id, message, comment.image_url or comment.link)
+    if platform_name == "linkedin":
+        owner_urn = f"urn:li:person:{account.get('platform_user_id')}"
+        return await _post_linkedin_comment(token, owner_urn, post_external_id, message)
+    raise HTTPException(status_code=404, detail=_UNSUPPORTED_PLATFORM)
+
+
+async def _post_comments_sequence(
+    platform_name: str, account: Dict[str, Any], post_external_id: str, comments: List["SocialPostCommentInput"],
+) -> List[Dict[str, Any]]:
+    """Posts every comment, in order, as the connected account itself. A
+    comment that fails is recorded and skipped rather than aborting the rest
+    -- the post itself already succeeded by the time this runs, so a single
+    rejected comment (rate limit, moderation, ...) shouldn't take the
+    remaining ones down with it."""
+    results: List[Dict[str, Any]] = []
+    if not comments:
+        return results
+    token = await get_valid_token(account)
+    for comment in comments:
+        try:
+            comment_result = await _post_platform_comment(platform_name, account, token, post_external_id, comment)
+            results.append({"success": True, "id": comment_result.get("id"), "text": comment.text})
+        except Exception as exc:
+            logger.warning("Failed to post comment on %s post %s: %s", platform_name, post_external_id, exc)
+            results.append({"success": False, "error": str(exc), "text": comment.text})
+    return results
+
+
+def _build_social_post_publish_payload(text_value: str, background_id: Optional[str]) -> "PublishRequest":
+    return PublishRequest(
+        user_id="",
+        title="Vireel",
+        description=text_value,
+        text=text_value,
+        caption=text_value,
+        facebook_text_format_preset_id=anonymous_stories.get_facebook_text_format_preset_id(background_id),
+    )
+
+
+async def _publish_social_post_now(
+    user_id: str, platform_name: str, publish_priority: int, text_value: str,
+    background_id: Optional[str], comments: List["SocialPostCommentInput"],
+) -> Dict[str, Any]:
+    publish_job_id = await _insert_publish_job(
+        user_id=user_id,
+        platform=platform_name,
+        external_id="n/a",
+        status="queued",
+        priority=publish_priority,
+        payload={"source_type": "social_post", "comments": [c.model_dump() for c in comments]},
+    )
+    try:
+        await _update_publish_job_status(publish_job_id, "processing")
+        account = await _get_social_account(user_id, platform_name)
+        if not account:
+            raise HTTPException(status_code=404, detail=f"No connected {platform_name} account found")
+
+        publish_payload = _build_social_post_publish_payload(text_value, background_id)
+        publish_payload.user_id = user_id
+        platform_result = await publish_post(account, publish_payload)
+        external_id = str(platform_result.get("publish_id") or platform_result.get("id") or "n/a")
+        post_url = _build_social_post_url(platform_name, platform_result)
+
+        comments_results = await _post_comments_sequence(platform_name, account, external_id, comments)
+
+        await _update_publish_job_status(
+            publish_job_id, "done", external_id=external_id, post_url=post_url,
+            extra_payload={"comments_results": comments_results},
+        )
+        return {
+            "success": True,
+            "result": platform_result,
+            "publish_job_id": publish_job_id,
+            "comments_results": comments_results,
+        }
+    except Exception as exc:
+        err_msg = str(exc)
+        await _update_publish_job_status(publish_job_id, "failed", error_message=err_msg)
+        return {
+            "success": False,
+            "error": err_msg,
+            "publish_job_id": publish_job_id,
+        }
+
+
+async def _schedule_social_post_job(
+    user_id: str, platform_name: str, publish_priority: int, scheduled_for, timezone: Optional[str],
+    text_value: str, background_id: Optional[str], comments: List["SocialPostCommentInput"],
+) -> Dict[str, Any]:
+    publish_job_id = await _insert_publish_job(
+        user_id=user_id,
+        platform=platform_name,
+        external_id="scheduled",
+        status="queued",
+        priority=publish_priority,
+        scheduled_for=scheduled_for.isoformat() if scheduled_for else None,
+        timezone=timezone or "UTC",
+        payload={
+            "source_type": "social_post",
+            "text": text_value,
+            "background_id": background_id,
+            "comments": [c.model_dump() for c in comments],
+        },
+    )
+    return {
+        "success": True,
+        "scheduled": True,
+        "scheduled_for": scheduled_for.isoformat() if scheduled_for else None,
+        "publish_job_id": publish_job_id,
+    }
+
+
+async def _execute_scheduled_social_post_job(job_id: str, user_id: str, platform: str, task_payload: Dict[str, Any]) -> None:
+    try:
+        await _update_publish_job_status(job_id, "processing", error_message=None)
+
+        account = await _get_social_account(user_id, platform)
+        if not account:
+            raise HTTPException(status_code=404, detail=f"No connected {platform} account found")
+
+        text_value = str(task_payload.get("text") or "")
+        background_id = task_payload.get("background_id")
+        comments = [
+            SocialPostCommentInput(**c) for c in (task_payload.get("comments") or []) if isinstance(c, dict)
+        ]
+
+        publish_payload = _build_social_post_publish_payload(text_value, background_id)
+        publish_payload.user_id = user_id
+        platform_result = await publish_post(account, publish_payload)
+        external_id = str(platform_result.get("publish_id") or platform_result.get("id") or "n/a")
+        post_url = _build_social_post_url(platform, platform_result)
+
+        comments_results = await _post_comments_sequence(platform, account, external_id, comments)
+
+        await _update_publish_job_status(
+            job_id, "done", external_id=external_id, post_url=post_url,
+            extra_payload={"comments_results": comments_results},
+        )
+        await _debit_scheduled_publish_credits(user_id, task_payload, job_id)
+    except Exception as exc:
+        await _update_publish_job_status(job_id, "failed", error_message=str(exc))
+
+
+@app.post("/api/social/posts", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
+    await _assert_user_has_required_credits(user_id, 0.0)
+
+    text_value = (payload.text or "").strip()
+    if not text_value:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    selected_platforms = _resolve_social_post_platforms(payload.platforms)
+    publish_priority = await _resolve_user_job_priority(user_id)
+    scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
+    if payload.scheduled_date and not scheduled_for:
+        raise HTTPException(status_code=400, detail=_INVALID_SCHEDULED_DATE)
+    is_scheduled = bool(scheduled_for and scheduled_for > _utcnow())
+    background_id = payload.background_id or anonymous_stories.BACKGROUND_PRESETS[0]["id"]
+    comments = payload.comments or []
+
+    results: Dict[str, Any] = {}
+    for platform_name in selected_platforms:
+        if is_scheduled:
+            results[platform_name] = await _schedule_social_post_job(
+                user_id, platform_name, publish_priority, scheduled_for, payload.timezone,
+                text_value, background_id, comments,
+            )
+            continue
+        results[platform_name] = await _publish_social_post_now(
+            user_id, platform_name, publish_priority, text_value, background_id, comments,
+        )
+
+    overall_success = all(result.get("success") for result in results.values())
+
+    if not is_scheduled:
+        await _debit_publish_credits_after_share(user_id, f"social_post:{uuid.uuid4().hex[:12]}", results)
+
+    return {
+        "success": overall_success,
+        "results": results,
+        "background_id": background_id,
+        "scheduled": is_scheduled,
+    }
+
+
 async def _publish_caption_now(user_id: str, platform_name: str, publish_priority: int, final_title: str, final_description: str, media_url: str) -> Dict[str, Any]:
     publish_job_id = await _insert_publish_job(
         user_id=user_id,
@@ -12056,6 +12335,10 @@ async def _execute_scheduled_publish_job(job_row: Dict[str, Any]) -> None:
     if not job_id or not user_id or not platform:
         return
 
+    if str(task_payload.get("source_type") or "") == "social_post":
+        await _execute_scheduled_social_post_job(job_id, user_id, platform, task_payload)
+        return
+
     try:
         await _update_publish_job_status(job_id, "processing", error_message=None)
 
@@ -12108,6 +12391,7 @@ async def _update_publish_job_status(
     error_message: Optional[str] = None,
     external_id: Optional[str] = None,
     post_url: Optional[str] = None,
+    extra_payload: Optional[Dict[str, Any]] = None,
 ) -> None:
     if not publish_job_id:
         return
@@ -12119,8 +12403,15 @@ async def _update_publish_job_status(
         payload["error_message"] = error_message
     if external_id is not None:
         payload["external_id"] = external_id
-    if post_url:
-        payload["payload"] = {"post_url": post_url}
+    # Note: this replaces the row's whole `payload` jsonb column rather than
+    # merging into it -- fine for every current caller since nothing reads
+    # back the pre-completion payload (source_type/comments/background_id)
+    # after a job finishes.
+    if post_url or extra_payload:
+        merged_payload: Dict[str, Any] = dict(extra_payload or {})
+        if post_url:
+            merged_payload["post_url"] = post_url
+        payload["payload"] = merged_payload
     if status in {"done", "failed"}:
         payload["completed_at"] = _utcnow_iso()
     await client.table(SUPABASE_SOCIAL_PUBLISH_JOBS_TABLE).update(payload).eq("id", publish_job_id).execute()
@@ -12343,7 +12634,7 @@ async def select_facebook_page(payload: SelectFacebookPageRequest):
         expires_in=int(data.get("user_token_expires_in") or 5_184_000),
         platform_user_id=payload.page_id,
         platform_account_name=identity.get("name", "Facebook Page"),
-        scopes="pages_manage_posts,pages_read_engagement",
+        scopes="pages_manage_posts,pages_read_engagement,pages_manage_engagement",
     )
 
     return {

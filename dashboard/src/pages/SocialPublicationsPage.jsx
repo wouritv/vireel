@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
-import { Loader2, Search, Trash2, ExternalLink, Calendar, Filter } from "lucide-react";
+import { Loader2, Search, Trash2, ExternalLink, Calendar, Filter, Plus } from "lucide-react";
 import { getApiUrl } from "../config";
 import { getAuthHeaders } from "../lib/apiAuth";
 import { useAuth } from "../state/AuthContext";
 import { useTranslation } from "../state/LanguageContext";
+import SocialPostComposerModal from "../components/SocialPostComposerModal";
 
 const PLATFORMS = [
     { value: "facebook", label: "Facebook" },
@@ -340,6 +341,8 @@ export default function SocialPublicationsPage() {
     const [customDateEnd, setCustomDateEnd] = useState("");
     const [searchInput, setSearchInput] = useState("");
     const [deletingId, setDeletingId] = useState("");
+    const [showComposer, setShowComposer] = useState(false);
+    const [refreshToken, setRefreshToken] = useState(0);
 
     useEffect(() => {
         if (!user?.id) return;
@@ -381,7 +384,7 @@ export default function SocialPublicationsPage() {
         return () => {
             cancelled = true;
         };
-    }, [user?.id, page, platform, status, dateFilter, customDateStart, customDateEnd, searchInput, pageSize]);
+    }, [user?.id, page, platform, status, dateFilter, customDateStart, customDateEnd, searchInput, pageSize, refreshToken]);
 
     const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
@@ -422,6 +425,14 @@ export default function SocialPublicationsPage() {
                         <h1 className="text-3xl font-black tracking-tight">{t('social.socialPublications', 'Publications sociales')}</h1>
                         <p className="text-sm text-slate-500 dark:text-zinc-400 mt-1">{t('social.realTimeTracking', 'Suivi en temps réel de vos publications')}</p>
                     </div>
+                    <button
+                        type="button"
+                        onClick={() => setShowComposer(true)}
+                        className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-sm font-bold shadow-lg shadow-blue-500/20 hover:from-blue-500 hover:to-indigo-500 transition-all"
+                    >
+                        <Plus size={16} />
+                        {t('social.createPublicationButton', 'Faire une publication')}
+                    </button>
                 </div>
 
                 {/* Filtres */}
@@ -566,6 +577,15 @@ export default function SocialPublicationsPage() {
                     </div>
                 </div>
             )}
+
+            <SocialPostComposerModal
+                isOpen={showComposer}
+                onClose={() => setShowComposer(false)}
+                onCreated={() => {
+                    setPage(1);
+                    setRefreshToken((prev) => prev + 1);
+                }}
+            />
         </div>
     );
 }

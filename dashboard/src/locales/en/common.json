@@ -499,7 +499,22 @@
     "postPublishButton": "Publish",
     "postScheduleButton": "Schedule",
     "postPublishing": "Publishing...",
-    "postScheduling": "Scheduling..."
+    "postScheduling": "Scheduling...",
+    "createPublicationButton": "Make a post",
+    "facebook": "Facebook",
+    "linkedin": "LinkedIn",
+    "postComposerTitle": "Make a post",
+    "postComposerTextLabel": "Post text",
+    "postComposerTextPlaceholder": "Write your post...",
+    "postComposerTextRequired": "Write the text of your post.",
+    "postComposerFailed": "Publishing failed.",
+    "postComposerCommentsLabel": "Comments (posted by the page)",
+    "postComposerAddComment": "Add a comment",
+    "postComposerNoComments": "No comments yet.",
+    "postComposerCommentN": "Comment {{n}}",
+    "postComposerCommentTextPlaceholder": "Comment text, #hashtags...",
+    "postComposerCommentLinkPlaceholder": "Link (optional)",
+    "postComposerCommentImagePlaceholder": "Image URL (optional, Facebook only)"
   },
   "abonnement": {
     "title": "Subscription",

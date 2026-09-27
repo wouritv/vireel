@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -4422,3 +4423,363 @@ def test_change_souscription_plan_404_for_unknown_plan(monkeypatch):
     with pytest.raises(app.HTTPException) as exc_info:
         asyncio.run(coro)
     assert exc_info.value.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Social posts: a user-authored post + follow-up comments, published (or
+# scheduled) by the connected Facebook/LinkedIn account itself.
+# ---------------------------------------------------------------------------
+
+class _FakeHttpxResponse:
+    def __init__(self, status_code=200, json_data=None, headers=None):
+        self.status_code = status_code
+        self._json_data = json_data or {}
+        self.headers = headers or {}
+        self.text = str(self._json_data)
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError("error", request=types.SimpleNamespace(), response=self)
+
+    def json(self):
+        return self._json_data
+
+
+class _FakeHttpxAsyncClient:
+    calls = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def post(self, url, **kwargs):
+        _FakeHttpxAsyncClient.calls.append({"url": url, **kwargs})
+        return _FakeHttpxAsyncClient.next_response
+
+
+def _install_fake_httpx_post(monkeypatch, app, response):
+    _FakeHttpxAsyncClient.calls = []
+    _FakeHttpxAsyncClient.next_response = response
+    monkeypatch.setattr(app.httpx, "AsyncClient", _FakeHttpxAsyncClient)
+    return _FakeHttpxAsyncClient
+
+
+def test_post_facebook_comment_sends_message_and_attachment(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_client = _install_fake_httpx_post(
+        monkeypatch, app, _FakeHttpxResponse(200, {"id": "comment_1"}),
+    )
+
+    result = asyncio.run(app._post_facebook_comment("page-token", "1234_5678", "Hello world", "https://example.com/img.png"))
+
+    assert result == {"id": "comment_1"}
+    call = fake_client.calls[0]
+    assert call["url"] == "https://graph.facebook.com/v19.0/1234_5678/comments"
+    assert call["data"]["message"] == "Hello world"
+    assert call["data"]["attachment_url"] == "https://example.com/img.png"
+    assert call["data"]["access_token"] == "page-token"
+
+
+def test_post_facebook_comment_requires_object_id(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(app._post_facebook_comment("page-token", "", "Hello"))
+    assert exc_info.value.status_code == 400
+
+
+def test_post_linkedin_comment_sends_actor_and_encoded_urn(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_client = _install_fake_httpx_post(
+        monkeypatch, app, _FakeHttpxResponse(201, {}, headers={"x-restli-id": "urn:li:comment:(urn:li:share:123,456)"}),
+    )
+
+    result = asyncio.run(
+        app._post_linkedin_comment("member-token", "urn:li:person:u1", "urn:li:share:123", "Nice post"),
+    )
+
+    assert result == {"id": "urn:li:comment:(urn:li:share:123,456)"}
+    call = fake_client.calls[0]
+    assert call["url"] == f"https://api.linkedin.com/rest/socialActions/{app.quote('urn:li:share:123', safe='')}/comments"
+    assert call["json"]["actor"] == "urn:li:person:u1"
+    assert call["json"]["message"]["text"] == "Nice post"
+
+
+def test_resolve_social_post_platforms_rejects_when_none_recognized(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    with pytest.raises(app.HTTPException) as exc_info:
+        app._resolve_social_post_platforms(["tiktok", "youtube"])
+    assert exc_info.value.status_code == 400
+
+
+def test_resolve_social_post_platforms_dedupes_and_filters(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    result = app._resolve_social_post_platforms(["facebook", "FACEBOOK", "linkedin", "tiktok"])
+    assert result == ["facebook", "linkedin"]
+
+
+def test_build_comment_message_appends_link_when_missing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    comment = app.SocialPostCommentInput(text="Check this out", link="https://example.com")
+    assert app._build_comment_message(comment) == "Check this out\nhttps://example.com"
+
+
+def test_build_comment_message_skips_duplicate_link(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    comment = app.SocialPostCommentInput(text="See https://example.com for more", link="https://example.com")
+    assert app._build_comment_message(comment) == "See https://example.com for more"
+
+
+def _social_post_account(platform="facebook"):
+    return {"id": "acct-1", "user_id": "u1", "platform": platform, "platform_user_id": "page-1"}
+
+
+def test_create_social_post_rejects_empty_text(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/social/posts",
+            json={"text": "   ", "platforms": ["facebook"]},
+            headers=_auth_headers("u1"),
+        )
+    assert resp.status_code == 400
+
+
+def test_create_social_post_rejects_unsupported_platforms(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/social/posts",
+            json={"text": "Hello", "platforms": ["tiktok"]},
+            headers=_auth_headers("u1"),
+        )
+    assert resp.status_code == 400
+
+
+def test_create_social_post_publishes_now_and_posts_comments(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_get_social_account", AsyncMock(return_value=_social_post_account()))
+    monkeypatch.setattr(app, "get_valid_token", AsyncMock(return_value="page-token"))
+    monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "1234_5678"}))
+    insert_job_mock = AsyncMock(return_value="job-1")
+    monkeypatch.setattr(app, "_insert_publish_job", insert_job_mock)
+    update_status_mock = AsyncMock()
+    monkeypatch.setattr(app, "_update_publish_job_status", update_status_mock)
+    post_comment_mock = AsyncMock(side_effect=[{"id": "c1"}, {"id": "c2"}])
+    monkeypatch.setattr(app, "_post_platform_comment", post_comment_mock)
+    monkeypatch.setattr(app, "supabase_deduct_user_credits", AsyncMock(return_value=True))
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/social/posts",
+            json={
+                "text": "Big announcement!",
+                "platforms": ["facebook"],
+                "comments": [
+                    {"text": "First comment", "link": "https://example.com"},
+                    {"text": "Second comment", "image_url": "https://example.com/img.png"},
+                ],
+            },
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["success"] is True
+    assert data["scheduled"] is False
+    fb_result = data["results"]["facebook"]
+    assert fb_result["success"] is True
+    assert fb_result["comments_results"] == [
+        {"success": True, "id": "c1", "text": "First comment"},
+        {"success": True, "id": "c2", "text": "Second comment"},
+    ]
+    assert post_comment_mock.await_count == 2
+    # final status update carries the post_url + comment results, not just post_url
+    done_call = [c for c in update_status_mock.await_args_list if len(c.args) > 1 and c.args[1] == "done"][0]
+    assert done_call.kwargs["extra_payload"]["comments_results"] == fb_result["comments_results"]
+
+
+def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_get_social_account", AsyncMock(return_value=_social_post_account()))
+    monkeypatch.setattr(app, "get_valid_token", AsyncMock(return_value="page-token"))
+    monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "1234_5678"}))
+    monkeypatch.setattr(app, "_insert_publish_job", AsyncMock(return_value="job-1"))
+    monkeypatch.setattr(app, "_update_publish_job_status", AsyncMock())
+    monkeypatch.setattr(
+        app, "_post_platform_comment",
+        AsyncMock(side_effect=[RuntimeError("rate limited"), {"id": "c2"}]),
+    )
+    monkeypatch.setattr(app, "supabase_deduct_user_credits", AsyncMock(return_value=True))
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/social/posts",
+            json={
+                "text": "Big announcement!",
+                "platforms": ["facebook"],
+                "comments": [{"text": "First"}, {"text": "Second"}],
+            },
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["success"] is True  # the post itself succeeded even though one comment failed
+    comments_results = data["results"]["facebook"]["comments_results"]
+    assert comments_results[0]["success"] is False
+    assert "rate limited" in comments_results[0]["error"]
+    assert comments_results[1] == {"success": True, "id": "c2", "text": "Second"}
+
+
+def test_create_social_post_schedules_job_without_publishing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
+    insert_job_mock = AsyncMock(return_value="job-scheduled-1")
+    monkeypatch.setattr(app, "_insert_publish_job", insert_job_mock)
+    publish_post_mock = AsyncMock()
+    monkeypatch.setattr(app, "publish_post", publish_post_mock)
+    debit_mock = AsyncMock()
+    monkeypatch.setattr(app, "_debit_publish_credits_after_share", debit_mock)
+
+    future_iso = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/social/posts",
+            json={
+                "text": "Scheduled announcement",
+                "platforms": ["facebook", "linkedin"],
+                "background_id": "some-preset",
+                "comments": [{"text": "Follow-up"}],
+                "scheduled_date": future_iso,
+                "timezone": "UTC",
+            },
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["scheduled"] is True
+    assert data["success"] is True
+    publish_post_mock.assert_not_awaited()
+    debit_mock.assert_not_awaited()
+    assert insert_job_mock.await_count == 2  # one job per platform
+
+    inserted_payloads = [call.kwargs["payload"] for call in insert_job_mock.await_args_list]
+    for payload in inserted_payloads:
+        assert payload["source_type"] == "social_post"
+        assert payload["text"] == "Scheduled announcement"
+        assert payload["background_id"] == "some-preset"
+        assert payload["comments"] == [{"text": "Follow-up", "link": None, "image_url": None}]
+
+
+def test_execute_scheduled_social_post_job_publishes_and_comments(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_get_social_account", AsyncMock(return_value=_social_post_account("linkedin")))
+    monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "urn:li:share:999"}))
+    monkeypatch.setattr(app, "get_valid_token", AsyncMock(return_value="member-token"))
+    update_status_mock = AsyncMock()
+    monkeypatch.setattr(app, "_update_publish_job_status", update_status_mock)
+    post_comment_mock = AsyncMock(return_value={"id": "comment-urn"})
+    monkeypatch.setattr(app, "_post_platform_comment", post_comment_mock)
+    debit_mock = AsyncMock()
+    monkeypatch.setattr(app, "_debit_scheduled_publish_credits", debit_mock)
+
+    task_payload = {
+        "source_type": "social_post",
+        "text": "Scheduled text",
+        "background_id": None,
+        "comments": [{"text": "A comment", "link": None, "image_url": None}],
+    }
+
+    asyncio.run(app._execute_scheduled_social_post_job("job-9", "u1", "linkedin", task_payload))
+
+    post_comment_mock.assert_awaited_once()
+    debit_mock.assert_awaited_once()
+    done_call = [c for c in update_status_mock.await_args_list if len(c.args) > 1 and c.args[1] == "done"][0]
+    assert done_call.kwargs["external_id"] == "urn:li:share:999"
+    assert done_call.kwargs["extra_payload"]["comments_results"] == [
+        {"success": True, "id": "comment-urn", "text": "A comment"}
+    ]
+
+
+def test_execute_scheduled_social_post_job_marks_failed_without_account(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_get_social_account", AsyncMock(return_value=None))
+    update_status_mock = AsyncMock()
+    monkeypatch.setattr(app, "_update_publish_job_status", update_status_mock)
+
+    task_payload = {"source_type": "social_post", "text": "x", "comments": []}
+    asyncio.run(app._execute_scheduled_social_post_job("job-10", "u1", "facebook", task_payload))
+
+    failed_call = [c for c in update_status_mock.await_args_list if len(c.args) > 1 and c.args[1] == "failed"]
+    assert failed_call
+    assert "No connected facebook account" in failed_call[0].kwargs["error_message"]
+
+
+def test_execute_scheduled_publish_job_dispatches_social_post_by_source_type(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    dispatched = AsyncMock()
+    monkeypatch.setattr(app, "_execute_scheduled_social_post_job", dispatched)
+
+    job_row = {
+        "id": "job-11",
+        "user_id": "u1",
+        "platform": "facebook",
+        "payload": {"source_type": "social_post", "text": "hi"},
+    }
+    asyncio.run(app._execute_scheduled_publish_job(job_row))
+
+    dispatched.assert_awaited_once_with("job-11", "u1", "facebook", job_row["payload"])
+
+
+def test_update_publish_job_status_merges_extra_payload_with_post_url(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    captured = {}
+
+    class _FakeTable:
+        def update(self, payload):
+            captured["payload"] = payload
+            return self
+
+        def eq(self, *_a, **_k):
+            return self
+
+        async def execute(self):
+            return types.SimpleNamespace(data=[{"id": "job-1"}])
+
+    class _FakeClient:
+        def table(self, _name):
+            return _FakeTable()
+
+    monkeypatch.setattr(app, "supabase_get_client", AsyncMock(return_value=_FakeClient()))
+
+    asyncio.run(app._update_publish_job_status(
+        "job-1", "done", external_id="ext-1", post_url="https://example.com/post",
+        extra_payload={"comments_results": [{"success": True, "id": "c1"}]},
+    ))
+
+    assert captured["payload"]["payload"] == {
+        "comments_results": [{"success": True, "id": "c1"}],
+        "post_url": "https://example.com/post",
+    }
