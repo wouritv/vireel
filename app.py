@@ -1374,11 +1374,13 @@ def _normalize_caption_row(row: Dict[str, Any]) -> Dict[str, Any]:
     thumbnail_url = _caption_media_url_from_s3_key(thumbnail_ref) if thumbnail_ref.startswith(_CAPTIONS_PREFIX) else thumbnail_ref
     preview_url = thumbnail_url or media_url
 
-    # See _normalize_reel_row's reel_original_url -- same idea, for the
-    # dedicated captions job's own default caption burn-in.
-    original_s3_key = str((row.get("generation_inputs") or {}).get("original_s3_key") or "")
-    original_media_url = _caption_media_url_from_s3_key(original_s3_key) if original_s3_key else ""
-
+    # caption_original_url used to expose the clean, pre-caption clip
+    # (generation_inputs.original_s3_key) so the app could point restyles at
+    # it directly. The app now always works off a single URL -- the
+    # currently displayed one -- so this just mirrors media_url; the clean
+    # clip is still resolved server-side when actually re-burning (see
+    # _resolve_authoritative_clean_video_source), which is what actually
+    # keeps a restyle from stacking onto the default captions.
     return {
         **row,
         "caption_url": media_url or row.get("caption_url") or "",
@@ -1387,7 +1389,7 @@ def _normalize_caption_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "caption_playback_url": media_url,
         "caption_download_url": media_url,
         "caption_preview_url": preview_url,
-        "caption_original_url": original_media_url or media_url,
+        "caption_original_url": media_url,
         "media_url": media_url,
     }
 
@@ -1939,15 +1941,13 @@ def _normalize_reel_row(row: Dict[str, Any]) -> Dict[str, Any]:
     thumbnail_url = _reel_thumbnail_url_from_s3_key(thumbnail_s3_key) or thumbnail_ref or ""
     preview_url = thumbnail_url or media_url
 
-    # When the reel was auto-captioned at generation time (see
-    # _burn_default_captions_for_clip), reel_url/media_url point at the
-    # captioned video -- reel_original_url is the pre-caption clip, kept so
-    # the dashboard can render manual edits (Sous-titres/Hook/Auto-edit) from
-    # a clean source instead of stacking a second caption layer on top of
-    # the default one.
-    original_s3_key = str((row.get("billing_details") or {}).get("original_s3_key") or "")
-    original_media_url = _reel_media_url_from_s3_key(original_s3_key) if original_s3_key else ""
-
+    # reel_original_url used to expose the clean, pre-caption clip
+    # (billing_details.original_s3_key) so the app could point restyles at
+    # it directly. The app now always works off a single URL -- the
+    # currently displayed one -- so this just mirrors media_url; the clean
+    # clip is still resolved server-side when actually re-burning (see
+    # _resolve_authoritative_clean_video_source), which is what actually
+    # keeps a restyle from stacking onto the default captions.
     return {
         **row,
         "reel_url": media_url or row.get("reel_url") or "",
@@ -1955,7 +1955,7 @@ def _normalize_reel_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "reel_preview_url": preview_url,
         "reel_playback_url": media_url,
         "reel_download_url": media_url,
-        "reel_original_url": original_media_url or media_url,
+        "reel_original_url": media_url,
         "media_url": media_url,
     }
 
@@ -2005,7 +2005,7 @@ def _compute_clip_duration_seconds(clip: Dict[str, Any]) -> int:
 # style, which prefers a user's own saved default when one exists.
 _DEFAULT_AUTO_CAPTION_STYLE_KWARGS: Dict[str, Any] = dict(
     position="bottom", position_x=50.0, position_y=82.0,
-    font_size=52, font_name="Montserrat", font_color="#FFFFFF",
+    font_size=28, font_name="Montserrat", font_color="#FFFFFF",
     highlight_color="#FFDD00", border_color="#000000", border_width=3,
     text_shadow_color="#000000", shadow_blur=8, shadow_offset_x=0, shadow_offset_y=2,
     bg_color="#000000", bg_opacity=0.0, text_case="none", bold=True, italic=False,
@@ -2027,7 +2027,7 @@ class DefaultCaptionStyleRequest(BaseModel):
     position: str = "bottom"
     position_x: float = 50.0
     position_y: float = 82.0
-    font_size: int = Field(default=52, ge=10, le=200)
+    font_size: int = Field(default=28, ge=10, le=200)
     font_name: str = "Montserrat"
     font_color: str = "#FFFFFF"
     highlight_color: str = "#FFDD00"
@@ -5515,12 +5515,23 @@ async def get_clip_transcript(job_id: str, clip_index: int, request: Request):
 
     duration_sec = clip_end - clip_start
 
+    # The dashboard's client-side captions render (Remotion/WebCodecs, see
+    # ResultCard.jsx's handleCaptions) composites a brand new subtitle layer
+    # onto whatever video it's given -- if that's the already-captioned
+    # default clip, the old captions stay baked into the pixels underneath
+    # the new ones. Resolve the clean, pre-caption source here (same lookup
+    # add_subtitles uses server-side, see _resolve_authoritative_clean_video_
+    # source) so that render always starts from clean pixels.
+    clean_original_s3_key = await _resolve_authoritative_clean_video_source(job_id, clip_index, verified_user_id)
+    clean_video_url = _reel_media_url_from_s3_key(clean_original_s3_key) if clean_original_s3_key else ""
+
     return {
         "captions": captions,
         "durationSec": duration_sec,
         "language": (transcript or {}).get('language', 'en'),
         "subtitleConfig": saved_subtitle_config if isinstance(saved_subtitle_config, dict) else None,
         "remotionLayers": clip_data.get("remotion_layers") if isinstance(clip_data, dict) else None,
+        "cleanVideoUrl": clean_video_url,
     }
 
 
@@ -6141,6 +6152,56 @@ async def _resolve_subtitle_source_video_history(job_id: str, clip_index: int, u
     return source_video_url_for_history
 
 
+async def _resolve_authoritative_clean_video_source(job_id: str, clip_index: int, user_id: str) -> str:
+    """Resolves the S3 key of the clean, pre-caption clip stored at
+    generation time (see _build_reel_row_for_clip's original_s3_key /
+    _burn_default_captions_for_clip's caption-job equivalent).
+
+    The app now shows/works off a single video URL per clip -- there's no
+    "original vs captioned" distinction exposed anywhere anymore (see
+    _normalize_reel_row/_normalize_caption_row) -- so a subtitle burn can no
+    longer trust whatever URL the request carries to be caption-free. This
+    looks the clean source up server-side instead, so re-burning always
+    starts from clean pixels and replaces the default captions rather than
+    drawing a second layer on top of them. Returns "" when there is none
+    (clip was never auto-captioned, or Supabase isn't configured), in which
+    case the caller falls back to the request's own video reference, which
+    is clean in that case anyway."""
+    if not is_supabase_configured():
+        return ""
+    try:
+        reel_row = await supabase_get_reel_by_job_clip(job_id, clip_index, user_id=user_id)
+        original_s3_key = str(((reel_row or {}).get("billing_details") or {}).get("original_s3_key") or "")
+        if original_s3_key:
+            return original_s3_key
+    except Exception:
+        pass
+    try:
+        caption_row = await supabase_get_caption_by_job_clip(job_id, clip_index, user_id)
+        original_s3_key = str(((caption_row or {}).get("generation_inputs") or {}).get("original_s3_key") or "")
+        if original_s3_key:
+            return original_s3_key
+    except Exception:
+        pass
+    return ""
+
+
+async def _resolve_burn_source_input_path(
+    req, output_dir: str, clip_data: Dict[str, Any], metadata_path: str, user_id: str,
+):
+    """Like _resolve_add_subtitles_input_path, but prefers the clean,
+    pre-caption source recorded at generation time over whatever video the
+    request points at -- used by endpoints that burn a *new* subtitle track
+    (add_subtitles, translate_clip), so a restyle/translation always
+    replaces the default captions instead of stacking on top of them."""
+    original_s3_key = await _resolve_authoritative_clean_video_source(req.job_id, req.clip_index, user_id)
+    if original_s3_key:
+        clean_source_url = _reel_media_url_from_s3_key(original_s3_key)
+        if clean_source_url:
+            return _download_input_url_to_job_dir(clean_source_url, req.job_id)
+    return _resolve_add_subtitles_input_path(req, output_dir, clip_data, metadata_path)
+
+
 def _resolve_add_subtitles_input_path(req: SubtitleRequest, output_dir: str, clip_data: Dict[str, Any], metadata_path: str):
     if req.input_filename:
         filename = _sanitize_input_filename(req.input_filename)
@@ -6352,7 +6413,7 @@ async def add_subtitles(req: SubtitleRequest, user_id: Annotated[str, Depends(ge
     clip_data = clips[req.clip_index]
     source_video_url_for_history = await _resolve_subtitle_source_video_history(req.job_id, req.clip_index, user_id, clip_data)
 
-    input_path, filename = _resolve_add_subtitles_input_path(req, output_dir, clip_data, metadata_path)
+    input_path, filename = await _resolve_burn_source_input_path(req, output_dir, clip_data, metadata_path, user_id)
 
     # Define outputs
     srt_filename = f"subs_{req.clip_index}_{int(time.time())}.srt"
@@ -7616,7 +7677,7 @@ async def translate_clip(req: TranslateRequest, user_id: Annotated[str, Depends(
         raise HTTPException(status_code=404, detail=_CLIP_NOT_FOUND)
 
     clip_data = clips[req.clip_index]
-    input_path, filename = _resolve_add_subtitles_input_path(req, output_dir, clip_data, metadata_path)
+    input_path, filename = await _resolve_burn_source_input_path(req, output_dir, clip_data, metadata_path, user_id)
 
     # Load clip transcript segments from existing metadata transcript (no re-transcription)
     source_lang = _normalize_lang(req.source_language) or _normalize_lang((data.get("transcript") or {}).get("language"))

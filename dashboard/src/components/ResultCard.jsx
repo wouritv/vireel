@@ -58,19 +58,6 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
     const videoRef = React.useRef(null);
     const originalVideoUrl = rawVideoUrl ? getApiUrl(rawVideoUrl) : '';
     const [currentVideoUrl, setCurrentVideoUrl] = useState(originalVideoUrl);
-    // Backend clips generated after the "default captions" feature are
-    // captioned by default (see _burn_default_captions_for_clip in app.py):
-    // reel_playback_url/caption_playback_url already show burned-in
-    // captions. reel_original_url/caption_original_url point at the clean,
-    // pre-caption source (falling back to the same playback URL when no
-    // separate original exists, e.g. older clips or ones with no speech to
-    // caption) -- handleCaptions renders from this clean source so a manual
-    // restyle replaces the default captions instead of stacking a second
-    // caption layer on top of them.
-    const rawCaptionSourceUrl = typeof (safeClip.reel_original_url || safeClip.caption_original_url) === 'string'
-        ? (safeClip.reel_original_url || safeClip.caption_original_url)
-        : '';
-    const captionSourceVideoUrl = rawCaptionSourceUrl ? getApiUrl(rawCaptionSourceUrl) : originalVideoUrl;
 
     const [platforms, setPlatforms] = useState({
         tiktok: defaultPlatforms.includes('tiktok'),
@@ -375,10 +362,11 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
     // server-side, so it only needs the style, not captionLayer.captions.
     const applyCaptionsViaServerFallback = async (captionLayer) => {
         const style = captionLayer?.style || {};
-        // Burn onto the clean pre-caption source, not whatever's currently
-        // displayed -- otherwise FFmpeg would burn these new captions right
-        // on top of the default ones already baked into currentVideoUrl.
-        const effectiveInputUrl = captionSourceVideoUrl;
+        // The server resolves the clean pre-caption source itself (see
+        // _resolve_authoritative_clean_video_source in app.py) so this new
+        // style replaces the default captions instead of stacking on top of
+        // them -- whatever's currently displayed is fine to send here.
+        const effectiveInputUrl = currentVideoUrl?.startsWith('blob:') ? originalVideoUrl : currentVideoUrl;
 
         const res = await fetch(getApiUrl('/api/subtitle'), {
             method: 'POST',
@@ -389,7 +377,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
             body: JSON.stringify({
                 job_id: jobId,
                 clip_index: clipIndexForApi,
-                input_filename: inputFilenameFromVideoUrl(captionSourceVideoUrl),
+                input_filename: inputFilenameFromVideoUrl(effectiveInputUrl),
                 input_url: effectiveInputUrl,
                 position_x: style.positionX,
                 position_y: style.positionY,
@@ -460,10 +448,17 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
             setActiveLayers(newLayers);
             setClipDuration(nextDurationSec);
 
+            // Server-resolved clean, pre-caption source (see cleanVideoUrl in
+            // app.py's /api/clip/.../transcript) -- rendering onto it keeps
+            // this new style from stacking on top of the default captions
+            // already baked into the clip's normal playback URL.
+            const renderSourceUrl = options.cleanVideoUrl
+                || (currentVideoUrl?.startsWith('blob:') ? originalVideoUrl : currentVideoUrl);
+
             let blobUrl;
             try {
                 blobUrl = await renderInBrowser({
-                    videoUrl: captionSourceVideoUrl,
+                    videoUrl: renderSourceUrl,
                     durationInSeconds: nextDurationSec,
                     subtitles: resolveTextLayer(newLayers),
                     hook: newLayers.hook,

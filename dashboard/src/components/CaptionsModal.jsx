@@ -12,7 +12,7 @@ const DEFAULT_STYLE = {
   positionX: 50,
   positionY: 82,
   fontFamily: 'Montserrat',
-  fontSize: 52,
+  fontSize: 28,
   fontColor: '#FFFFFF',
   highlightColor: '#FFDD00',
   borderColor: '#000000',
@@ -232,6 +232,10 @@ export default function CaptionsModal({
 
   const [lines, setLines] = useState([]);
   const [durationSec, setDurationSec] = useState(30);
+  // Clean, pre-caption source resolved server-side (see /api/clip/.../
+  // transcript in app.py) -- used as the render base so the new style
+  // replaces the default captions instead of stacking on top of them.
+  const [cleanVideoUrl, setCleanVideoUrl] = useState('');
   const [captionsLoading, setCaptionsLoading] = useState(false);
   const [fetchError, setFetchError] = useState('');
   const [selectedLineId, setSelectedLineId] = useState(null);
@@ -517,6 +521,7 @@ export default function CaptionsModal({
         setLines(nextLines);
         setSelectedLineId(nextLines[0]?.id || null);
         setDurationSec(Number(data?.durationSec) > 0 ? Number(data.durationSec) : 30);
+        setCleanVideoUrl(typeof data?.cleanVideoUrl === 'string' ? data.cleanVideoUrl : '');
         setWordsPerLineTouched(false);
       })
       .catch((err) => {
@@ -740,7 +745,7 @@ export default function CaptionsModal({
 
                 <div className="rounded-lg border border-slate-300 dark:border-white/10 bg-white/[0.03] px-3 py-3">
                   <label className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{t('captionsModal.lineSize', 'Line size')} ({currentStyle.fontSize}px)</label>
-                  <input type="range" min="28" max="96" value={currentStyle.fontSize} onChange={(e) => { updateAllLinesStyle({ fontSize: Number(e.target.value) || 52 }); focusSelectedPreview(); }} className="mt-2 w-full accent-emerald-500" />
+                  <input type="range" min="28" max="96" value={currentStyle.fontSize} onChange={(e) => { updateAllLinesStyle({ fontSize: Number(e.target.value) || 28 }); focusSelectedPreview(); }} className="mt-2 w-full accent-emerald-500" />
                 </div>
 
                 <div className="rounded-lg border border-slate-300 dark:border-white/10 bg-white/[0.03] px-3 py-3">
@@ -1132,7 +1137,7 @@ export default function CaptionsModal({
           <div className="flex-1 rounded-lg border border-slate-300 dark:border-white/10 overflow-hidden bg-black min-h-[360px]">
             <RemotionPreview
               ref={previewRef}
-              videoUrl={videoUrl}
+              videoUrl={cleanVideoUrl || videoUrl}
               durationInSeconds={durationSec}
               subtitles={flattenedCaptions.length > 0 ? subtitleConfig : null}
               hook={existingHook || null}
@@ -1142,7 +1147,7 @@ export default function CaptionsModal({
 
           <button
             type="button"
-            onClick={() => onGenerate({ remotion: subtitleConfig, previewDurationSec: durationSec })}
+            onClick={() => onGenerate({ remotion: subtitleConfig, previewDurationSec: durationSec, cleanVideoUrl })}
             disabled={isProcessing || flattenedCaptions.length === 0 || creditBlocked}
             className="w-full py-3 bg-gradient-to-r from-emerald-500 to-green-500 hover:from-emerald-400 hover:to-green-400 text-black font-bold rounded-xl shadow-lg shadow-emerald-500/20 transition-all active:scale-[0.98] inline-flex items-center justify-center gap-2 disabled:opacity-60"
           >

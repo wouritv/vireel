@@ -3277,7 +3277,7 @@ def test_burn_default_captions_for_clip_burns_and_returns_true(monkeypatch):
     burn_req = burn_mock.call_args.args[0]
     assert burn_req.job_id == "job-1"
     assert burn_req.clip_index == 2
-    assert burn_req.font_size == 52
+    assert burn_req.font_size == 28
     assert burn_req.animation == "word-highlight"
 
 
@@ -3321,9 +3321,9 @@ def test_burn_default_captions_for_clip_returns_false_on_exception(monkeypatch):
     assert result is False
 
 
-def test_normalize_reel_row_exposes_original_url_from_billing_details(monkeypatch):
+def test_normalize_reel_row_always_exposes_media_url_as_original(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_reel_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}")
+    monkeypatch.setattr(app, "_reel_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}" if key else "")
     monkeypatch.setattr(app, "_extract_s3_key_from_thumbnail_ref", lambda ref: "")
     monkeypatch.setattr(app, "_reel_thumbnail_url_from_s3_key", lambda key: "")
 
@@ -3333,24 +3333,16 @@ def test_normalize_reel_row_exposes_original_url_from_billing_details(monkeypatc
     }
     result = app._normalize_reel_row(row)
 
-    assert result["reel_original_url"] == "https://cdn.example/reels/u1/job1/original_reel.mp4"
-
-
-def test_normalize_reel_row_falls_back_to_media_url_without_original(monkeypatch):
-    app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_reel_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}" if key else "")
-    monkeypatch.setattr(app, "_extract_s3_key_from_thumbnail_ref", lambda ref: "")
-    monkeypatch.setattr(app, "_reel_thumbnail_url_from_s3_key", lambda key: "")
-
-    row = {"reel_s3_key": "reels/u1/job1/reel.mp4", "billing_details": {}}
-    result = app._normalize_reel_row(row)
-
+    # reel_original_url no longer exposes a separate clean-clip URL -- the
+    # app works off a single URL per clip; the clean clip is only resolved
+    # server-side when actually re-burning (see
+    # _resolve_authoritative_clean_video_source).
     assert result["reel_original_url"] == result["media_url"]
 
 
-def test_normalize_caption_row_exposes_original_url_from_generation_inputs(monkeypatch):
+def test_normalize_caption_row_always_exposes_media_url_as_original(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_caption_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}")
+    monkeypatch.setattr(app, "_caption_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}" if key else "")
 
     row = {
         "caption_s3_key": "captions/u1/job1/cap.mp4",
@@ -3358,7 +3350,7 @@ def test_normalize_caption_row_exposes_original_url_from_generation_inputs(monke
     }
     result = app._normalize_caption_row(row)
 
-    assert result["caption_original_url"] == "https://cdn.example/captions/u1/job1/original_cap.mp4"
+    assert result["caption_original_url"] == result["media_url"]
 
 
 def test_build_reel_row_for_clip_auto_captions_and_uploads_original(monkeypatch, tmp_path):
