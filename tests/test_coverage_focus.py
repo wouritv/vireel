@@ -115,7 +115,8 @@ def _import_app_with_stubs(monkeypatch):
         "soft_delete_anonymous_story", "get_anonymous_stories_by_project",
         "get_job_record", "insert_film_summary", "list_film_summaries",
         "get_film_summary", "update_film_summary", "soft_delete_film_summary",
-        "get_film_summaries_by_project"]:
+        "get_film_summaries_by_project", "list_caption_style_themes",
+        "upsert_caption_style_theme", "delete_caption_style_theme"]:
         setattr(supabase_request_mod, func_name, MagicMock(return_value=None) if "get" not in func_name else AsyncMock(return_value=None))
 
     supabase_request_mod.is_supabase_configured = MagicMock(return_value=False)

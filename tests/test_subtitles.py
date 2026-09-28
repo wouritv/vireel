@@ -262,12 +262,12 @@ def test_generate_highlighted_srt_marks_each_word_and_fills_gaps(tmp_path):
         f"hello {marker}world{marker}",
     ]
     # "hello"'s highlighted window starts at the clip-relative block start.
-    assert blocks[0][0] == pytest.approx(0.0)
+    assert abs(blocks[0][0] - 0.0) < 0.01
     # The gap filler picks up exactly where "hello"'s window ended.
-    assert blocks[1][0] == pytest.approx(blocks[0][1])
+    assert abs(blocks[1][0] - blocks[0][1]) < 0.01
     # "world"'s highlighted window starts where the gap filler ended.
-    assert blocks[2][0] == pytest.approx(blocks[1][1])
-    assert blocks[2][0] == pytest.approx(1.0, abs=0.01)
+    assert abs(blocks[2][0] - blocks[1][1]) < 0.01
+    assert abs(blocks[2][0] - 1.0) < 0.01
 
 
 def test_generate_highlighted_srt_returns_false_when_no_words_in_range(tmp_path):
