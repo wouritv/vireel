@@ -339,10 +339,15 @@ PLATFORM_CONFIG = {
         "long_lived_token_url": "https://graph.instagram.com/access_token",
         "client_id": os.getenv("INSTAGRAM_APP_ID"),
         "client_secret": os.getenv("INSTAGRAM_APP_SECRET"),
+        # publish_to_instagram/publish_to_instagram_image (content_publish)
+        # and identity lookup at connect time (basic) are the only ones the
+        # app's own endpoints call today. manage_messages/manage_comments
+        # were requested but never used by any endpoint -- dropped so App
+        # Review isn't asked to approve permissions with no real use case
+        # to demonstrate. manage_insights is kept deliberately (planned
+        # analytics use) despite the same gap.
         "scopes": [
             "instagram_business_basic",
-            "instagram_business_manage_messages",
-            "instagram_business_manage_comments",
             "instagram_business_content_publish",
             "instagram_business_manage_insights",
         ],
