@@ -13061,6 +13061,17 @@ def connect(platform: str, request: Request, user_id: Annotated[str, Depends(get
         params["access_type"] = "offline"
         params["prompt"] = "consent"
 
+    if key == "facebook":
+        # Without this, Facebook silently skips the consent screen for a
+        # user who already authorized the app and just reissues a token
+        # with whatever permissions were granted the first time -- so
+        # adding a new scope (e.g. pages_manage_engagement) to
+        # PLATFORM_CONFIG never actually gets requested on a plain
+        # "reconnect", even though the URL's `scope` param lists it.
+        # auth_type=rerequest forces Facebook to show the full permission
+        # dialog again, including newly added scopes.
+        params["auth_type"] = "rerequest"
+
     if key == "tiktok":
         code_verifier, code_challenge = generate_pkce_pair()
         state_payload["code_verifier"] = code_verifier
