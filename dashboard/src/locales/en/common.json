@@ -509,6 +509,7 @@
     "postComposerTextPlaceholder": "Write your post...",
     "postComposerTextRequired": "Write the text of your post.",
     "postComposerFailed": "Publishing failed.",
+    "postComposerCommentsFailed": "Post published, but {{count}} comment(s) could not be posted on: {{platforms}}. {{error}}",
     "postComposerCommentsLabel": "Comments (posted by the page)",
     "postComposerAddComment": "Add a comment",
     "postComposerNoComments": "No comments yet.",

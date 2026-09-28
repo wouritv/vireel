@@ -193,6 +193,33 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
                 return;
             }
 
+            // The post itself can succeed while a follow-up comment fails
+            // (e.g. a stale connected token missing the comment-posting
+            // permission) -- create_social_post's top-level "success" only
+            // reflects the post, so check each platform's own
+            // comments_results here instead of silently showing "success"
+            // while comments never actually appeared.
+            const failedComments = !isScheduling
+                ? Object.entries(data?.results || {}).flatMap(([platform, r]) =>
+                      (r?.comments_results || [])
+                          .filter((c) => !c?.success)
+                          .map((c) => ({ platform, error: c?.error }))
+                  )
+                : [];
+
+            if (failedComments.length > 0) {
+                const platformNames = [...new Set(failedComments.map((c) => c.platform))].join(", ");
+                setResult({
+                    success: false,
+                    msg: t(
+                        "social.postComposerCommentsFailed",
+                        "Publication envoyee, mais {{count}} commentaire(s) n'ont pas pu etre postes sur : {{platforms}}. {{error}}",
+                        { count: failedComments.length, platforms: platformNames, error: describePlatformPublishError(t, failedComments[0].error) }
+                    ),
+                });
+                return;
+            }
+
             setResult({
                 success: true,
                 msg: isScheduling

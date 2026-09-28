@@ -510,6 +510,7 @@
     "postComposerTextPlaceholder": "Écris ta publication...",
     "postComposerTextRequired": "Écris le texte de ta publication.",
     "postComposerFailed": "La publication a échoué.",
+    "postComposerCommentsFailed": "Publication envoyée, mais {{count}} commentaire(s) n'ont pas pu être postés sur : {{platforms}}. {{error}}",
     "postComposerCommentsLabel": "Commentaires (publiés par la page)",
     "postComposerAddComment": "Ajouter un commentaire",
     "postComposerNoComments": "Aucun commentaire pour l'instant.",

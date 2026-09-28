@@ -7826,7 +7826,7 @@ def _resolve_public_video_url(video_ref: str, request: Request, job_id: str) -> 
     base_url = SOCIAL_BASE_URL or str(request.base_url).rstrip("/")
     return f"{base_url}/videos/{job_id}/{ref}"
 
-async def _schedule_social_post_job(
+async def _schedule_reel_social_post_job(
     user_id: str, platform_name: str, req: "SocialPostRequest", publish_priority: int,
     scheduled_for, final_title: str, final_description: str, public_video_url: str,
 ) -> Dict[str, Any]:
@@ -7855,7 +7855,7 @@ async def _schedule_social_post_job(
     }
 
 
-async def _publish_social_post_now(
+async def _publish_reel_social_post_now(
     user_id: str, platform_name: str, publish_priority: int,
     final_title: str, final_description: str, public_video_url: str, local_video_path: str,
 ) -> Dict[str, Any]:
@@ -7927,12 +7927,12 @@ async def post_to_socials(req: SocialPostRequest, request: Request, user_id_head
 
     for platform_name in selected_platforms:
         if is_scheduled:
-            results[platform_name] = await _schedule_social_post_job(
+            results[platform_name] = await _schedule_reel_social_post_job(
                 user_id, platform_name, req, publish_priority, scheduled_for, final_title, final_description, public_video_url,
             )
             continue
 
-        result = await _publish_social_post_now(
+        result = await _publish_reel_social_post_now(
             user_id, platform_name, publish_priority, final_title, final_description, public_video_url, local_video_path,
         )
         results[platform_name] = result
