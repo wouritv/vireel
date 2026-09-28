@@ -3277,7 +3277,7 @@ def test_burn_default_captions_for_clip_burns_and_returns_true(monkeypatch):
     burn_req = burn_mock.call_args.args[0]
     assert burn_req.job_id == "job-1"
     assert burn_req.clip_index == 2
-    assert burn_req.font_size == 28
+    assert burn_req.font_size == 14
     assert burn_req.animation == "word-highlight"
 
 

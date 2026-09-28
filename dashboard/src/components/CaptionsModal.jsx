@@ -12,7 +12,7 @@ const DEFAULT_STYLE = {
   positionX: 50,
   positionY: 82,
   fontFamily: 'Montserrat',
-  fontSize: 28,
+  fontSize: 14,
   fontColor: '#FFFFFF',
   highlightColor: '#FFDD00',
   borderColor: '#000000',
@@ -745,7 +745,7 @@ export default function CaptionsModal({
 
                 <div className="rounded-lg border border-slate-300 dark:border-white/10 bg-white/[0.03] px-3 py-3">
                   <label className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{t('captionsModal.lineSize', 'Line size')} ({currentStyle.fontSize}px)</label>
-                  <input type="range" min="28" max="96" value={currentStyle.fontSize} onChange={(e) => { updateAllLinesStyle({ fontSize: Number(e.target.value) || 28 }); focusSelectedPreview(); }} className="mt-2 w-full accent-emerald-500" />
+                  <input type="range" min="14" max="96" value={currentStyle.fontSize} onChange={(e) => { updateAllLinesStyle({ fontSize: Number(e.target.value) || 14 }); focusSelectedPreview(); }} className="mt-2 w-full accent-emerald-500" />
                 </div>
 
                 <div className="rounded-lg border border-slate-300 dark:border-white/10 bg-white/[0.03] px-3 py-3">
