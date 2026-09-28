@@ -51,7 +51,7 @@ def transcribe_audio(video_path):
     return transcript
 
 
-def generate_srt_from_video(video_path, output_path, max_chars=20, max_duration=2.0, max_words_per_line=4):
+def generate_srt_from_video(video_path, output_path, max_chars=20, max_duration=2.0, max_words_per_line=4, highlight=False):
     """
     Transcribe a video and generate SRT directly.
     Used for dubbed videos that don't have a pre-existing transcript.
@@ -66,7 +66,8 @@ def generate_srt_from_video(video_path, output_path, max_chars=20, max_duration=
     duration = frame_count / fps if fps else 0
     cap.release()
 
-    return generate_srt(
+    generator = generate_highlighted_srt if highlight else generate_srt
+    return generator(
         transcript,
         0,
         duration,
@@ -106,49 +107,112 @@ def _flush_srt_block(current_block, clip_start, block_start, index):
     return index + 1, format_srt_block(index, block_start, block_end, text)
 
 
+def _group_words_into_relative_blocks(words, clip_start, max_chars, max_duration, max_words_per_line):
+    """Groups words into the same line-sized blocks generate_srt renders,
+    tagging each word with its own clip-relative start/end ('rel_start'/
+    'rel_end') alongside its original fields -- generate_srt only needs the
+    block boundaries, but generate_highlighted_srt needs each word's own
+    timing to know exactly when it's the one being spoken."""
+    blocks = []
+    current_block = []
+    block_start = None
+
+    for word in words:
+        start = max(0, word['start'] - clip_start)
+        end = max(0, word['end'] - clip_start)
+        rel_word = {**word, 'rel_start': start, 'rel_end': end}
+
+        if not current_block:
+            current_block.append(rel_word)
+            block_start = start
+            continue
+
+        if _should_flush_block(current_block, block_start, end, word['word'], max_chars, max_duration, max_words_per_line):
+            blocks.append(current_block)
+            current_block = [rel_word]
+            block_start = start
+        else:
+            current_block.append(rel_word)
+
+    if current_block:
+        blocks.append(current_block)
+
+    return blocks
+
+
 def generate_srt(transcript, clip_start, clip_end, output_path, max_chars=20, max_duration=2.0, max_words_per_line=4):
     """
     Generates an SRT file from the transcript for a specific time range.
     Groups words into short lines suitable for vertical video.
     """
-    
     words = _extract_words_in_range(transcript, clip_start, clip_end)
 
     if not words:
         return False
 
+    blocks = _group_words_into_relative_blocks(words, clip_start, max_chars, max_duration, max_words_per_line)
+
     srt_content = ""
     index = 1
-
-    current_block = []
-    block_start = None
-
-    for word in words:
-        # Adjust times relative to clip
-        start = max(0, word['start'] - clip_start)
-        end = max(0, word['end'] - clip_start)
-        
-        if not current_block:
-            current_block.append(word)
-            block_start = start
-            continue
-
-        if _should_flush_block(current_block, block_start, end, word['word'], max_chars, max_duration, max_words_per_line):
-            index, block_text = _flush_srt_block(current_block, clip_start, block_start, index)
-            srt_content += block_text
-            current_block = [word]
-            block_start = start
-        else:
-            current_block.append(word)
-
-    # Final block
-    if current_block:
-        _, block_text = _flush_srt_block(current_block, clip_start, block_start, index)
+    for block in blocks:
+        index, block_text = _flush_srt_block(block, clip_start, block[0]['rel_start'], index)
         srt_content += block_text
 
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(srt_content)
-        
+
+    return True
+
+
+# Wraps the word an SRT entry produced by generate_highlighted_srt should
+# highlight -- a control character so it can never collide with real
+# caption text, and passes through untouched to the .srt/.ass files where
+# _escape_ass_text_with_highlight (see below) turns it into an inline ASS
+# colour override instead of visible text.
+_HIGHLIGHT_MARKER = "\x01"
+
+
+def generate_highlighted_srt(transcript, clip_start, clip_end, output_path, max_chars=20, max_duration=2.0, max_words_per_line=4):
+    """Like generate_srt, but marks up whichever word is actively being
+    spoken in each entry (wrapped in _HIGHLIGHT_MARKER) so burn_subtitles
+    can colour it with the style's highlight colour -- reproducing, in the
+    burned-in video, the same word-by-word highlight the dashboard's own
+    Remotion preview already renders for every caption animation except
+    "none" (see Subtitles.tsx: `isActive -> color = style.highlightColor`).
+
+    Emits one SRT entry per spoken word, plus an unmarked filler entry for
+    any silent gap before/between/after words, so the line never goes
+    blank between highlights.
+    """
+    words = _extract_words_in_range(transcript, clip_start, clip_end)
+
+    if not words:
+        return False
+
+    blocks = _group_words_into_relative_blocks(words, clip_start, max_chars, max_duration, max_words_per_line)
+
+    srt_content = ""
+    index = 1
+    for block in blocks:
+        block_words = [w['word'] for w in block]
+        cursor = block[0]['rel_start']
+        for i, word in enumerate(block):
+            if word['rel_start'] > cursor:
+                plain_text = " ".join(block_words).strip()
+                srt_content += format_srt_block(index, cursor, word['rel_start'], plain_text)
+                index += 1
+
+            highlighted_text = " ".join(
+                f"{_HIGHLIGHT_MARKER}{w}{_HIGHLIGHT_MARKER}" if i == j else w
+                for j, w in enumerate(block_words)
+            ).strip()
+            srt_content += format_srt_block(index, word['rel_start'], word['rel_end'], highlighted_text)
+            index += 1
+            cursor = word['rel_end']
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(srt_content)
+
     return True
 
 def format_srt_block(index, start, end, text):
@@ -211,6 +275,7 @@ class SubtitleStyleOptions:
     bold: bool = True
     italic: bool = False
     text_case: str = "none"
+    highlight_color: str = "#FFDD00"
 
 
 def _probe_video_resolution(video_path):
@@ -278,10 +343,39 @@ def _escape_ass_text(text: str) -> str:
     return text.replace('\\', '\\\\').replace('{', '\\{').replace('}', '\\}').replace('\n', '\\N')
 
 
+def _ass_inline_colour_tag(ass_colour: str) -> str:
+    """Converts a &HAABBGGRR Style-line colour (see hex_to_ass_color) into
+    an inline \\c override usable inside a Dialogue's Text field -- \\c only
+    takes the BBGGRR bytes, without the leading alpha byte a Style line
+    colour carries."""
+    hex_part = ass_colour[2:] if ass_colour.upper().startswith("&H") else ass_colour
+    bgr = hex_part[-6:].rjust(6, "0")
+    return f"\\c&H{bgr}&"
+
+
+def _escape_ass_text_with_highlight(text: str, normal_colour: str, highlight_colour: str) -> str:
+    """Escapes Dialogue text for the .ass file, turning the single word
+    generate_highlighted_srt wrapped in _HIGHLIGHT_MARKER (if any) into an
+    inline colour override instead of visible text -- this is what actually
+    makes the currently-spoken word light up in highlight_colour when the
+    burned-in video plays. Text with no marker (plain SRT, or a
+    generate_highlighted_srt filler entry) is escaped exactly as before."""
+    if _HIGHLIGHT_MARKER not in text:
+        return _escape_ass_text(text)
+    before, word, after = text.split(_HIGHLIGHT_MARKER, 2)
+    return (
+        _escape_ass_text(before)
+        + "{" + _ass_inline_colour_tag(highlight_colour) + "}"
+        + _escape_ass_text(word)
+        + "{" + _ass_inline_colour_tag(normal_colour) + "}"
+        + _escape_ass_text(after)
+    )
+
+
 def _build_ass_document(
     blocks, width: int, height: int, ass_alignment: int, font_name: str, fontsize: int,
     primary_colour: str, outline_colour: str, back_colour: str, border_style: int,
-    outline_width: int, shadow: int, bold: int, italic: int,
+    outline_width: int, shadow: int, bold: int, italic: int, highlight_colour: str = "",
 ) -> str:
     """Builds a complete .ass script with its own [Script Info] PlayResX/
     PlayResY set to the video's real resolution -- unlike a bare .srt (which
@@ -310,8 +404,10 @@ def _build_ass_document(
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
+    effective_highlight_colour = highlight_colour or primary_colour
     events = "".join(
-        f"Dialogue: 0,{_format_ass_time(start)},{_format_ass_time(end)},Default,,0,0,0,,{_escape_ass_text(text)}\n"
+        f"Dialogue: 0,{_format_ass_time(start)},{_format_ass_time(end)},Default,,0,0,0,,"
+        f"{_escape_ass_text_with_highlight(text, primary_colour, effective_highlight_colour)}\n"
         for start, end, text in blocks
     )
     return header + events
@@ -368,12 +464,14 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16, 
         outline_width = max(1, style.border_width)
 
     back_colour = hex_to_ass_color("#000000", 0.0)
+    highlight_colour = hex_to_ass_color(style.highlight_color, 1.0)
 
     blocks = _parse_srt_blocks(srt_path)
     ass_content = _build_ass_document(
         blocks, width, height, ass_alignment, safe_font_name, final_fontsize,
         primary_colour, outline_colour, back_colour, border_style, outline_width,
         max(0, int(style.shadow_blur)), 1 if style.bold else 0, 1 if style.italic else 0,
+        highlight_colour=highlight_colour,
     )
     ass_path = f"{os.path.splitext(srt_path)[0]}.ass"
     with open(ass_path, 'w', encoding='utf-8') as f:

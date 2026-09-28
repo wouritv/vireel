@@ -2090,7 +2090,13 @@ async def _burn_default_captions_for_clip(
         return False
     srt_path = f"{output_path}.srt"
     try:
-        has_words = generate_srt(
+        # Any animation other than "none" highlights the currently-spoken
+        # word (see Subtitles.tsx's isActive -> color = highlightColor,
+        # applied for every animation value) -- generate_highlighted_srt
+        # marks up the SRT so burn_subtitles can reproduce that in the
+        # burned-in video instead of leaving it static.
+        srt_generator = generate_srt if style_kwargs.get("animation", "none") == "none" else generate_highlighted_srt
+        has_words = srt_generator(
             transcript, clip_start, clip_end, srt_path,
             max_words_per_line=style_kwargs["words_per_line"],
         )
@@ -4946,7 +4952,7 @@ async def get_status(job_id: str, user_id: Annotated[str, Depends(get_user_id_he
     return response
 
 from editor import VideoEditor
-from subtitles import generate_srt, burn_subtitles, generate_srt_from_video, SubtitleStyleOptions
+from subtitles import generate_srt, generate_highlighted_srt, burn_subtitles, generate_srt_from_video, SubtitleStyleOptions
 from hooks import add_hook_to_video
 from thumbnail import analyze_video_for_titles, refine_titles, generate_thumbnail, generate_youtube_description
 
@@ -6226,19 +6232,25 @@ def _resolve_add_subtitles_input_path(req: SubtitleRequest, output_dir: str, cli
     return input_path, filename
 
 
-async def _generate_subtitle_srt(input_path: str, filename: str, transcript: Dict[str, Any], clip_data: Dict[str, Any], srt_path: str, words_per_line: int) -> bool:
+async def _generate_subtitle_srt(input_path: str, filename: str, transcript: Dict[str, Any], clip_data: Dict[str, Any], srt_path: str, words_per_line: int, animation: str = "none") -> bool:
+    # Any animation other than "none" highlights the currently-spoken word
+    # (see Subtitles.tsx's isActive -> color = highlightColor) -- mark up
+    # the SRT so burn_subtitles reproduces that in the burned-in video.
+    highlight = animation != "none"
+
     # Check if this is a dubbed video - if so, transcribe it fresh
     is_dubbed = filename.startswith("translated_")
     if is_dubbed:
         print("🎙️ Dubbed video detected, transcribing audio for subtitles...")
 
         def run_transcribe_srt():
-            return generate_srt_from_video(input_path, srt_path, max_words_per_line=words_per_line)
+            return generate_srt_from_video(input_path, srt_path, max_words_per_line=words_per_line, highlight=highlight)
 
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, run_transcribe_srt)
 
-    return generate_srt(
+    srt_generator = generate_highlighted_srt if highlight else generate_srt
+    return srt_generator(
         transcript,
         clip_data['start'],
         clip_data['end'],
@@ -6262,6 +6274,7 @@ def _burn_subtitles_for_request(req: SubtitleRequest, input_path: str, srt_path:
         bold=req.bold,
         italic=req.italic,
         text_case=req.text_case,
+        highlight_color=req.highlight_color,
     )
     burn_subtitles(
         input_path,
@@ -6426,7 +6439,7 @@ async def add_subtitles(req: SubtitleRequest, user_id: Annotated[str, Depends(ge
 
     try:
         words_per_line = max(2, min(8, int(req.words_per_line or 4)))
-        success = await _generate_subtitle_srt(input_path, filename, transcript, clip_data, srt_path, words_per_line)
+        success = await _generate_subtitle_srt(input_path, filename, transcript, clip_data, srt_path, words_per_line, animation=req.animation)
         if not success:
             raise HTTPException(status_code=400, detail="No words found for this clip range.")
 

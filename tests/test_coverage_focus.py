@@ -65,6 +65,7 @@ def _import_app_with_stubs(monkeypatch):
 
     subtitles_mod = types.ModuleType("subtitles")
     subtitles_mod.generate_srt = lambda *args, **kwargs: True
+    subtitles_mod.generate_highlighted_srt = lambda *args, **kwargs: True
     subtitles_mod.burn_subtitles = lambda *args, **kwargs: True
     subtitles_mod.generate_srt_from_video = lambda *args, **kwargs: True
     subtitles_mod.SubtitleStyleOptions = object

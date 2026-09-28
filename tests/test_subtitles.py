@@ -233,3 +233,98 @@ def test_burn_subtitles_raises_on_ffmpeg_error(monkeypatch, tmp_path):
     assert not Path(srt_path.replace(".srt", ".ass")).exists()
 
 
+def test_generate_highlighted_srt_marks_each_word_and_fills_gaps(tmp_path):
+    transcript = {
+        "segments": [
+            {
+                "words": [
+                    {"word": "hello", "start": 1.0, "end": 1.4},
+                    {"word": "world", "start": 2.0, "end": 2.4},
+                ]
+            }
+        ]
+    }
+    out = tmp_path / "clip.srt"
+
+    ok = subtitles.generate_highlighted_srt(
+        transcript, clip_start=1.0, clip_end=3.0, output_path=str(out), max_duration=10.0,
+    )
+
+    assert ok is True
+    blocks = subtitles._parse_srt_blocks(str(out))
+    marker = subtitles._HIGHLIGHT_MARKER
+    texts = [text for _start, _end, text in blocks]
+    # Clip-relative: "hello" is active over [0, 0.4), then a silent gap
+    # (both words share one line/block) until "world" starts at [1.0, 1.4).
+    assert texts == [
+        f"{marker}hello{marker} world",
+        "hello world",
+        f"hello {marker}world{marker}",
+    ]
+    # "hello"'s highlighted window starts at the clip-relative block start.
+    assert blocks[0][0] == pytest.approx(0.0)
+    # The gap filler picks up exactly where "hello"'s window ended.
+    assert blocks[1][0] == pytest.approx(blocks[0][1])
+    # "world"'s highlighted window starts where the gap filler ended.
+    assert blocks[2][0] == pytest.approx(blocks[1][1])
+    assert blocks[2][0] == pytest.approx(1.0, abs=0.01)
+
+
+def test_generate_highlighted_srt_returns_false_when_no_words_in_range(tmp_path):
+    transcript = {"segments": [{"words": [{"word": "hello", "start": 0.0, "end": 0.5}]}]}
+    out = tmp_path / "empty.srt"
+
+    ok = subtitles.generate_highlighted_srt(transcript, clip_start=10, clip_end=12, output_path=str(out))
+
+    assert ok is False
+    assert not out.exists()
+
+
+def test_ass_inline_colour_tag_strips_alpha_byte():
+    assert subtitles._ass_inline_colour_tag("&H00FFDD00") == "\\c&HFFDD00&"
+
+
+def test_escape_ass_text_with_highlight_wraps_marked_word_in_colour_override():
+    marker = subtitles._HIGHLIGHT_MARKER
+    text = f"hello {marker}world{marker} again"
+
+    result = subtitles._escape_ass_text_with_highlight(text, "&H00FFFFFF", "&H0000DDFF")
+
+    assert result == "hello {\\c&H00DDFF&}world{\\c&HFFFFFF&} again"
+
+
+def test_escape_ass_text_with_highlight_falls_back_to_plain_escape_without_marker():
+    result = subtitles._escape_ass_text_with_highlight("100% {great}", "&H00FFFFFF", "&H0000DDFF")
+
+    assert result == subtitles._escape_ass_text("100% {great}")
+
+
+def test_burn_subtitles_colours_the_highlighted_word(monkeypatch, tmp_path):
+    marker = subtitles._HIGHLIGHT_MARKER
+    srt_path = tmp_path / "sub.srt"
+    srt_path.write_text(
+        f"1\n00:00:01,000 --> 00:00:01,400\n{marker}hello{marker} world\n\n",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_run(cmd, stdout=None, stderr=None, **kwargs):
+        ass_path = cmd[5].split("subtitles='")[1].split("'")[0]
+        captured["ass_content"] = Path(ass_path).read_text(encoding="utf-8")
+        class _Result:
+            returncode = 0
+            stderr = b""
+        return _Result()
+
+    monkeypatch.setattr(subtitles, "_normalize_subtitle_text_case", lambda *args, **kwargs: None)
+    monkeypatch.setattr(subtitles.subprocess, "run", fake_run)
+    monkeypatch.setattr(subtitles, "_probe_video_resolution", lambda _path: (1080, 1920))
+
+    style = subtitles.SubtitleStyleOptions(font_color="#FFFFFF", highlight_color="#FFDD00")
+    ok = subtitles.burn_subtitles("in.mp4", str(srt_path), "out.mp4", style_options=style)
+
+    assert ok is True
+    assert "{\\c&H00DDFF&}hello{\\c&HFFFFFF&}" in captured["ass_content"]
+    assert " world" in captured["ass_content"]
+
+

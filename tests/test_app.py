@@ -88,6 +88,7 @@ def _install_optional_dependency_stubs(monkeypatch):
 
     subtitles_mod = types.ModuleType("subtitles")
     subtitles_mod.generate_srt = lambda *args, **kwargs: True
+    subtitles_mod.generate_highlighted_srt = lambda *args, **kwargs: True
     subtitles_mod.burn_subtitles = lambda *args, **kwargs: True
     subtitles_mod.generate_srt_from_video = lambda *args, **kwargs: True
 
@@ -2081,7 +2082,7 @@ def test_add_subtitles_dubbed_video_uses_transcription(monkeypatch, tmp_path):
 
     calls = {"transcribed": 0}
 
-    def _fake_transcribe(_input, _srt, max_words_per_line=4):
+    def _fake_transcribe(_input, _srt, max_words_per_line=4, highlight=False):
         calls["transcribed"] += 1
         return True
 
@@ -3247,6 +3248,7 @@ def test_burn_default_captions_for_clip_returns_false_without_transcript(monkeyp
 def test_burn_default_captions_for_clip_returns_false_when_no_words_in_range(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "generate_srt", lambda *args, **kwargs: False)
+    monkeypatch.setattr(app, "generate_highlighted_srt", lambda *args, **kwargs: False)
     burn_mock = MagicMock()
     monkeypatch.setattr(app, "_burn_subtitles_for_request", burn_mock)
 
