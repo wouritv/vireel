@@ -2160,6 +2160,60 @@ async def _record_default_style_version(
         logger.warning("Failed to record default style version for job %s clip %s: %s", job_id, clip_index, exc)
 
 
+async def _upload_and_finalize_auto_caption(
+    clip_path: str,
+    primary_path: str,
+    auto_captioned: bool,
+    clip: Dict[str, Any],
+    default_style_kwargs: Dict[str, Any],
+    user_id: str,
+    job_id: str,
+    clip_index: int,
+    clip_filename: str,
+    bucket: str,
+) -> tuple:
+    """Uploads the (possibly captioned) clip to S3 and, when auto-captioning
+    was applied, also uploads the pre-caption original, estimates its
+    caption cost, and records the default style version so a later reset
+    can fall back to this properly-styled version. Returns (media_url,
+    s3_key, clip_size_bytes, original_s3_key, caption_credit_cost,
+    auto_caption_cost_breakdown)."""
+    s3_key = f"reels/{user_id}/{job_id}/{clip_filename}"
+    if not upload_file_to_s3(primary_path, bucket, s3_key):
+        raise RuntimeError(f"Failed to upload clip to S3: {clip_filename}")
+    clip_size_bytes = int(os.path.getsize(primary_path) or 0)
+    media_url = _reel_media_url_from_s3_key(s3_key)
+
+    if not auto_captioned:
+        return media_url, s3_key, clip_size_bytes, "", 0.0, {}
+
+    original_s3_key = f"reels/{user_id}/{job_id}/original_{clip_filename}"
+    if not upload_file_to_s3(clip_path, bucket, original_s3_key):
+        # Best-effort: the reel itself is already captioned and uploaded
+        # above -- losing the pre-caption original only means a later
+        # manual restyle rebuilds from the captioned version instead.
+        original_s3_key = ""
+
+    clip_duration_for_caption_cost = _compute_clip_duration_seconds(clip)
+    auto_caption_cost_breakdown = _estimate_caption_cost_breakdown(
+        duration_seconds=float(clip_duration_for_caption_cost or 0),
+        size_bytes=float(clip_size_bytes),
+        uses_assembly=False, uses_openai=False, uses_gemini=False,
+    )
+    caption_credit_cost = _estimate_caption_required_credits(
+        duration_seconds=float(clip_duration_for_caption_cost or 0),
+        size_bytes=float(clip_size_bytes),
+        uses_assembly=False, uses_openai=False, uses_gemini=False,
+    )
+    await _record_default_style_version(
+        user_id, job_id, clip_index,
+        source_video_url=_reel_media_url_from_s3_key(original_s3_key) if original_s3_key else "",
+        output_video_url=media_url,
+        style_config=default_style_kwargs,
+    )
+    return media_url, s3_key, clip_size_bytes, original_s3_key, caption_credit_cost, auto_caption_cost_breakdown
+
+
 async def _build_reel_row_for_clip(
     job_id: str,
     user_id: str,
@@ -2188,42 +2242,13 @@ async def _build_reel_row_for_clip(
     )
     primary_path = captioned_path if auto_captioned else clip_path
 
-    s3_key = f"reels/{user_id}/{job_id}/{clip_filename}"
-    uploaded = upload_file_to_s3(primary_path, bucket, s3_key)
-    if not uploaded:
-        raise RuntimeError(f"Failed to upload clip to S3: {clip_filename}")
-    clip_size_bytes = int(os.path.getsize(primary_path) or 0)
-
-    original_s3_key = ""
-    caption_credit_cost = 0.0
-    auto_caption_cost_breakdown: Dict[str, Any] = {}
-    if auto_captioned:
-        original_s3_key = f"reels/{user_id}/{job_id}/original_{clip_filename}"
-        if not upload_file_to_s3(clip_path, bucket, original_s3_key):
-            # Best-effort: the reel itself is already captioned and uploaded
-            # above -- losing the pre-caption original only means a later
-            # manual restyle rebuilds from the captioned version instead.
-            original_s3_key = ""
-        clip_duration_for_caption_cost = _compute_clip_duration_seconds(clip)
-        auto_caption_cost_breakdown = _estimate_caption_cost_breakdown(
-            duration_seconds=float(clip_duration_for_caption_cost or 0),
-            size_bytes=float(clip_size_bytes),
-            uses_assembly=False, uses_openai=False, uses_gemini=False,
-        )
-        caption_credit_cost = _estimate_caption_required_credits(
-            duration_seconds=float(clip_duration_for_caption_cost or 0),
-            size_bytes=float(clip_size_bytes),
-            uses_assembly=False, uses_openai=False, uses_gemini=False,
-        )
-
-    media_url = _reel_media_url_from_s3_key(s3_key)
-    if auto_captioned:
-        await _record_default_style_version(
-            user_id, job_id, clip_index,
-            source_video_url=_reel_media_url_from_s3_key(original_s3_key) if original_s3_key else "",
-            output_video_url=media_url,
-            style_config=default_style_kwargs,
-        )
+    (
+        media_url, s3_key, clip_size_bytes, original_s3_key,
+        caption_credit_cost, auto_caption_cost_breakdown,
+    ) = await _upload_and_finalize_auto_caption(
+        clip_path, primary_path, auto_captioned, clip, default_style_kwargs,
+        user_id, job_id, clip_index, clip_filename, bucket,
+    )
     thumbnail_s3_key = _upload_reel_clip_thumbnail(clip, primary_path, output_dir, job_id, clip_index, user_id, bucket)
 
     duration = _compute_clip_duration_seconds(clip)

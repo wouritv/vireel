@@ -372,11 +372,29 @@ def _escape_ass_text_with_highlight(text: str, normal_colour: str, highlight_col
     )
 
 
-def _build_ass_document(
-    blocks, width: int, height: int, ass_alignment: int, font_name: str, fontsize: int,
-    primary_colour: str, outline_colour: str, back_colour: str, border_style: int,
-    outline_width: int, shadow: int, bold: int, italic: int, highlight_colour: str = "",
-) -> str:
+@dataclass
+class _AssStyleParams:
+    """Bundles everything _build_ass_document needs to know about the
+    video canvas and the [V4+ Styles] line it writes -- kept as one object
+    instead of a long parameter list, since burn_subtitles resolves all of
+    these together from a single SubtitleStyleOptions anyway."""
+    width: int
+    height: int
+    ass_alignment: int
+    font_name: str
+    fontsize: int
+    primary_colour: str
+    outline_colour: str
+    back_colour: str
+    border_style: int
+    outline_width: int
+    shadow: int
+    bold: int
+    italic: int
+    highlight_colour: str = ""
+
+
+def _build_ass_document(blocks, params: _AssStyleParams) -> str:
     """Builds a complete .ass script with its own [Script Info] PlayResX/
     PlayResY set to the video's real resolution -- unlike a bare .srt (which
     carries no resolution info of its own and makes ffmpeg's `subtitles`
@@ -388,29 +406,57 @@ def _build_ass_document(
     font_size looks in the Remotion-based manual caption editor (whose
     composition is sized to the real output resolution and treats fontSize
     as literal CSS pixels -- see remotion/src/Root.tsx)."""
+    p = params
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
-        f"PlayResX: {width}\n"
-        f"PlayResY: {height}\n"
+        f"PlayResX: {p.width}\n"
+        f"PlayResY: {p.height}\n"
         "WrapStyle: 0\n"
         "ScaledBorderAndShadow: yes\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,{font_name},{fontsize},{primary_colour},{primary_colour},{outline_colour},{back_colour},"
-        f"{bold},{italic},0,0,100,100,0,0,{border_style},{outline_width},{shadow},{ass_alignment},10,10,25,1\n\n"
+        f"Style: Default,{p.font_name},{p.fontsize},{p.primary_colour},{p.primary_colour},{p.outline_colour},{p.back_colour},"
+        f"{p.bold},{p.italic},0,0,100,100,0,0,{p.border_style},{p.outline_width},{p.shadow},{p.ass_alignment},10,10,25,1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
-    effective_highlight_colour = highlight_colour or primary_colour
+    effective_highlight_colour = p.highlight_colour or p.primary_colour
     events = "".join(
         f"Dialogue: 0,{_format_ass_time(start)},{_format_ass_time(end)},Default,,0,0,0,,"
-        f"{_escape_ass_text_with_highlight(text, primary_colour, effective_highlight_colour)}\n"
+        f"{_escape_ass_text_with_highlight(text, p.primary_colour, effective_highlight_colour)}\n"
         for start, end, text in blocks
     )
     return header + events
+
+
+def _resolve_ass_alignment(alignment) -> int:
+    return {'top': 6, 'middle': 10, 'bottom': 2}.get(str(alignment).lower(), 2)
+
+
+def _resolve_ass_border_params(style: "SubtitleStyleOptions") -> tuple:
+    """Returns (border_style, outline_colour, outline_width) for either of
+    burn_subtitles' two rendering modes: an opaque background box
+    (bg_opacity > 0) or a plain text outline/border."""
+    if style.bg_opacity > 0:
+        return 3, hex_to_ass_color(style.bg_color, style.bg_opacity), 1
+    return 1, hex_to_ass_color(style.border_color, 1.0), max(1, style.border_width)
+
+
+def _run_ffmpeg_subtitle_burn(cmd: list) -> None:
+    print(f"🎬 Burning subtitles: {' '.join(cmd)}")
+    try:
+        result = subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=FFMPEG_STEP_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"FFmpeg timed out after {FFMPEG_STEP_TIMEOUT_SECONDS}s while burning subtitles") from exc
+
+    if result.returncode != 0:
+        print(f"❌ FFmpeg Subtitle Error: {result.stderr.decode()}")
+        raise RuntimeError(f"FFmpeg failed: {result.stderr.decode()}")
 
 
 def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16, style_options=None):
@@ -422,23 +468,11 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16, 
     """
     style = style_options or SubtitleStyleOptions()
 
-    # Position mapping
-    ass_alignment = 2
-    align_lower = str(alignment).lower()
-    if align_lower == 'top':
-        ass_alignment = 6
-    elif align_lower == 'middle':
-        ass_alignment = 10
-    elif align_lower == 'bottom':
-        ass_alignment = 2
-
     width, height = _probe_video_resolution(video_path)
     if not width or not height:
         # Sane vertical-reel fallback: better than ever letting this fall
         # through to ffmpeg's own tiny default virtual canvas.
         width, height = 1080, 1920
-
-    final_fontsize = max(10, int(fontsize))
 
     _normalize_subtitle_text_case(srt_path, style.text_case)
 
@@ -447,32 +481,20 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16, 
     # can't break out of the Style line or inject extra script sections.
     safe_font_name = re.sub(r"[^A-Za-z0-9 _.\-]", "", style.font_name or "")[:64].strip() or "Verdana"
 
-    # Convert colors to ASS format and build style
-    primary_colour = hex_to_ass_color(style.font_color, 1.0)
-    shadow_colour = hex_to_ass_color(style.text_shadow_color, 1.0)
-    _ = (shadow_colour, style.shadow_offset_x, style.shadow_offset_y)  # Kept for API compatibility; ASS shadow offset/colour are limited.
+    border_style, outline_colour, outline_width = _resolve_ass_border_params(style)
 
-    if style.bg_opacity > 0:
-        # Box mode: opaque background box
-        border_style = 3
-        outline_colour = hex_to_ass_color(style.bg_color, style.bg_opacity)
-        outline_width = 1
-    else:
-        # Outline mode: text border/outline
-        border_style = 1
-        outline_colour = hex_to_ass_color(style.border_color, 1.0)
-        outline_width = max(1, style.border_width)
-
-    back_colour = hex_to_ass_color("#000000", 0.0)
-    highlight_colour = hex_to_ass_color(style.highlight_color, 1.0)
+    ass_params = _AssStyleParams(
+        width=width, height=height, ass_alignment=_resolve_ass_alignment(alignment),
+        font_name=safe_font_name, fontsize=max(10, int(fontsize)),
+        primary_colour=hex_to_ass_color(style.font_color, 1.0),
+        outline_colour=outline_colour, back_colour=hex_to_ass_color("#000000", 0.0),
+        border_style=border_style, outline_width=outline_width,
+        shadow=max(0, int(style.shadow_blur)), bold=1 if style.bold else 0, italic=1 if style.italic else 0,
+        highlight_colour=hex_to_ass_color(style.highlight_color, 1.0),
+    )
 
     blocks = _parse_srt_blocks(srt_path)
-    ass_content = _build_ass_document(
-        blocks, width, height, ass_alignment, safe_font_name, final_fontsize,
-        primary_colour, outline_colour, back_colour, border_style, outline_width,
-        max(0, int(style.shadow_blur)), 1 if style.bold else 0, 1 if style.italic else 0,
-        highlight_colour=highlight_colour,
-    )
+    ass_content = _build_ass_document(blocks, ass_params)
     ass_path = f"{os.path.splitext(srt_path)[0]}.ass"
     with open(ass_path, 'w', encoding='utf-8') as f:
         f.write(ass_content)
@@ -495,17 +517,7 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16, 
             output_path
         ]
 
-        print(f"🎬 Burning subtitles: {' '.join(cmd)}")
-        try:
-            result = subprocess.run(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=FFMPEG_STEP_TIMEOUT_SECONDS
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(f"FFmpeg timed out after {FFMPEG_STEP_TIMEOUT_SECONDS}s while burning subtitles") from exc
-
-        if result.returncode != 0:
-            print(f"❌ FFmpeg Subtitle Error: {result.stderr.decode()}")
-            raise RuntimeError(f"FFmpeg failed: {result.stderr.decode()}")
+        _run_ffmpeg_subtitle_burn(cmd)
 
         return True
     finally:
