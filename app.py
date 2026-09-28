@@ -162,6 +162,7 @@ _CLIP_INDEX_SUFFIX_PATTERN = r"_clip_(\d+)\.mp4$"
 _JOB_NOT_FOUND = "Job not found"
 _INVALID_INPUT_FILENAME = "Invalid input filename"
 _CLIP_NOT_FOUND = "Clip not found"
+_FACEBOOK_TOKEN_EXPIRED_OR_MISSING = "Facebook page access token expired or missing"
 _METADATA_NOT_FOUND = "Metadata not found"
 _HTTPS_SCHEME_PREFIX = "https://"
 _INVALID_SCHEDULED_DATE = "Invalid scheduled_date (expected ISO-8601)"
@@ -1399,12 +1400,15 @@ def _normalize_caption_row(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+_COMMON_VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm", ".mkv")
+
+
 def _is_probably_video_url(value: str) -> bool:
     text = str(value or "").strip().lower()
     if not text:
         return False
     path = urlparse(text).path or text
-    return path.endswith((".mp4", ".mov", ".webm", ".mkv", ".m4v", ".avi"))
+    return path.endswith(_COMMON_VIDEO_EXTENSIONS + (".m4v", ".avi"))
 
 
 async def _fetch_reel_and_caption_rows_for_preview(job_id: str, clip_index: int, user_id: str):
@@ -2008,14 +2012,14 @@ def _compute_clip_duration_seconds(clip: Dict[str, Any]) -> int:
 # what they'd get by opening "Sous-titres" and accepting the defaults. This
 # is only ever the *factory* fallback now -- see _get_user_default_caption_
 # style, which prefers a user's own saved default when one exists.
-_DEFAULT_AUTO_CAPTION_STYLE_KWARGS: Dict[str, Any] = dict(
-    position="bottom", position_x=50.0, position_y=82.0,
-    font_size=14, font_name="Montserrat", font_color="#FFFFFF",
-    highlight_color="#FFDD00", border_color="#000000", border_width=3,
-    text_shadow_color="#000000", shadow_blur=8, shadow_offset_x=0, shadow_offset_y=2,
-    bg_color="#000000", bg_opacity=0.0, text_case="none", bold=True, italic=False,
-    words_per_line=4, animation="word-highlight",
-)
+_DEFAULT_AUTO_CAPTION_STYLE_KWARGS: Dict[str, Any] = {
+    "position": "bottom", "position_x": 50.0, "position_y": 82.0,
+    "font_size": 14, "font_name": "Montserrat", "font_color": "#FFFFFF",
+    "highlight_color": "#FFDD00", "border_color": "#000000", "border_width": 3,
+    "text_shadow_color": "#000000", "shadow_blur": 8, "shadow_offset_x": 0, "shadow_offset_y": 2,
+    "bg_color": "#000000", "bg_opacity": 0.0, "text_case": "none", "bold": True, "italic": False,
+    "words_per_line": 4, "animation": "word-highlight",
+}
 
 # Sentinel (job_id, clip_index) under which a user's own default caption
 # style is stored in style_edit_versions -- not a real job/clip, just a
@@ -2790,6 +2794,35 @@ def _enrich_clips_with_saved_rows(clips: List[Dict[str, Any]], saved_rows: List[
     return enriched_clips
 
 
+async def _debit_auto_caption_credits_for_completed_job(job_id: str, user_id: Optional[str], saved_rows: List[Dict[str, Any]]) -> None:
+    """Bills the per-clip auto-caption credit cost recorded on each saved
+    reel row (see _burn_default_captions_for_clip) -- additive to the reel
+    generation charge in _finalize_completed_reel_billing, never folded
+    into it, since its storage side is already counted in that charge's
+    total_reel_size_bytes (reel_size_bytes is the post-burn, captioned
+    file size)."""
+    auto_caption_credit_total = sum(
+        float(((row.get("billing_details") or {}).get("auto_caption") or {}).get("credit_cost") or 0.0)
+        for row in saved_rows
+    )
+    if not (is_supabase_configured() and user_id and auto_caption_credit_total > 0):
+        return
+    try:
+        caption_debited = await supabase_deduct_user_credits(user_id, auto_caption_credit_total, 0.0)
+        if caption_debited:
+            await supabase_insert_user_data_history(
+                user_id=user_id,
+                credit=auto_caption_credit_total,
+                storage=0.0,
+                operation="output",
+                operation_type="sous_titre",
+                operation_id=f"{job_id}:auto_captions",
+            )
+    except Exception as caption_billing_error:
+        logger.exception("Auto-caption billing update failed for job %s", job_id)
+        jobs[job_id]['logs'].append(f"Auto-caption billing update failed: {caption_billing_error}")
+
+
 async def _finalize_completed_reel_billing(
     job_id: str, job_data: Dict[str, Any], user_id: Optional[str], source_is_url: bool,
     start_ts: float, enriched_clips: List[Dict[str, Any]], cost_analysis, saved_rows: List[Dict[str, Any]],
@@ -2826,31 +2859,9 @@ async def _finalize_completed_reel_billing(
             logger.exception("Billing update failed")
             jobs[job_id]['logs'].append(f"Billing update failed: {billing_error}")
 
-    # Auto-captioned clips (see _burn_default_captions_for_clip) carry their
-    # own credit cost per clip, billed the same way the manual captions
-    # persist flow already bills captioning (_debit_caption_persist_credits)
-    # -- additive to the reel generation charge above, never folded into it,
-    # since its storage side is already counted in total_reel_size_bytes
-    # (reel_size_bytes is the post-burn, captioned file size).
-    auto_caption_credit_total = sum(
-        float(((row.get("billing_details") or {}).get("auto_caption") or {}).get("credit_cost") or 0.0)
-        for row in saved_rows
-    )
-    if is_supabase_configured() and user_id and auto_caption_credit_total > 0:
-        try:
-            caption_debited = await supabase_deduct_user_credits(user_id, auto_caption_credit_total, 0.0)
-            if caption_debited:
-                await supabase_insert_user_data_history(
-                    user_id=user_id,
-                    credit=auto_caption_credit_total,
-                    storage=0.0,
-                    operation="output",
-                    operation_type="sous_titre",
-                    operation_id=f"{job_id}:auto_captions",
-                )
-        except Exception as caption_billing_error:
-            logger.exception("Auto-caption billing update failed for job %s", job_id)
-            jobs[job_id]['logs'].append(f"Auto-caption billing update failed: {caption_billing_error}")
+    # Additive to the reel generation charge above -- see
+    # _debit_auto_caption_credits_for_completed_job for why.
+    await _debit_auto_caption_credits_for_completed_job(job_id, user_id, saved_rows)
 
     result_payload = {
         'clips': enriched_clips,
@@ -2926,7 +2937,7 @@ async def _update_project_on_reel_completion(
 
 
 _SOURCE_VIDEO_BASENAME = "source"
-_SOURCE_VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".webm", ".m4v")
+_SOURCE_VIDEO_EXTENSIONS = _COMMON_VIDEO_EXTENSIONS + (".m4v",)
 
 
 def _find_leftover_source_video(output_dir: str) -> Optional[str]:
@@ -3026,7 +3037,7 @@ def _resolve_preserved_source_video(output_dir: str) -> Optional[str]:
     return None
 
 
-async def _ensure_preserved_source_video_available(job_id: str, user_id: str, output_dir: str) -> Optional[str]:
+def _ensure_preserved_source_video_available(job_id: str, user_id: str, output_dir: str) -> Optional[str]:
     """Like _resolve_preserved_source_video, but falls back to re-downloading
     the S3 backup (see _upload_and_bill_preserved_source_video) when the
     local copy has been swept by the retention cleanup -- so manual clipping
@@ -5877,7 +5888,7 @@ def _resolve_captioned_reel_output_path(job_id: str, clip_index: int, filename: 
     os.makedirs(output_dir, exist_ok=True)
     upload_name = str(filename or "captioned.mp4")
     ext = os.path.splitext(upload_name)[1].lower()
-    if ext not in {".mp4", ".mov", ".webm", ".mkv"}:
+    if ext not in _COMMON_VIDEO_EXTENSIONS:
         ext = ".mp4"
     output_filename = f"captioned_{clip_index}_{int(time.time())}{ext}"
     output_path = os.path.join(output_dir, output_filename)
@@ -6695,7 +6706,7 @@ async def get_reel_job_source_endpoint(job_id: str, user_id: Annotated[str, Depe
     button" rather than an error."""
     await _require_job_ownership(job_id, user_id)
     output_dir = os.path.join(OUTPUT_DIR, job_id)
-    source_path = await _ensure_preserved_source_video_available(job_id, user_id, output_dir)
+    source_path = _ensure_preserved_source_video_available(job_id, user_id, output_dir)
     if not source_path:
         return {"available": False}
     return {
@@ -6750,6 +6761,81 @@ async def _cut_and_verticalize_custom_clip(
     return final_path
 
 
+def _validate_custom_reel_clip_timing(req: "CustomReelClipRequest") -> tuple:
+    """Validates the user-picked start/end range for a custom reel clip.
+    Returns (duration_seconds, start_seconds, end_seconds)."""
+    start_ms = max(0, int(req.start_ms))
+    end_ms = int(req.end_ms)
+    if end_ms <= start_ms:
+        raise HTTPException(status_code=400, detail="end_ms doit etre superieur a start_ms")
+    duration_seconds = (end_ms - start_ms) / 1000.0
+    if duration_seconds < _CUSTOM_REEL_CLIP_MIN_SECONDS or duration_seconds > _CUSTOM_REEL_CLIP_MAX_SECONDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"La duree du clip doit etre comprise entre {_CUSTOM_REEL_CLIP_MIN_SECONDS:.0f} et {_CUSTOM_REEL_CLIP_MAX_SECONDS:.0f} secondes",
+        )
+    return duration_seconds, start_ms / 1000.0, end_ms / 1000.0
+
+
+def _resolve_custom_reel_clip_source_path(job_id: str, user_id: str, output_dir: str, end_seconds: float) -> str:
+    """Resolves the preserved source video for a custom-clip cut and checks
+    that the requested range actually fits within it."""
+    source_path = _ensure_preserved_source_video_available(job_id, user_id, output_dir)
+    if not source_path:
+        raise HTTPException(status_code=404, detail="La video source n'est plus disponible pour ce job")
+    source_duration = _probe_local_video_duration_seconds(source_path)
+    if source_duration > 0 and end_seconds > source_duration + 0.5:
+        raise HTTPException(status_code=400, detail="La plage selectionnee depasse la duree de la video source")
+    return source_path
+
+
+async def _resolve_custom_reel_project_id(job_data: Dict[str, Any], req: "CustomReelClipRequest", user_id: str) -> Optional[str]:
+    """Defaults to the job's own project, but lets the request target a
+    different (still user-owned) project instead."""
+    if not req.project_id:
+        return job_data.get("project_id")
+    if not await supabase_get_project(req.project_id, user_id):
+        raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND)
+    return req.project_id
+
+
+async def _finalize_custom_reel_clip_creation(
+    job_id: str, user_id: str, project_id: Optional[str],
+    reel_row: Dict[str, Any], saved_row: Dict[str, Any],
+    clip_entry: Dict[str, Any], next_index: int,
+) -> None:
+    """Debits the actual cost, bumps the project's output count, and mirrors
+    the new clip into the job's in-memory result -- the bookkeeping
+    _persist_reels_for_job already does for AI-generated clips, done here
+    explicitly since a custom clip is a single reel saved outside that
+    batch path."""
+    billing_details = reel_row.get("billing_details") or {}
+    total_credits = float(billing_details.get("final_credits") or 0.0) + float((billing_details.get("auto_caption") or {}).get("credit_cost") or 0.0)
+    storage_gb = _bytes_to_gb(float(reel_row.get("reel_size_bytes") or 0))
+    debit_ok = await reel_job_manager.debit_credits_for_job(
+        job_id=job_id, user_id=user_id, credits=total_credits, storage_delta=-storage_gb,
+        operation_type="generation_reel", reserved_credits=0.0,
+    )
+    if not debit_ok:
+        logger.warning("Failed to debit credits for custom reel clip (job %s, user %s)", job_id, user_id)
+
+    if project_id:
+        try:
+            await supabase_increment_project_output_count(project_id, user_id=user_id)
+        except Exception as e:
+            logger.warning("Failed to increment project output count: %s", e)
+
+    if job_id not in jobs or not isinstance(jobs[job_id].get("result"), dict):
+        return
+    jobs[job_id]["result"].setdefault("clips", []).append({
+        **clip_entry,
+        "video_url": saved_row.get("reel_playback_url"),
+        "reel_clip_index": next_index - 1,
+        "reel_job_id": job_id,
+    })
+    jobs[job_id]["result"].setdefault("reels", []).append(saved_row)
+
+
 @app.post("/api/reels/{job_id}/custom-clip", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 500: {"description": "Internal Server Error"}, 503: {"description": "Service Unavailable"}})
 async def create_custom_reel_clip_endpoint(
     job_id: str, req: CustomReelClipRequest, user_id: Annotated[str, Depends(get_user_id_header)],
@@ -6764,27 +6850,10 @@ async def create_custom_reel_clip_endpoint(
     if not is_supabase_configured():
         raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
 
-    start_ms = max(0, int(req.start_ms))
-    end_ms = int(req.end_ms)
-    if end_ms <= start_ms:
-        raise HTTPException(status_code=400, detail="end_ms doit etre superieur a start_ms")
-    duration_seconds = (end_ms - start_ms) / 1000.0
-    if duration_seconds < _CUSTOM_REEL_CLIP_MIN_SECONDS or duration_seconds > _CUSTOM_REEL_CLIP_MAX_SECONDS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"La duree du clip doit etre comprise entre {_CUSTOM_REEL_CLIP_MIN_SECONDS:.0f} et {_CUSTOM_REEL_CLIP_MAX_SECONDS:.0f} secondes",
-        )
+    duration_seconds, start_seconds, end_seconds = _validate_custom_reel_clip_timing(req)
 
     output_dir = os.path.join(OUTPUT_DIR, job_id)
-    source_path = await _ensure_preserved_source_video_available(job_id, user_id, output_dir)
-    if not source_path:
-        raise HTTPException(status_code=404, detail="La video source n'est plus disponible pour ce job")
-
-    start_seconds = start_ms / 1000.0
-    end_seconds = end_ms / 1000.0
-    source_duration = _probe_local_video_duration_seconds(source_path)
-    if source_duration > 0 and end_seconds > source_duration + 0.5:
-        raise HTTPException(status_code=400, detail="La plage selectionnee depasse la duree de la video source")
+    source_path = _resolve_custom_reel_clip_source_path(job_id, user_id, output_dir, end_seconds)
 
     metadata_path, data = await _get_or_build_job_metadata(job_id, 0, user_id=user_id)
     if not metadata_path or not data:
@@ -6830,12 +6899,7 @@ async def create_custom_reel_clip_endpoint(
     if not bucket:
         raise HTTPException(status_code=503, detail="AWS_S3_BUCKET is required for reel persistence")
 
-    project_id = job_data.get("project_id")
-    if req.project_id:
-        owned_project = await supabase_get_project(req.project_id, user_id)
-        if not owned_project:
-            raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND)
-        project_id = req.project_id
+    project_id = await _resolve_custom_reel_project_id(job_data, req, user_id)
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     reel_row = await _build_reel_row_for_clip(
         job_id, user_id, output_dir, bucket, base_name, clip_entry, next_index, now_iso,
@@ -6849,30 +6913,7 @@ async def create_custom_reel_clip_endpoint(
         raise HTTPException(status_code=500, detail="Echec de l'enregistrement du reel personnalise")
     saved_row = _normalize_reel_row(saved_rows[0])
 
-    billing_details = reel_row.get("billing_details") or {}
-    total_credits = float(billing_details.get("final_credits") or 0.0) + float((billing_details.get("auto_caption") or {}).get("credit_cost") or 0.0)
-    storage_gb = _bytes_to_gb(float(reel_row.get("reel_size_bytes") or 0))
-    debit_ok = await reel_job_manager.debit_credits_for_job(
-        job_id=job_id, user_id=user_id, credits=total_credits, storage_delta=-storage_gb,
-        operation_type="generation_reel", reserved_credits=0.0,
-    )
-    if not debit_ok:
-        logger.warning("Failed to debit credits for custom reel clip (job %s, user %s)", job_id, user_id)
-
-    if project_id:
-        try:
-            await supabase_increment_project_output_count(project_id, user_id=user_id)
-        except Exception as e:
-            logger.warning("Failed to increment project output count: %s", e)
-
-    if job_id in jobs and isinstance(jobs[job_id].get("result"), dict):
-        jobs[job_id]["result"].setdefault("clips", []).append({
-            **clip_entry,
-            "video_url": saved_row.get("reel_playback_url"),
-            "reel_clip_index": next_index - 1,
-            "reel_job_id": job_id,
-        })
-        jobs[job_id]["result"].setdefault("reels", []).append(saved_row)
+    await _finalize_custom_reel_clip_creation(job_id, user_id, project_id, reel_row, saved_row, clip_entry, next_index)
 
     return saved_row
 
@@ -6949,7 +6990,7 @@ async def get_project_manual_scene(project_id: str, user_id: Annotated[str, Depe
         return {"available": False, "job_id": None}
 
     output_dir = os.path.join(OUTPUT_DIR, job_id)
-    source_path = await _ensure_preserved_source_video_available(job_id, user_id, output_dir)
+    source_path = _ensure_preserved_source_video_available(job_id, user_id, output_dir)
     if not source_path:
         return {"available": False, "job_id": job_id}
 
@@ -10225,7 +10266,7 @@ async def _post_facebook_comment(access_token: str, object_id: str, message: str
     if not object_id or object_id == "n/a":
         raise HTTPException(status_code=400, detail="Missing Facebook post id to comment on")
     if not access_token:
-        raise HTTPException(status_code=401, detail="Facebook page access token expired or missing")
+        raise HTTPException(status_code=401, detail=_FACEBOOK_TOKEN_EXPIRED_OR_MISSING)
 
     data = {"message": message, "access_token": access_token}
     if attachment_url:
@@ -13919,7 +13960,7 @@ async def publish_to_facebook_video(access_token: str, target_id: str, video_url
     if not target_id:
         raise HTTPException(status_code=400, detail="Connected Facebook target id is missing")
     if not access_token:
-        raise HTTPException(status_code=401, detail="Facebook page access token expired or missing")
+        raise HTTPException(status_code=401, detail=_FACEBOOK_TOKEN_EXPIRED_OR_MISSING)
 
     async with httpx.AsyncClient(timeout=90.0) as client:
         response = await client.post(
@@ -13942,7 +13983,7 @@ async def publish_to_facebook_text_with_background(
     if not page_id:
         raise HTTPException(status_code=400, detail="Connected Facebook target id is missing")
     if not access_token:
-        raise HTTPException(status_code=401, detail="Facebook page access token expired or missing")
+        raise HTTPException(status_code=401, detail=_FACEBOOK_TOKEN_EXPIRED_OR_MISSING)
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(

@@ -4194,7 +4194,7 @@ def test_ensure_preserved_source_video_available_prefers_local_copy(monkeypatch,
     download_mock = MagicMock()
     monkeypatch.setattr(app, "download_s3_object", download_mock)
 
-    result = asyncio.run(app._ensure_preserved_source_video_available("job-1", "u1", str(output_dir)))
+    result = app._ensure_preserved_source_video_available("job-1", "u1", str(output_dir))
 
     assert result == str(output_dir / "source.mp4")
     download_mock.assert_not_called()
@@ -4213,7 +4213,7 @@ def test_ensure_preserved_source_video_available_downloads_s3_backup_when_local_
 
     monkeypatch.setattr(app, "download_s3_object", _fake_download)
 
-    result = asyncio.run(app._ensure_preserved_source_video_available("job-1", "u1", str(output_dir)))
+    result = app._ensure_preserved_source_video_available("job-1", "u1", str(output_dir))
 
     assert result == str(output_dir / "source.mp4")
     assert Path(result).read_bytes() == b"restored-bytes"
@@ -4226,7 +4226,7 @@ def test_ensure_preserved_source_video_available_returns_none_when_nothing_found
     monkeypatch.setenv("AWS_S3_BUCKET", "test-bucket")
     monkeypatch.setattr(app, "get_s3_object_size", lambda bucket, key: 0)
 
-    result = asyncio.run(app._ensure_preserved_source_video_available("job-1", "u1", str(output_dir)))
+    result = app._ensure_preserved_source_video_available("job-1", "u1", str(output_dir))
 
     assert result is None
 
@@ -4330,7 +4330,7 @@ def test_get_project_manual_scene_reports_unavailable_without_source(monkeypatch
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "supabase_get_project", AsyncMock(return_value={"id": "proj-1", "user_id": "u1"}))
     monkeypatch.setattr(app, "supabase_get_latest_job_record_by_project", AsyncMock(return_value={"id": "job-1"}))
-    monkeypatch.setattr(app, "_ensure_preserved_source_video_available", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "_ensure_preserved_source_video_available", MagicMock(return_value=None))
 
     with TestClient(app.app) as client:
         resp = client.get("/api/projects/proj-1/manual-scene", headers=_auth_headers("u1"))
@@ -4349,7 +4349,7 @@ def test_get_project_manual_scene_happy_path(monkeypatch, tmp_path):
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "supabase_get_project", AsyncMock(return_value={"id": "proj-1", "user_id": "u1"}))
     monkeypatch.setattr(app, "supabase_get_latest_job_record_by_project", AsyncMock(return_value={"id": "job-1"}))
-    monkeypatch.setattr(app, "_ensure_preserved_source_video_available", AsyncMock(return_value=str(source_path)))
+    monkeypatch.setattr(app, "_ensure_preserved_source_video_available", MagicMock(return_value=str(source_path)))
     monkeypatch.setattr(app, "_probe_local_video_duration_seconds", lambda _p: 42.0)
     monkeypatch.setattr(app, "_generate_scene_waveform_png", lambda *_a, **_k: str(output_dir / "waveform.png"))
     transcript = {"segments": [{"words": [{"word": "hi", "start": 0.0, "end": 0.3}]}]}
@@ -4975,8 +4975,9 @@ def test_post_facebook_comment_sends_message_and_attachment(monkeypatch):
 def test_post_facebook_comment_requires_object_id(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
 
+    coro = app._post_facebook_comment("page-token", "", "Hello")
     with pytest.raises(app.HTTPException) as exc_info:
-        asyncio.run(app._post_facebook_comment("page-token", "", "Hello"))
+        asyncio.run(coro)
     assert exc_info.value.status_code == 400
 
 
