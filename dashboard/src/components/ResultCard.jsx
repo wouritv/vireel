@@ -719,7 +719,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
                 onClick={() => setShowAutoEditModal(true)}
                 disabled={isEditing || !hasClipContext || !hasAnyEditingCredit}
                 title="Auto Edit"
-                className={`col-span-1 py-2 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white rounded-lg text-xs font-bold shadow-lg shadow-purple-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 mb-1 truncate px-1 ${compactActions ? 'min-h-[40px]' : ''}`}
+                className={`col-span-1 py-2 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white rounded-lg text-xs font-bold shadow-lg shadow-purple-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 mb-1 truncate px-1 ${compactActions ? 'min-h-[40px] flex-1' : ''}`}
             >
                 {isEditing ? <Loader2 size={14} className="animate-spin" /> : <Wand2 size={14} />}
                 {!compactActions ? autoEditLabel : null}
@@ -729,7 +729,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
                 onClick={() => setShowHookModal(true)}
                 disabled={isHooking || !hasClipContext || !hasAnyEditingCredit}
                 title="Viral Hook"
-                className={`col-span-1 py-2 bg-gradient-to-r from-amber-400 to-yellow-500 hover:from-amber-300 hover:to-yellow-400 text-black rounded-lg text-xs font-bold shadow-lg shadow-yellow-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 mb-1 truncate px-1 ${compactActions ? 'min-h-[40px]' : ''}`}
+                className={`col-span-1 py-2 bg-gradient-to-r from-amber-400 to-yellow-500 hover:from-amber-300 hover:to-yellow-400 text-black rounded-lg text-xs font-bold shadow-lg shadow-yellow-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 mb-1 truncate px-1 ${compactActions ? 'min-h-[40px] flex-1' : ''}`}
             >
                 {isHooking ? <Loader2 size={14} className="animate-spin" /> : <Wand2 size={14} />}
                 {!compactActions ? hookLabel : null}
@@ -739,7 +739,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
                 onClick={() => setShowCaptionsModal(true)}
                 disabled={isCaptioning || !hasClipContext || !hasAnyEditingCredit}
                 title={t('common.subtitles', 'Subtitles')}
-                className={`col-span-1 py-2 bg-gradient-to-r from-emerald-600 to-green-600 hover:from-emerald-500 hover:to-green-500 text-white rounded-lg text-xs font-bold shadow-lg shadow-emerald-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 mb-1 truncate px-1 ${compactActions ? 'min-h-[40px]' : ''}`}
+                className={`col-span-1 py-2 bg-gradient-to-r from-emerald-600 to-green-600 hover:from-emerald-500 hover:to-green-500 text-white rounded-lg text-xs font-bold shadow-lg shadow-emerald-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 mb-1 truncate px-1 ${compactActions ? 'min-h-[40px] flex-1' : ''}`}
             >
                 {isCaptioning ? <Loader2 size={14} className="animate-spin" /> : <Type size={14} />}
                 {!compactActions ? captionsLabel : null}
@@ -749,7 +749,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
                 onClick={handleResetStyles}
                 disabled={isResettingStyles || !hasClipContext}
                 title={t('captionsModal.resetVideo', 'Reset')}
-                className={`col-span-1 py-2 bg-rose-100 dark:bg-rose-500/10 hover:bg-rose-200 dark:hover:bg-rose-500/20 border border-rose-300/60 dark:border-rose-500/40 text-rose-700 dark:text-rose-200 rounded-lg text-xs font-bold transition-all active:scale-[0.98] flex items-center justify-center gap-2 mb-1 truncate px-1 ${compactActions ? 'min-h-[40px]' : ''}`}
+                className={`col-span-1 py-2 bg-rose-100 dark:bg-rose-500/10 hover:bg-rose-200 dark:hover:bg-rose-500/20 border border-rose-300/60 dark:border-rose-500/40 text-rose-700 dark:text-rose-200 rounded-lg text-xs font-bold transition-all active:scale-[0.98] flex items-center justify-center gap-2 mb-1 truncate px-1 ${compactActions ? 'min-h-[40px] flex-1' : ''}`}
             >
                 {isResettingStyles ? <Loader2 size={14} className="animate-spin" /> : <RotateCcw size={14} />}
                 {!compactActions ? resetLabel : null}
@@ -760,7 +760,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
                     onClick={() => setShowModal(true)}
                     disabled={!hasClipContext || !canShare}
                     title={t("common.post", "Post")}
-                    className={`col-span-1 py-2 bg-primary hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-xs font-bold shadow-lg shadow-primary/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 truncate px-2 ${compactActions ? 'min-h-[40px]' : ''}`}
+                    className={`col-span-1 py-2 bg-primary hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-xs font-bold shadow-lg shadow-primary/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 truncate px-2 ${compactActions ? 'min-h-[40px] flex-1' : ''}`}
                 >
                     <Share2 size={14} className="shrink-0" />
                     {!compactActions ? t("common.post", "Post") : null}
