@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -87,6 +88,7 @@ def _install_optional_dependency_stubs(monkeypatch):
 
     subtitles_mod = types.ModuleType("subtitles")
     subtitles_mod.generate_srt = lambda *args, **kwargs: True
+    subtitles_mod.generate_highlighted_srt = lambda *args, **kwargs: True
     subtitles_mod.burn_subtitles = lambda *args, **kwargs: True
     subtitles_mod.generate_srt_from_video = lambda *args, **kwargs: True
 
@@ -730,6 +732,50 @@ def test_run_caption_job_missing_input_fails_and_retries(monkeypatch):
     assert any("Caption job failed" in line for line in app.jobs[job_id]["logs"])
     app.reel_job_manager.fail_job.assert_awaited_once()
     assert create_task_mock.call_count == 1
+
+
+def test_process_and_complete_caption_job_auto_captions_and_uploads_original(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    job_id = "caption-auto-1"
+    app.jobs[job_id] = {"logs": [], "result": None, "status": "processing"}
+    output_dir = str(tmp_path)
+    input_path = os.path.join(output_dir, "source.mp4")
+    Path(input_path).write_bytes(b"raw-source-bytes")
+
+    async def _fake_burn(input_path_, output_path, transcript, clip_start, clip_end, job_id_, clip_index, style_kwargs):
+        Path(output_path).write_bytes(b"captioned-source-bytes-longer")
+        return True
+
+    monkeypatch.setattr(app, "_burn_default_captions_for_clip", _fake_burn)
+    monkeypatch.setattr(app, "_build_and_persist_caption_metadata", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app, "_generate_reel_thumbnail_from_video", lambda *args, **kwargs: "")
+    monkeypatch.setattr(app, "_caption_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}")
+    upload_calls = []
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda path, bucket, key: upload_calls.append(key) or True)
+    monkeypatch.setenv("AWS_S3_BUCKET", "test-bucket")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+    monkeypatch.setattr(app, "_normalize_caption_row", lambda row: row)
+    app.reel_job_manager.complete_job = AsyncMock()
+    monkeypatch.setattr(app, "_update_project_on_caption_completion", AsyncMock())
+    monkeypatch.setattr(app, "_persist_transcription_cache", AsyncMock())
+
+    class _Pipeline:
+        async def persisting(self):
+            return None
+
+        async def rendering(self):
+            return None
+
+    asyncio.run(app._process_and_complete_caption_job(
+        job_id, {}, "user-1", _Pipeline(), input_path, "source.mp4", 10.0,
+        {"segments": [{"words": [{"word": "hi", "start": 0, "end": 1}]}]},
+        0.0, output_dir,
+    ))
+
+    assert any(key.startswith("captions/user-1/caption-auto-1/original_") for key in upload_calls)
+    saved_row = app.jobs[job_id]["result"]["item"]
+    assert saved_row["generation_inputs"]["original_s3_key"]
+    assert saved_row["caption_duration"] == 10
 
 
 def test_run_caption_job_insufficient_balance_marks_failed(monkeypatch):
@@ -2036,7 +2082,7 @@ def test_add_subtitles_dubbed_video_uses_transcription(monkeypatch, tmp_path):
 
     calls = {"transcribed": 0}
 
-    def _fake_transcribe(_input, _srt, max_words_per_line=4):
+    def _fake_transcribe(_input, _srt, max_words_per_line=4, highlight=False):
         calls["transcribed"] += 1
         return True
 
@@ -2227,6 +2273,107 @@ def test_persist_captioned_reel_rejects_non_video_content_type(monkeypatch):
     assert "Invalid rendered video content type" in str(exc.value.detail)
 
 
+
+
+def test_reset_clip_metadata_to_original_prefers_default_video_url(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    metadata_path = str(tmp_path / "meta.json")
+    monkeypatch.setattr(app, "_persist_metadata_json", lambda *_a, **_k: None)
+    data = {"shorts": [{"video_url": "custom.mp4", "original_video_url": "bare.mp4"}]}
+
+    result = app._reset_clip_metadata_to_original(metadata_path, data, 0, default_video_url="default-styled.mp4")
+
+    assert result == "default-styled.mp4"
+    assert data["shorts"][0]["video_url"] == "default-styled.mp4"
+
+
+def test_reset_clip_metadata_to_original_falls_back_to_bare_original(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    metadata_path = str(tmp_path / "meta.json")
+    monkeypatch.setattr(app, "_persist_metadata_json", lambda *_a, **_k: None)
+    data = {"shorts": [{"video_url": "custom.mp4", "original_video_url": "bare.mp4"}]}
+
+    result = app._reset_clip_metadata_to_original(metadata_path, data, 0)
+
+    assert result == "bare.mp4"
+    assert data["shorts"][0]["video_url"] == "bare.mp4"
+
+
+def test_find_default_style_version_returns_matching_version(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    versions = [
+        {"version_number": 1, "output_video_url": "default.mp4"},
+        {"version_number": 2, "output_video_url": "manual-edit.mp4"},
+    ]
+    monkeypatch.setattr(app, "supabase_list_style_edit_versions", AsyncMock(return_value=versions))
+
+    result = asyncio.run(app._find_default_style_version("job-1", 0, "u1"))
+
+    assert result == versions[0]
+
+
+def test_find_default_style_version_returns_none_without_supabase(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+    list_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_list_style_edit_versions", list_mock)
+
+    result = asyncio.run(app._find_default_style_version("job-1", 0, "u1"))
+
+    assert result is None
+    list_mock.assert_not_awaited()
+
+
+def test_reset_caption_style_history_restores_default_version(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    data = {"shorts": [{"video_url": "manual-edit.mp4", "original_video_url": "bare.mp4"}]}
+    monkeypatch.setattr(app, "_get_or_build_job_metadata", AsyncMock(return_value=("meta.json", data)))
+    monkeypatch.setattr(app, "_persist_metadata_json", lambda *_a, **_k: None)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+
+    default_version = {
+        "version_number": 1,
+        "operation_type": "subtitle_style",
+        "source_video_url": "bare.mp4",
+        "output_video_url": "default-styled.mp4",
+        "style_config": dict(app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS),
+        "billing_details": {},
+    }
+    monkeypatch.setattr(app, "_find_default_style_version", AsyncMock(return_value=default_version))
+    delete_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_delete_style_edit_versions", delete_mock)
+    insert_mock = AsyncMock(return_value={})
+    monkeypatch.setattr(app, "supabase_insert_style_edit_version", insert_mock)
+
+    result = asyncio.run(app.reset_caption_style_history("job-1", 0, "u1"))
+
+    assert result["video_url"] == "default-styled.mp4"
+    assert data["shorts"][0]["video_url"] == "default-styled.mp4"
+    delete_mock.assert_awaited_once_with("job-1", 0, "u1")
+    insert_mock.assert_awaited_once()
+    reinserted = insert_mock.await_args.args[0]
+    assert reinserted["version_number"] == app._DEFAULT_STYLE_VERSION_NUMBER
+    assert reinserted["output_video_url"] == "default-styled.mp4"
+
+
+def test_reset_caption_style_history_falls_back_without_default_version(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    data = {"shorts": [{"video_url": "manual-edit.mp4", "original_video_url": "bare.mp4"}]}
+    monkeypatch.setattr(app, "_get_or_build_job_metadata", AsyncMock(return_value=("meta.json", data)))
+    monkeypatch.setattr(app, "_persist_metadata_json", lambda *_a, **_k: None)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_find_default_style_version", AsyncMock(return_value=None))
+    delete_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_delete_style_edit_versions", delete_mock)
+    insert_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_style_edit_version", insert_mock)
+
+    result = asyncio.run(app.reset_caption_style_history("job-1", 0, "u1"))
+
+    assert result["video_url"] == "bare.mp4"
+    delete_mock.assert_awaited_once_with("job-1", 0, "u1")
+    insert_mock.assert_not_awaited()
 
 
 def test_resolve_anonymous_story_platforms_filters_to_facebook_and_linkedin(monkeypatch):
@@ -3032,6 +3179,268 @@ def test_finalize_completed_reel_billing_sums_and_debits_clip_storage(monkeypatc
     assert debit_mock.await_args.kwargs["operation_type"] == "generation_reel"
 
 
+def test_finalize_completed_reel_billing_debits_auto_caption_credits(monkeypatch):
+    # Auto-captioned clips (default subtitles burned in at generation time)
+    # carry their own credit cost, additive to the reel generation charge
+    # and billed under "sous_titre" -- the same category the manual
+    # captions-persist flow already uses.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    app.jobs["job-reel-2"] = {"logs": []}
+
+    monkeypatch.setattr(app, "_estimate_reel_job_consumption", lambda **kwargs: {
+        "actual_credit": 2.0, "actual_storage_gb": 0.5, "actual_cost_usd": 0.1,
+        "processing_ratio": 1.0, "cost_breakdown": {},
+    })
+    app.reel_job_manager.debit_credits_for_job = AsyncMock(return_value=True)
+    app.reel_job_manager.complete_job = AsyncMock()
+    deduct_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_deduct_user_credits", deduct_mock)
+    history_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", history_mock)
+
+    saved_rows = [
+        {"reel_size_bytes": 100, "billing_details": {"auto_caption": {"applied": True, "credit_cost": 1.5}}},
+        {"reel_size_bytes": 100, "billing_details": {"auto_caption": {"applied": False, "credit_cost": 0.0}}},
+    ]
+    asyncio.run(app._finalize_completed_reel_billing(
+        job_id="job-reel-2", job_data={"reel_required_credits": 2.0}, user_id="u1", source_is_url=False,
+        start_ts=time.time(), enriched_clips=[{}, {}], cost_analysis={}, saved_rows=saved_rows,
+    ))
+
+    deduct_mock.assert_awaited_once_with("u1", pytest.approx(1.5), 0.0)
+    history_mock.assert_awaited_once()
+    assert history_mock.await_args.kwargs["operation_type"] == "sous_titre"
+    assert history_mock.await_args.kwargs["credit"] == pytest.approx(1.5)
+
+
+def test_finalize_completed_reel_billing_skips_auto_caption_debit_when_none_applied(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    app.jobs["job-reel-3"] = {"logs": []}
+
+    monkeypatch.setattr(app, "_estimate_reel_job_consumption", lambda **kwargs: {
+        "actual_credit": 2.0, "actual_storage_gb": 0.5, "actual_cost_usd": 0.1,
+        "processing_ratio": 1.0, "cost_breakdown": {},
+    })
+    app.reel_job_manager.debit_credits_for_job = AsyncMock(return_value=True)
+    app.reel_job_manager.complete_job = AsyncMock()
+    deduct_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_deduct_user_credits", deduct_mock)
+
+    saved_rows = [{"reel_size_bytes": 100}]
+    asyncio.run(app._finalize_completed_reel_billing(
+        job_id="job-reel-3", job_data={"reel_required_credits": 2.0}, user_id="u1", source_is_url=False,
+        start_ts=time.time(), enriched_clips=[{}], cost_analysis={}, saved_rows=saved_rows,
+    ))
+
+    deduct_mock.assert_not_awaited()
+
+
+def test_burn_default_captions_for_clip_returns_false_without_transcript(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    result = asyncio.run(app._burn_default_captions_for_clip(
+        "/tmp/in.mp4", "/tmp/out.mp4", None, 0.0, 10.0, "job-1", 0, app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS,
+    ))
+    assert result is False
+
+
+def test_burn_default_captions_for_clip_returns_false_when_no_words_in_range(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "generate_srt", lambda *args, **kwargs: False)
+    monkeypatch.setattr(app, "generate_highlighted_srt", lambda *args, **kwargs: False)
+    burn_mock = MagicMock()
+    monkeypatch.setattr(app, "_burn_subtitles_for_request", burn_mock)
+
+    result = asyncio.run(app._burn_default_captions_for_clip(
+        "/tmp/in.mp4", "/tmp/out.mp4", {"segments": []}, 0.0, 10.0, "job-1", 0, app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS,
+    ))
+
+    assert result is False
+    burn_mock.assert_not_called()
+
+
+def test_burn_default_captions_for_clip_burns_and_returns_true(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "generate_srt", lambda *args, **kwargs: True)
+    burn_mock = MagicMock()
+    monkeypatch.setattr(app, "_burn_subtitles_for_request", burn_mock)
+    monkeypatch.setattr(app.os.path, "exists", lambda p: True)
+    monkeypatch.setattr(app.os.path, "getsize", lambda p: 4096)
+    monkeypatch.setattr(app.os, "remove", lambda p: None)
+
+    result = asyncio.run(app._burn_default_captions_for_clip(
+        "/tmp/in.mp4", "/tmp/out.mp4", {"segments": [{"words": [{"word": "hi", "start": 0, "end": 1}]}]},
+        0.0, 10.0, "job-1", 2, app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS,
+    ))
+
+    assert result is True
+    burn_mock.assert_called_once()
+    burn_req = burn_mock.call_args.args[0]
+    assert burn_req.job_id == "job-1"
+    assert burn_req.clip_index == 2
+    assert burn_req.font_size == 14
+    assert burn_req.animation == "word-highlight"
+
+
+def test_burn_default_captions_for_clip_uses_given_style_kwargs(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "generate_srt", lambda *args, **kwargs: True)
+    burn_mock = MagicMock()
+    monkeypatch.setattr(app, "_burn_subtitles_for_request", burn_mock)
+    monkeypatch.setattr(app.os.path, "exists", lambda p: True)
+    monkeypatch.setattr(app.os.path, "getsize", lambda p: 4096)
+    monkeypatch.setattr(app.os, "remove", lambda p: None)
+
+    custom_style = dict(app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS, font_size=30, font_name="Poppins")
+    result = asyncio.run(app._burn_default_captions_for_clip(
+        "/tmp/in.mp4", "/tmp/out.mp4", {"segments": [{"words": [{"word": "hi", "start": 0, "end": 1}]}]},
+        0.0, 10.0, "job-1", 0, custom_style,
+    ))
+
+    assert result is True
+    burn_req = burn_mock.call_args.args[0]
+    assert burn_req.font_size == 30
+    assert burn_req.font_name == "Poppins"
+
+
+def test_burn_default_captions_for_clip_returns_false_on_exception(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("ffmpeg exploded")
+
+    monkeypatch.setattr(app, "generate_srt", lambda *args, **kwargs: True)
+    monkeypatch.setattr(app, "_burn_subtitles_for_request", _boom)
+    monkeypatch.setattr(app.os.path, "exists", lambda p: False)
+    monkeypatch.setattr(app.os, "remove", lambda p: None)
+
+    result = asyncio.run(app._burn_default_captions_for_clip(
+        "/tmp/in.mp4", "/tmp/out.mp4", {"segments": [{"words": [{"word": "hi", "start": 0, "end": 1}]}]},
+        0.0, 10.0, "job-1", 0, app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS,
+    ))
+
+    assert result is False
+
+
+def test_normalize_reel_row_always_exposes_media_url_as_original(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_reel_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}" if key else "")
+    monkeypatch.setattr(app, "_extract_s3_key_from_thumbnail_ref", lambda ref: "")
+    monkeypatch.setattr(app, "_reel_thumbnail_url_from_s3_key", lambda key: "")
+
+    row = {
+        "reel_s3_key": "reels/u1/job1/reel.mp4",
+        "billing_details": {"original_s3_key": "reels/u1/job1/original_reel.mp4"},
+    }
+    result = app._normalize_reel_row(row)
+
+    # reel_original_url no longer exposes a separate clean-clip URL -- the
+    # app works off a single URL per clip; the clean clip is only resolved
+    # server-side when actually re-burning (see
+    # _resolve_authoritative_clean_video_source).
+    assert result["reel_original_url"] == result["media_url"]
+
+
+def test_normalize_caption_row_always_exposes_media_url_as_original(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_caption_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}" if key else "")
+
+    row = {
+        "caption_s3_key": "captions/u1/job1/cap.mp4",
+        "generation_inputs": {"original_s3_key": "captions/u1/job1/original_cap.mp4"},
+    }
+    result = app._normalize_caption_row(row)
+
+    assert result["caption_original_url"] == result["media_url"]
+
+
+def test_build_reel_row_for_clip_auto_captions_and_uploads_original(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    output_dir = str(tmp_path)
+    clip_path = os.path.join(output_dir, "base_clip_1.mp4")
+    Path(clip_path).write_bytes(b"raw-clip-bytes")
+
+    async def _fake_burn(input_path, output_path, transcript, clip_start, clip_end, job_id, clip_index, style_kwargs):
+        Path(output_path).write_bytes(b"captioned-bytes-longer")
+        return True
+
+    monkeypatch.setattr(app, "_burn_default_captions_for_clip", _fake_burn)
+    upload_calls = []
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda path, bucket, key: upload_calls.append(key) or True)
+    monkeypatch.setattr(app, "_reel_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}")
+    monkeypatch.setattr(app, "_upload_reel_clip_thumbnail", lambda *args, **kwargs: "")
+    monkeypatch.setattr(app, "_estimate_reel_cost_breakdown", lambda **kwargs: {})
+
+    row = asyncio.run(app._build_reel_row_for_clip(
+        "job-1", "user-1", output_dir, "bucket", "base", {"start": 0.0, "end": 10.0}, 1,
+        "2024-01-01T00:00:00Z", False, None, transcript={"segments": [{"words": []}]},
+    ))
+
+    assert row is not None
+    assert any(key.startswith("reels/user-1/job-1/original_") for key in upload_calls)
+    assert row["billing_details"]["auto_caption"]["applied"] is True
+    assert row["billing_details"]["auto_caption"]["credit_cost"] > 0
+    assert row["reel_size_bytes"] == len(b"captioned-bytes-longer")
+
+
+def test_build_reel_row_for_clip_records_default_style_version(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    output_dir = str(tmp_path)
+    clip_path = os.path.join(output_dir, "base_clip_1.mp4")
+    Path(clip_path).write_bytes(b"raw-clip-bytes")
+
+    async def _fake_burn(input_path, output_path, transcript, clip_start, clip_end, job_id, clip_index, style_kwargs):
+        Path(output_path).write_bytes(b"captioned-bytes-longer")
+        return True
+
+    monkeypatch.setattr(app, "_burn_default_captions_for_clip", _fake_burn)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda path, bucket, key: True)
+    monkeypatch.setattr(app, "_reel_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}" if key else "")
+    monkeypatch.setattr(app, "_upload_reel_clip_thumbnail", lambda *args, **kwargs: "")
+    monkeypatch.setattr(app, "_estimate_reel_cost_breakdown", lambda **kwargs: {})
+    monkeypatch.setattr(app, "supabase_list_style_edit_versions", AsyncMock(return_value=[]))
+    insert_mock = AsyncMock(return_value={})
+    monkeypatch.setattr(app, "supabase_insert_style_edit_version", insert_mock)
+
+    asyncio.run(app._build_reel_row_for_clip(
+        "job-1", "user-1", output_dir, "bucket", "base", {"start": 0.0, "end": 10.0}, 1,
+        "2024-01-01T00:00:00Z", False, None, transcript={"segments": [{"words": []}]},
+    ))
+
+    insert_mock.assert_awaited_once()
+    row_arg = insert_mock.await_args.args[0]
+    assert row_arg["job_id"] == "job-1"
+    assert row_arg["clip_index"] == 0
+    assert row_arg["version_number"] == app._DEFAULT_STYLE_VERSION_NUMBER
+    assert row_arg["output_video_url"] == "https://cdn.example/reels/user-1/job-1/base_clip_1.mp4"
+    assert row_arg["source_video_url"] == "https://cdn.example/reels/user-1/job-1/original_base_clip_1.mp4"
+    assert row_arg["style_config"]["font_name"] == "Montserrat"
+
+
+def test_build_reel_row_for_clip_skips_captioning_without_transcript(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    output_dir = str(tmp_path)
+    clip_path = os.path.join(output_dir, "base_clip_1.mp4")
+    Path(clip_path).write_bytes(b"raw-clip-bytes")
+
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda path, bucket, key: True)
+    monkeypatch.setattr(app, "_reel_media_url_from_s3_key", lambda key: f"https://cdn.example/{key}")
+    monkeypatch.setattr(app, "_upload_reel_clip_thumbnail", lambda *args, **kwargs: "")
+    monkeypatch.setattr(app, "_estimate_reel_cost_breakdown", lambda **kwargs: {})
+
+    row = asyncio.run(app._build_reel_row_for_clip(
+        "job-1", "user-1", output_dir, "bucket", "base", {"start": 0.0, "end": 10.0}, 1,
+        "2024-01-01T00:00:00Z", False, None, transcript=None,
+    ))
+
+    assert row is not None
+    assert row["billing_details"]["auto_caption"]["applied"] is False
+    assert row["billing_details"]["original_s3_key"] == ""
+    assert row["reel_size_bytes"] == len(b"raw-clip-bytes")
+
+
 def test_save_caption_row_and_debit_debits_video_storage(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
@@ -3231,6 +3640,747 @@ def test_film_summary_voice_preview_skips_synthesis_when_cached(monkeypatch, tmp
     assert resp.status_code == 200
     assert resp.json() == {"preview_url": "/voice-previews/nova.mp3"}
     synth.assert_not_awaited()
+
+
+def test_film_summary_voice_preview_regenerates_empty_cached_file(monkeypatch, tmp_path):
+    # Regression test: a previous request that failed partway through
+    # streaming (see synthesize_tts_segment) could leave a zero-byte file
+    # behind under the old direct-write implementation. The cache check
+    # must not treat that as "already generated" -- it must regenerate
+    # instead of permanently serving a broken preview for that voice.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "FILM_SUMMARY_VOICE_PREVIEWS_DIR", str(tmp_path))
+    (tmp_path / "sage.mp3").write_bytes(b"")
+    synth = AsyncMock(side_effect=lambda **kwargs: Path(kwargs["output_path"]).write_bytes(b"fake-mp3") or 1.5)
+    monkeypatch.setattr(app.film_summary, "synthesize_tts_segment", synth)
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/film-summaries/voice-previews/sage", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    synth.assert_awaited_once()
+    assert (tmp_path / "sage.mp3").read_bytes() == b"fake-mp3"
+
+
+# ---------------------------------------------------------------------------
+# User-replaceable default caption style (style_edit_versions, sentinel
+# job_id/clip_index) -- what new reels/captions get auto-captioned with.
+# ---------------------------------------------------------------------------
+
+def test_get_user_default_caption_style_returns_factory_default_without_supabase(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+
+    result = asyncio.run(app._get_user_default_caption_style("u1"))
+
+    assert result == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS
+
+
+def test_get_user_default_caption_style_returns_factory_default_without_user_id(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    list_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_list_style_edit_versions", list_mock)
+
+    result = asyncio.run(app._get_user_default_caption_style(None))
+
+    assert result == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS
+    list_mock.assert_not_awaited()
+
+
+def test_get_user_default_caption_style_returns_latest_saved_version(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    versions = [
+        {"version_number": 1, "style_config": {"font_name": "Montserrat", "font_size": 52}},
+        {"version_number": 2, "style_config": {"font_name": "Poppins", "font_size": 30}},
+    ]
+    monkeypatch.setattr(app, "supabase_list_style_edit_versions", AsyncMock(return_value=versions))
+
+    result = asyncio.run(app._get_user_default_caption_style("u1"))
+
+    assert result == {"font_name": "Poppins", "font_size": 30}
+
+
+def test_get_user_default_caption_style_falls_back_when_query_fails(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_list_style_edit_versions", AsyncMock(side_effect=RuntimeError("boom")))
+
+    result = asyncio.run(app._get_user_default_caption_style("u1"))
+
+    assert result == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS
+
+
+def test_get_default_caption_style_endpoint_returns_current_default(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/caption-style-default", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json()["style"] == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS
+
+
+def test_set_default_caption_style_endpoint_requires_supabase(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+
+    with TestClient(app.app) as client:
+        resp = client.put(
+            "/api/caption-style-default",
+            json={"font_name": "Poppins", "font_size": 30},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 503
+
+
+def test_set_default_caption_style_endpoint_appends_next_version(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(
+        app, "supabase_list_style_edit_versions",
+        AsyncMock(return_value=[{"version_number": 1}, {"version_number": 2}]),
+    )
+    insert_mock = AsyncMock(return_value={})
+    monkeypatch.setattr(app, "supabase_insert_style_edit_version", insert_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.put(
+            "/api/caption-style-default",
+            json={"font_name": "Poppins", "font_size": 30},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True
+    assert body["style"]["font_name"] == "Poppins"
+    assert body["style"]["font_size"] == 30
+
+    insert_mock.assert_awaited_once()
+    inserted = insert_mock.await_args.args[0]
+    assert inserted["job_id"] == app._DEFAULT_STYLE_SENTINEL_JOB_ID
+    assert inserted["clip_index"] == app._DEFAULT_STYLE_SENTINEL_CLIP_INDEX
+    assert inserted["version_number"] == 3
+    assert inserted["user_id"] == "u1"
+    assert inserted["style_config"]["font_name"] == "Poppins"
+
+
+def test_set_default_caption_style_endpoint_rejects_out_of_range_font_size(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+
+    with TestClient(app.app) as client:
+        resp = client.put(
+            "/api/caption-style-default",
+            json={"font_size": 1000},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Caption style themes (CaptionsModal "Themes" picker, user-saved presets)
+# ---------------------------------------------------------------------------
+
+def test_list_caption_style_themes_returns_empty_without_supabase(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/caption-style-themes", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"themes": []}
+
+
+def test_list_caption_style_themes_returns_user_rows(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    list_mock = AsyncMock(return_value=[{"id": "t1", "name": "Mon Style", "style": {"fontFamily": "Montserrat"}}])
+    monkeypatch.setattr(app, "supabase_list_caption_style_themes", list_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/caption-style-themes", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"themes": [{"id": "t1", "name": "Mon Style", "style": {"fontFamily": "Montserrat"}}]}
+    list_mock.assert_awaited_once_with("u1")
+
+
+def test_save_caption_style_theme_requires_name(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+
+    with TestClient(app.app) as client:
+        resp = client.post("/api/caption-style-themes", json={"name": "  ", "style": {}}, headers=_auth_headers("u1"))
+
+    assert resp.status_code == 400
+
+
+def test_save_caption_style_theme_requires_supabase(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+
+    with TestClient(app.app) as client:
+        resp = client.post("/api/caption-style-themes", json={"name": "Mon Style", "style": {}}, headers=_auth_headers("u1"))
+
+    assert resp.status_code == 503
+
+
+def test_save_caption_style_theme_upserts_and_returns_row(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    upsert_mock = AsyncMock(return_value={"id": "t1", "name": "Mon Style", "style": {"fontFamily": "Bangers"}})
+    monkeypatch.setattr(app, "supabase_upsert_caption_style_theme", upsert_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/caption-style-themes",
+            json={"name": "Mon Style", "style": {"fontFamily": "Bangers"}},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"id": "t1", "name": "Mon Style", "style": {"fontFamily": "Bangers"}}
+    upsert_mock.assert_awaited_once_with("u1", "Mon Style", {"fontFamily": "Bangers"})
+
+
+def test_delete_caption_style_theme_returns_404_when_not_found(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_delete_caption_style_theme", AsyncMock(return_value=False))
+
+    with TestClient(app.app) as client:
+        resp = client.delete("/api/caption-style-themes/does-not-exist", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 404
+
+
+def test_delete_caption_style_theme_succeeds(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    delete_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_delete_caption_style_theme", delete_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.delete("/api/caption-style-themes/t1", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    delete_mock.assert_awaited_once_with("t1", "u1")
+
+
+# ---------------------------------------------------------------------------
+# Custom reels: manual start/end selection on the preserved source video
+# ---------------------------------------------------------------------------
+
+_CUSTOM_REEL_JOB_ID = "deadbeef1234"
+
+
+def test_preserve_source_video_copies_input_path(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    src = tmp_path / "upload.mp4"
+    src.write_bytes(b"video-bytes")
+
+    asyncio.run(app._preserve_source_video_for_manual_clipping("job-1", {"input_path": str(src)}, str(tmp_path)))
+
+    assert (tmp_path / "source.mp4").read_bytes() == b"video-bytes"
+
+
+def test_preserve_source_video_falls_back_to_leftover_scan(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    (tmp_path / "My Cool Video.mp4").write_bytes(b"downloaded-bytes")
+
+    asyncio.run(app._preserve_source_video_for_manual_clipping("job-1", {"input_path": None}, str(tmp_path)))
+
+    assert (tmp_path / "source.mp4").read_bytes() == b"downloaded-bytes"
+
+
+def test_preserve_source_video_ignores_clip_files_when_scanning(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    (tmp_path / "base_clip_1.mp4").write_bytes(b"clip-bytes")
+
+    asyncio.run(app._preserve_source_video_for_manual_clipping("job-1", {}, str(tmp_path)))
+
+    assert not (tmp_path / "source.mp4").exists()
+
+
+def test_preserve_source_video_is_best_effort_on_failure(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    src = tmp_path / "upload.mp4"
+    src.write_bytes(b"video-bytes")
+    monkeypatch.setattr(app.shutil, "copyfile", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+
+    # must not raise
+    asyncio.run(app._preserve_source_video_for_manual_clipping("job-1", {"input_path": str(src)}, str(tmp_path)))
+
+
+def test_preserve_source_video_uploads_to_s3_and_bills_storage(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    src = tmp_path / "upload.mp4"
+    src.write_bytes(b"video-bytes")
+
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setenv("AWS_S3_BUCKET", "my-bucket")
+    upload_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(app, "upload_file_to_s3", upload_mock)
+    deduct_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_deduct_user_credits", deduct_mock)
+    history_mock = AsyncMock(return_value={})
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", history_mock)
+
+    asyncio.run(app._preserve_source_video_for_manual_clipping(
+        "job-1", {"input_path": str(src)}, str(tmp_path), "user-1",
+    ))
+
+    dest = str(tmp_path / "source.mp4")
+    upload_mock.assert_called_once_with(dest, "my-bucket", "reels/user-1/job-1/source.mp4")
+
+    expected_storage_gb = app._bytes_to_gb(len(b"video-bytes"))
+    deduct_mock.assert_awaited_once_with("user-1", 0.0, -expected_storage_gb)
+    history_mock.assert_awaited_once_with(
+        user_id="user-1",
+        credit=0.0,
+        storage=round(expected_storage_gb, 6),
+        operation="output",
+        operation_type="generation_reel",
+        operation_id="job-1:source_video",
+    )
+
+
+def test_preserve_source_video_skips_billing_without_user_id(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    src = tmp_path / "upload.mp4"
+    src.write_bytes(b"video-bytes")
+
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setenv("AWS_S3_BUCKET", "my-bucket")
+    upload_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(app, "upload_file_to_s3", upload_mock)
+
+    asyncio.run(app._preserve_source_video_for_manual_clipping("job-1", {"input_path": str(src)}, str(tmp_path)))
+
+    upload_mock.assert_not_called()
+
+
+def test_preserve_source_video_is_best_effort_on_s3_failure(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    src = tmp_path / "upload.mp4"
+    src.write_bytes(b"video-bytes")
+
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setenv("AWS_S3_BUCKET", "my-bucket")
+    monkeypatch.setattr(app, "upload_file_to_s3", MagicMock(side_effect=RuntimeError("boom")))
+    deduct_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_deduct_user_credits", deduct_mock)
+
+    # must not raise, and the local copy must still be in place
+    asyncio.run(app._preserve_source_video_for_manual_clipping(
+        "job-1", {"input_path": str(src)}, str(tmp_path), "user-1",
+    ))
+
+    assert (tmp_path / "source.mp4").read_bytes() == b"video-bytes"
+    deduct_mock.assert_not_awaited()
+
+
+def test_get_reel_job_source_endpoint_reports_unavailable_when_missing(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    app.jobs[_CUSTOM_REEL_JOB_ID] = {"user_id": "u1"}
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+
+    with TestClient(app.app) as client:
+        resp = client.get(f"/api/reels/{_CUSTOM_REEL_JOB_ID}/source", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"available": False}
+
+
+def test_get_reel_job_source_endpoint_reports_available(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    app.jobs[_CUSTOM_REEL_JOB_ID] = {"user_id": "u1"}
+    job_dir = tmp_path / _CUSTOM_REEL_JOB_ID
+    job_dir.mkdir()
+    (job_dir / "source.mp4").write_bytes(b"x")
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "_probe_local_video_duration_seconds", lambda path: 42.0)
+
+    with TestClient(app.app) as client:
+        resp = client.get(f"/api/reels/{_CUSTOM_REEL_JOB_ID}/source", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "available": True,
+        "source_url": f"/videos/{_CUSTOM_REEL_JOB_ID}/source.mp4",
+        "duration_seconds": 42.0,
+    }
+
+
+def _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path):
+    app.jobs[_CUSTOM_REEL_JOB_ID] = {"user_id": "u1", "project_id": "proj-1"}
+    job_dir = tmp_path / _CUSTOM_REEL_JOB_ID
+    job_dir.mkdir()
+    (job_dir / "source.mp4").write_bytes(b"source-bytes")
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setenv("AWS_S3_BUCKET", "test-bucket")
+    monkeypatch.setattr(app, "_probe_local_video_duration_seconds", lambda path: 300.0)
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock(return_value=1.0))
+    monkeypatch.setattr(app, "_get_or_build_job_metadata", AsyncMock(return_value=(
+        str(job_dir / f"{_CUSTOM_REEL_JOB_ID}_metadata.json"),
+        {"shorts": [], "transcript": {"segments": []}},
+    )))
+    monkeypatch.setattr(app, "_persist_metadata_json", lambda *a, **k: None)
+    monkeypatch.setattr(app, "_cut_and_verticalize_custom_clip", AsyncMock(return_value=str(job_dir / "clip_1.mp4")))
+    reel_row = {
+        "reel_url": "https://cdn.example/clip.mp4",
+        "reel_size_bytes": 1000,
+        "billing_details": {"final_credits": 2.5, "auto_caption": {"applied": True, "credit_cost": 0.5}},
+    }
+    monkeypatch.setattr(app, "_build_reel_row_for_clip", AsyncMock(return_value=reel_row))
+    monkeypatch.setattr(app, "supabase_insert_reels", AsyncMock(return_value=[{"id": "reel-1", **reel_row}]))
+    monkeypatch.setattr(app, "_normalize_reel_row", lambda row: row)
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+    monkeypatch.setattr(app, "supabase_increment_project_output_count", AsyncMock())
+    return debit_mock
+
+
+def test_create_custom_reel_clip_rejects_end_before_start(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 5000, "end_ms": 4000},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 400
+
+
+def test_create_custom_reel_clip_rejects_too_short_duration(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 0, "end_ms": 500},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 400
+
+
+def test_create_custom_reel_clip_rejects_too_long_duration(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 0, "end_ms": 200000},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 400
+
+
+def test_create_custom_reel_clip_returns_404_without_preserved_source(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+    os.remove(str(tmp_path / _CUSTOM_REEL_JOB_ID / "source.mp4"))
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 0, "end_ms": 10000},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 404
+
+
+def test_create_custom_reel_clip_rejects_range_past_source_duration(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+    monkeypatch.setattr(app, "_probe_local_video_duration_seconds", lambda path: 5.0)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 0, "end_ms": 10000},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 400
+
+
+def test_create_custom_reel_clip_happy_path(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    debit_mock = _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 1000, "end_ms": 11000, "title": "Mon moment prefere"},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == "reel-1"
+
+    # Bills base cost + auto-caption add-on together, no reservation to
+    # reconcile against (this is an ad-hoc, post-job-completion action).
+    debit_mock.assert_awaited_once()
+    assert debit_mock.await_args.kwargs["credits"] == pytest.approx(3.0)
+    assert debit_mock.await_args.kwargs["operation_type"] == "generation_reel"
+    assert debit_mock.await_args.kwargs["reserved_credits"] == 0.0
+
+    build_row_mock = app._build_reel_row_for_clip
+    build_row_mock.assert_awaited_once()
+    call_args = build_row_mock.await_args.args
+    clip_entry = call_args[5]
+    assert clip_entry["title"] == "Mon moment prefere"
+    assert clip_entry["start"] == pytest.approx(1.0)
+    assert clip_entry["end"] == pytest.approx(11.0)
+    assert clip_entry["is_custom"] is True
+
+
+def test_create_custom_reel_clip_uses_explicit_project_id_when_owned(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+    monkeypatch.setattr(app, "supabase_get_project", AsyncMock(return_value={"id": "proj-2", "user_id": "u1"}))
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 1000, "end_ms": 11000, "project_id": "proj-2"},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    build_row_mock = app._build_reel_row_for_clip
+    call_args = build_row_mock.await_args.args
+    assert call_args[9] == "proj-2"
+
+
+def test_create_custom_reel_clip_rejects_unowned_explicit_project_id(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+    monkeypatch.setattr(app, "supabase_get_project", AsyncMock(return_value=None))
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 1000, "end_ms": 11000, "project_id": "someone-elses-project"},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 404
+
+
+def test_ensure_preserved_source_video_available_prefers_local_copy(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    output_dir = tmp_path / "job-1"
+    output_dir.mkdir()
+    (output_dir / "source.mp4").write_bytes(b"local-bytes")
+    download_mock = MagicMock()
+    monkeypatch.setattr(app, "download_s3_object", download_mock)
+
+    result = app._ensure_preserved_source_video_available("job-1", "u1", str(output_dir))
+
+    assert result == str(output_dir / "source.mp4")
+    download_mock.assert_not_called()
+
+
+def test_ensure_preserved_source_video_available_downloads_s3_backup_when_local_missing(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    output_dir = tmp_path / "job-1"
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setenv("AWS_S3_BUCKET", "test-bucket")
+    monkeypatch.setattr(app, "get_s3_object_size", lambda bucket, key: 1234 if key.endswith(".mp4") else 0)
+
+    def _fake_download(bucket, key, dest):
+        Path(dest).write_bytes(b"restored-bytes")
+        return True
+
+    monkeypatch.setattr(app, "download_s3_object", _fake_download)
+
+    result = app._ensure_preserved_source_video_available("job-1", "u1", str(output_dir))
+
+    assert result == str(output_dir / "source.mp4")
+    assert Path(result).read_bytes() == b"restored-bytes"
+
+
+def test_ensure_preserved_source_video_available_returns_none_when_nothing_found(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    output_dir = tmp_path / "job-1"
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setenv("AWS_S3_BUCKET", "test-bucket")
+    monkeypatch.setattr(app, "get_s3_object_size", lambda bucket, key: 0)
+
+    result = app._ensure_preserved_source_video_available("job-1", "u1", str(output_dir))
+
+    assert result is None
+
+
+def test_flatten_transcript_words_extracts_all_words_at_absolute_times():
+    import app as app_module
+    transcript = {
+        "segments": [
+            {"words": [{"word": "Hello", "start": 0.0, "end": 0.4}, {"word": " ", "start": 0.4, "end": 0.4}]},
+            {"words": [{"word": "world", "start": 12.5, "end": 13.0}]},
+        ]
+    }
+    result = app_module._flatten_transcript_words(transcript)
+    assert result == [
+        {"text": "Hello", "startMs": 0, "endMs": 400},
+        {"text": "world", "startMs": 12500, "endMs": 13000},
+    ]
+
+
+def test_flatten_transcript_words_handles_missing_or_malformed_input():
+    import app as app_module
+    assert app_module._flatten_transcript_words(None) == []
+    assert app_module._flatten_transcript_words({}) == []
+    assert app_module._flatten_transcript_words({"segments": [{"words": [{"word": "x", "start": "bad"}]}]}) == []
+
+
+def test_generate_scene_waveform_png_success(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"video")
+
+    def _fake_run(cmd, **kwargs):
+        (tmp_path / "waveform.png").write_bytes(b"png-bytes")
+        return types.SimpleNamespace(returncode=0, stderr=b"")
+
+    monkeypatch.setattr(app.subprocess, "run", _fake_run)
+
+    result = app._generate_scene_waveform_png(str(source_path), str(tmp_path))
+
+    assert result == str(tmp_path / "waveform.png")
+
+
+def test_generate_scene_waveform_png_returns_none_on_ffmpeg_failure(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"video")
+    monkeypatch.setattr(
+        app.subprocess, "run",
+        lambda *a, **k: types.SimpleNamespace(returncode=1, stderr=b"no audio stream"),
+    )
+
+    result = app._generate_scene_waveform_png(str(source_path), str(tmp_path))
+
+    assert result is None
+
+
+def test_generate_scene_waveform_png_reuses_cached_file(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"video")
+    waveform_path = tmp_path / "waveform.png"
+    waveform_path.write_bytes(b"cached-png")
+    # Make sure the cached waveform is not considered stale relative to source.
+    os.utime(waveform_path, (os.path.getmtime(source_path) + 10, os.path.getmtime(source_path) + 10))
+
+    run_mock = MagicMock()
+    monkeypatch.setattr(app.subprocess, "run", run_mock)
+
+    result = app._generate_scene_waveform_png(str(source_path), str(tmp_path))
+
+    assert result == str(waveform_path)
+    run_mock.assert_not_called()
+
+
+def test_get_project_manual_scene_returns_unavailable_without_job(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_project", AsyncMock(return_value={"id": "proj-1", "user_id": "u1"}))
+    monkeypatch.setattr(app, "supabase_get_latest_job_record_by_project", AsyncMock(return_value=None))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/projects/proj-1/manual-scene", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"available": False, "job_id": None}
+
+
+def test_get_project_manual_scene_returns_404_for_unknown_project(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_project", AsyncMock(return_value=None))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/projects/proj-1/manual-scene", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 404
+
+
+def test_get_project_manual_scene_reports_unavailable_without_source(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_project", AsyncMock(return_value={"id": "proj-1", "user_id": "u1"}))
+    monkeypatch.setattr(app, "supabase_get_latest_job_record_by_project", AsyncMock(return_value={"id": "job-1"}))
+    monkeypatch.setattr(app, "_ensure_preserved_source_video_available", MagicMock(return_value=None))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/projects/proj-1/manual-scene", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"available": False, "job_id": "job-1"}
+
+
+def test_get_project_manual_scene_happy_path(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    output_dir = tmp_path / "job-1"
+    output_dir.mkdir()
+    source_path = output_dir / "source.mp4"
+    source_path.write_bytes(b"video-bytes")
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_project", AsyncMock(return_value={"id": "proj-1", "user_id": "u1"}))
+    monkeypatch.setattr(app, "supabase_get_latest_job_record_by_project", AsyncMock(return_value={"id": "job-1"}))
+    monkeypatch.setattr(app, "_ensure_preserved_source_video_available", MagicMock(return_value=str(source_path)))
+    monkeypatch.setattr(app, "_probe_local_video_duration_seconds", lambda _p: 42.0)
+    monkeypatch.setattr(app, "_generate_scene_waveform_png", lambda *_a, **_k: str(output_dir / "waveform.png"))
+    transcript = {"segments": [{"words": [{"word": "hi", "start": 0.0, "end": 0.3}]}]}
+    monkeypatch.setattr(app, "_get_or_build_job_metadata", AsyncMock(return_value=("meta.json", {"transcript": transcript})))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/projects/proj-1/manual-scene", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is True
+    assert body["job_id"] == "job-1"
+    assert body["source_url"] == "/videos/job-1/source.mp4"
+    assert body["duration_seconds"] == 42.0
+    assert body["waveform_url"] == "/videos/job-1/waveform.png"
+    assert body["words"] == [{"text": "hi", "startMs": 0, "endMs": 300}]
+
+
+def test_create_custom_reel_clip_requires_supabase(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    _setup_custom_reel_clip_mocks(app, monkeypatch, tmp_path)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            f"/api/reels/{_CUSTOM_REEL_JOB_ID}/custom-clip",
+            json={"start_ms": 0, "end_ms": 10000},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 503
 
 
 # ---------------------------------------------------------------------------
@@ -3760,3 +4910,364 @@ def test_change_souscription_plan_404_for_unknown_plan(monkeypatch):
     with pytest.raises(app.HTTPException) as exc_info:
         asyncio.run(coro)
     assert exc_info.value.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Social posts: a user-authored post + follow-up comments, published (or
+# scheduled) by the connected Facebook/LinkedIn account itself.
+# ---------------------------------------------------------------------------
+
+class _FakeHttpxResponse:
+    def __init__(self, status_code=200, json_data=None, headers=None):
+        self.status_code = status_code
+        self._json_data = json_data or {}
+        self.headers = headers or {}
+        self.text = str(self._json_data)
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError("error", request=types.SimpleNamespace(), response=self)
+
+    def json(self):
+        return self._json_data
+
+
+class _FakeHttpxAsyncClient:
+    calls = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def post(self, url, **kwargs):
+        _FakeHttpxAsyncClient.calls.append({"url": url, **kwargs})
+        return _FakeHttpxAsyncClient.next_response
+
+
+def _install_fake_httpx_post(monkeypatch, app, response):
+    _FakeHttpxAsyncClient.calls = []
+    _FakeHttpxAsyncClient.next_response = response
+    monkeypatch.setattr(app.httpx, "AsyncClient", _FakeHttpxAsyncClient)
+    return _FakeHttpxAsyncClient
+
+
+def test_post_facebook_comment_sends_message_and_attachment(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_client = _install_fake_httpx_post(
+        monkeypatch, app, _FakeHttpxResponse(200, {"id": "comment_1"}),
+    )
+
+    result = asyncio.run(app._post_facebook_comment("page-token", "1234_5678", "Hello world", "https://example.com/img.png"))
+
+    assert result == {"id": "comment_1"}
+    call = fake_client.calls[0]
+    assert call["url"] == "https://graph.facebook.com/v19.0/1234_5678/comments"
+    assert call["data"]["message"] == "Hello world"
+    assert call["data"]["attachment_url"] == "https://example.com/img.png"
+    assert call["data"]["access_token"] == "page-token"
+
+
+def test_post_facebook_comment_requires_object_id(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    coro = app._post_facebook_comment("page-token", "", "Hello")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 400
+
+
+def test_post_linkedin_comment_sends_actor_and_encoded_urn(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_client = _install_fake_httpx_post(
+        monkeypatch, app, _FakeHttpxResponse(201, {}, headers={"x-restli-id": "urn:li:comment:(urn:li:share:123,456)"}),
+    )
+
+    result = asyncio.run(
+        app._post_linkedin_comment("member-token", "urn:li:person:u1", "urn:li:share:123", "Nice post"),
+    )
+
+    assert result == {"id": "urn:li:comment:(urn:li:share:123,456)"}
+    call = fake_client.calls[0]
+    assert call["url"] == f"https://api.linkedin.com/rest/socialActions/{app.quote('urn:li:share:123', safe='')}/comments"
+    assert call["json"]["actor"] == "urn:li:person:u1"
+    assert call["json"]["message"]["text"] == "Nice post"
+
+
+def test_resolve_social_post_platforms_rejects_when_none_recognized(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    with pytest.raises(app.HTTPException) as exc_info:
+        app._resolve_social_post_platforms(["tiktok", "youtube"])
+    assert exc_info.value.status_code == 400
+
+
+def test_resolve_social_post_platforms_dedupes_and_filters(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    result = app._resolve_social_post_platforms(["facebook", "FACEBOOK", "linkedin", "tiktok"])
+    assert result == ["facebook", "linkedin"]
+
+
+def test_build_comment_message_appends_link_when_missing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    comment = app.SocialPostCommentInput(text="Check this out", link="https://example.com")
+    assert app._build_comment_message(comment) == "Check this out\nhttps://example.com"
+
+
+def test_build_comment_message_skips_duplicate_link(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    comment = app.SocialPostCommentInput(text="See https://example.com for more", link="https://example.com")
+    assert app._build_comment_message(comment) == "See https://example.com for more"
+
+
+def _social_post_account(platform="facebook"):
+    return {"id": "acct-1", "user_id": "u1", "platform": platform, "platform_user_id": "page-1"}
+
+
+def test_create_social_post_rejects_empty_text(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/social/posts",
+            json={"text": "   ", "platforms": ["facebook"]},
+            headers=_auth_headers("u1"),
+        )
+    assert resp.status_code == 400
+
+
+def test_create_social_post_rejects_unsupported_platforms(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/social/posts",
+            json={"text": "Hello", "platforms": ["tiktok"]},
+            headers=_auth_headers("u1"),
+        )
+    assert resp.status_code == 400
+
+
+def test_create_social_post_publishes_now_and_posts_comments(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_get_social_account", AsyncMock(return_value=_social_post_account()))
+    monkeypatch.setattr(app, "get_valid_token", AsyncMock(return_value="page-token"))
+    monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "1234_5678"}))
+    insert_job_mock = AsyncMock(return_value="job-1")
+    monkeypatch.setattr(app, "_insert_publish_job", insert_job_mock)
+    update_status_mock = AsyncMock()
+    monkeypatch.setattr(app, "_update_publish_job_status", update_status_mock)
+    post_comment_mock = AsyncMock(side_effect=[{"id": "c1"}, {"id": "c2"}])
+    monkeypatch.setattr(app, "_post_platform_comment", post_comment_mock)
+    monkeypatch.setattr(app, "supabase_deduct_user_credits", AsyncMock(return_value=True))
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/social/posts",
+            json={
+                "text": "Big announcement!",
+                "platforms": ["facebook"],
+                "comments": [
+                    {"text": "First comment", "link": "https://example.com"},
+                    {"text": "Second comment", "image_url": "https://example.com/img.png"},
+                ],
+            },
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["success"] is True
+    assert data["scheduled"] is False
+    fb_result = data["results"]["facebook"]
+    assert fb_result["success"] is True
+    assert fb_result["comments_results"] == [
+        {"success": True, "id": "c1", "text": "First comment"},
+        {"success": True, "id": "c2", "text": "Second comment"},
+    ]
+    assert post_comment_mock.await_count == 2
+    # final status update carries the post_url + comment results, not just post_url
+    done_call = [c for c in update_status_mock.await_args_list if len(c.args) > 1 and c.args[1] == "done"][0]
+    assert done_call.kwargs["extra_payload"]["comments_results"] == fb_result["comments_results"]
+
+
+def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_get_social_account", AsyncMock(return_value=_social_post_account()))
+    monkeypatch.setattr(app, "get_valid_token", AsyncMock(return_value="page-token"))
+    monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "1234_5678"}))
+    monkeypatch.setattr(app, "_insert_publish_job", AsyncMock(return_value="job-1"))
+    monkeypatch.setattr(app, "_update_publish_job_status", AsyncMock())
+    monkeypatch.setattr(
+        app, "_post_platform_comment",
+        AsyncMock(side_effect=[RuntimeError("rate limited"), {"id": "c2"}]),
+    )
+    monkeypatch.setattr(app, "supabase_deduct_user_credits", AsyncMock(return_value=True))
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/social/posts",
+            json={
+                "text": "Big announcement!",
+                "platforms": ["facebook"],
+                "comments": [{"text": "First"}, {"text": "Second"}],
+            },
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["success"] is True  # the post itself succeeded even though one comment failed
+    comments_results = data["results"]["facebook"]["comments_results"]
+    assert comments_results[0]["success"] is False
+    assert "rate limited" in comments_results[0]["error"]
+    assert comments_results[1] == {"success": True, "id": "c2", "text": "Second"}
+
+
+def test_create_social_post_schedules_job_without_publishing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
+    insert_job_mock = AsyncMock(return_value="job-scheduled-1")
+    monkeypatch.setattr(app, "_insert_publish_job", insert_job_mock)
+    publish_post_mock = AsyncMock()
+    monkeypatch.setattr(app, "publish_post", publish_post_mock)
+    debit_mock = AsyncMock()
+    monkeypatch.setattr(app, "_debit_publish_credits_after_share", debit_mock)
+
+    future_iso = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/social/posts",
+            json={
+                "text": "Scheduled announcement",
+                "platforms": ["facebook", "linkedin"],
+                "background_id": "some-preset",
+                "comments": [{"text": "Follow-up"}],
+                "scheduled_date": future_iso,
+                "timezone": "UTC",
+            },
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["scheduled"] is True
+    assert data["success"] is True
+    publish_post_mock.assert_not_awaited()
+    debit_mock.assert_not_awaited()
+    assert insert_job_mock.await_count == 2  # one job per platform
+
+    inserted_payloads = [call.kwargs["payload"] for call in insert_job_mock.await_args_list]
+    for payload in inserted_payloads:
+        assert payload["source_type"] == "social_post"
+        assert payload["text"] == "Scheduled announcement"
+        assert payload["background_id"] == "some-preset"
+        assert payload["comments"] == [{"text": "Follow-up", "link": None, "image_url": None}]
+
+
+def test_execute_scheduled_social_post_job_publishes_and_comments(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_get_social_account", AsyncMock(return_value=_social_post_account("linkedin")))
+    monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "urn:li:share:999"}))
+    monkeypatch.setattr(app, "get_valid_token", AsyncMock(return_value="member-token"))
+    update_status_mock = AsyncMock()
+    monkeypatch.setattr(app, "_update_publish_job_status", update_status_mock)
+    post_comment_mock = AsyncMock(return_value={"id": "comment-urn"})
+    monkeypatch.setattr(app, "_post_platform_comment", post_comment_mock)
+    debit_mock = AsyncMock()
+    monkeypatch.setattr(app, "_debit_scheduled_publish_credits", debit_mock)
+
+    task_payload = {
+        "source_type": "social_post",
+        "text": "Scheduled text",
+        "background_id": None,
+        "comments": [{"text": "A comment", "link": None, "image_url": None}],
+    }
+
+    asyncio.run(app._execute_scheduled_social_post_job("job-9", "u1", "linkedin", task_payload))
+
+    post_comment_mock.assert_awaited_once()
+    debit_mock.assert_awaited_once()
+    done_call = [c for c in update_status_mock.await_args_list if len(c.args) > 1 and c.args[1] == "done"][0]
+    assert done_call.kwargs["external_id"] == "urn:li:share:999"
+    assert done_call.kwargs["extra_payload"]["comments_results"] == [
+        {"success": True, "id": "comment-urn", "text": "A comment"}
+    ]
+
+
+def test_execute_scheduled_social_post_job_marks_failed_without_account(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_get_social_account", AsyncMock(return_value=None))
+    update_status_mock = AsyncMock()
+    monkeypatch.setattr(app, "_update_publish_job_status", update_status_mock)
+
+    task_payload = {"source_type": "social_post", "text": "x", "comments": []}
+    asyncio.run(app._execute_scheduled_social_post_job("job-10", "u1", "facebook", task_payload))
+
+    failed_call = [c for c in update_status_mock.await_args_list if len(c.args) > 1 and c.args[1] == "failed"]
+    assert failed_call
+    assert "No connected facebook account" in failed_call[0].kwargs["error_message"]
+
+
+def test_execute_scheduled_publish_job_dispatches_social_post_by_source_type(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    dispatched = AsyncMock()
+    monkeypatch.setattr(app, "_execute_scheduled_social_post_job", dispatched)
+
+    job_row = {
+        "id": "job-11",
+        "user_id": "u1",
+        "platform": "facebook",
+        "payload": {"source_type": "social_post", "text": "hi"},
+    }
+    asyncio.run(app._execute_scheduled_publish_job(job_row))
+
+    dispatched.assert_awaited_once_with("job-11", "u1", "facebook", job_row["payload"])
+
+
+def test_update_publish_job_status_merges_extra_payload_with_post_url(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    captured = {}
+
+    class _FakeTable:
+        def update(self, payload):
+            captured["payload"] = payload
+            return self
+
+        def eq(self, *_a, **_k):
+            return self
+
+        async def execute(self):
+            return types.SimpleNamespace(data=[{"id": "job-1"}])
+
+    class _FakeClient:
+        def table(self, _name):
+            return _FakeTable()
+
+    monkeypatch.setattr(app, "supabase_get_client", AsyncMock(return_value=_FakeClient()))
+
+    asyncio.run(app._update_publish_job_status(
+        "job-1", "done", external_id="ext-1", post_url="https://example.com/post",
+        extra_payload={"comments_results": [{"success": True, "id": "c1"}]},
+    ))
+
+    assert captured["payload"]["payload"] == {
+        "comments_results": [{"success": True, "id": "c1"}],
+        "post_url": "https://example.com/post",
+    }

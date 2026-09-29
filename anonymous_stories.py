@@ -417,41 +417,57 @@ The exact wording must be generated naturally from the transcript.
 
 The story MUST begin with the feeling that the narrator is personally submitting THEIR OWN STORY anonymously to PAGE_NAME.
 
-The introduction should follow this conceptual pattern:
+The introduction always follows the SAME underlying structure. This structure (the "formula") never changes:
 
 GREETING + PAGE_NAME + ANONYMITY + PERSONAL NEED TO TELL THE STORY + OWNERSHIP OF THE EXPERIENCE
 
-For example:
+What MUST change from one story to the next is the exact wording used to express each part of that structure. One specific combination has been overused to the point of sounding like a robotic template:
 
-"Bonsoir DJANGUI, je prefere rester anonyme, mais j'ai besoin de vous raconter mon histoire, c'est ce que j'ai vecu."
+"Bonsoir/Bonjour PAGE_NAME, je prefere rester anonyme, mais j'ai besoin de vous raconter mon histoire[, c'est ce que j'ai vecu]."
 
-This is the desired STYLE and INTENT.
+Treat that exact combination as the DEFAULT TO AVOID, not as the model to imitate. Producing it, or a near-identical paraphrase of it, two stories in a row is a failure.
 
-However, NEVER repeat this exact sentence mechanically.
+Instead, assemble the introduction from an ANONYMITY CLAUSE and a PERSONAL NEED / TRANSITION CLAUSE, choosing wording for each that fits the specific tone of THIS transcript (formal or casual, urgent, tired, sad, relieved, angry...). Two different stories should almost never end up built from the same two sentences.
 
-The formulation MUST vary naturally from one story to another while preserving the same meaning:
+ANONYMITY CLAUSE -- vary among (and beyond) these:
 
-"I am speaking directly to this page, I want to remain anonymous, and I am here to tell you about something that happened to ME."
+"je prefere rester anonyme"
+"je souhaite rester anonyme"
+"je prefere ne pas reveler mon identite"
+"je voudrais garder l'anonymat"
+"je prefere ne pas donner mon nom"
+"publiez-moi en anonyme"
+"publiez mon histoire anonymement"
+"je souhaite que mon identite reste anonyme"
+"je prefererais qu'on ne me reconnaisse pas"
+"merci de ne pas devoiler qui je suis"
 
-Possible formulations include:
+PERSONAL NEED / TRANSITION CLAUSE -- vary among (and beyond) these:
 
-"Bonsoir DJANGUI, je prefere rester anonyme, mais j'ai besoin de vous raconter mon histoire."
+"mais j'ai besoin de vous raconter mon histoire"
+"mais j'aimerais vous raconter ce que j'ai vecu"
+"mais je voudrais partager avec vous ce qui m'est arrive"
+"mais j'ai besoin de parler de ce que je traverse"
+"mais je veux vous raconter ce qui s'est passe"
+"mais j'ai besoin de vous expliquer ma situation"
+"mais il fallait que je partage ca quelque part"
+"mais ca me ferait du bien de le dire enfin"
+"mais je n'en peux plus de garder ca pour moi"
+"mais je pense que mon histoire peut parler a d'autres personnes"
+
+These two lists are STYLE examples, not a fixed phrase library -- write natural variations of your own when they fit the story better. Pick one clause from each (or an original equivalent), combine them to fit the transcript's tone, then let the ownership of the experience (see section 5) flow out of it -- sometimes in the same sentence, sometimes as the very next one.
+
+All of the following are valid, DISTINCT introductions built from the exact same formula -- notice that no two of them share a sentence:
 
 "Bonsoir DJANGUI, je souhaite rester anonyme, mais j'aimerais vous raconter ce que j'ai vecu."
 
-"Bonsoir DJANGUI, publiez-moi en anonyme. J'ai besoin de vous raconter ce qui m'est arrive."
+"Bonjour DJANGUI, publiez-moi en anonyme, j'ai besoin de parler de ce que je traverse en ce moment."
 
-"Bonsoir DJANGUI, je prefere ne pas donner mon nom, mais je voudrais partager avec vous mon histoire."
+"Bonsoir DJANGUI, je prefere ne pas reveler mon identite, mais il fallait que je partage mon histoire quelque part."
 
-"Bonsoir DJANGUI, je souhaite que mon identite reste anonyme, mais j'ai besoin de parler de ce que je vis."
+"Bonjour DJANGUI, merci de ne pas devoiler qui je suis -- je veux vous raconter ce qui s'est passe, c'est mon histoire."
 
-"Bonsoir DJANGUI, publiez mon histoire anonymement. C'est une situation que je vis personnellement et dont j'ai besoin de parler."
-
-These are STYLE examples only.
-
-Do NOT copy them mechanically.
-
-Generate an introduction that feels natural for the specific story.
+These are STYLE examples only. Generate an introduction that feels natural for the specific story, and that does not read like the same sentence as the story before it.
 
 
 ==================================================
@@ -484,9 +500,9 @@ For example, if the transcript says:
 
 "My divorce has lasted for years, and I made a huge mistake."
 
-The introduction should preserve this ownership:
+The introduction should preserve this ownership (using one of the varied phrasings from section 4, never the same one every time):
 
-"Bonsoir WOURI TV, je prefere rester anonyme, mais j'ai besoin de vous raconter mon histoire. Mon divorce dure depuis des annees, et avec le recul, je reconnais que j'ai fait une enorme erreur."
+"Bonsoir WOURI TV, je souhaite rester anonyme, mais j'aimerais vous raconter ce que j'ai vecu. Mon divorce dure depuis des annees, et avec le recul, je reconnais que j'ai fait une enorme erreur."
 
 It must NEVER become:
 
@@ -552,14 +568,7 @@ Evening:
 Late evening/night:
 Use the most natural greeting for the TARGET_LANGUAGE and context.
 
-The exact transition after the greeting should vary naturally.
-
-IMPORTANT:
-Do NOT always produce:
-
-"Bonsoir WOURI TV, je prefere rester anonyme, mais j'ai besoin de vous raconter mon histoire."
-
-The editorial identity should remain consistent, but the wording should feel individually written.
+The exact transition after the greeting should vary naturally: pick a different anonymity clause and a different transition clause every time (see section 4). The editorial identity (the formula) stays consistent; the sentence built from it must not.
 
 Variation must occur in:
 
@@ -576,7 +585,7 @@ Do NOT vary the core meaning.
 
 The objective is NOT to generate random introductions.
 
-The objective is to preserve a recognizable editorial identity while avoiding a generic template.
+The objective is to preserve a recognizable editorial identity (the formula in section 4) while avoiding a generic, mechanically repeated template.
 
 Every introduction should communicate:
 
@@ -585,28 +594,9 @@ Every introduction should communicate:
 3. This is MY story.
 4. I want or need to tell what happened to me.
 
-Possible variations:
+How each of those four ideas gets worded is exactly what must vary -- use the ANONYMITY CLAUSE and PERSONAL NEED / TRANSITION CLAUSE lists in section 4, or natural equivalents of your own, and let the specific transcript's tone (not habit) drive the choice. Before finalizing the introduction, check that it is not the same combination you would produce for a completely different story -- if the wording feels generic or interchangeable, pick different clauses.
 
-"je prefere rester anonyme"
-"je souhaite rester anonyme"
-"je prefere ne pas reveler mon identite"
-"je voudrais rester anonyme"
-"publiez-moi en anonyme"
-"publiez mon histoire anonymement"
-"je souhaite que mon identite reste anonyme"
-
-Possible transitions:
-
-"j'ai besoin de vous raconter mon histoire"
-"j'aimerais vous raconter ce que j'ai vecu"
-"je voudrais partager avec vous ce qui m'est arrive"
-"j'ai besoin de parler de ce que je traverse"
-"je veux vous raconter ce qui s'est passe"
-"j'ai besoin de vous expliquer ma situation"
-
-These are examples, not a phrase library to mechanically combine.
-
-The final sentence must sound like something a real person would naturally write.
+The final sentence must sound like something a real person would naturally write, not like a filled-in template.
 
 
 ==================================================
@@ -673,7 +663,15 @@ Other examples of the desired STYLE:
 
 "I never imagined that one decision could have such a lasting impact on my life."
 
-These are STYLE examples only.
+These are STYLE examples only. Do NOT let "je n'aurais jamais imagine/pense que..." become your own default opener -- it is only one possible structure among several. Vary the OPENING STRUCTURE of the hook itself from one story to the next, for example:
+
+- a regret stated in hindsight ("je n'aurais jamais imagine que...", used occasionally, not by default)
+- a blunt statement of fact or consequence ("une simple photo a fini par me couter mon mariage.")
+- a moment in time ("il y a trois ans, je ne savais pas encore que ma vie allait basculer.")
+- a direct, personal question ("comment une seule erreur a-t-elle pu tout changer a ce point ?")
+- an admission ("je n'ai jamais dit a personne a quel point cette decision m'a coute.")
+
+Pick the structure that best fits what actually happened in THIS transcript, not the one you used last.
 
 Generate the actual hook from the transcript.
 
@@ -694,9 +692,9 @@ The hook belongs to the narrator's story.
 
 Correct structure:
 
-"Bonsoir WOURI TV, je prefere rester anonyme, mais j'ai besoin de vous raconter mon histoire, c'est ce que j'ai vecu.
+"Bonsoir WOURI TV, je prefere ne pas reveler mon identite, mais il fallait que je partage mon histoire quelque part.
 
-Je n'aurais jamais imagine qu'une photo sur les reseaux sociaux puisse me couter si cher dans un divorce."
+Une simple photo sur les reseaux sociaux a fini par me couter tres cher dans mon divorce."
 
 The first paragraph establishes the anonymous submission.
 

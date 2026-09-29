@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowLeft, Play, Plus, Download, Loader2, Search, Share2, Trash2, X } from "lucide-react";
+import { ArrowLeft, Play, Plus, Download, Loader2, Scissors, Search, Share2, Trash2, X } from "lucide-react";
 import { fetchAppConfig, getApiUrl, getDefaultHideSocialPlatforms } from "../config";
 import { useAuth } from "../state/AuthContext";
 import { useUserCredits } from "../state/UserCreditsContext";
@@ -380,14 +380,24 @@ export default function ReelsPage({ projectId = "" }) {
                 </div>
 
                 {projectId ? (
-                    <button
-                        type="button"
-                        onClick={() => navigate("/dashboard/reels")}
-                        className="inline-flex items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
-                    >
-                        <ArrowLeft size={14} />
-                        {t('projects.backToProjects', 'Retour aux projets')}
-                    </button>
+                    <div className="flex flex-wrap items-center gap-2">
+                        <button
+                            type="button"
+                            onClick={() => navigate(`/dashboard/reels/projects/${projectId}/manual`)}
+                            className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-emerald-500 to-green-500 px-4 py-2.5 text-sm font-bold text-black shadow-lg shadow-emerald-500/20 hover:from-emerald-400 hover:to-green-400"
+                        >
+                            <Scissors size={14} />
+                            {t('projects.manualCreationButton', 'Creation manuelle')}
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => navigate("/dashboard/reels")}
+                            className="inline-flex items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
+                        >
+                            <ArrowLeft size={14} />
+                            {t('projects.backToProjects', 'Retour aux projets')}
+                        </button>
+                    </div>
                 ) : (
                     <button
                         type="button"

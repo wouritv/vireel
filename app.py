@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from typing import Dict, Optional, List, Any, Annotated, Tuple
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse, unquote, urlencode
+from urllib.parse import urlparse, unquote, urlencode, quote
 from urllib.request import Request as UrlRequest, urlopen, HTTPRedirectHandler, build_opener
 from starlette.background import BackgroundTask
 from fastapi import FastAPI, APIRouter, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks, Query, Depends
@@ -30,7 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, StreamingResponse
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import jwt as pyjwt
 from jwt import PyJWTError
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -115,6 +115,9 @@ from supabase_request import (
 	update_film_summary as supabase_update_film_summary,
 	soft_delete_film_summary as supabase_soft_delete_film_summary,
 	get_film_summaries_by_project as supabase_get_film_summaries_by_project,
+	list_caption_style_themes as supabase_list_caption_style_themes,
+	upsert_caption_style_theme as supabase_upsert_caption_style_theme,
+	delete_caption_style_theme as supabase_delete_caption_style_theme,
 )
 import anonymous_stories
 import email_templates
@@ -159,6 +162,7 @@ _CLIP_INDEX_SUFFIX_PATTERN = r"_clip_(\d+)\.mp4$"
 _JOB_NOT_FOUND = "Job not found"
 _INVALID_INPUT_FILENAME = "Invalid input filename"
 _CLIP_NOT_FOUND = "Clip not found"
+_FACEBOOK_TOKEN_EXPIRED_OR_MISSING = "Facebook page access token expired or missing"
 _METADATA_NOT_FOUND = "Metadata not found"
 _HTTPS_SCHEME_PREFIX = "https://"
 _INVALID_SCHEDULED_DATE = "Invalid scheduled_date (expected ISO-8601)"
@@ -324,7 +328,11 @@ PLATFORM_CONFIG = {
         "token_url": "https://graph.facebook.com/v19.0/oauth/access_token",
         "client_id": os.getenv("FACEBOOK_CLIENT_ID"),
         "client_secret": os.getenv("FACEBOOK_CLIENT_SECRET"),
-        "scopes": ["pages_show_list", "pages_manage_posts", "pages_read_engagement"],
+        # pages_manage_engagement is required for the Page itself to comment
+        # on its own posts (POST /{post_id}/comments with the Page token --
+        # see _post_facebook_comment) -- pages_manage_posts alone only
+        # covers creating the post.
+        "scopes": ["pages_show_list", "pages_manage_posts", "pages_read_engagement", "pages_manage_engagement"],
     },
     "instagram": {
         "auth_url": "https://www.instagram.com/oauth/authorize",
@@ -332,10 +340,15 @@ PLATFORM_CONFIG = {
         "long_lived_token_url": "https://graph.instagram.com/access_token",
         "client_id": os.getenv("INSTAGRAM_APP_ID"),
         "client_secret": os.getenv("INSTAGRAM_APP_SECRET"),
+        # publish_to_instagram/publish_to_instagram_image (content_publish)
+        # and identity lookup at connect time (basic) are the only ones the
+        # app's own endpoints call today. manage_messages/manage_comments
+        # were requested but never used by any endpoint -- dropped so App
+        # Review isn't asked to approve permissions with no real use case
+        # to demonstrate. manage_insights is kept deliberately (planned
+        # analytics use) despite the same gap.
         "scopes": [
             "instagram_business_basic",
-            "instagram_business_manage_messages",
-            "instagram_business_manage_comments",
             "instagram_business_content_publish",
             "instagram_business_manage_insights",
         ],
@@ -1367,6 +1380,13 @@ def _normalize_caption_row(row: Dict[str, Any]) -> Dict[str, Any]:
     thumbnail_url = _caption_media_url_from_s3_key(thumbnail_ref) if thumbnail_ref.startswith(_CAPTIONS_PREFIX) else thumbnail_ref
     preview_url = thumbnail_url or media_url
 
+    # caption_original_url used to expose the clean, pre-caption clip
+    # (generation_inputs.original_s3_key) so the app could point restyles at
+    # it directly. The app now always works off a single URL -- the
+    # currently displayed one -- so this just mirrors media_url; the clean
+    # clip is still resolved server-side when actually re-burning (see
+    # _resolve_authoritative_clean_video_source), which is what actually
+    # keeps a restyle from stacking onto the default captions.
     return {
         **row,
         "caption_url": media_url or row.get("caption_url") or "",
@@ -1375,8 +1395,12 @@ def _normalize_caption_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "caption_playback_url": media_url,
         "caption_download_url": media_url,
         "caption_preview_url": preview_url,
+        "caption_original_url": media_url,
         "media_url": media_url,
     }
+
+
+_COMMON_VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm", ".mkv")
 
 
 def _is_probably_video_url(value: str) -> bool:
@@ -1384,7 +1408,7 @@ def _is_probably_video_url(value: str) -> bool:
     if not text:
         return False
     path = urlparse(text).path or text
-    return path.endswith((".mp4", ".mov", ".webm", ".mkv", ".m4v", ".avi"))
+    return path.endswith(_COMMON_VIDEO_EXTENSIONS + (".m4v", ".avi"))
 
 
 async def _fetch_reel_and_caption_rows_for_preview(job_id: str, clip_index: int, user_id: str):
@@ -1926,6 +1950,13 @@ def _normalize_reel_row(row: Dict[str, Any]) -> Dict[str, Any]:
     thumbnail_url = _reel_thumbnail_url_from_s3_key(thumbnail_s3_key) or thumbnail_ref or ""
     preview_url = thumbnail_url or media_url
 
+    # reel_original_url used to expose the clean, pre-caption clip
+    # (billing_details.original_s3_key) so the app could point restyles at
+    # it directly. The app now always works off a single URL -- the
+    # currently displayed one -- so this just mirrors media_url; the clean
+    # clip is still resolved server-side when actually re-burning (see
+    # _resolve_authoritative_clean_video_source), which is what actually
+    # keeps a restyle from stacking onto the default captions.
     return {
         **row,
         "reel_url": media_url or row.get("reel_url") or "",
@@ -1933,6 +1964,7 @@ def _normalize_reel_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "reel_preview_url": preview_url,
         "reel_playback_url": media_url,
         "reel_download_url": media_url,
+        "reel_original_url": media_url,
         "media_url": media_url,
     }
 
@@ -1974,7 +2006,219 @@ def _compute_clip_duration_seconds(clip: Dict[str, Any]) -> int:
         return 0
 
 
-def _build_reel_row_for_clip(
+# Matches CaptionsModal.jsx's own DEFAULT_STYLE (dashboard/src/components/
+# CaptionsModal.jsx) so a clip's default captions -- burned in automatically,
+# server-side, before the user ever opens the editor -- look identical to
+# what they'd get by opening "Sous-titres" and accepting the defaults. This
+# is only ever the *factory* fallback now -- see _get_user_default_caption_
+# style, which prefers a user's own saved default when one exists.
+_DEFAULT_AUTO_CAPTION_STYLE_KWARGS: Dict[str, Any] = {
+    "position": "bottom", "position_x": 50.0, "position_y": 82.0,
+    "font_size": 14, "font_name": "Montserrat", "font_color": "#FFFFFF",
+    "highlight_color": "#FFDD00", "border_color": "#000000", "border_width": 3,
+    "text_shadow_color": "#000000", "shadow_blur": 8, "shadow_offset_x": 0, "shadow_offset_y": 2,
+    "bg_color": "#000000", "bg_opacity": 0.0, "text_case": "none", "bold": True, "italic": False,
+    "words_per_line": 4, "animation": "word-highlight",
+}
+
+# Sentinel (job_id, clip_index) under which a user's own default caption
+# style is stored in style_edit_versions -- not a real job/clip, just a
+# fixed key so "the user's global default" fits the same per-(user_id,
+# job_id, clip_index) row shape everything else in that table uses,
+# instead of needing a separate table. Each save (see
+# set_default_caption_style_endpoint) appends a new version; the latest
+# one wins, so "replacing" the default is just saving another version.
+_DEFAULT_STYLE_SENTINEL_JOB_ID = "__user_default__"
+_DEFAULT_STYLE_SENTINEL_CLIP_INDEX = 0
+
+
+class DefaultCaptionStyleRequest(BaseModel):
+    position: str = "bottom"
+    position_x: float = 50.0
+    position_y: float = 82.0
+    font_size: int = Field(default=14, ge=10, le=200)
+    font_name: str = "Montserrat"
+    font_color: str = "#FFFFFF"
+    highlight_color: str = "#FFDD00"
+    border_color: str = "#000000"
+    border_width: int = 3
+    text_shadow_color: str = "#000000"
+    shadow_blur: int = 8
+    shadow_offset_x: int = 0
+    shadow_offset_y: int = 2
+    bg_color: str = "#000000"
+    bg_opacity: float = 0.0
+    text_case: str = "none"
+    bold: bool = True
+    italic: bool = False
+    words_per_line: int = Field(default=4, ge=1, le=10)
+    animation: str = "word-highlight"
+
+
+async def _get_user_default_caption_style(user_id: Optional[str]) -> Dict[str, Any]:
+    """Resolves the style new clips get auto-captioned with: a user's own
+    saved default when they have one (a readable, replaceable
+    style_edit_versions row -- see set_default_caption_style_endpoint --
+    rather than a value only ever baked into application code), falling
+    back to the factory default (_DEFAULT_AUTO_CAPTION_STYLE_KWARGS)
+    otherwise."""
+    if is_supabase_configured() and user_id:
+        try:
+            versions = await supabase_list_style_edit_versions(
+                _DEFAULT_STYLE_SENTINEL_JOB_ID, _DEFAULT_STYLE_SENTINEL_CLIP_INDEX, user_id,
+            )
+            if versions:
+                style_config = versions[-1].get("style_config")
+                if isinstance(style_config, dict) and style_config:
+                    return style_config
+        except Exception as exc:
+            logger.warning("Failed to load user default caption style for %s: %s", user_id, exc)
+    return dict(_DEFAULT_AUTO_CAPTION_STYLE_KWARGS)
+
+
+async def _burn_default_captions_for_clip(
+    input_path: str, output_path: str, transcript: Optional[Dict[str, Any]],
+    clip_start: float, clip_end: float, job_id: str, clip_index: int,
+    style_kwargs: Dict[str, Any],
+) -> bool:
+    """Burn default subtitles into a freshly produced clip so reels/captions
+    come out captioned without the user opening the manual editor first.
+
+    Reuses the same FFmpeg burn-in as the manual /api/subtitle endpoint
+    (_burn_subtitles_for_request). `style_kwargs` is the resolved style to
+    burn with (the user's own saved default when they have one, else the
+    factory default -- see _get_user_default_caption_style), resolved once
+    by the caller so it can also be recorded alongside the result (see
+    _record_default_style_version) without a second lookup.
+
+    Returns False (leaving the source clip untouched) when there's no
+    transcript or no words fall inside this clip's time range -- a silent
+    clip has nothing to caption.
+    """
+    if not transcript:
+        return False
+    srt_path = f"{output_path}.srt"
+    try:
+        # Any animation other than "none" highlights the currently-spoken
+        # word (see Subtitles.tsx's isActive -> color = highlightColor,
+        # applied for every animation value) -- generate_highlighted_srt
+        # marks up the SRT so burn_subtitles can reproduce that in the
+        # burned-in video instead of leaving it static.
+        srt_generator = generate_srt if style_kwargs.get("animation", "none") == "none" else generate_highlighted_srt
+        has_words = srt_generator(
+            transcript, clip_start, clip_end, srt_path,
+            max_words_per_line=style_kwargs["words_per_line"],
+        )
+        if not has_words:
+            return False
+        req = SubtitleRequest(job_id=job_id, clip_index=clip_index, **style_kwargs)
+        await asyncio.to_thread(_burn_subtitles_for_request, req, input_path, srt_path, output_path)
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except Exception as exc:
+        logger.warning("Default caption burn failed for job %s clip %s: %s", job_id, clip_index, exc)
+        return False
+    finally:
+        try:
+            if os.path.exists(srt_path):
+                os.remove(srt_path)
+        except Exception:
+            pass
+
+
+# The version_number a clip's auto-applied default caption style is always
+# recorded under (see _record_default_style_version) -- reset_caption_style_
+# history looks this up specifically so "reset" restores the *styled*
+# default instead of stripping captions back to a bare, uncaptioned clip.
+_DEFAULT_STYLE_VERSION_NUMBER = 1
+
+
+async def _record_default_style_version(
+    user_id: str, job_id: str, clip_index: int, source_video_url: str, output_video_url: str,
+    style_config: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Records the style a clip was actually auto-captioned with (the
+    user's own saved default when they have one, else the factory default
+    -- see _get_user_default_caption_style) as a real style_edit_versions
+    row, the same table manual restyles are recorded in -- so the captions
+    editor can treat "the default" as an actual version instead of a value
+    only ever baked into application code, and so resetting a clip's
+    captions falls back to this properly-styled version instead of a bare,
+    uncaptioned video.
+
+    Best-effort: any failure here must never fail the reel job itself -- it
+    just means reset falls back to the plain original video for this clip."""
+    if not (is_supabase_configured() and user_id):
+        return
+    try:
+        await supabase_insert_style_edit_version({
+            "user_id": user_id,
+            "job_id": job_id,
+            "clip_index": int(clip_index),
+            "version_number": _DEFAULT_STYLE_VERSION_NUMBER,
+            "operation_type": "subtitle_style",
+            "source_video_url": source_video_url,
+            "output_video_url": output_video_url,
+            "style_config": style_config if isinstance(style_config, dict) and style_config else dict(_DEFAULT_AUTO_CAPTION_STYLE_KWARGS),
+        })
+    except Exception as exc:
+        logger.warning("Failed to record default style version for job %s clip %s: %s", job_id, clip_index, exc)
+
+
+async def _upload_and_finalize_auto_caption(
+    clip_path: str,
+    primary_path: str,
+    auto_captioned: bool,
+    clip: Dict[str, Any],
+    default_style_kwargs: Dict[str, Any],
+    user_id: str,
+    job_id: str,
+    clip_index: int,
+    clip_filename: str,
+    bucket: str,
+) -> tuple:
+    """Uploads the (possibly captioned) clip to S3 and, when auto-captioning
+    was applied, also uploads the pre-caption original, estimates its
+    caption cost, and records the default style version so a later reset
+    can fall back to this properly-styled version. Returns (media_url,
+    s3_key, clip_size_bytes, original_s3_key, caption_credit_cost,
+    auto_caption_cost_breakdown)."""
+    s3_key = f"reels/{user_id}/{job_id}/{clip_filename}"
+    if not upload_file_to_s3(primary_path, bucket, s3_key):
+        raise RuntimeError(f"Failed to upload clip to S3: {clip_filename}")
+    clip_size_bytes = int(os.path.getsize(primary_path) or 0)
+    media_url = _reel_media_url_from_s3_key(s3_key)
+
+    if not auto_captioned:
+        return media_url, s3_key, clip_size_bytes, "", 0.0, {}
+
+    original_s3_key = f"reels/{user_id}/{job_id}/original_{clip_filename}"
+    if not upload_file_to_s3(clip_path, bucket, original_s3_key):
+        # Best-effort: the reel itself is already captioned and uploaded
+        # above -- losing the pre-caption original only means a later
+        # manual restyle rebuilds from the captioned version instead.
+        original_s3_key = ""
+
+    clip_duration_for_caption_cost = _compute_clip_duration_seconds(clip)
+    auto_caption_cost_breakdown = _estimate_caption_cost_breakdown(
+        duration_seconds=float(clip_duration_for_caption_cost or 0),
+        size_bytes=float(clip_size_bytes),
+        uses_assembly=False, uses_openai=False, uses_gemini=False,
+    )
+    caption_credit_cost = _estimate_caption_required_credits(
+        duration_seconds=float(clip_duration_for_caption_cost or 0),
+        size_bytes=float(clip_size_bytes),
+        uses_assembly=False, uses_openai=False, uses_gemini=False,
+    )
+    await _record_default_style_version(
+        user_id, job_id, clip_index,
+        source_video_url=_reel_media_url_from_s3_key(original_s3_key) if original_s3_key else "",
+        output_video_url=media_url,
+        style_config=default_style_kwargs,
+    )
+    return media_url, s3_key, clip_size_bytes, original_s3_key, caption_credit_cost, auto_caption_cost_breakdown
+
+
+async def _build_reel_row_for_clip(
     job_id: str,
     user_id: str,
     output_dir: str,
@@ -1985,20 +2229,31 @@ def _build_reel_row_for_clip(
     now_iso: str,
     uses_youtube_source: bool,
     project_id: Optional[str],
+    transcript: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     clip_filename = f"{base_name}_clip_{i}.mp4"
     clip_path = os.path.join(output_dir, clip_filename)
     if not os.path.exists(clip_path):
         return None
 
-    s3_key = f"reels/{user_id}/{job_id}/{clip_filename}"
-    uploaded = upload_file_to_s3(clip_path, bucket, s3_key)
-    if not uploaded:
-        raise RuntimeError(f"Failed to upload clip to S3: {clip_filename}")
-    clip_size_bytes = int(os.path.getsize(clip_path) or 0)
+    clip_index = i - 1
+    captioned_path = os.path.join(output_dir, f"{base_name}_clip_{i}_captioned.mp4")
+    default_style_kwargs = await _get_user_default_caption_style(user_id)
+    auto_captioned = await _burn_default_captions_for_clip(
+        clip_path, captioned_path, transcript,
+        float(clip.get("start", 0) or 0), float(clip.get("end", 0) or 0),
+        job_id, clip_index, default_style_kwargs,
+    )
+    primary_path = captioned_path if auto_captioned else clip_path
 
-    media_url = _reel_media_url_from_s3_key(s3_key)
-    thumbnail_s3_key = _upload_reel_clip_thumbnail(clip, clip_path, output_dir, job_id, i - 1, user_id, bucket)
+    (
+        media_url, s3_key, clip_size_bytes, original_s3_key,
+        caption_credit_cost, auto_caption_cost_breakdown,
+    ) = await _upload_and_finalize_auto_caption(
+        clip_path, primary_path, auto_captioned, clip, default_style_kwargs,
+        user_id, job_id, clip_index, clip_filename, bucket,
+    )
+    thumbnail_s3_key = _upload_reel_clip_thumbnail(clip, primary_path, output_dir, job_id, clip_index, user_id, bucket)
 
     duration = _compute_clip_duration_seconds(clip)
     reel_cost_breakdown = _estimate_reel_cost_breakdown(
@@ -2020,12 +2275,20 @@ def _build_reel_row_for_clip(
         "reel_size_bytes": clip_size_bytes,
         "reel_s3_key": s3_key,
         "reel_job_id": job_id,
-        "reel_clip_index": i - 1,
+        "reel_clip_index": clip_index,
         "billing_details": _build_billing_details(
             "generation_reel",
             reel_cost_breakdown,
             actual_storage_gb=_bytes_to_gb(clip_size_bytes),
-            extra={"clip_index": i - 1},
+            extra={
+                "clip_index": clip_index,
+                "original_s3_key": original_s3_key,
+                "auto_caption": {
+                    "applied": auto_captioned,
+                    "credit_cost": caption_credit_cost,
+                    "cost_breakdown": auto_caption_cost_breakdown,
+                },
+            },
         ),
         "total_cost_usd": 0,
     }
@@ -2044,6 +2307,7 @@ async def _persist_reels_for_job(
     clips: List[Dict[str, Any]],
     uses_youtube_source: bool = False,
     project_id: Optional[str] = None,
+    transcript: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     if not user_id:
         raise RuntimeError("Missing app user id for reel persistence")
@@ -2059,8 +2323,8 @@ async def _persist_reels_for_job(
     rows: List[Dict[str, Any]] = []
 
     for i, clip in enumerate(clips, start=1):
-        reel_row = _build_reel_row_for_clip(
-            job_id, user_id, output_dir, bucket, base_name, clip, i, now_iso, uses_youtube_source, project_id,
+        reel_row = await _build_reel_row_for_clip(
+            job_id, user_id, output_dir, bucket, base_name, clip, i, now_iso, uses_youtube_source, project_id, transcript,
         )
         if reel_row:
             rows.append(reel_row)
@@ -2483,6 +2747,7 @@ def _find_completed_job_metadata_path(job_id: str, output_dir: str) -> Optional[
 async def _persist_completed_reel_job_or_fail(
     job_id: str, job_data: Dict[str, Any], output_dir: str, user_id: Optional[str],
     source_is_url: bool, target_json: str, clips: List[Dict[str, Any]], start_ts: float,
+    transcript: Optional[Dict[str, Any]] = None,
 ):
     try:
         project_id = job_data.get("project_id") if job_data else None
@@ -2494,6 +2759,7 @@ async def _persist_completed_reel_job_or_fail(
             clips=clips,
             uses_youtube_source=source_is_url,
             project_id=project_id,
+            transcript=transcript,
         )
     except Exception as persist_error:
         jobs[job_id]['status'] = 'failed'
@@ -2526,6 +2792,35 @@ def _enrich_clips_with_saved_rows(clips: List[Dict[str, Any]], saved_rows: List[
             clip_copy['preview_image_url'] = saved_rows[i].get('reel_preview_url') or saved_rows[i].get('reel_thumbnail_url') or ''
         enriched_clips.append(clip_copy)
     return enriched_clips
+
+
+async def _debit_auto_caption_credits_for_completed_job(job_id: str, user_id: Optional[str], saved_rows: List[Dict[str, Any]]) -> None:
+    """Bills the per-clip auto-caption credit cost recorded on each saved
+    reel row (see _burn_default_captions_for_clip) -- additive to the reel
+    generation charge in _finalize_completed_reel_billing, never folded
+    into it, since its storage side is already counted in that charge's
+    total_reel_size_bytes (reel_size_bytes is the post-burn, captioned
+    file size)."""
+    auto_caption_credit_total = sum(
+        float(((row.get("billing_details") or {}).get("auto_caption") or {}).get("credit_cost") or 0.0)
+        for row in saved_rows
+    )
+    if not (is_supabase_configured() and user_id and auto_caption_credit_total > 0):
+        return
+    try:
+        caption_debited = await supabase_deduct_user_credits(user_id, auto_caption_credit_total, 0.0)
+        if caption_debited:
+            await supabase_insert_user_data_history(
+                user_id=user_id,
+                credit=auto_caption_credit_total,
+                storage=0.0,
+                operation="output",
+                operation_type="sous_titre",
+                operation_id=f"{job_id}:auto_captions",
+            )
+    except Exception as caption_billing_error:
+        logger.exception("Auto-caption billing update failed for job %s", job_id)
+        jobs[job_id]['logs'].append(f"Auto-caption billing update failed: {caption_billing_error}")
 
 
 async def _finalize_completed_reel_billing(
@@ -2563,6 +2858,10 @@ async def _finalize_completed_reel_billing(
         except Exception as billing_error:
             logger.exception("Billing update failed")
             jobs[job_id]['logs'].append(f"Billing update failed: {billing_error}")
+
+    # Additive to the reel generation charge above -- see
+    # _debit_auto_caption_credits_for_completed_job for why.
+    await _debit_auto_caption_credits_for_completed_job(job_id, user_id, saved_rows)
 
     result_payload = {
         'clips': enriched_clips,
@@ -2637,6 +2936,137 @@ async def _update_project_on_reel_completion(
         logger.warning(f"Failed to update project status to completed: {str(e)}")
 
 
+_SOURCE_VIDEO_BASENAME = "source"
+_SOURCE_VIDEO_EXTENSIONS = _COMMON_VIDEO_EXTENSIONS + (".m4v",)
+
+
+def _find_leftover_source_video(output_dir: str) -> Optional[str]:
+    """Locates the original video main.py downloaded for a plain YouTube URL
+    job (kept around thanks to --keep-original), when app.py itself never
+    learned its path (see _prepare_process_job_from_url's `-u` branch).
+    Picks the first video file in the job's output dir that isn't a
+    generated reel clip (`..._clip_N.mp4`) or an already-preserved source."""
+    if not os.path.isdir(output_dir):
+        return None
+    for name in sorted(os.listdir(output_dir)):
+        lower = name.lower()
+        if not lower.endswith(_SOURCE_VIDEO_EXTENSIONS):
+            continue
+        if "_clip_" in lower or lower.startswith(f"{_SOURCE_VIDEO_BASENAME}."):
+            continue
+        return os.path.join(output_dir, name)
+    return None
+
+
+async def _upload_and_bill_preserved_source_video(job_id: str, user_id: Optional[str], local_path: str) -> None:
+    """Backs up the locally preserved source video to S3 and debits the
+    storage it consumes from the user's quota, the same way every other
+    reel artifact's storage is billed (see _build_reel_row_for_clip's
+    original_s3_key). Best-effort: the local copy is what actually powers
+    manual clipping (_resolve_preserved_source_video), so a failure here
+    never affects that -- it only means the backup/billing didn't happen."""
+    if not user_id or not is_supabase_configured():
+        return
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket:
+        return
+    try:
+        ext = os.path.splitext(local_path)[1].lower() or ".mp4"
+        s3_key = f"reels/{user_id}/{job_id}/source{ext}"
+        if not upload_file_to_s3(local_path, bucket, s3_key):
+            return
+        storage_gb = _bytes_to_gb(int(os.path.getsize(local_path) or 0))
+        if storage_gb <= 0:
+            return
+        debited = await supabase_deduct_user_credits(user_id, 0.0, -storage_gb)
+        if debited:
+            await supabase_insert_user_data_history(
+                user_id=user_id,
+                credit=0.0,
+                storage=round(storage_gb, 6),
+                operation="output",
+                operation_type="generation_reel",
+                operation_id=f"{job_id}:source_video",
+            )
+    except Exception as exc:
+        logger.warning("Failed to upload/bill preserved source video for job %s: %s", job_id, exc)
+
+
+async def _preserve_source_video_for_manual_clipping(
+    job_id: str, job_data: Dict[str, Any], output_dir: str, user_id: Optional[str] = None,
+) -> None:
+    """Keeps a copy of the full source video after a reel job completes, so
+    the user can later pick their own start/end range by hand (see
+    POST /api/reels/{job_id}/custom-clip) instead of only the AI-selected
+    clips -- even though the AI pipeline itself only ever needed the source
+    transiently and normally has it deleted (uploads: run_job's
+    _cleanup_job_input_file; plain YouTube URLs: main.py's own end-of-run
+    cleanup, unless --keep-original was passed). The copy is also backed up
+    to S3 and billed as storage against the user's quota, like any other
+    reel artifact (see _upload_and_bill_preserved_source_video).
+
+    Best-effort: any failure here must never fail the job itself -- it just
+    means manual clipping won't be available for this particular job."""
+    try:
+        candidate = str(job_data.get("input_path") or "")
+        if not candidate or not os.path.exists(candidate):
+            candidate = _find_leftover_source_video(output_dir) or ""
+        if not candidate or not os.path.exists(candidate):
+            return
+        ext = os.path.splitext(candidate)[1].lower() or ".mp4"
+        if ext not in _SOURCE_VIDEO_EXTENSIONS:
+            ext = ".mp4"
+        dest = os.path.join(output_dir, f"{_SOURCE_VIDEO_BASENAME}{ext}")
+        if os.path.abspath(candidate) != os.path.abspath(dest):
+            shutil.copyfile(candidate, dest)
+        await _upload_and_bill_preserved_source_video(job_id, user_id, dest)
+    except Exception as exc:
+        logger.warning("Failed to preserve source video for manual clipping (job %s): %s", job_id, exc)
+
+
+def _resolve_preserved_source_video(output_dir: str) -> Optional[str]:
+    """Finds the source video _preserve_source_video_for_manual_clipping
+    saved for this job, if any (and if the job's output dir hasn't been
+    swept yet by the retention cleanup -- see JOB_RETENTION_SECONDS)."""
+    if not os.path.isdir(output_dir):
+        return None
+    for ext in _SOURCE_VIDEO_EXTENSIONS:
+        candidate = os.path.join(output_dir, f"{_SOURCE_VIDEO_BASENAME}{ext}")
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _ensure_preserved_source_video_available(job_id: str, user_id: str, output_dir: str) -> Optional[str]:
+    """Like _resolve_preserved_source_video, but falls back to re-downloading
+    the S3 backup (see _upload_and_bill_preserved_source_video) when the
+    local copy has been swept by the retention cleanup -- so manual clipping
+    (and the project-level "Creation manuelle" scene view) keeps working
+    long after a job's output dir is gone, not just within the first hour."""
+    local_path = _resolve_preserved_source_video(output_dir)
+    if local_path:
+        return local_path
+
+    if not (is_supabase_configured() and user_id):
+        return None
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket:
+        return None
+
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        for ext in _SOURCE_VIDEO_EXTENSIONS:
+            s3_key = f"reels/{user_id}/{job_id}/source{ext}"
+            if get_s3_object_size(bucket, s3_key) <= 0:
+                continue
+            dest = os.path.join(output_dir, f"{_SOURCE_VIDEO_BASENAME}{ext}")
+            if download_s3_object(bucket, s3_key, dest):
+                return dest
+    except Exception as exc:
+        logger.warning("Failed to re-download preserved source video for job %s: %s", job_id, exc)
+    return None
+
+
 async def _handle_completed_reel_job_with_metadata(
     job_id: str, job_data: Dict[str, Any], output_dir: str, user_id: Optional[str],
     source_is_url: bool, start_ts: float, target_json: str, pipeline,
@@ -2656,9 +3086,12 @@ async def _handle_completed_reel_job_with_metadata(
     await pipeline.uploading_reels(len(clips))
     saved_rows = await _persist_completed_reel_job_or_fail(
         job_id, job_data, output_dir, user_id, source_is_url, target_json, clips, start_ts,
+        transcript=data.get("transcript"),
     )
     if saved_rows is None:
         return
+
+    await _preserve_source_video_for_manual_clipping(job_id, job_data, output_dir, user_id)
 
     enriched_clips = _enrich_clips_with_saved_rows(clips, saved_rows, job_id)
 
@@ -2837,11 +3270,23 @@ def _build_and_persist_caption_metadata(job_id: str, output_dir: str, source_nam
     _persist_metadata_json(metadata_path, metadata)
 
 
-def _upload_caption_source_and_thumbnail(input_path: str, user_id: Optional[str], job_id: str, bucket: str, local_video_ref: str):
+def _upload_caption_source_and_thumbnail(
+    input_path: str, user_id: Optional[str], job_id: str, bucket: str, local_video_ref: str,
+    original_path: Optional[str] = None,
+):
     caption_s3_key = f"captions/{user_id}/{job_id}/{os.path.basename(input_path)}"
     if not upload_file_to_s3(input_path, bucket, caption_s3_key):
         raise RuntimeError("Failed to upload caption source video to S3")
     media_url = _caption_media_url_from_s3_key(caption_s3_key) or local_video_ref
+
+    original_s3_key = ""
+    if original_path and os.path.exists(original_path):
+        original_s3_key = f"captions/{user_id}/{job_id}/original_{os.path.basename(original_path)}"
+        if not upload_file_to_s3(original_path, bucket, original_s3_key):
+            # Best-effort: the job's own (already captioned) output is
+            # already uploaded above -- losing the pre-caption original
+            # only means a later manual restyle rebuilds from it instead.
+            original_s3_key = ""
 
     thumbnail_ref = ""
     thumb_local = _generate_reel_thumbnail_from_video(input_path, OUTPUT_DIR, job_id, 0)
@@ -2855,13 +3300,14 @@ def _upload_caption_source_and_thumbnail(input_path: str, user_id: Optional[str]
         except Exception:
             pass
 
-    return caption_s3_key, media_url, thumbnail_ref
+    return caption_s3_key, media_url, thumbnail_ref, original_s3_key
 
 
 def _build_caption_row_payload(
     job_id: str, job_data: Dict[str, Any], user_id: Optional[str], source_name: str, title: str,
     duration_sec: float, media_url: str, thumbnail_ref: str, caption_s3_key: str,
     caption_required_credits: float, caption_storage_gb: float, caption_cost_breakdown: Dict[str, Any],
+    original_s3_key: str = "",
 ) -> Dict[str, Any]:
     now_iso = datetime.now(timezone.utc).isoformat()
     row_payload: Dict[str, Any] = {
@@ -2883,6 +3329,7 @@ def _build_caption_row_payload(
             "caption_max_duration_minutes": CAPTION_MAX_DURATION_MINUTES,
             "caption_max_storage_gb": CAPTION_MAX_STORAGE_GB,
             "duration_seconds": duration_sec,
+            "original_s3_key": original_s3_key,
         },
         "input_source_type": "file",
         "input_source_value": source_name,
@@ -3006,27 +3453,39 @@ async def _process_and_complete_caption_job(
 ) -> None:
     await pipeline.persisting()
     duration_sec = max(0.5, float(local_duration) or _estimate_transcript_duration_seconds(transcript))
-    caption_storage_gb = _bytes_to_gb(float(os.path.getsize(input_path) if os.path.exists(input_path) else 0))
+
+    captioned_path = os.path.join(output_dir, f"captioned_{os.path.basename(input_path)}")
+    default_style_kwargs = await _get_user_default_caption_style(user_id)
+    auto_captioned = await _burn_default_captions_for_clip(
+        input_path, captioned_path, transcript, 0.0, duration_sec, job_id, 0, default_style_kwargs,
+    )
+    primary_path = captioned_path if auto_captioned else input_path
+
+    caption_storage_gb = _bytes_to_gb(float(os.path.getsize(primary_path) if os.path.exists(primary_path) else 0))
     caption_cost_breakdown = _estimate_caption_cost_breakdown(
         duration_seconds=duration_sec,
-        size_bytes=float(os.path.getsize(input_path) if os.path.exists(input_path) else 0),
+        size_bytes=float(os.path.getsize(primary_path) if os.path.exists(primary_path) else 0),
         uses_assembly=True,
         uses_openai=True,
         uses_gemini=False,
     )
     title = os.path.splitext(source_name)[0] or "Sous-titres"
-    local_video_ref = f"/videos/{job_id}/{os.path.basename(input_path)}"
+    local_video_ref = f"/videos/{job_id}/{os.path.basename(primary_path)}"
 
     _build_and_persist_caption_metadata(job_id, output_dir, source_name, title, duration_sec, local_video_ref, transcript)
 
     bucket = os.environ.get("AWS_S3_BUCKET", "")
     if not bucket:
         raise RuntimeError("AWS_S3_BUCKET is required for caption persistence")
-    caption_s3_key, media_url, thumbnail_ref = _upload_caption_source_and_thumbnail(input_path, user_id, job_id, bucket, local_video_ref)
+    caption_s3_key, media_url, thumbnail_ref, original_s3_key = _upload_caption_source_and_thumbnail(
+        primary_path, user_id, job_id, bucket, local_video_ref,
+        original_path=input_path if auto_captioned else None,
+    )
 
     row_payload = _build_caption_row_payload(
         job_id, job_data, user_id, source_name, title, duration_sec, media_url, thumbnail_ref,
         caption_s3_key, caption_required_credits, caption_storage_gb, caption_cost_breakdown,
+        original_s3_key=original_s3_key,
     )
     normalized_item = await _save_caption_row_and_debit(row_payload, job_id, user_id, caption_required_credits, caption_storage_gb)
 
@@ -4236,7 +4695,14 @@ async def _prepare_process_job_from_url(url: str, user_id: str, job_id: str, job
     if input_path:
         cmd.extend(["-i", input_path])
     else:
-        cmd.extend(["-u", url])
+        # --keep-original: without it main.py deletes the video it downloads
+        # for a plain URL right after processing (see its __main__ cleanup),
+        # which would make manual custom-clip selection (see
+        # _preserve_source_video_for_manual_clipping) impossible for
+        # anything that went through this branch (i.e. genuine YouTube
+        # links, resolved via yt-dlp inside main.py rather than pre-
+        # downloaded here).
+        cmd.extend(["-u", url, "--keep-original"])
 
     return {
         "input_path": input_path,
@@ -4527,7 +4993,7 @@ async def get_status(job_id: str, user_id: Annotated[str, Depends(get_user_id_he
     return response
 
 from editor import VideoEditor
-from subtitles import generate_srt, burn_subtitles, generate_srt_from_video, SubtitleStyleOptions
+from subtitles import generate_srt, generate_highlighted_srt, burn_subtitles, generate_srt_from_video, SubtitleStyleOptions
 from hooks import add_hook_to_video
 from thumbnail import analyze_video_for_titles, refine_titles, generate_thumbnail, generate_youtube_description
 
@@ -5096,12 +5562,23 @@ async def get_clip_transcript(job_id: str, clip_index: int, request: Request):
 
     duration_sec = clip_end - clip_start
 
+    # The dashboard's client-side captions render (Remotion/WebCodecs, see
+    # ResultCard.jsx's handleCaptions) composites a brand new subtitle layer
+    # onto whatever video it's given -- if that's the already-captioned
+    # default clip, the old captions stay baked into the pixels underneath
+    # the new ones. Resolve the clean, pre-caption source here (same lookup
+    # add_subtitles uses server-side, see _resolve_authoritative_clean_video_
+    # source) so that render always starts from clean pixels.
+    clean_original_s3_key = await _resolve_authoritative_clean_video_source(job_id, clip_index, verified_user_id)
+    clean_video_url = _reel_media_url_from_s3_key(clean_original_s3_key) if clean_original_s3_key else ""
+
     return {
         "captions": captions,
         "durationSec": duration_sec,
         "language": (transcript or {}).get('language', 'en'),
         "subtitleConfig": saved_subtitle_config if isinstance(saved_subtitle_config, dict) else None,
         "remotionLayers": clip_data.get("remotion_layers") if isinstance(clip_data, dict) else None,
+        "cleanVideoUrl": clean_video_url,
     }
 
 
@@ -5411,7 +5888,7 @@ def _resolve_captioned_reel_output_path(job_id: str, clip_index: int, filename: 
     os.makedirs(output_dir, exist_ok=True)
     upload_name = str(filename or "captioned.mp4")
     ext = os.path.splitext(upload_name)[1].lower()
-    if ext not in {".mp4", ".mov", ".webm", ".mkv"}:
+    if ext not in _COMMON_VIDEO_EXTENSIONS:
         ext = ".mp4"
     output_filename = f"captioned_{clip_index}_{int(time.time())}{ext}"
     output_path = os.path.join(output_dir, output_filename)
@@ -5722,6 +6199,56 @@ async def _resolve_subtitle_source_video_history(job_id: str, clip_index: int, u
     return source_video_url_for_history
 
 
+async def _resolve_authoritative_clean_video_source(job_id: str, clip_index: int, user_id: str) -> str:
+    """Resolves the S3 key of the clean, pre-caption clip stored at
+    generation time (see _build_reel_row_for_clip's original_s3_key /
+    _burn_default_captions_for_clip's caption-job equivalent).
+
+    The app now shows/works off a single video URL per clip -- there's no
+    "original vs captioned" distinction exposed anywhere anymore (see
+    _normalize_reel_row/_normalize_caption_row) -- so a subtitle burn can no
+    longer trust whatever URL the request carries to be caption-free. This
+    looks the clean source up server-side instead, so re-burning always
+    starts from clean pixels and replaces the default captions rather than
+    drawing a second layer on top of them. Returns "" when there is none
+    (clip was never auto-captioned, or Supabase isn't configured), in which
+    case the caller falls back to the request's own video reference, which
+    is clean in that case anyway."""
+    if not is_supabase_configured():
+        return ""
+    try:
+        reel_row = await supabase_get_reel_by_job_clip(job_id, clip_index, user_id=user_id)
+        original_s3_key = str(((reel_row or {}).get("billing_details") or {}).get("original_s3_key") or "")
+        if original_s3_key:
+            return original_s3_key
+    except Exception:
+        pass
+    try:
+        caption_row = await supabase_get_caption_by_job_clip(job_id, clip_index, user_id)
+        original_s3_key = str(((caption_row or {}).get("generation_inputs") or {}).get("original_s3_key") or "")
+        if original_s3_key:
+            return original_s3_key
+    except Exception:
+        pass
+    return ""
+
+
+async def _resolve_burn_source_input_path(
+    req, output_dir: str, clip_data: Dict[str, Any], metadata_path: str, user_id: str,
+):
+    """Like _resolve_add_subtitles_input_path, but prefers the clean,
+    pre-caption source recorded at generation time over whatever video the
+    request points at -- used by endpoints that burn a *new* subtitle track
+    (add_subtitles, translate_clip), so a restyle/translation always
+    replaces the default captions instead of stacking on top of them."""
+    original_s3_key = await _resolve_authoritative_clean_video_source(req.job_id, req.clip_index, user_id)
+    if original_s3_key:
+        clean_source_url = _reel_media_url_from_s3_key(original_s3_key)
+        if clean_source_url:
+            return _download_input_url_to_job_dir(clean_source_url, req.job_id)
+    return _resolve_add_subtitles_input_path(req, output_dir, clip_data, metadata_path)
+
+
 def _resolve_add_subtitles_input_path(req: SubtitleRequest, output_dir: str, clip_data: Dict[str, Any], metadata_path: str):
     if req.input_filename:
         filename = _sanitize_input_filename(req.input_filename)
@@ -5746,19 +6273,25 @@ def _resolve_add_subtitles_input_path(req: SubtitleRequest, output_dir: str, cli
     return input_path, filename
 
 
-async def _generate_subtitle_srt(input_path: str, filename: str, transcript: Dict[str, Any], clip_data: Dict[str, Any], srt_path: str, words_per_line: int) -> bool:
+async def _generate_subtitle_srt(input_path: str, filename: str, transcript: Dict[str, Any], clip_data: Dict[str, Any], srt_path: str, words_per_line: int, animation: str = "none") -> bool:
+    # Any animation other than "none" highlights the currently-spoken word
+    # (see Subtitles.tsx's isActive -> color = highlightColor) -- mark up
+    # the SRT so burn_subtitles reproduces that in the burned-in video.
+    highlight = animation != "none"
+
     # Check if this is a dubbed video - if so, transcribe it fresh
     is_dubbed = filename.startswith("translated_")
     if is_dubbed:
         print("🎙️ Dubbed video detected, transcribing audio for subtitles...")
 
         def run_transcribe_srt():
-            return generate_srt_from_video(input_path, srt_path, max_words_per_line=words_per_line)
+            return generate_srt_from_video(input_path, srt_path, max_words_per_line=words_per_line, highlight=highlight)
 
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, run_transcribe_srt)
 
-    return generate_srt(
+    srt_generator = generate_highlighted_srt if highlight else generate_srt
+    return srt_generator(
         transcript,
         clip_data['start'],
         clip_data['end'],
@@ -5782,6 +6315,7 @@ def _burn_subtitles_for_request(req: SubtitleRequest, input_path: str, srt_path:
         bold=req.bold,
         italic=req.italic,
         text_case=req.text_case,
+        highlight_color=req.highlight_color,
     )
     burn_subtitles(
         input_path,
@@ -5933,7 +6467,7 @@ async def add_subtitles(req: SubtitleRequest, user_id: Annotated[str, Depends(ge
     clip_data = clips[req.clip_index]
     source_video_url_for_history = await _resolve_subtitle_source_video_history(req.job_id, req.clip_index, user_id, clip_data)
 
-    input_path, filename = _resolve_add_subtitles_input_path(req, output_dir, clip_data, metadata_path)
+    input_path, filename = await _resolve_burn_source_input_path(req, output_dir, clip_data, metadata_path, user_id)
 
     # Define outputs
     srt_filename = f"subs_{req.clip_index}_{int(time.time())}.srt"
@@ -5946,7 +6480,7 @@ async def add_subtitles(req: SubtitleRequest, user_id: Annotated[str, Depends(ge
 
     try:
         words_per_line = max(2, min(8, int(req.words_per_line or 4)))
-        success = await _generate_subtitle_srt(input_path, filename, transcript, clip_data, srt_path, words_per_line)
+        success = await _generate_subtitle_srt(input_path, filename, transcript, clip_data, srt_path, words_per_line, animation=req.animation)
         if not success:
             raise HTTPException(status_code=400, detail="No words found for this clip range.")
 
@@ -5996,7 +6530,9 @@ class HookRequest(BaseModel):
     size: Optional[str] = "M" # S, M, L
 
 
-def _reset_clip_metadata_to_original(metadata_path: str, data: Dict[str, Any], clip_index: int) -> str:
+def _reset_clip_metadata_to_original(
+    metadata_path: str, data: Dict[str, Any], clip_index: int, default_video_url: Optional[str] = None,
+) -> str:
     clips = data.get("shorts") or []
     if clip_index < 0 or clip_index >= len(clips):
         raise HTTPException(status_code=404, detail=_CLIP_NOT_FOUND)
@@ -6006,13 +6542,19 @@ def _reset_clip_metadata_to_original(metadata_path: str, data: Dict[str, Any], c
     history_key = str(int(clip_index))
     entries = history.get(history_key) if isinstance(history, dict) else None
 
-    original_video_url = str(clip.get("original_video_url") or "").strip()
-    if not original_video_url and isinstance(entries, list) and entries:
-        original_video_url = str(entries[0].get("source_video_url") or "").strip()
-    if not original_video_url:
+    # Prefer the clip's recorded default style version (the auto-captioned
+    # video, properly sized/fonted -- see _record_default_style_version)
+    # over the bare, uncaptioned original: "reset" should bring back the
+    # default look, not strip captions off entirely.
+    reset_video_url = str(default_video_url or "").strip()
+    if not reset_video_url:
+        reset_video_url = str(clip.get("original_video_url") or "").strip()
+    if not reset_video_url and isinstance(entries, list) and entries:
+        reset_video_url = str(entries[0].get("source_video_url") or "").strip()
+    if not reset_video_url:
         raise HTTPException(status_code=400, detail="No original video reference found for reset")
 
-    clip["video_url"] = original_video_url
+    clip["video_url"] = reset_video_url
     clips[clip_index] = clip
     data["shorts"] = clips
     if isinstance(history, dict):
@@ -6020,7 +6562,20 @@ def _reset_clip_metadata_to_original(metadata_path: str, data: Dict[str, Any], c
         data["style_history"] = history
     _persist_metadata_json(metadata_path, data)
 
-    return original_video_url
+    return reset_video_url
+
+
+async def _find_default_style_version(job_id: str, clip_index: int, user_id: str) -> Optional[Dict[str, Any]]:
+    if not is_supabase_configured():
+        return None
+    try:
+        versions = await supabase_list_style_edit_versions(job_id, int(clip_index), user_id)
+    except Exception as e:
+        print(f"⚠️ Failed to load default style version: {e}")
+        return None
+    return next(
+        (v for v in versions if int(v.get("version_number") or 0) == _DEFAULT_STYLE_VERSION_NUMBER), None,
+    )
 
 
 @app.post("/api/reels/{job_id}/{clip_index}/captions/reset", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
@@ -6033,19 +6588,36 @@ async def reset_caption_style_history(
     if not metadata_path or not data:
         raise HTTPException(status_code=404, detail=_METADATA_NOT_FOUND)
 
-    original_video_url = _reset_clip_metadata_to_original(metadata_path, data, clip_index)
+    default_version = await _find_default_style_version(job_id, clip_index, user_id)
+    default_video_url = str((default_version or {}).get("output_video_url") or "")
+    reset_video_url = _reset_clip_metadata_to_original(metadata_path, data, clip_index, default_video_url=default_video_url)
 
     if is_supabase_configured():
         try:
+            # Clears every manual restyle, then restores the default version
+            # (rather than leaving the clip with no history row at all) so a
+            # later reset or a captions-editor "history" view still finds it.
             await supabase_delete_style_edit_versions(job_id, int(clip_index), user_id)
+            if default_version:
+                await supabase_insert_style_edit_version({
+                    "user_id": user_id,
+                    "job_id": job_id,
+                    "clip_index": int(clip_index),
+                    "version_number": _DEFAULT_STYLE_VERSION_NUMBER,
+                    "operation_type": default_version.get("operation_type") or "subtitle_style",
+                    "source_video_url": default_version.get("source_video_url") or "",
+                    "output_video_url": default_version.get("output_video_url") or "",
+                    "style_config": default_version.get("style_config") or dict(_DEFAULT_AUTO_CAPTION_STYLE_KWARGS),
+                    "billing_details": default_version.get("billing_details") or {},
+                })
         except Exception as e:
-            print(f"⚠️ Failed to delete style history versions: {e}")
+            print(f"⚠️ Failed to reset style history versions: {e}")
 
     return {
         "success": True,
         "job_id": job_id,
         "clip_index": clip_index,
-        "video_url": original_video_url,
+        "video_url": reset_video_url,
         "history_cleared": True,
     }
 
@@ -6100,6 +6672,341 @@ async def get_caption_style_history_debug(
             "db_latest_output_is_amazon": _looks_amazon_url(db_last.get("output_video_url")),
         },
     }
+
+
+# --- Custom reels: manual start/end selection on the source video, for
+# when the AI-generated clips aren't satisfying (see _preserve_source_video_
+# for_manual_clipping) ---
+
+_CUSTOM_REEL_CLIP_MIN_SECONDS = float(os.environ.get("CUSTOM_REEL_CLIP_MIN_SECONDS", "3"))
+_CUSTOM_REEL_CLIP_MAX_SECONDS = float(os.environ.get("CUSTOM_REEL_CLIP_MAX_SECONDS", "120"))
+
+
+class CustomReelClipRequest(BaseModel):
+    start_ms: int
+    end_ms: int
+    title: Optional[str] = None
+    # Explicit override for callers reaching this endpoint long after the
+    # generation job finished (see the project-level "Creation manuelle"
+    # scene view), when the in-memory `jobs[job_id]` entry this endpoint
+    # would otherwise read project_id from has long since expired/been
+    # dropped by a worker restart -- validated against the caller's own
+    # projects below, never trusted blindly.
+    project_id: Optional[str] = None
+
+
+@app.get("/api/reels/{job_id}/source", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
+async def get_reel_job_source_endpoint(job_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Tells the frontend whether the full source video is still available
+    for this reel job (see _preserve_source_video_for_manual_clipping), so
+    it can offer the "Reel personnalise" manual-trim option, and if so, the
+    URL/duration to load into the trimmer. Never 404s -- a job whose source
+    was never preserved or has since been swept by the retention cleanup
+    just reports itself unavailable, which the UI treats as "hide the
+    button" rather than an error."""
+    await _require_job_ownership(job_id, user_id)
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    source_path = _ensure_preserved_source_video_available(job_id, user_id, output_dir)
+    if not source_path:
+        return {"available": False}
+    return {
+        "available": True,
+        "source_url": f"/videos/{job_id}/{os.path.basename(source_path)}",
+        "duration_seconds": _probe_local_video_duration_seconds(source_path),
+    }
+
+
+async def _cut_and_verticalize_custom_clip(
+    source_path: str, start_seconds: float, end_seconds: float, output_dir: str, clip_filename: str,
+) -> str:
+    """Cuts [start_seconds, end_seconds] out of source_path and reframes it
+    to vertical the exact same way the AI pipeline does for each of its own
+    clips (main.py's process_video_to_vertical, scene-aware face tracking),
+    so a manually-picked reel looks consistent with an AI-generated one
+    instead of a plain center-crop. Both steps are blocking/CPU-bound
+    subprocess work, run off the event loop."""
+    from main import process_video_to_vertical, EXPORT_VIDEO_CRF, EXPORT_VIDEO_PRESET, EXPORT_AUDIO_BITRATE
+
+    temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
+    final_path = os.path.join(output_dir, clip_filename)
+
+    def _cut() -> None:
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start_seconds), "-to", str(end_seconds),
+            "-i", source_path,
+            "-c:v", "libx264", "-crf", EXPORT_VIDEO_CRF, "-preset", EXPORT_VIDEO_PRESET,
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", EXPORT_AUDIO_BITRATE,
+            temp_path,
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=FFMPEG_STEP_TIMEOUT_SECONDS)
+        if result.returncode != 0 or not os.path.exists(temp_path):
+            raise RuntimeError(f"FFmpeg cut failed: {result.stderr.decode(errors='replace')[-1000:]}")
+
+    def _verticalize() -> None:
+        try:
+            success = process_video_to_vertical(temp_path, final_path)
+        finally:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+        if not success or not os.path.exists(final_path):
+            raise RuntimeError("Vertical reframing failed")
+
+    await asyncio.to_thread(_cut)
+    await asyncio.to_thread(_verticalize)
+    return final_path
+
+
+def _validate_custom_reel_clip_timing(req: "CustomReelClipRequest") -> tuple:
+    """Validates the user-picked start/end range for a custom reel clip.
+    Returns (duration_seconds, start_seconds, end_seconds)."""
+    start_ms = max(0, int(req.start_ms))
+    end_ms = int(req.end_ms)
+    if end_ms <= start_ms:
+        raise HTTPException(status_code=400, detail="end_ms doit etre superieur a start_ms")
+    duration_seconds = (end_ms - start_ms) / 1000.0
+    if duration_seconds < _CUSTOM_REEL_CLIP_MIN_SECONDS or duration_seconds > _CUSTOM_REEL_CLIP_MAX_SECONDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"La duree du clip doit etre comprise entre {_CUSTOM_REEL_CLIP_MIN_SECONDS:.0f} et {_CUSTOM_REEL_CLIP_MAX_SECONDS:.0f} secondes",
+        )
+    return duration_seconds, start_ms / 1000.0, end_ms / 1000.0
+
+
+def _resolve_custom_reel_clip_source_path(job_id: str, user_id: str, output_dir: str, end_seconds: float) -> str:
+    """Resolves the preserved source video for a custom-clip cut and checks
+    that the requested range actually fits within it."""
+    source_path = _ensure_preserved_source_video_available(job_id, user_id, output_dir)
+    if not source_path:
+        raise HTTPException(status_code=404, detail="La video source n'est plus disponible pour ce job")
+    source_duration = _probe_local_video_duration_seconds(source_path)
+    if source_duration > 0 and end_seconds > source_duration + 0.5:
+        raise HTTPException(status_code=400, detail="La plage selectionnee depasse la duree de la video source")
+    return source_path
+
+
+async def _resolve_custom_reel_project_id(job_data: Dict[str, Any], req: "CustomReelClipRequest", user_id: str) -> Optional[str]:
+    """Defaults to the job's own project, but lets the request target a
+    different (still user-owned) project instead."""
+    if not req.project_id:
+        return job_data.get("project_id")
+    if not await supabase_get_project(req.project_id, user_id):
+        raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND)
+    return req.project_id
+
+
+async def _finalize_custom_reel_clip_creation(
+    job_id: str, user_id: str, project_id: Optional[str],
+    reel_row: Dict[str, Any], saved_row: Dict[str, Any],
+    clip_entry: Dict[str, Any], next_index: int,
+) -> None:
+    """Debits the actual cost, bumps the project's output count, and mirrors
+    the new clip into the job's in-memory result -- the bookkeeping
+    _persist_reels_for_job already does for AI-generated clips, done here
+    explicitly since a custom clip is a single reel saved outside that
+    batch path."""
+    billing_details = reel_row.get("billing_details") or {}
+    total_credits = float(billing_details.get("final_credits") or 0.0) + float((billing_details.get("auto_caption") or {}).get("credit_cost") or 0.0)
+    storage_gb = _bytes_to_gb(float(reel_row.get("reel_size_bytes") or 0))
+    debit_ok = await reel_job_manager.debit_credits_for_job(
+        job_id=job_id, user_id=user_id, credits=total_credits, storage_delta=-storage_gb,
+        operation_type="generation_reel", reserved_credits=0.0,
+    )
+    if not debit_ok:
+        logger.warning("Failed to debit credits for custom reel clip (job %s, user %s)", job_id, user_id)
+
+    if project_id:
+        try:
+            await supabase_increment_project_output_count(project_id, user_id=user_id)
+        except Exception as e:
+            logger.warning("Failed to increment project output count: %s", e)
+
+    if job_id not in jobs or not isinstance(jobs[job_id].get("result"), dict):
+        return
+    jobs[job_id]["result"].setdefault("clips", []).append({
+        **clip_entry,
+        "video_url": saved_row.get("reel_playback_url"),
+        "reel_clip_index": next_index - 1,
+        "reel_job_id": job_id,
+    })
+    jobs[job_id]["result"].setdefault("reels", []).append(saved_row)
+
+
+@app.post("/api/reels/{job_id}/custom-clip", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 500: {"description": "Internal Server Error"}, 503: {"description": "Service Unavailable"}})
+async def create_custom_reel_clip_endpoint(
+    job_id: str, req: CustomReelClipRequest, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Cuts a reel clip from the exact start/end range the user picked by
+    hand on the source video, instead of one of the AI-selected scenes --
+    the "Reel personnalise" option for when the AI generation isn't
+    satisfying. Produces and bills the clip the same way an AI-generated
+    one is (same _build_reel_row_for_clip path: S3 upload, thumbnail,
+    default captions, credits/storage debit)."""
+    await _require_job_ownership(job_id, user_id)
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    duration_seconds, start_seconds, end_seconds = _validate_custom_reel_clip_timing(req)
+
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    source_path = _resolve_custom_reel_clip_source_path(job_id, user_id, output_dir, end_seconds)
+
+    metadata_path, data = await _get_or_build_job_metadata(job_id, 0, user_id=user_id)
+    if not metadata_path or not data:
+        raise HTTPException(status_code=404, detail=_METADATA_NOT_FOUND)
+
+    # Rough upfront sanity check (fixed bitrate assumption -- we don't have
+    # a real file yet) before spending CPU on the cut/vertical-reframe
+    # pipeline. The precise charge (base cost + any auto-caption add-on) is
+    # computed and debited below from the actual produced file.
+    job_data = jobs.get(job_id) or {}
+    uses_youtube_source = _job_uses_remote_source(job_data) if job_data else False
+    precheck_credits = _estimate_reel_required_credits(
+        duration_seconds=duration_seconds, size_bytes=duration_seconds * 1_000_000, uses_youtube_source=uses_youtube_source,
+    )
+    await _assert_user_has_required_credits(user_id, precheck_credits)
+
+    clips = data.get("shorts") or []
+    next_index = len(clips) + 1
+    base_name = os.path.basename(metadata_path).replace(_METADATA_JSON_SUFFIX, "")
+    clip_filename = f"{base_name}_clip_{next_index}.mp4"
+
+    try:
+        await _cut_and_verticalize_custom_clip(source_path, start_seconds, end_seconds, output_dir, clip_filename)
+    except Exception as exc:
+        raise _generic_error("Custom reel clip cut failed", exc, detail="Impossible de generer ce reel personnalise.")
+
+    title = (req.title or "").strip() or f"Reel personnalise {next_index}"
+    clip_entry = {
+        "title": title,
+        "start": start_seconds,
+        "end": end_seconds,
+        "duration": duration_seconds,
+        "video_title_for_youtube_short": title,
+        "video_description_for_instagram": "",
+        "video_description_for_tiktok": "",
+        "is_custom": True,
+    }
+    clips.append(clip_entry)
+    data["shorts"] = clips
+    _persist_metadata_json(metadata_path, data)
+
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket:
+        raise HTTPException(status_code=503, detail="AWS_S3_BUCKET is required for reel persistence")
+
+    project_id = await _resolve_custom_reel_project_id(job_data, req, user_id)
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    reel_row = await _build_reel_row_for_clip(
+        job_id, user_id, output_dir, bucket, base_name, clip_entry, next_index, now_iso,
+        uses_youtube_source, project_id, data.get("transcript"),
+    )
+    if not reel_row:
+        raise HTTPException(status_code=500, detail="Echec de la creation du reel personnalise")
+
+    saved_rows = await supabase_insert_reels([reel_row])
+    if not saved_rows:
+        raise HTTPException(status_code=500, detail="Echec de l'enregistrement du reel personnalise")
+    saved_row = _normalize_reel_row(saved_rows[0])
+
+    await _finalize_custom_reel_clip_creation(job_id, user_id, project_id, reel_row, saved_row, clip_entry, next_index)
+
+    return saved_row
+
+
+def _flatten_transcript_words(transcript: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Flattens a job's whole-source transcript (metadata.json's `transcript`
+    field) into one word list at absolute times, in milliseconds -- unlike
+    _extract_clip_captions_from_transcript, this is not windowed/offset to a
+    single AI-picked clip's range, since the "Creation manuelle" scene view
+    needs every word across the full source video."""
+    words: List[Dict[str, Any]] = []
+    if not isinstance(transcript, dict):
+        return words
+    for segment in (transcript.get("segments") or []):
+        for word_info in (segment.get("words") or []):
+            text = str(word_info.get("word") or "").strip()
+            if not text:
+                continue
+            try:
+                start_ms = int(float(word_info.get("start", 0) or 0) * 1000)
+                end_ms = int(float(word_info.get("end", 0) or 0) * 1000)
+            except (TypeError, ValueError):
+                continue
+            words.append({"text": text, "startMs": start_ms, "endMs": end_ms})
+    return words
+
+
+def _generate_scene_waveform_png(source_path: str, output_dir: str) -> Optional[str]:
+    """Renders a static waveform image for the manual-creation scene view
+    via ffmpeg's showwavespic (a single frame -- fast even for a several-
+    minute source), so the frontend doesn't have to download and decode the
+    whole video client-side with the Web Audio API just to draw one.
+    Cached alongside the source video; regenerated only if missing or
+    older than it. Returns None (no waveform, not a hard failure) if the
+    source has no audio track or ffmpeg otherwise fails."""
+    waveform_path = os.path.join(output_dir, "waveform.png")
+    try:
+        if os.path.exists(waveform_path) and os.path.getmtime(waveform_path) >= os.path.getmtime(source_path):
+            return waveform_path
+        cmd = [
+            "ffmpeg", "-y", "-i", source_path,
+            "-filter_complex", "[0:a]aformat=channel_layouts=mono,showwavespic=s=1600x200:colors=0x10B981",
+            "-frames:v", "1", waveform_path,
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=FFMPEG_STEP_TIMEOUT_SECONDS)
+        if result.returncode != 0 or not os.path.exists(waveform_path):
+            logger.warning("Waveform generation failed for %s: %s", source_path, result.stderr.decode(errors="replace")[-500:])
+            return None
+        return waveform_path
+    except Exception as exc:
+        logger.warning("Waveform generation errored for %s: %s", source_path, exc)
+        return None
+
+
+@app.get("/api/projects/{project_id}/manual-scene", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def get_project_manual_scene(project_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Backs the project-level "Creation manuelle" view: the full source
+    video (or its S3 backup, re-downloaded on demand -- see
+    _ensure_preserved_source_video_available), a waveform image, and the
+    whole-source word-level transcript, so a user can hand-pick a range to
+    cut into a reel straight from the project page instead of only right
+    after a specific generation job completes (see /api/reels/{job_id}/
+    source, the job-scoped equivalent this builds on)."""
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_PROJECTS_NOT_CONFIGURED)
+
+    project = await supabase_get_project(project_id, user_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND)
+
+    job_row = await supabase_get_latest_job_record_by_project(project_id, user_id)
+    job_id = str(job_row.get("id") or "") if job_row else ""
+    if not job_id:
+        return {"available": False, "job_id": None}
+
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    source_path = _ensure_preserved_source_video_available(job_id, user_id, output_dir)
+    if not source_path:
+        return {"available": False, "job_id": job_id}
+
+    waveform_path = _generate_scene_waveform_png(source_path, output_dir)
+    _, data = await _get_or_build_job_metadata(job_id, 0, user_id=user_id)
+    words = _flatten_transcript_words((data or {}).get("transcript"))
+
+    return {
+        "available": True,
+        "job_id": job_id,
+        "source_url": f"/videos/{job_id}/{os.path.basename(source_path)}",
+        "duration_seconds": _probe_local_video_duration_seconds(source_path),
+        "waveform_url": f"/videos/{job_id}/{os.path.basename(waveform_path)}" if waveform_path else None,
+        "words": words,
+    }
+
 
 def _run_add_hook(input_path: str, text: str, output_path: str, position: str, font_scale: float) -> None:
     add_hook_to_video(input_path, text, output_path, position=position, font_scale=font_scale)
@@ -6581,6 +7488,81 @@ def get_languages():
     }
 
 
+class CaptionStyleThemeRequest(BaseModel):
+    name: str
+    style: Dict[str, Any]
+
+
+@app.get("/api/caption-style-default", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
+async def get_default_caption_style_endpoint(user_id: Annotated[str, Depends(get_user_id_header)]):
+    return {"style": await _get_user_default_caption_style(user_id)}
+
+
+@app.put("/api/caption-style-default", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
+async def set_default_caption_style_endpoint(
+    payload: DefaultCaptionStyleRequest, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    existing = await supabase_list_style_edit_versions(
+        _DEFAULT_STYLE_SENTINEL_JOB_ID, _DEFAULT_STYLE_SENTINEL_CLIP_INDEX, user_id,
+    )
+    next_version = max((int(v.get("version_number") or 0) for v in existing), default=0) + 1
+    style_config = payload.model_dump()
+
+    await supabase_insert_style_edit_version({
+        "user_id": user_id,
+        "job_id": _DEFAULT_STYLE_SENTINEL_JOB_ID,
+        "clip_index": _DEFAULT_STYLE_SENTINEL_CLIP_INDEX,
+        "version_number": next_version,
+        "operation_type": "subtitle_style_default",
+        "source_video_url": "",
+        "output_video_url": "",
+        "style_config": style_config,
+    })
+    return {"success": True, "style": style_config}
+
+
+@app.get("/api/caption-style-themes", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
+async def list_caption_style_themes_endpoint(user_id: Annotated[str, Depends(get_user_id_header)]):
+    """The user's own saved subtitle style presets ("themes") for the
+    CaptionsModal theme picker. Built-in themes are static frontend data
+    (dashboard/src/lib/captionThemes.js) and never appear here -- this only
+    ever returns what the user explicitly saved."""
+    if not is_supabase_configured():
+        return {"themes": []}
+    rows = await supabase_list_caption_style_themes(user_id)
+    return {"themes": [{"id": row.get("id"), "name": row.get("name"), "style": row.get("style") or {}} for row in rows]}
+
+
+@app.post("/api/caption-style-themes", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
+async def save_caption_style_theme_endpoint(req: CaptionStyleThemeRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Saves a custom theme under `name` -- overwrites the caller's own
+    theme of the same name if one already exists (see
+    upsert_caption_style_theme), so re-saving under a name already used is
+    how a saved theme gets updated."""
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Theme name is required")
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+    saved = await supabase_upsert_caption_style_theme(user_id, name, req.style or {})
+    if not saved:
+        raise HTTPException(status_code=503, detail="Failed to save theme")
+    return {"id": saved.get("id"), "name": saved.get("name"), "style": saved.get("style") or {}}
+
+
+@app.delete("/api/caption-style-themes/{theme_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def delete_caption_style_theme_endpoint(theme_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+    deleted = await supabase_delete_caption_style_theme(theme_id, user_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Theme not found")
+    return {"success": True}
+
+
 async def _resolve_translation_cache_and_owner(user_id: str, job_id: str, clip_index: int, translation_cache: Dict[str, Any]):
     transcription_row = None
     if is_supabase_configured():
@@ -6779,7 +7761,7 @@ async def translate_clip(req: TranslateRequest, user_id: Annotated[str, Depends(
         raise HTTPException(status_code=404, detail=_CLIP_NOT_FOUND)
 
     clip_data = clips[req.clip_index]
-    input_path, filename = _resolve_add_subtitles_input_path(req, output_dir, clip_data, metadata_path)
+    input_path, filename = await _resolve_burn_source_input_path(req, output_dir, clip_data, metadata_path, user_id)
 
     # Load clip transcript segments from existing metadata transcript (no re-transcription)
     source_lang = _normalize_lang(req.source_language) or _normalize_lang((data.get("transcript") or {}).get("language"))
@@ -6915,7 +7897,7 @@ def _resolve_public_video_url(video_ref: str, request: Request, job_id: str) -> 
     base_url = SOCIAL_BASE_URL or str(request.base_url).rstrip("/")
     return f"{base_url}/videos/{job_id}/{ref}"
 
-async def _schedule_social_post_job(
+async def _schedule_reel_social_post_job(
     user_id: str, platform_name: str, req: "SocialPostRequest", publish_priority: int,
     scheduled_for, final_title: str, final_description: str, public_video_url: str,
 ) -> Dict[str, Any]:
@@ -6944,7 +7926,7 @@ async def _schedule_social_post_job(
     }
 
 
-async def _publish_social_post_now(
+async def _publish_reel_social_post_now(
     user_id: str, platform_name: str, publish_priority: int,
     final_title: str, final_description: str, public_video_url: str, local_video_path: str,
 ) -> Dict[str, Any]:
@@ -7016,12 +7998,12 @@ async def post_to_socials(req: SocialPostRequest, request: Request, user_id_head
 
     for platform_name in selected_platforms:
         if is_scheduled:
-            results[platform_name] = await _schedule_social_post_job(
+            results[platform_name] = await _schedule_reel_social_post_job(
                 user_id, platform_name, req, publish_priority, scheduled_for, final_title, final_description, public_video_url,
             )
             continue
 
-        result = await _publish_social_post_now(
+        result = await _publish_reel_social_post_now(
             user_id, platform_name, publish_priority, final_title, final_description, public_video_url, local_video_path,
         )
         results[platform_name] = result
@@ -9233,6 +10215,281 @@ async def _debit_publish_credits_after_share(user_id: str, operation_id: str, re
     )
 
 
+# ---------------------------------------------------------------------------
+# Social posts: a user-authored post (with an optional Facebook background
+# theme, reusing anonymous_stories.BACKGROUND_PRESETS) published together
+# with zero or more follow-up comments, posted by the connected Page/account
+# itself right after the post goes live. Billed the same as any other
+# publication (_debit_publish_credits_after_share / _debit_scheduled_publish_
+# credits) -- comments ride along on the same charge, they don't add their
+# own cost.
+# ---------------------------------------------------------------------------
+
+_SOCIAL_POST_PLATFORMS = {"facebook", "linkedin"}
+
+
+class SocialPostCommentInput(BaseModel):
+    text: str = ""
+    link: Optional[str] = None
+    image_url: Optional[str] = None
+
+
+class CreateSocialPostRequest(BaseModel):
+    text: str
+    platforms: List[str]
+    background_id: Optional[str] = None
+    comments: List[SocialPostCommentInput] = []
+    scheduled_date: Optional[str] = None
+    timezone: Optional[str] = "UTC"
+
+
+def _resolve_social_post_platforms(platforms: Optional[List[str]]) -> List[str]:
+    candidate = [p.strip().lower() for p in (platforms or []) if isinstance(p, str) and p.strip()]
+    result: List[str] = []
+    for p in candidate:
+        if p in _SOCIAL_POST_PLATFORMS and p not in result:
+            result.append(p)
+    if not result:
+        raise HTTPException(status_code=400, detail="platforms must include at least one of: facebook, linkedin")
+    return result
+
+
+def _build_comment_message(comment: "SocialPostCommentInput") -> str:
+    text = (comment.text or "").strip()
+    link = (comment.link or "").strip()
+    if link and link not in text:
+        text = f"{text}\n{link}".strip()
+    return text
+
+
+async def _post_facebook_comment(access_token: str, object_id: str, message: str, attachment_url: Optional[str] = None) -> Dict[str, Any]:
+    if not object_id or object_id == "n/a":
+        raise HTTPException(status_code=400, detail="Missing Facebook post id to comment on")
+    if not access_token:
+        raise HTTPException(status_code=401, detail=_FACEBOOK_TOKEN_EXPIRED_OR_MISSING)
+
+    data = {"message": message, "access_token": access_token}
+    if attachment_url:
+        data["attachment_url"] = attachment_url
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(f"https://graph.facebook.com/v19.0/{object_id}/comments", data=data)
+    await _raise_for_status_or_502(response, "Facebook")
+    return response.json()
+
+
+async def _post_linkedin_comment(access_token: str, owner_urn: str, share_urn: str, message: str) -> Dict[str, Any]:
+    # LinkedIn's Social Actions comments API is text-only -- unlike Facebook's
+    # /comments, it has no attachment_url equivalent, so a comment's link is
+    # folded into the message text (see _build_comment_message) and any
+    # comment.image_url is simply not usable here.
+    if not share_urn or share_urn == "n/a":
+        raise HTTPException(status_code=400, detail="Missing LinkedIn post id to comment on")
+
+    encoded_urn = quote(share_urn, safe="")
+    payload = {"actor": owner_urn, "message": {"text": message}}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            f"https://api.linkedin.com/rest/socialActions/{encoded_urn}/comments",
+            headers=_linkedin_headers(access_token),
+            json=payload,
+        )
+    await _raise_for_status_or_502(response, "LinkedIn")
+    comment_id = response.headers.get("x-restli-id") or response.headers.get("X-RestLi-Id")
+    return {"id": comment_id}
+
+
+async def _post_platform_comment(
+    platform_name: str, account: Dict[str, Any], token: str, post_external_id: str, comment: "SocialPostCommentInput",
+) -> Dict[str, Any]:
+    message = _build_comment_message(comment)
+    if platform_name == "facebook":
+        return await _post_facebook_comment(token, post_external_id, message, comment.image_url or comment.link)
+    if platform_name == "linkedin":
+        owner_urn = f"urn:li:person:{account.get('platform_user_id')}"
+        return await _post_linkedin_comment(token, owner_urn, post_external_id, message)
+    raise HTTPException(status_code=404, detail=_UNSUPPORTED_PLATFORM)
+
+
+async def _post_comments_sequence(
+    platform_name: str, account: Dict[str, Any], post_external_id: str, comments: List["SocialPostCommentInput"],
+) -> List[Dict[str, Any]]:
+    """Posts every comment, in order, as the connected account itself. A
+    comment that fails is recorded and skipped rather than aborting the rest
+    -- the post itself already succeeded by the time this runs, so a single
+    rejected comment (rate limit, moderation, ...) shouldn't take the
+    remaining ones down with it."""
+    results: List[Dict[str, Any]] = []
+    if not comments:
+        return results
+    token = await get_valid_token(account)
+    for comment in comments:
+        try:
+            comment_result = await _post_platform_comment(platform_name, account, token, post_external_id, comment)
+            results.append({"success": True, "id": comment_result.get("id"), "text": comment.text})
+        except Exception as exc:
+            logger.warning("Failed to post comment on %s post %s: %s", platform_name, post_external_id, exc)
+            results.append({"success": False, "error": str(exc), "text": comment.text})
+    return results
+
+
+def _build_social_post_publish_payload(text_value: str, background_id: Optional[str]) -> "PublishRequest":
+    return PublishRequest(
+        user_id="",
+        title="Vireel",
+        description=text_value,
+        text=text_value,
+        caption=text_value,
+        facebook_text_format_preset_id=anonymous_stories.get_facebook_text_format_preset_id(background_id),
+    )
+
+
+async def _publish_social_post_now(
+    user_id: str, platform_name: str, publish_priority: int, text_value: str,
+    background_id: Optional[str], comments: List["SocialPostCommentInput"],
+) -> Dict[str, Any]:
+    publish_job_id = await _insert_publish_job(
+        user_id=user_id,
+        platform=platform_name,
+        external_id="n/a",
+        status="queued",
+        priority=publish_priority,
+        payload={"source_type": "social_post", "comments": [c.model_dump() for c in comments]},
+    )
+    try:
+        await _update_publish_job_status(publish_job_id, "processing")
+        account = await _get_social_account(user_id, platform_name)
+        if not account:
+            raise HTTPException(status_code=404, detail=f"No connected {platform_name} account found")
+
+        publish_payload = _build_social_post_publish_payload(text_value, background_id)
+        publish_payload.user_id = user_id
+        platform_result = await publish_post(account, publish_payload)
+        external_id = str(platform_result.get("publish_id") or platform_result.get("id") or "n/a")
+        post_url = _build_social_post_url(platform_name, platform_result)
+
+        comments_results = await _post_comments_sequence(platform_name, account, external_id, comments)
+
+        await _update_publish_job_status(
+            publish_job_id, "done", external_id=external_id, post_url=post_url,
+            extra_payload={"comments_results": comments_results},
+        )
+        return {
+            "success": True,
+            "result": platform_result,
+            "publish_job_id": publish_job_id,
+            "comments_results": comments_results,
+        }
+    except Exception as exc:
+        err_msg = str(exc)
+        await _update_publish_job_status(publish_job_id, "failed", error_message=err_msg)
+        return {
+            "success": False,
+            "error": err_msg,
+            "publish_job_id": publish_job_id,
+        }
+
+
+async def _schedule_social_post_job(
+    user_id: str, platform_name: str, publish_priority: int, scheduled_for, timezone: Optional[str],
+    text_value: str, background_id: Optional[str], comments: List["SocialPostCommentInput"],
+) -> Dict[str, Any]:
+    publish_job_id = await _insert_publish_job(
+        user_id=user_id,
+        platform=platform_name,
+        external_id="scheduled",
+        status="queued",
+        priority=publish_priority,
+        scheduled_for=scheduled_for.isoformat() if scheduled_for else None,
+        timezone=timezone or "UTC",
+        payload={
+            "source_type": "social_post",
+            "text": text_value,
+            "background_id": background_id,
+            "comments": [c.model_dump() for c in comments],
+        },
+    )
+    return {
+        "success": True,
+        "scheduled": True,
+        "scheduled_for": scheduled_for.isoformat() if scheduled_for else None,
+        "publish_job_id": publish_job_id,
+    }
+
+
+async def _execute_scheduled_social_post_job(job_id: str, user_id: str, platform: str, task_payload: Dict[str, Any]) -> None:
+    try:
+        await _update_publish_job_status(job_id, "processing", error_message=None)
+
+        account = await _get_social_account(user_id, platform)
+        if not account:
+            raise HTTPException(status_code=404, detail=f"No connected {platform} account found")
+
+        text_value = str(task_payload.get("text") or "")
+        background_id = task_payload.get("background_id")
+        comments = [
+            SocialPostCommentInput(**c) for c in (task_payload.get("comments") or []) if isinstance(c, dict)
+        ]
+
+        publish_payload = _build_social_post_publish_payload(text_value, background_id)
+        publish_payload.user_id = user_id
+        platform_result = await publish_post(account, publish_payload)
+        external_id = str(platform_result.get("publish_id") or platform_result.get("id") or "n/a")
+        post_url = _build_social_post_url(platform, platform_result)
+
+        comments_results = await _post_comments_sequence(platform, account, external_id, comments)
+
+        await _update_publish_job_status(
+            job_id, "done", external_id=external_id, post_url=post_url,
+            extra_payload={"comments_results": comments_results},
+        )
+        await _debit_scheduled_publish_credits(user_id, task_payload, job_id)
+    except Exception as exc:
+        await _update_publish_job_status(job_id, "failed", error_message=str(exc))
+
+
+@app.post("/api/social/posts", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
+    await _assert_user_has_required_credits(user_id, 0.0)
+
+    text_value = (payload.text or "").strip()
+    if not text_value:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    selected_platforms = _resolve_social_post_platforms(payload.platforms)
+    publish_priority = await _resolve_user_job_priority(user_id)
+    scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
+    if payload.scheduled_date and not scheduled_for:
+        raise HTTPException(status_code=400, detail=_INVALID_SCHEDULED_DATE)
+    is_scheduled = bool(scheduled_for and scheduled_for > _utcnow())
+    background_id = payload.background_id or anonymous_stories.BACKGROUND_PRESETS[0]["id"]
+    comments = payload.comments or []
+
+    results: Dict[str, Any] = {}
+    for platform_name in selected_platforms:
+        if is_scheduled:
+            results[platform_name] = await _schedule_social_post_job(
+                user_id, platform_name, publish_priority, scheduled_for, payload.timezone,
+                text_value, background_id, comments,
+            )
+            continue
+        results[platform_name] = await _publish_social_post_now(
+            user_id, platform_name, publish_priority, text_value, background_id, comments,
+        )
+
+    overall_success = all(result.get("success") for result in results.values())
+
+    if not is_scheduled:
+        await _debit_publish_credits_after_share(user_id, f"social_post:{uuid.uuid4().hex[:12]}", results)
+
+    return {
+        "success": overall_success,
+        "results": results,
+        "background_id": background_id,
+        "scheduled": is_scheduled,
+    }
+
+
 async def _publish_caption_now(user_id: str, platform_name: str, publish_priority: int, final_title: str, final_description: str, media_url: str) -> Dict[str, Any]:
     publish_job_id = await _insert_publish_job(
         user_id=user_id,
@@ -10037,7 +11294,11 @@ async def get_film_summary_voice_preview_endpoint(voice_id: str, _user_id: Annot
         raise HTTPException(status_code=400, detail="Unknown voice")
 
     preview_path = os.path.join(FILM_SUMMARY_VOICE_PREVIEWS_DIR, f"{resolved_voice}.mp3")
-    if not os.path.exists(preview_path):
+    # An empty/missing file is treated as "not cached yet" so a previous
+    # generation that failed partway through (see synthesize_tts_segment)
+    # and left nothing playable behind gets regenerated instead of being
+    # served -- and permanently broken -- forever.
+    if not os.path.exists(preview_path) or os.path.getsize(preview_path) == 0:
         try:
             await film_summary.synthesize_tts_segment(
                 text=FILM_SUMMARY_VOICE_PREVIEW_TEXT, voice=resolved_voice, model=FILM_SUMMARY_TTS_MODEL,
@@ -11526,6 +12787,10 @@ async def _execute_scheduled_publish_job(job_row: Dict[str, Any]) -> None:
     if not job_id or not user_id or not platform:
         return
 
+    if str(task_payload.get("source_type") or "") == "social_post":
+        await _execute_scheduled_social_post_job(job_id, user_id, platform, task_payload)
+        return
+
     try:
         await _update_publish_job_status(job_id, "processing", error_message=None)
 
@@ -11578,6 +12843,7 @@ async def _update_publish_job_status(
     error_message: Optional[str] = None,
     external_id: Optional[str] = None,
     post_url: Optional[str] = None,
+    extra_payload: Optional[Dict[str, Any]] = None,
 ) -> None:
     if not publish_job_id:
         return
@@ -11589,8 +12855,15 @@ async def _update_publish_job_status(
         payload["error_message"] = error_message
     if external_id is not None:
         payload["external_id"] = external_id
-    if post_url:
-        payload["payload"] = {"post_url": post_url}
+    # Note: this replaces the row's whole `payload` jsonb column rather than
+    # merging into it -- fine for every current caller since nothing reads
+    # back the pre-completion payload (source_type/comments/background_id)
+    # after a job finishes.
+    if post_url or extra_payload:
+        merged_payload: Dict[str, Any] = dict(extra_payload or {})
+        if post_url:
+            merged_payload["post_url"] = post_url
+        payload["payload"] = merged_payload
     if status in {"done", "failed"}:
         payload["completed_at"] = _utcnow_iso()
     await client.table(SUPABASE_SOCIAL_PUBLISH_JOBS_TABLE).update(payload).eq("id", publish_job_id).execute()
@@ -11813,7 +13086,7 @@ async def select_facebook_page(payload: SelectFacebookPageRequest):
         expires_in=int(data.get("user_token_expires_in") or 5_184_000),
         platform_user_id=payload.page_id,
         platform_account_name=identity.get("name", "Facebook Page"),
-        scopes="pages_manage_posts,pages_read_engagement",
+        scopes="pages_manage_posts,pages_read_engagement,pages_manage_engagement",
     )
 
     return {
@@ -11853,6 +13126,17 @@ def connect(platform: str, request: Request, user_id: Annotated[str, Depends(get
     if key == "youtube":
         params["access_type"] = "offline"
         params["prompt"] = "consent"
+
+    if key == "facebook":
+        # Without this, Facebook silently skips the consent screen for a
+        # user who already authorized the app and just reissues a token
+        # with whatever permissions were granted the first time -- so
+        # adding a new scope (e.g. pages_manage_engagement) to
+        # PLATFORM_CONFIG never actually gets requested on a plain
+        # "reconnect", even though the URL's `scope` param lists it.
+        # auth_type=rerequest forces Facebook to show the full permission
+        # dialog again, including newly added scopes.
+        params["auth_type"] = "rerequest"
 
     if key == "tiktok":
         code_verifier, code_challenge = generate_pkce_pair()
@@ -12676,7 +13960,7 @@ async def publish_to_facebook_video(access_token: str, target_id: str, video_url
     if not target_id:
         raise HTTPException(status_code=400, detail="Connected Facebook target id is missing")
     if not access_token:
-        raise HTTPException(status_code=401, detail="Facebook page access token expired or missing")
+        raise HTTPException(status_code=401, detail=_FACEBOOK_TOKEN_EXPIRED_OR_MISSING)
 
     async with httpx.AsyncClient(timeout=90.0) as client:
         response = await client.post(
@@ -12699,7 +13983,7 @@ async def publish_to_facebook_text_with_background(
     if not page_id:
         raise HTTPException(status_code=400, detail="Connected Facebook target id is missing")
     if not access_token:
-        raise HTTPException(status_code=401, detail="Facebook page access token expired or missing")
+        raise HTTPException(status_code=401, detail=_FACEBOOK_TOKEN_EXPIRED_OR_MISSING)
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(

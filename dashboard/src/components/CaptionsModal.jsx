@@ -1,8 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, Loader2, MessageSquareText, Plus, RotateCcw, X } from 'lucide-react';
+import { ArrowLeft, Check, Loader2, MessageSquareText, Palette, Plus, RotateCcw, Trash2, X } from 'lucide-react';
 import { getApiUrl } from '../config';
 import RemotionPreview from './RemotionPreview';
 import { ANIMATION_OPTIONS, COLOR_PRESETS, HIGHLIGHT_COLOR_PRESETS, FONT_OPTIONS } from '../lib/subtitleOptions';
+import { BUILTIN_CAPTION_THEMES } from '../lib/captionThemes';
 import { useTranslation } from '../state/LanguageContext';
 import { useAuth } from '../state/AuthContext';
 import { getAuthHeaders } from '../lib/apiAuth';
@@ -10,8 +11,8 @@ import { getAuthHeaders } from '../lib/apiAuth';
 const DEFAULT_STYLE = {
   positionX: 50,
   positionY: 82,
-  fontFamily: 'Arial',
-  fontSize: 52,
+  fontFamily: 'Montserrat',
+  fontSize: 14,
   fontColor: '#FFFFFF',
   highlightColor: '#FFDD00',
   borderColor: '#000000',
@@ -231,10 +232,25 @@ export default function CaptionsModal({
 
   const [lines, setLines] = useState([]);
   const [durationSec, setDurationSec] = useState(30);
+  // Clean, pre-caption source resolved server-side (see /api/clip/.../
+  // transcript in app.py) -- used as the render base so the new style
+  // replaces the default captions instead of stacking on top of them.
+  const [cleanVideoUrl, setCleanVideoUrl] = useState('');
   const [captionsLoading, setCaptionsLoading] = useState(false);
   const [fetchError, setFetchError] = useState('');
   const [selectedLineId, setSelectedLineId] = useState(null);
   const [showStyleEditor, setShowStyleEditor] = useState(false);
+  const [showThemePicker, setShowThemePicker] = useState(false);
+  const [customThemes, setCustomThemes] = useState([]);
+  const [themesLoading, setThemesLoading] = useState(false);
+  const [themesError, setThemesError] = useState('');
+  const [activeThemeId, setActiveThemeId] = useState(null);
+  const [saveThemeName, setSaveThemeName] = useState('');
+  const [isSavingTheme, setIsSavingTheme] = useState(false);
+  const [saveThemeMessage, setSaveThemeMessage] = useState('');
+  const [isSavingDefaultStyle, setIsSavingDefaultStyle] = useState(false);
+  const [saveDefaultStyleMessage, setSaveDefaultStyleMessage] = useState('');
+  const [deletingThemeId, setDeletingThemeId] = useState(null);
 
   const [translationEnabled, setTranslationEnabled] = useState(false);
   const [translateText, setTranslateText] = useState(true);
@@ -308,6 +324,122 @@ export default function CaptionsModal({
 
   const focusSelectedPreview = () => {
     if (selectedLine) focusPreviewLine(selectedLine.id);
+  };
+
+  // Applying a theme is a full style replacement, not a merge -- if the
+  // theme also changes wordsPerLine, regroup the words into new lines the
+  // same way the "Words per line" slider already does (applyWordsPerLine)
+  // before laying the theme's style on top, so the stored wordsPerLine
+  // value always matches the actual line grouping.
+  const applyTheme = (theme, isCustom = false) => {
+    if (!theme?.style) return;
+    const nextWordsPerLine = clamp(Number(theme.style.wordsPerLine) || DEFAULT_STYLE.wordsPerLine, 2, 8);
+    const activeWordsPerLine = currentStyle.wordsPerLine || DEFAULT_STYLE.wordsPerLine;
+    if (nextWordsPerLine !== activeWordsPerLine) {
+      setWordsPerLineTouched(true);
+      applyWordsPerLine(nextWordsPerLine);
+    }
+    updateAllLinesStyle(theme.style);
+    setActiveThemeId(theme.id || null);
+    setSaveThemeName(isCustom ? theme.name || '' : '');
+    setSaveThemeMessage('');
+    focusSelectedPreview();
+  };
+
+  const handleSaveTheme = async () => {
+    const name = saveThemeName.trim();
+    if (!name) return;
+    setIsSavingTheme(true);
+    setSaveThemeMessage('');
+    try {
+      const res = await fetch(getApiUrl('/api/caption-style-themes'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(user?.id),
+        },
+        body: JSON.stringify({ name, style: currentStyle }),
+      });
+      if (!res.ok) {
+        const raw = await res.text();
+        throw new Error(parseApiDetail(raw, t('captionsModal.themeSaveFailed', "Echec de l'enregistrement du theme.")));
+      }
+      const saved = await res.json();
+      setCustomThemes((prev) => [saved, ...prev.filter((theme) => theme.id !== saved.id)]);
+      setActiveThemeId(saved.id);
+      setSaveThemeMessage(t('captionsModal.themeSaved', 'Theme enregistre.'));
+    } catch (error) {
+      setSaveThemeMessage(error.message || t('captionsModal.themeSaveFailed', "Echec de l'enregistrement du theme."));
+    } finally {
+      setIsSavingTheme(false);
+    }
+  };
+
+  // Replaces what new reels/captions get auto-captioned with, going
+  // forward -- stored server-side as a style_edit_versions row (see
+  // PUT /api/caption-style-default in app.py) rather than only ever living
+  // as this component's own DEFAULT_STYLE constant, so it survives across
+  // sessions/devices and future clips actually pick it up.
+  const handleSetAsDefaultStyle = async () => {
+    setIsSavingDefaultStyle(true);
+    setSaveDefaultStyleMessage('');
+    try {
+      const res = await fetch(getApiUrl('/api/caption-style-default'), {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(user?.id),
+        },
+        body: JSON.stringify({
+          position: 'bottom',
+          position_x: currentStyle.positionX,
+          position_y: currentStyle.positionY,
+          font_size: currentStyle.fontSize,
+          font_name: currentStyle.fontFamily,
+          font_color: currentStyle.fontColor,
+          highlight_color: currentStyle.highlightColor,
+          border_color: currentStyle.borderColor,
+          border_width: currentStyle.borderWidth,
+          text_shadow_color: currentStyle.textShadowColor,
+          shadow_blur: currentStyle.shadowBlur,
+          shadow_offset_x: currentStyle.shadowOffsetX,
+          shadow_offset_y: currentStyle.shadowOffsetY,
+          bg_color: currentStyle.bgColor,
+          bg_opacity: currentStyle.bgOpacity,
+          text_case: currentStyle.textCase,
+          bold: currentStyle.bold,
+          italic: currentStyle.italic,
+          words_per_line: currentStyle.wordsPerLine,
+          animation: currentStyle.animation,
+        }),
+      });
+      if (!res.ok) {
+        const raw = await res.text();
+        throw new Error(parseApiDetail(raw, t('captionsModal.setDefaultFailed', "Echec de la mise a jour du style par defaut.")));
+      }
+      setSaveDefaultStyleMessage(t('captionsModal.setDefaultSuccess', 'Ce style est maintenant le style par defaut.'));
+    } catch (error) {
+      setSaveDefaultStyleMessage(error.message || t('captionsModal.setDefaultFailed', "Echec de la mise a jour du style par defaut."));
+    } finally {
+      setIsSavingDefaultStyle(false);
+      setTimeout(() => setSaveDefaultStyleMessage(''), 3000);
+    }
+  };
+
+  const handleDeleteTheme = async (themeId) => {
+    setDeletingThemeId(themeId);
+    try {
+      const res = await fetch(getApiUrl(`/api/caption-style-themes/${themeId}`), {
+        method: 'DELETE',
+        headers: getAuthHeaders(user?.id),
+      });
+      if (res.ok) {
+        setCustomThemes((prev) => prev.filter((theme) => theme.id !== themeId));
+        setActiveThemeId((prev) => (prev === themeId ? null : prev));
+      }
+    } finally {
+      setDeletingThemeId(null);
+    }
   };
 
   const updateWordText = (lineId, wordId, text) => {
@@ -389,6 +521,7 @@ export default function CaptionsModal({
         setLines(nextLines);
         setSelectedLineId(nextLines[0]?.id || null);
         setDurationSec(Number(data?.durationSec) > 0 ? Number(data.durationSec) : 30);
+        setCleanVideoUrl(typeof data?.cleanVideoUrl === 'string' ? data.cleanVideoUrl : '');
         setWordsPerLineTouched(false);
       })
       .catch((err) => {
@@ -475,6 +608,34 @@ export default function CaptionsModal({
     }
   }, [showStyleEditor, lines.length]);
 
+  useEffect(() => {
+    if (showThemePicker && lines.length === 0) {
+      setShowThemePicker(false);
+    }
+  }, [showThemePicker, lines.length]);
+
+  useEffect(() => {
+    if (!isOpen) return undefined;
+    let cancelled = false;
+    setThemesLoading(true);
+    setThemesError('');
+    fetch(getApiUrl('/api/caption-style-themes'), { headers: getAuthHeaders(user?.id) })
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error('themes_unavailable'))))
+      .then((data) => {
+        if (cancelled) return;
+        setCustomThemes(Array.isArray(data?.themes) ? data.themes : []);
+      })
+      .catch(() => {
+        if (!cancelled) setThemesError(t('captionsModal.themesLoadFailed', 'Impossible de charger vos themes.'));
+      })
+      .finally(() => {
+        if (!cancelled) setThemesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, user?.id, t]);
+
   if (!isOpen) return null;
 
   return (
@@ -487,11 +648,24 @@ export default function CaptionsModal({
         <div className="w-full md:w-[50%] rounded-xl border border-slate-300 dark:border-white/10 bg-slate-50 dark:bg-black/30 p-4 md:p-5 overflow-y-auto overflow-x-hidden custom-scrollbar">
           {showStyleEditor && lines.length > 0 ? (
             <>
-              <div className="mb-4 flex items-center justify-between gap-2">
+              <div className="mb-2 flex items-center justify-between gap-2">
                 <button onClick={() => setShowStyleEditor(false)} className="inline-flex items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
                   <ArrowLeft size={14} /> {t('captionsModal.back', 'Retour')}
                 </button>
                 <h4 className="text-sm font-bold text-slate-900 dark:text-white">{t('captionsModal.styleEditor', 'Edition de style')}</h4>
+              </div>
+
+              <div className="mb-4 flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={handleSetAsDefaultStyle}
+                  disabled={isSavingDefaultStyle}
+                  className="rounded-lg border border-emerald-400/60 dark:border-emerald-500/40 bg-emerald-50 dark:bg-emerald-500/10 hover:bg-emerald-100 dark:hover:bg-emerald-500/20 px-3 py-1.5 text-xs font-semibold text-emerald-700 dark:text-emerald-200 disabled:opacity-40 inline-flex items-center gap-1"
+                >
+                  {isSavingDefaultStyle ? <Loader2 size={12} className="animate-spin" /> : null}
+                  {t('captionsModal.setAsDefault', 'Definir comme style par defaut')}
+                </button>
+                {saveDefaultStyleMessage ? <p className="text-[11px] text-slate-500 dark:text-slate-400">{saveDefaultStyleMessage}</p> : null}
               </div>
 
               <div className="space-y-4">
@@ -571,7 +745,7 @@ export default function CaptionsModal({
 
                 <div className="rounded-lg border border-slate-300 dark:border-white/10 bg-white/[0.03] px-3 py-3">
                   <label className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{t('captionsModal.lineSize', 'Line size')} ({currentStyle.fontSize}px)</label>
-                  <input type="range" min="28" max="96" value={currentStyle.fontSize} onChange={(e) => { updateAllLinesStyle({ fontSize: Number(e.target.value) || 52 }); focusSelectedPreview(); }} className="mt-2 w-full accent-emerald-500" />
+                  <input type="range" min="14" max="96" value={currentStyle.fontSize} onChange={(e) => { updateAllLinesStyle({ fontSize: Number(e.target.value) || 14 }); focusSelectedPreview(); }} className="mt-2 w-full accent-emerald-500" />
                 </div>
 
                 <div className="rounded-lg border border-slate-300 dark:border-white/10 bg-white/[0.03] px-3 py-3">
@@ -683,6 +857,109 @@ export default function CaptionsModal({
                 </div>
               </div>
             </>
+          ) : showThemePicker && lines.length > 0 ? (
+            <>
+              <div className="mb-4 flex items-center justify-between gap-2">
+                <button onClick={() => setShowThemePicker(false)} className="inline-flex items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
+                  <ArrowLeft size={14} /> {t('captionsModal.back', 'Retour')}
+                </button>
+                <h4 className="text-sm font-bold text-slate-900 dark:text-white">{t('captionsModal.themes', 'Themes')}</h4>
+              </div>
+
+              <div className="space-y-4">
+                <div>
+                  <label className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{t('captionsModal.builtinThemes', "Themes prets a l'emploi")}</label>
+                  <div className="mt-2 grid grid-cols-2 gap-2">
+                    {BUILTIN_CAPTION_THEMES.map((theme) => (
+                      <button
+                        key={theme.id}
+                        type="button"
+                        onClick={() => applyTheme(theme, false)}
+                        className={`relative rounded-lg border px-3 py-2.5 text-left ${activeThemeId === theme.id ? 'border-emerald-400 bg-emerald-500/15' : 'border-slate-300 dark:border-white/10 bg-white dark:bg-black/30'}`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className="text-base leading-none">{theme.emoji}</span>
+                          <span className="text-xs font-semibold text-slate-800 dark:text-slate-100">{theme.name}</span>
+                          {activeThemeId === theme.id ? <Check size={13} className="ml-auto text-emerald-500" /> : null}
+                        </div>
+                        <div
+                          className="mt-2 h-7 rounded flex items-center justify-center text-xs"
+                          style={{
+                            backgroundColor: theme.style.bgOpacity > 0 ? theme.style.bgColor : 'transparent',
+                            color: theme.style.fontColor,
+                            fontFamily: theme.style.fontFamily,
+                            textTransform: theme.style.textCase === 'uppercase' ? 'uppercase' : theme.style.textCase === 'lowercase' ? 'lowercase' : 'none',
+                            fontWeight: theme.style.bold ? 700 : 400,
+                            fontStyle: theme.style.italic ? 'italic' : 'normal',
+                            textShadow: `0 0 4px ${theme.style.highlightColor}`,
+                          }}
+                        >
+                          Aa
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between">
+                    <label className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{t('captionsModal.myThemes', 'Mes themes')}</label>
+                    {themesLoading ? <Loader2 size={12} className="animate-spin text-slate-400" /> : null}
+                  </div>
+                  {themesError ? <p className="mt-1 text-[11px] text-red-300">{themesError}</p> : null}
+                  {!themesLoading && customThemes.length === 0 ? (
+                    <p className="mt-2 text-[11px] text-slate-400">{t('captionsModal.noCustomThemes', 'Personnalisez un theme puis enregistrez-le ici.')}</p>
+                  ) : null}
+                  <div className="mt-2 space-y-1.5">
+                    {customThemes.map((theme) => (
+                      <div
+                        key={theme.id}
+                        className={`flex items-center gap-2 rounded-lg border px-3 py-2 ${activeThemeId === theme.id ? 'border-emerald-400 bg-emerald-500/15' : 'border-slate-300 dark:border-white/10 bg-white dark:bg-black/30'}`}
+                      >
+                        <button type="button" onClick={() => applyTheme(theme, true)} className="flex-1 text-left text-xs font-semibold text-slate-800 dark:text-slate-100 inline-flex items-center gap-2">
+                          <Palette size={13} className="text-slate-400" />
+                          {theme.name}
+                          {activeThemeId === theme.id ? <Check size={13} className="text-emerald-500" /> : null}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteTheme(theme.id)}
+                          disabled={deletingThemeId === theme.id}
+                          className="text-rose-400 hover:text-rose-300 disabled:opacity-40"
+                          title={t('captionsModal.deleteTheme', 'Supprimer ce theme')}
+                        >
+                          {deletingThemeId === theme.id ? <Loader2 size={13} className="animate-spin" /> : <Trash2 size={13} />}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-slate-300 dark:border-white/10 bg-white/[0.03] px-3 py-3">
+                  <label className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{t('captionsModal.saveTheme', 'Enregistrer le style actuel comme theme')}</label>
+                  <div className="mt-2 flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={saveThemeName}
+                      onChange={(e) => setSaveThemeName(e.target.value)}
+                      placeholder={t('captionsModal.themeNamePlaceholder', 'Nom du theme')}
+                      className="flex-1 bg-white dark:bg-black/40 border border-slate-300 dark:border-white/10 rounded-md px-2 py-1.5 text-xs text-slate-900 dark:text-zinc-100"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleSaveTheme}
+                      disabled={isSavingTheme || !saveThemeName.trim()}
+                      className="rounded-md bg-emerald-500/20 border border-emerald-500/40 px-3 py-1.5 text-xs font-semibold text-emerald-700 dark:text-emerald-200 disabled:opacity-50 inline-flex items-center gap-1"
+                    >
+                      {isSavingTheme ? <Loader2 size={12} className="animate-spin" /> : null}
+                      {t('captionsModal.save', 'Enregistrer')}
+                    </button>
+                  </div>
+                  {saveThemeMessage ? <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">{saveThemeMessage}</p> : null}
+                  <p className="mt-1.5 text-[10px] text-slate-400">{t('captionsModal.saveThemeHint', "Astuce : reutilisez le nom d'un theme existant pour le mettre a jour.")}</p>
+                </div>
+              </div>
+            </>
           ) : (
             <>
               <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -693,7 +970,16 @@ export default function CaptionsModal({
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => setShowStyleEditor(true)}
+                    onClick={() => { setShowStyleEditor(false); setShowThemePicker(true); }}
+                    disabled={lines.length === 0}
+                    className="rounded-lg border border-slate-300 dark:border-white/10 bg-white dark:bg-white/5 hover:bg-slate-100 dark:hover:bg-white/10 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 disabled:opacity-40 inline-flex items-center gap-1"
+                  >
+                    <Palette size={13} />
+                    {t('captionsModal.themes', 'Themes')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setShowThemePicker(false); setShowStyleEditor(true); }}
                     disabled={lines.length === 0}
                     className="rounded-lg border border-slate-300 dark:border-white/10 bg-white dark:bg-white/5 hover:bg-slate-100 dark:hover:bg-white/10 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 disabled:opacity-40"
                   >
@@ -851,7 +1137,7 @@ export default function CaptionsModal({
           <div className="flex-1 rounded-lg border border-slate-300 dark:border-white/10 overflow-hidden bg-black min-h-[360px]">
             <RemotionPreview
               ref={previewRef}
-              videoUrl={videoUrl}
+              videoUrl={cleanVideoUrl || videoUrl}
               durationInSeconds={durationSec}
               subtitles={flattenedCaptions.length > 0 ? subtitleConfig : null}
               hook={existingHook || null}
@@ -861,7 +1147,7 @@ export default function CaptionsModal({
 
           <button
             type="button"
-            onClick={() => onGenerate({ remotion: subtitleConfig, previewDurationSec: durationSec })}
+            onClick={() => onGenerate({ remotion: subtitleConfig, previewDurationSec: durationSec, cleanVideoUrl })}
             disabled={isProcessing || flattenedCaptions.length === 0 || creditBlocked}
             className="w-full py-3 bg-gradient-to-r from-emerald-500 to-green-500 hover:from-emerald-400 hover:to-green-400 text-black font-bold rounded-xl shadow-lg shadow-emerald-500/20 transition-all active:scale-[0.98] inline-flex items-center justify-center gap-2 disabled:opacity-60"
           >

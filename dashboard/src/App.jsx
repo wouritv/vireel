@@ -1,12 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import {
   Sparkles, Activity, ArrowLeft,
-  CheckCircle2, Clock3, Download, Film, Loader2, AlertCircle, X,
+  CheckCircle2, Clock3, Download, Film, Loader2, AlertCircle, Scissors, X,
 } from 'lucide-react';
 import MediaInput from './components/MediaInput';
 import ResultCard from './components/ResultCard';
 import ProcessingAnimation from './components/ProcessingAnimation';
 import ScheduleWeekModal from './components/ScheduleWeekModal';
+import CustomReelModal from './components/CustomReelModal';
 import { getApiUrl } from './config';
 import { getAuthHeaders } from './lib/apiAuth';
 import { useLocation, useNavigate } from "react-router-dom";
@@ -319,6 +320,12 @@ function App({ activeTab = "reel-generator", embedded = false } = {}) {
   const [processingMedia, setProcessingMedia] = useState(null);
   const [showScheduleWeek, setShowScheduleWeek] = useState(false);
   const [showCompletionPanel, setShowCompletionPanel] = useState(false);
+  // "Reel personnalise": lets the user cut their own clip by hand when the
+  // AI-generated ones aren't satisfying (see CustomReelModal). The source
+  // video is only preserved for a limited time after the job completes, so
+  // this is fetched once processing finishes rather than assumed available.
+  const [customReelSource, setCustomReelSource] = useState(null);
+  const [showCustomReelModal, setShowCustomReelModal] = useState(false);
 
   const [syncedTime, setSyncedTime] = useState(0);
   const [isSyncedPlaying, setIsSyncedPlaying] = useState(false);
@@ -552,6 +559,44 @@ function App({ activeTab = "reel-generator", embedded = false } = {}) {
     }
   }, [uiStatus, results, hasNotifiedCompletion]);
 
+  useEffect(() => {
+    if (uiStatus !== 'complete' || !jobId || !user?.id) {
+      setCustomReelSource(null);
+      return undefined;
+    }
+    let cancelled = false;
+    fetch(getApiUrl(`/api/reels/${jobId}/source`), { headers: getAuthHeaders(user.id) })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!cancelled) setCustomReelSource(data?.available ? data : null);
+      })
+      .catch(() => {
+        if (!cancelled) setCustomReelSource(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [uiStatus, jobId, user?.id]);
+
+  const handleCustomReelCreated = (createdReel) => {
+    const videoUrl = createdReel?.reel_playback_url || createdReel?.reel_url || '';
+    const newClip = {
+      ...createdReel,
+      video_url: videoUrl,
+      thumbnail_url: createdReel?.reel_preview_url || createdReel?.reel_thumbnail_url || '',
+      preview_image_url: createdReel?.reel_preview_url || createdReel?.reel_thumbnail_url || '',
+      reel_id: createdReel?.id,
+    };
+    setResults((prev) => {
+      const base = prev || { clips: [], reels: [] };
+      return {
+        ...base,
+        clips: [...(base.clips || []), newClip],
+        reels: [...(base.reels || []), createdReel],
+      };
+    });
+  };
+
   const handleProcess = async (data) => {
     if (!user?.id) {
       setStatus('error');
@@ -620,13 +665,23 @@ function App({ activeTab = "reel-generator", embedded = false } = {}) {
   // ─── Modals (rendus dans les deux modes) ───────────────────────────────────
 
   const modals = (
-    <ScheduleWeekModal
-        isOpen={showScheduleWeek}
-        onClose={() => setShowScheduleWeek(false)}
-        clips={results?.clips || []}
-        jobId={jobId}
-        userId={user?.id || ""}
-    />
+    <>
+      <ScheduleWeekModal
+          isOpen={showScheduleWeek}
+          onClose={() => setShowScheduleWeek(false)}
+          clips={results?.clips || []}
+          jobId={jobId}
+          userId={user?.id || ""}
+      />
+      <CustomReelModal
+          isOpen={showCustomReelModal}
+          onClose={() => setShowCustomReelModal(false)}
+          jobId={jobId}
+          sourceUrl={customReelSource ? getApiUrl(customReelSource.source_url) : ''}
+          durationSeconds={customReelSource?.duration_seconds || 0}
+          onCreated={handleCustomReelCreated}
+      />
+    </>
   );
 
   // ─── Contenu principal (partagé entre les deux modes) ─────────────────────
@@ -748,12 +803,23 @@ function App({ activeTab = "reel-generator", embedded = false } = {}) {
                       <h2 className="text-lg font-semibold mb-6 flex items-center gap-2 shrink-0">
                         <Sparkles className="text-yellow-400" size={20} />
                         {t('app.generatedReels', 'Generated reels')}
-                        {visibleClips.length > 0 && (
-                          <span className="text-xs bg-white/10 text-white px-2 py-0.5 rounded-full ml-auto">
-                            {visibleClips.length} Clips
-                          </span>
-                        )}
-
+                        <div className="ml-auto flex items-center gap-2">
+                          {customReelSource?.available && (
+                            <button
+                              type="button"
+                              onClick={() => setShowCustomReelModal(true)}
+                              className="inline-flex items-center gap-1.5 rounded-full border border-emerald-400/40 bg-emerald-500/10 hover:bg-emerald-500/20 px-3 py-1 text-xs font-semibold text-emerald-600 dark:text-emerald-300"
+                            >
+                              <Scissors size={13} />
+                              {t('app.customReelButton', 'Reel personnalise')}
+                            </button>
+                          )}
+                          {visibleClips.length > 0 && (
+                            <span className="text-xs bg-white/10 text-white px-2 py-0.5 rounded-full">
+                              {visibleClips.length} Clips
+                            </span>
+                          )}
+                        </div>
                       </h2>
 
                       <div className="flex-1 overflow-y-auto custom-scrollbar p-1">

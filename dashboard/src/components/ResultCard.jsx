@@ -362,6 +362,10 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
     // server-side, so it only needs the style, not captionLayer.captions.
     const applyCaptionsViaServerFallback = async (captionLayer) => {
         const style = captionLayer?.style || {};
+        // The server resolves the clean pre-caption source itself (see
+        // _resolve_authoritative_clean_video_source in app.py) so this new
+        // style replaces the default captions instead of stacking on top of
+        // them -- whatever's currently displayed is fine to send here.
         const effectiveInputUrl = currentVideoUrl?.startsWith('blob:') ? originalVideoUrl : currentVideoUrl;
 
         const res = await fetch(getApiUrl('/api/subtitle'), {
@@ -373,7 +377,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
             body: JSON.stringify({
                 job_id: jobId,
                 clip_index: clipIndexForApi,
-                input_filename: inputFilenameFromVideoUrl(currentVideoUrl),
+                input_filename: inputFilenameFromVideoUrl(effectiveInputUrl),
                 input_url: effectiveInputUrl,
                 position_x: style.positionX,
                 position_y: style.positionY,
@@ -444,10 +448,17 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
             setActiveLayers(newLayers);
             setClipDuration(nextDurationSec);
 
+            // Server-resolved clean, pre-caption source (see cleanVideoUrl in
+            // app.py's /api/clip/.../transcript) -- rendering onto it keeps
+            // this new style from stacking on top of the default captions
+            // already baked into the clip's normal playback URL.
+            const renderSourceUrl = options.cleanVideoUrl
+                || (currentVideoUrl?.startsWith('blob:') ? originalVideoUrl : currentVideoUrl);
+
             let blobUrl;
             try {
                 blobUrl = await renderInBrowser({
-                    videoUrl: originalVideoUrl,
+                    videoUrl: renderSourceUrl,
                     durationInSeconds: nextDurationSec,
                     subtitles: resolveTextLayer(newLayers),
                     hook: newLayers.hook,
@@ -696,10 +707,72 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
         }
     };
 
+    // Reused as-is whether it renders inline in the content column
+    // (compactActions === false, e.g. the full clip preview modals in
+    // ReelsPage/CaptionsPage) or as the floating icon-only overlay over the
+    // preview (compactActions === true, e.g. the reel-generator grid) --
+    // the `!compactActions ? label : null` in each button already collapses
+    // it to an icon in the latter case.
+    const actionButtons = (
+        <>
+            <button
+                onClick={() => setShowAutoEditModal(true)}
+                disabled={isEditing || !hasClipContext || !hasAnyEditingCredit}
+                title="Auto Edit"
+                className={`col-span-1 py-2 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white rounded-lg text-xs font-bold shadow-lg shadow-purple-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 mb-1 truncate px-1 ${compactActions ? 'min-h-[40px] flex-1' : ''}`}
+            >
+                {isEditing ? <Loader2 size={14} className="animate-spin" /> : <Wand2 size={14} />}
+                {!compactActions ? autoEditLabel : null}
+            </button>
+
+            <button
+                onClick={() => setShowHookModal(true)}
+                disabled={isHooking || !hasClipContext || !hasAnyEditingCredit}
+                title="Viral Hook"
+                className={`col-span-1 py-2 bg-gradient-to-r from-amber-400 to-yellow-500 hover:from-amber-300 hover:to-yellow-400 text-black rounded-lg text-xs font-bold shadow-lg shadow-yellow-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 mb-1 truncate px-1 ${compactActions ? 'min-h-[40px] flex-1' : ''}`}
+            >
+                {isHooking ? <Loader2 size={14} className="animate-spin" /> : <Wand2 size={14} />}
+                {!compactActions ? hookLabel : null}
+            </button>
+
+            <button
+                onClick={() => setShowCaptionsModal(true)}
+                disabled={isCaptioning || !hasClipContext || !hasAnyEditingCredit}
+                title={t('common.subtitles', 'Subtitles')}
+                className={`col-span-1 py-2 bg-gradient-to-r from-emerald-600 to-green-600 hover:from-emerald-500 hover:to-green-500 text-white rounded-lg text-xs font-bold shadow-lg shadow-emerald-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 mb-1 truncate px-1 ${compactActions ? 'min-h-[40px] flex-1' : ''}`}
+            >
+                {isCaptioning ? <Loader2 size={14} className="animate-spin" /> : <Type size={14} />}
+                {!compactActions ? captionsLabel : null}
+            </button>
+
+            <button
+                onClick={handleResetStyles}
+                disabled={isResettingStyles || !hasClipContext}
+                title={t('captionsModal.resetVideo', 'Reset')}
+                className={`col-span-1 py-2 bg-rose-100 dark:bg-rose-500/10 hover:bg-rose-200 dark:hover:bg-rose-500/20 border border-rose-300/60 dark:border-rose-500/40 text-rose-700 dark:text-rose-200 rounded-lg text-xs font-bold transition-all active:scale-[0.98] flex items-center justify-center gap-2 mb-1 truncate px-1 ${compactActions ? 'min-h-[40px] flex-1' : ''}`}
+            >
+                {isResettingStyles ? <Loader2 size={14} className="animate-spin" /> : <RotateCcw size={14} />}
+                {!compactActions ? resetLabel : null}
+            </button>
+
+            {!hideSocialPlatforms ? (
+                <button
+                    onClick={() => setShowModal(true)}
+                    disabled={!hasClipContext || !canShare}
+                    title={t("common.post", "Post")}
+                    className={`col-span-1 py-2 bg-primary hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-xs font-bold shadow-lg shadow-primary/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 truncate px-2 ${compactActions ? 'min-h-[40px] flex-1' : ''}`}
+                >
+                    <Share2 size={14} className="shrink-0" />
+                    {!compactActions ? t("common.post", "Post") : null}
+                </button>
+            ) : null}
+        </>
+    );
+
     return (
-        <div className="bg-surface border border-slate-200 dark:border-white/5 rounded-2xl overflow-hidden flex flex-col md:flex-row group hover:border-slate-300 dark:hover:border-white/10 transition-all animate-[fadeIn_0.5s_ease-out] min-h-[300px] h-auto" style={{ animationDelay: `${index * 0.1}s` }}>
-            {/* Left: Video Preview (Responsive Width) */}
-            <div className="w-full md:w-[180px] lg:w-[200px] bg-black relative shrink-0 aspect-[9/16] md:aspect-auto group/video">
+        <div className={`bg-surface border border-slate-200 dark:border-white/5 rounded-2xl overflow-hidden flex ${compactActions ? 'flex-col' : 'flex-col md:flex-row'} group hover:border-slate-300 dark:hover:border-white/10 transition-all animate-[fadeIn_0.5s_ease-out] min-h-[300px] h-auto`} style={{ animationDelay: `${index * 0.1}s` }}>
+            {/* Video Preview -- top/full-width in compact (icon-overlay) mode, a narrow left column otherwise */}
+            <div className={`${compactActions ? 'w-full max-w-[320px] mx-auto aspect-[9/16]' : 'w-full md:w-[180px] lg:w-[200px] aspect-[9/16] md:aspect-auto'} bg-black relative shrink-0 group/video`}>
                 {hideVideoPreview ? (
                     previewImageUrl ? (
                         <img src={previewImageUrl} alt={`Clip ${index + 1}`} className="w-full h-full object-cover" loading="lazy" />
@@ -752,6 +825,13 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
                         <Loader2 size={11} className="animate-spin" />
                         thumbnail regenerating...
                     </span>
+                ) : null}
+
+                {/* Floating icon actions: hidden until the preview is hovered, sitting just above the "Preview" button (bottom-3) */}
+                {compactActions ? (
+                    <div className="absolute inset-x-3 bottom-12 z-20 flex items-center justify-center gap-2 rounded-xl bg-black/60 backdrop-blur-sm p-1.5 opacity-0 pointer-events-none transition-opacity duration-200 group-hover/video:opacity-100 group-hover/video:pointer-events-auto">
+                        {actionButtons}
+                    </div>
                 ) : null}
 
                 {/* Auto Edit Overlay if Processing */}
@@ -818,60 +898,13 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
                     </div>
                 )}
 
-                {/* Actions Footer */}
-                <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mt-auto pt-4 border-t border-slate-200 dark:border-white/5">
-                    <button
-                        onClick={() => setShowAutoEditModal(true)}
-                        disabled={isEditing || !hasClipContext || !hasAnyEditingCredit}
-                        title="Auto Edit"
-                        className={`col-span-1 py-2 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white rounded-lg text-xs font-bold shadow-lg shadow-purple-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 mb-1 truncate px-1 ${compactActions ? 'min-h-[40px]' : ''}`}
-                    >
-                        {isEditing ? <Loader2 size={14} className="animate-spin" /> : <Wand2 size={14} />}
-                        {!compactActions ? autoEditLabel : null}
-                    </button>
-
-                    <button
-                        onClick={() => setShowHookModal(true)}
-                        disabled={isHooking || !hasClipContext || !hasAnyEditingCredit}
-                        title="Viral Hook"
-                        className={`col-span-1 py-2 bg-gradient-to-r from-amber-400 to-yellow-500 hover:from-amber-300 hover:to-yellow-400 text-black rounded-lg text-xs font-bold shadow-lg shadow-yellow-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 mb-1 truncate px-1 ${compactActions ? 'min-h-[40px]' : ''}`}
-                    >
-                        {isHooking ? <Loader2 size={14} className="animate-spin" /> : <Wand2 size={14} />}
-                        {!compactActions ? hookLabel : null}
-                    </button>
-
-                    <button
-                        onClick={() => setShowCaptionsModal(true)}
-                        disabled={isCaptioning || !hasClipContext || !hasAnyEditingCredit}
-                        title={t('common.subtitles', 'Subtitles')}
-                        className={`col-span-1 py-2 bg-gradient-to-r from-emerald-600 to-green-600 hover:from-emerald-500 hover:to-green-500 text-white rounded-lg text-xs font-bold shadow-lg shadow-emerald-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 mb-1 truncate px-1 ${compactActions ? 'min-h-[40px]' : ''}`}
-                    >
-                        {isCaptioning ? <Loader2 size={14} className="animate-spin" /> : <Type size={14} />}
-                        {!compactActions ? captionsLabel : null}
-                    </button>
-
-                    <button
-                        onClick={handleResetStyles}
-                        disabled={isResettingStyles || !hasClipContext}
-                        title={t('captionsModal.resetVideo', 'Reset')}
-                        className={`col-span-1 py-2 bg-rose-100 dark:bg-rose-500/10 hover:bg-rose-200 dark:hover:bg-rose-500/20 border border-rose-300/60 dark:border-rose-500/40 text-rose-700 dark:text-rose-200 rounded-lg text-xs font-bold transition-all active:scale-[0.98] flex items-center justify-center gap-2 mb-1 truncate px-1 ${compactActions ? 'min-h-[40px]' : ''}`}
-                    >
-                        {isResettingStyles ? <Loader2 size={14} className="animate-spin" /> : <RotateCcw size={14} />}
-                        {!compactActions ? resetLabel : null}
-                    </button>
-
-                    {!hideSocialPlatforms ? (
-                        <button
-                            onClick={() => setShowModal(true)}
-                            disabled={!hasClipContext || !canShare}
-                            title={t("common.post", "Post")}
-                            className={`col-span-1 py-2 bg-primary hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-xs font-bold shadow-lg shadow-primary/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 truncate px-2 ${compactActions ? 'min-h-[40px]' : ''}`}
-                        >
-                            <Share2 size={14} className="shrink-0" />
-                            {!compactActions ? t("common.post", "Post") : null}
-                        </button>
-                    ) : null}
-                </div>
+                {/* Actions Footer -- in compact mode these render as a floating
+                    icon overlay on the preview instead (see group/video above) */}
+                {!compactActions ? (
+                    <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mt-auto pt-4 border-t border-slate-200 dark:border-white/5">
+                        {actionButtons}
+                    </div>
+                ) : null}
             </div>
 
             {!hideSocialPlatforms ? (

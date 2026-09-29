@@ -108,6 +108,14 @@ SEGMENT_TYPE_ORIGINAL_DIALOGUE = "original_dialogue"
 SEGMENT_TYPE_BREATHING = "breathing"
 SEGMENT_TYPES = (SEGMENT_TYPE_VOICE_OVER, SEGMENT_TYPE_ORIGINAL_DIALOGUE, SEGMENT_TYPE_BREATHING)
 
+# Dominant mood for the whole film, used only to pick an optional
+# instrumental background bed mixed under narration (voice_over) segments --
+# see PLANNING_SYSTEM_PROMPT's BACKGROUND MUSIC MOOD section and
+# film_summary_render.resolve_background_music_track. Never affects
+# original_dialogue/breathing segments, where the film's own audio plays.
+MUSIC_MOODS = ("tense", "dark", "hopeful", "romantic", "melancholic", "triumphant", "comedic", "neutral")
+DEFAULT_MUSIC_MOOD = "neutral"
+
 EDIT_PLAN_SCHEMA_VERSION = "1.0"
 
 
@@ -295,7 +303,7 @@ def build_transcript_sample(transcript_segments: List[Dict[str, Any]], max_chars
     return "\n...\n".join(p for p in (start_part, middle_part, end_part) if p)[:max_chars]
 
 
-_AVERAGE_VOICE_OVER_SEGMENT_MS = 27500  # midpoint of the 20-35s range below
+_AVERAGE_VOICE_OVER_SEGMENT_MS = 27500  # ~27s average voice-over block length (NARRATIVE RULE 8 lets individual blocks run shorter or longer)
 
 
 def build_generation_constraints(
@@ -304,8 +312,8 @@ def build_generation_constraints(
     return {
         "target_duration_ms": target_duration_ms,
         "duration_tolerance_ratio": duration_tolerance_ratio,
-        "min_voice_over_segment_seconds": 20,
-        "max_voice_over_segment_seconds": 35,
+        "min_voice_over_segment_seconds": 12,
+        "max_voice_over_segment_seconds": 40,
         "hook_min_seconds": 20,
         "hook_max_seconds": 35,
         "conclusion_min_seconds": 25,
@@ -426,6 +434,8 @@ def validate_edit_plan_schema(
         "role": str(c.get("role") or "").strip(),
     } for i, c in enumerate(characters)]
 
+    requested_mood = str(raw.get("music_mood") or "").strip().lower()
+
     plan = {
         "schema_version": EDIT_PLAN_SCHEMA_VERSION,
         "movie": dict(movie_metadata),
@@ -434,6 +444,9 @@ def validate_edit_plan_schema(
         "segments": segments,
         "total_estimated_duration_ms": compute_total_estimated_duration_ms(segments),
         "unresolved_ambiguities": [str(a) for a in (raw.get("unresolved_ambiguities") or [])],
+        # Non-blocking: an unknown/missing mood just means no music, never a
+        # plan failure -- see MUSIC_MOODS.
+        "music_mood": requested_mood if requested_mood in MUSIC_MOODS else DEFAULT_MUSIC_MOOD,
     }
     return plan
 
@@ -713,17 +726,19 @@ INPUTS
 - generation_constraints: segment, clip, dialogue, duration and safety limits
 
 PRIMARY GOAL
-Create a condensed version of the movie that makes viewers experience the story rather than hear a flat synopsis. The audience must understand the plot, relationships, motivations, conflicts, major reversals, climax, resolution and meaningful character evolution. Respect the original movie and never mock its characters.
+Create a condensed version of the movie that plays like a real editor's recap cut, not a flat synopsis or a plot-point checklist. The audience must understand the plot, relationships, motivations, conflicts, major reversals, climax, resolution and meaningful character evolution -- through specific, named, evidence-backed particulars (who, where, what exact stakes), never through generic or interchangeable phrasing that could describe almost any movie. If a sentence you drafted could be pasted into a summary of a completely different film without anyone noticing, rewrite it with the actual confirmed detail that makes it true of THIS movie and no other. Respect the original movie and never mock its characters.
 
 NARRATIVE RULES
 1. Start with a compelling 20-to-35-second hook based on a confirmed paradox, conflict, transformation, impossible relationship, betrayal, dramatic consequence or extraordinary situation. Intrigue the viewer without needlessly exposing the ending.
-2. Select only events required to understand the story, preserve its main emotional progression and reach the resolution naturally.
-3. Remove repetition, inconsequential conversations, unnecessary travel, redundant explanations and secondary plots that do not affect the main story.
-4. Never remove an event required to understand a later event.
-5. Write natural, cinematic, emotionally precise narration suitable for AI speech. Never say “in this scene,” “we can see,” “the transcript says,” or similar analytical phrases.
-6. Voice-over blocks should normally last 20 to 35 seconds and contain enough words for the declared duration. Estimate speech at 125 to 150 words per minute, while recognizing that the backend will replace estimates with actual TTS durations.
-7. Each voice-over block must advance the story and should end with a useful transition, question, tension point or new information when this arises naturally.
-8. End with a 25-to-45-second reflection grounded in the movie's confirmed character evolution and theme. Do not impose an unsupported moral.
+2. Be concrete, never generic. Anchor every segment in specific, evidence-backed particulars: characters by their canonical name (never "the man," "someone," "a woman"), specific places, specific objects, specific numbers (ages, amounts of money, elapsed time, counts) and the specific stakes of that moment. A line that only asserts a generic escalation ("things get complicated," "the situation gets worse," "everything changes") is incomplete on its own -- it must be paired, in the same or the very next sentence, with the specific confirmed fact that makes it true. Write like an editor who actually watched this movie and is telling a friend exactly what happens in it, not like someone paraphrasing a synopsis they skimmed.
+3. Select only events required to understand the story, preserve its main emotional progression and reach the resolution naturally.
+4. Remove repetition, inconsequential conversations, unnecessary travel, redundant explanations and secondary plots that do not affect the main story.
+5. Never remove an event required to understand a later event.
+6. Write natural, cinematic, emotionally precise narration suitable for AI speech. Never say “in this scene,” “we can see,” “the transcript says,” or similar analytical phrases.
+7. Map the summary onto a real story structure, not a flat chronological list of things that happen: an opening status quo, the inciting incident that sets the real story in motion, two to four rising complications that escalate in stakes (not just in number), a midpoint turn where the situation changes in kind rather than merely in degree, the climax, and the resolution. Every segment should serve one identifiable beat in this structure -- if you cannot say which beat a segment serves, cut it or fold it into an adjacent one.
+8. Voice-over blocks average around 27 seconds, but do not force every block to the same length -- vary it with the story's own rhythm the way an editor would: a fast run of escalating complications can use a few shorter ~12-to-20-second blocks back to back, while a pivotal emotional beat can justify a longer ~30-to-40-second block. Contain enough words for the declared duration; estimate speech at 125 to 150 words per minute, while recognizing that the backend will replace estimates with actual TTS durations.
+9. Each voice-over block must advance the story and should end with a useful transition, question, tension point or new information when this arises naturally.
+10. End with a 25-to-45-second reflection grounded in the movie's confirmed character evolution and theme. Do not impose an unsupported moral.
 
 VISUAL MATCHING RULES
 1. Use only scene IDs and timecodes present in scene_index or transcript_segments.
@@ -742,10 +757,13 @@ CINEMATIC BREATHING RULES
 You may select short original-audio or silent visual moments for meaningful looks, crying, embraces, arrivals, departures, reactions, musical passages or silence after a revelation. Voice-over must stop during these segments. Use them sparingly, and never reuse or overlap a source time range already used by another original_dialogue or breathing segment (see ORIGINAL DIALOGUE RULES).
 
 DURATION RULES
-The total duration includes voice-over, original dialogue and breathing segments. Keep total_estimated_duration_ms within the tolerance supplied in generation_constraints. Do not pretend that a short sentence lasts 30 seconds. Never solve a duration deficit by selecting irrelevant footage or repeating information. Before writing segments, use generation_constraints.approximate_total_segment_count_hint as your sizing anchor: it is roughly target_duration_ms divided by a typical ~27-second voice-over block, so plan for approximately that many segments in total (voice-over blocks plus however many original-dialogue/breathing moments you add on top). Producing far fewer segments than that hint, or making voice-over blocks much shorter than 20-35 seconds each to compensate, is the most common way plans miss the duration tolerance -- if your draft segment count is well below the hint, add more voice-over blocks covering additional confirmed plot points rather than inflating estimated_duration_ms on existing ones.
+The total duration includes voice-over, original dialogue and breathing segments. Keep total_estimated_duration_ms within the tolerance supplied in generation_constraints. Do not pretend that a short sentence lasts 30 seconds. Never solve a duration deficit by selecting irrelevant footage or repeating information. Before writing segments, use generation_constraints.approximate_total_segment_count_hint as your sizing anchor: it is roughly target_duration_ms divided by a typical ~27-second voice-over block, so plan for approximately that many segments in total (voice-over blocks plus however many original-dialogue/breathing moments you add on top). Individual blocks may run shorter or longer than that average per NARRATIVE RULE 8, but producing far fewer segments than the hint, or making most voice-over blocks much shorter than average to compensate, is the most common way plans miss the duration tolerance -- if your draft segment count is well below the hint, add more voice-over blocks covering additional confirmed plot points rather than inflating estimated_duration_ms on existing ones.
 
 EVIDENCE AND UNCERTAINTY
 Every narrated segment must include source_event_ids. Every clip must reference a valid scene_id. When names are uncertain, use the canonical identity from character_bible or neutral wording. Add unresolved issues to unresolved_ambiguities. If the evidence cannot support a coherent summary, return status="insufficient_evidence" and explain the blocking evidence gaps without generating fake content.
+
+BACKGROUND MUSIC MOOD
+An optional, low-volume instrumental music bed (no lyrics) may be mixed under voice-over narration -- never under original_dialogue or breathing segments, where the film's own audio must remain the only thing heard. Pick exactly one dominant mood for the whole film from: tense, dark, hopeful, romantic, melancholic, triumphant, comedic, neutral. Base it on the film's actual confirmed tone, not a guess -- a thriller with a betrayal at its core is "tense" or "dark," a story ending in reconciliation is "hopeful," and so on. Use "neutral" only when no other mood clearly fits. This choice only selects which instrumental track (if any is available) may play under narration; it has no effect on the narration text or segment selection.
 
 OUTPUT SCHEMA
 Return exactly this JSON shape -- every field below is required unless marked optional, and no other top-level or segment field names are read:
@@ -755,6 +773,7 @@ Return exactly this JSON shape -- every field below is required unless marked op
   "characters": [ { "id": string, "canonical_name": string, "aliases": [string], "role": string } ],
   "segments": [ <segment, see below> ],
   "total_estimated_duration_ms": integer   (your own best-effort sum, backend recomputes the authoritative value),
+  "music_mood": "tense" | "dark" | "hopeful" | "romantic" | "melancholic" | "triumphant" | "comedic" | "neutral"   (optional, default "neutral", see BACKGROUND MUSIC MOOD),
   "unresolved_ambiguities": [string]
 }
 Every segment is a JSON object with these fields:
@@ -786,6 +805,9 @@ Before returning the JSON, silently verify:
 - no clip (same scene_id and start_ms/end_ms) is used in more than one segment, and repeated facts are minimized;
 - the target duration tolerance is respected;
 - the hook, main progression, climax, resolution and conclusion are present when supported by the movie;
+- the setup, inciting incident, rising complications, midpoint turn, climax and resolution are each identifiable in at least one segment;
+- every segment names its characters, places and objects specifically rather than generically, and no segment is a generic sentence that could describe almost any movie;
+- music_mood is one of the listed moods and genuinely reflects the film's confirmed tone;
 - the result can be executed by an automated FFmpeg pipeline."""
 
 
@@ -901,7 +923,7 @@ def _describe_duration_gap(plan: Dict[str, Any], target_duration_ms: int) -> str
     if gap_ms > 0:
         return (
             f" Your plan is {gap_ms}ms short of the target: add approximately {segment_count} more "
-            "voice-over segment(s) (~20-35s each) covering additional confirmed plot points -- do not "
+            "voice-over segment(s) (~27s on average) covering additional confirmed plot points -- do not "
             "just inflate estimated_duration_ms on existing segments."
         )
     return (
@@ -1228,20 +1250,36 @@ async def synthesize_tts_segment(
     """Generate one voice-over segment's audio with OpenAI TTS (spec
     section 14: "genere chaque bloc separement"). Returns the real audio
     duration in seconds (probed with ffprobe) so the caller can re-inject
-    it into the plan (see apply_actual_tts_durations)."""
-    client = _get_openai_client()
+    it into the plan (see apply_actual_tts_durations).
 
-    def _call():
-        with client.audio.speech.with_streaming_response.create(
-            model=model, voice=voice, input=text, instructions=instructions,
-        ) as response:
-            response.stream_to_file(output_path)
-
+    Writes to a temporary path first and only moves it to output_path on
+    full success. get_film_summary_voice_preview_endpoint caches its output
+    by checking whether output_path already exists -- writing directly to
+    it meant a request that failed partway through streaming (a dropped
+    connection, a timeout, a missing API key) could still leave a partial
+    or empty file there, which the cache check would then treat as a valid
+    preview forever, breaking that voice's preview permanently until
+    someone deleted the file by hand on the server."""
+    tmp_path = f"{output_path}.tmp-{uuid.uuid4().hex[:8]}"
     try:
+        client = _get_openai_client()
+
+        def _call():
+            with client.audio.speech.with_streaming_response.create(
+                model=model, voice=voice, input=text, instructions=instructions,
+            ) as response:
+                response.stream_to_file(tmp_path)
+
         await asyncio.to_thread(_call)
     except Exception as exc:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
         raise FilmSummaryValidationError(FilmSummaryErrorCode.TTS_FAILED, str(exc)) from exc
 
+    os.replace(tmp_path, output_path)
     return probe_media_duration_seconds(output_path)
 
 

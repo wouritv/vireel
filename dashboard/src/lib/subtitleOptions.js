@@ -10,6 +10,7 @@ export const FONT_OPTIONS = [
     { value: 'Teko', label: 'Teko', category: '🔥 TikTok / Viral' },
     { value: 'Oswald', label: 'Oswald', category: '🔥 TikTok / Viral' },
     { value: 'Saira Condensed', label: 'Saira Condensed', category: '🔥 TikTok / Viral' },
+    { value: 'Bungee', label: 'Bungee', category: '🔥 TikTok / Viral' },
     // 🎉 Fun & Playful
     { value: 'Pacifico', label: 'Pacifico', category: '🎉 Fun & Playful' },
     { value: 'Fredoka', label: 'Fredoka', category: '🎉 Fun & Playful' },
@@ -22,6 +23,7 @@ export const FONT_OPTIONS = [
     { value: 'Bubblegum Sans', label: 'Bubblegum Sans', category: '🎉 Fun & Playful' },
     { value: 'Comfortaa', label: 'Comfortaa', category: '🎉 Fun & Playful' },
     { value: 'Sniglet', label: 'Sniglet', category: '🎉 Fun & Playful' },
+    { value: 'Creepster', label: 'Creepster', category: '🎉 Fun & Playful' },
     // 💼 Professional
     { value: 'Montserrat', label: 'Montserrat', category: '💼 Professional' },
     { value: 'Poppins', label: 'Poppins', category: '💼 Professional' },
@@ -41,6 +43,7 @@ export const FONT_OPTIONS = [
     { value: 'Audiowide', label: 'Audiowide', category: '🚀 Exotic / Tech' },
     { value: 'Press Start 2P', label: 'Press Start 2P', category: '🚀 Exotic / Tech' },
     { value: 'Rajdhani', label: 'Rajdhani', category: '🚀 Exotic / Tech' },
+    { value: 'Kanit', label: 'Kanit', category: '🚀 Exotic / Tech' },
     // 😀 Emoji Friendly
     { value: 'Noto Sans', label: 'Noto Sans', category: '😀 Emoji Friendly' },
     { value: 'Nunito', label: 'Nunito', category: '😀 Emoji Friendly' },
@@ -52,6 +55,8 @@ export const FONT_OPTIONS = [
     { value: 'Arial', label: 'Arial', category: '📚 Classic' },
     { value: 'Courier New', label: 'Courier New', category: '📚 Classic' },
     { value: 'Trebuchet MS', label: 'Trebuchet MS', category: '📚 Classic' },
+    // 👑 Luxe / Premium
+    { value: 'Cinzel', label: 'Cinzel', category: '👑 Luxe / Premium' },
 ];
 
 export const COLOR_PRESETS = [

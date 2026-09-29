@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import types
@@ -249,6 +250,23 @@ def test_validate_edit_plan_schema_rejects_insufficient_evidence():
 def test_validate_edit_plan_schema_rejects_empty_segments():
     with pytest.raises(fs.FilmSummaryValidationError):
         fs.validate_edit_plan_schema({"segments": []}, movie_metadata={}, target_duration_ms=600000)
+
+
+def test_validate_edit_plan_schema_keeps_valid_music_mood():
+    raw = _valid_raw_plan()
+    raw["music_mood"] = "Tense"  # case-insensitive
+    plan = fs.validate_edit_plan_schema(raw, movie_metadata={}, target_duration_ms=600000)
+    assert plan["music_mood"] == "tense"
+
+
+def test_validate_edit_plan_schema_defaults_music_mood_when_missing_or_unknown():
+    plan = fs.validate_edit_plan_schema(_valid_raw_plan(), movie_metadata={}, target_duration_ms=600000)
+    assert plan["music_mood"] == fs.DEFAULT_MUSIC_MOOD
+
+    raw = _valid_raw_plan()
+    raw["music_mood"] = "epic orchestral battle theme"  # not one of MUSIC_MOODS
+    plan = fs.validate_edit_plan_schema(raw, movie_metadata={}, target_duration_ms=600000)
+    assert plan["music_mood"] == fs.DEFAULT_MUSIC_MOOD
 
 
 def test_validate_edit_plan_schema_rejects_unknown_segment_type():
@@ -664,9 +682,17 @@ def test_synthesize_tts_segment_returns_probed_duration(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     output_path = str(tmp_path / "segment.mp3")
 
+    # The real stream_to_file writes bytes to whatever path it's given --
+    # mimic that so the temp-file-then-rename dance under test actually has
+    # a file to rename.
+    def _fake_stream_to_file(path):
+        with open(path, "wb") as handle:
+            handle.write(b"fake-audio-bytes")
+
     fake_response = MagicMock()
     fake_response.__enter__ = MagicMock(return_value=fake_response)
     fake_response.__exit__ = MagicMock(return_value=False)
+    fake_response.stream_to_file = MagicMock(side_effect=_fake_stream_to_file)
     fake_client = MagicMock()
     fake_client.audio.speech.with_streaming_response.create.return_value = fake_response
     monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
@@ -677,7 +703,15 @@ def test_synthesize_tts_segment_returns_probed_duration(monkeypatch, tmp_path):
     ))
 
     assert duration == 12.5
-    fake_response.stream_to_file.assert_called_once_with(output_path)
+    fake_response.stream_to_file.assert_called_once()
+    written_path = fake_response.stream_to_file.call_args.args[0]
+    # Written to a temp path, not output_path directly, then moved into
+    # place -- see synthesize_tts_segment's docstring for why.
+    assert written_path != output_path
+    assert not os.path.exists(written_path)
+    assert os.path.exists(output_path)
+    with open(output_path, "rb") as handle:
+        assert handle.read() == b"fake-audio-bytes"
 
 
 def test_synthesize_tts_segment_wraps_failures_as_tts_failed(monkeypatch, tmp_path):
@@ -685,6 +719,55 @@ def test_synthesize_tts_segment_wraps_failures_as_tts_failed(monkeypatch, tmp_pa
     fake_client = MagicMock()
     fake_client.audio.speech.with_streaming_response.create.side_effect = RuntimeError("boom")
     monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    coro = fs.synthesize_tts_segment(
+        text="Hello", voice="cedar", model="gpt-4o-mini-tts", instructions="narrate",
+        output_path=str(tmp_path / "segment.mp3"),
+    )
+    with pytest.raises(fs.FilmSummaryValidationError) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.code == fs.FilmSummaryErrorCode.TTS_FAILED
+
+
+def test_synthesize_tts_segment_leaves_no_partial_file_on_mid_stream_failure(monkeypatch, tmp_path):
+    # Regression test: a request that fails partway through streaming (a
+    # dropped connection, a timeout) used to leave a partial/broken file at
+    # output_path, which the voice-preview endpoint's cache check then
+    # treated as valid forever -- permanently breaking that voice's preview.
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    output_path = str(tmp_path / "segment.mp3")
+    captured = {}
+
+    def _fake_stream_to_file(path):
+        captured["tmp_path"] = path
+        with open(path, "wb") as handle:
+            handle.write(b"partial-bytes")
+        raise RuntimeError("connection dropped mid-stream")
+
+    fake_response = MagicMock()
+    fake_response.__enter__ = MagicMock(return_value=fake_response)
+    fake_response.__exit__ = MagicMock(return_value=False)
+    fake_response.stream_to_file = MagicMock(side_effect=_fake_stream_to_file)
+    fake_client = MagicMock()
+    fake_client.audio.speech.with_streaming_response.create.return_value = fake_response
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    coro = fs.synthesize_tts_segment(
+        text="Hello", voice="cedar", model="gpt-4o-mini-tts", instructions="narrate", output_path=output_path,
+    )
+    with pytest.raises(fs.FilmSummaryValidationError):
+        asyncio.run(coro)
+
+    assert not os.path.exists(output_path)
+    assert not os.path.exists(captured["tmp_path"])
+
+
+def test_synthesize_tts_segment_raises_tts_failed_when_api_key_missing(monkeypatch, tmp_path):
+    # _get_openai_client() used to be called outside the try/except, so a
+    # missing API key raised a bare RuntimeError instead of the
+    # FilmSummaryValidationError callers (and the voice-preview endpoint)
+    # expect -- surfacing as an unhandled 500 instead of a clean 502.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     coro = fs.synthesize_tts_segment(
         text="Hello", voice="cedar", model="gpt-4o-mini-tts", instructions="narrate",

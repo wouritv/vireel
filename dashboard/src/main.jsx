@@ -15,6 +15,7 @@ import DashboardTabPage from "./pages/DashboardTabPage";
 import ReelsProjectsPage from "./pages/ReelsProjectsPage";
 import CaptionProjectsPage from "./pages/CaptionProjectsPage";
 import ReelProjectDetailPage from "./pages/ReelProjectDetailPage";
+import ManualReelCreationPage from "./pages/ManualReelCreationPage";
 import CaptionProjectDetailPage from "./pages/CaptionProjectDetailPage";
 import NewCaptionPage from "./pages/NewCaptionPage";
 import AnonymousStoriesProjectsPage from "./pages/AnonymousStoriesProjectsPage";
@@ -72,6 +73,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(
                             <Route path="reel-generator" element={<DashboardTabPage tabKey="reel-generator" />} />
                             <Route path="reels" element={<ReelsProjectsPage />} />
                             <Route path="reels/projects/:projectId" element={<ReelProjectDetailPage />} />
+                            <Route path="reels/projects/:projectId/manual" element={<ManualReelCreationPage />} />
                             <Route path="captions" element={<CaptionProjectsPage />} />
                             <Route path="captions/projects/:projectId" element={<CaptionProjectDetailPage />} />
                             <Route path="captions/new" element={<NewCaptionPage />} />
