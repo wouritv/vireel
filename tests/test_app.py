@@ -4972,6 +4972,72 @@ def test_post_facebook_comment_sends_message_and_attachment(monkeypatch):
     assert call["data"]["access_token"] == "page-token"
 
 
+class _FakeCommentImageUpload:
+    def __init__(self, content: bytes, filename: str = "photo.png", content_type: str = "image/png"):
+        self.filename = filename
+        self.content_type = content_type
+        self._content = content
+        self._done = False
+
+    async def read(self, _chunk_size: int):
+        if self._done:
+            return b""
+        self._done = True
+        return self._content
+
+
+def test_upload_social_comment_image_happy_path(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("AWS_S3_BUCKET", "bucket")
+
+    upload_calls = []
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda path, bucket, key: upload_calls.append((path, bucket, key)) or True)
+    monkeypatch.setattr(app, "generate_presigned_url", lambda bucket, key, expiration=3600: f"https://s3.example/{key}?exp={expiration}")
+
+    result = asyncio.run(app.upload_social_comment_image(user_id="u1", file=_FakeCommentImageUpload(b"fake-image-bytes")))
+
+    assert result["image_url"].startswith("https://s3.example/social_comment_images/u1/")
+    assert "exp=604800" in result["image_url"]
+    assert len(upload_calls) == 1
+    # The temp local file is cleaned up after the S3 upload, whether it
+    # succeeded or not -- nothing should be left behind in UPLOAD_DIR.
+    assert list((tmp_path / "uploads").glob("comment_image_*")) == []
+
+
+def test_upload_social_comment_image_rejects_non_image_content_type(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    coro = app.upload_social_comment_image(user_id="u1", file=_FakeCommentImageUpload(b"x", content_type="text/plain"))
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 400
+
+
+def test_upload_social_comment_image_rejects_oversized_file(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("AWS_S3_BUCKET", "bucket")
+    monkeypatch.setattr(app, "_COMMENT_IMAGE_MAX_BYTES", 4)
+
+    coro = app.upload_social_comment_image(user_id="u1", file=_FakeCommentImageUpload(b"0123456789"))
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 400
+    assert "too large" in str(exc.value.detail).lower()
+
+
+def test_upload_social_comment_image_requires_bucket_configured(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.delenv("AWS_S3_BUCKET", raising=False)
+
+    coro = app.upload_social_comment_image(user_id="u1", file=_FakeCommentImageUpload(b"fake-image-bytes"))
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 503
+
+
 def test_post_facebook_comment_requires_object_id(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
 
