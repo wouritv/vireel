@@ -331,8 +331,14 @@ PLATFORM_CONFIG = {
         # pages_manage_engagement is required for the Page itself to comment
         # on its own posts (POST /{post_id}/comments with the Page token --
         # see _post_facebook_comment) -- pages_manage_posts alone only
-        # covers creating the post.
-        "scopes": ["pages_show_list", "pages_manage_posts", "pages_read_engagement", "pages_manage_engagement"],
+        # covers creating the post. Meta requires pages_read_user_content to
+        # be requested alongside pages_manage_engagement (its App Review
+        # docs state the submission must include pages_show_list and
+        # pages_read_user_content to use pages_manage_engagement).
+        "scopes": [
+            "pages_show_list", "pages_manage_posts", "pages_read_engagement",
+            "pages_manage_engagement", "pages_read_user_content",
+        ],
     },
     "instagram": {
         "auth_url": "https://www.instagram.com/oauth/authorize",
@@ -13086,7 +13092,7 @@ async def select_facebook_page(payload: SelectFacebookPageRequest):
         expires_in=int(data.get("user_token_expires_in") or 5_184_000),
         platform_user_id=payload.page_id,
         platform_account_name=identity.get("name", "Facebook Page"),
-        scopes="pages_manage_posts,pages_read_engagement,pages_manage_engagement",
+        scopes=",".join(PLATFORM_CONFIG["facebook"]["scopes"]),
     )
 
     return {
