@@ -4972,6 +4972,37 @@ def test_post_facebook_comment_sends_message_and_attachment(monkeypatch):
     assert call["data"]["access_token"] == "page-token"
 
 
+def test_post_platform_comment_facebook_never_sends_link_as_attachment(monkeypatch):
+    # attachment_url must be a real image -- Facebook's Graph API rejects a
+    # plain webpage link there with a misleading "(#200) Permissions error".
+    # The link should still reach Facebook, just folded into the message
+    # text (see _build_comment_message), never as attachment_url.
+    app = _import_app_with_stubs(monkeypatch)
+    fake_client = _install_fake_httpx_post(
+        monkeypatch, app, _FakeHttpxResponse(200, {"id": "comment_1"}),
+    )
+    comment = app.SocialPostCommentInput(text="Check this out", link="https://example.com/article")
+
+    asyncio.run(app._post_platform_comment("facebook", {}, "page-token", "1234_5678", comment))
+
+    call = fake_client.calls[0]
+    assert "attachment_url" not in call["data"]
+    assert "https://example.com/article" in call["data"]["message"]
+
+
+def test_post_platform_comment_facebook_uses_image_url_as_attachment(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_client = _install_fake_httpx_post(
+        monkeypatch, app, _FakeHttpxResponse(200, {"id": "comment_1"}),
+    )
+    comment = app.SocialPostCommentInput(text="Look", image_url="https://s3.example/img.png")
+
+    asyncio.run(app._post_platform_comment("facebook", {}, "page-token", "1234_5678", comment))
+
+    call = fake_client.calls[0]
+    assert call["data"]["attachment_url"] == "https://s3.example/img.png"
+
+
 class _FakeCommentImageUpload:
     def __init__(self, content: bytes, filename: str = "photo.png", content_type: str = "image/png"):
         self.filename = filename

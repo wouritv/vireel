@@ -10310,7 +10310,12 @@ async def _post_platform_comment(
 ) -> Dict[str, Any]:
     message = _build_comment_message(comment)
     if platform_name == "facebook":
-        return await _post_facebook_comment(token, post_external_id, message, comment.image_url or comment.link)
+        # attachment_url must be an actual image -- Facebook's Graph API
+        # rejects it with a misleading "(#200) Permissions error" when it's
+        # a plain webpage link instead, so only ever pass a real uploaded
+        # image here. The link itself is never dropped: _build_comment_message
+        # already folded it into the comment text above.
+        return await _post_facebook_comment(token, post_external_id, message, comment.image_url)
     if platform_name == "linkedin":
         owner_urn = f"urn:li:person:{account.get('platform_user_id')}"
         return await _post_linkedin_comment(token, owner_urn, post_external_id, message)
