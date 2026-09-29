@@ -67,8 +67,13 @@ function nextCommentLocalId() {
 }
 
 function emptyComment() {
-    return { localId: nextCommentLocalId(), text: "", imageUrl: "", imageDraft: "", addingImage: false };
+    return {
+        localId: nextCommentLocalId(), text: "", imageUrl: "", imageDraft: "", addingImage: false,
+        imageUploading: false, imageError: "", isDraggingImage: false,
+    };
 }
+
+const COMMENT_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 
 export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) {
     const { t } = useTranslation();
@@ -126,6 +131,64 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
     const removeComment = (localId) => setComments((prev) => prev.filter((c) => c.localId !== localId));
     const updateComment = (localId, field, value) => {
         setComments((prev) => prev.map((c) => (c.localId === localId ? { ...c, [field]: value } : c)));
+    };
+
+    // Drag-and-drop (or a plain <input type="file">) upload path for a
+    // comment's image, alongside the existing "paste a URL" one above --
+    // the file has to actually go to the backend (see
+    // /api/social/comment-image/upload in app.py) because Facebook fetches
+    // the comment's attachment_url itself server-side, so a local blob: URL
+    // would never resolve for it.
+    const uploadCommentImage = async (localId, file) => {
+        if (!file) return;
+        if (!file.type.startsWith("image/")) {
+            updateComment(localId, "imageError", t("social.postComposerCommentImageInvalidType", "Ce fichier n'est pas une image."));
+            return;
+        }
+        if (file.size > COMMENT_IMAGE_MAX_BYTES) {
+            updateComment(localId, "imageError", t("social.postComposerCommentImageTooLarge", "Image trop volumineuse (10 Mo max)."));
+            return;
+        }
+
+        setComments((prev) =>
+            prev.map((c) => (c.localId === localId ? { ...c, imageUploading: true, imageError: "" } : c))
+        );
+        try {
+            const formData = new FormData();
+            formData.append("file", file);
+            const response = await fetch(getApiUrl("/api/social/comment-image/upload"), {
+                method: "POST",
+                headers: { ...getAuthHeaders(user?.id) },
+                body: formData,
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok || !data?.image_url) {
+                throw new Error(data?.detail || t("social.postComposerCommentImageUploadFailed", "Echec de l'envoi de l'image."));
+            }
+            setComments((prev) =>
+                prev.map((c) =>
+                    c.localId === localId
+                        ? { ...c, imageUrl: data.image_url, imageUploading: false, addingImage: false, imageDraft: "" }
+                        : c
+                )
+            );
+        } catch (err) {
+            setComments((prev) =>
+                prev.map((c) =>
+                    c.localId === localId
+                        ? { ...c, imageUploading: false, imageError: err.message || t("social.postComposerCommentImageUploadFailed", "Echec de l'envoi de l'image.") }
+                        : c
+                )
+            );
+        }
+    };
+
+    const handleCommentImageDrop = (localId, e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        updateComment(localId, "isDraggingImage", false);
+        const file = e.dataTransfer?.files?.[0];
+        if (file) uploadCommentImage(localId, file);
     };
 
     const handleSubmit = async () => {
@@ -435,35 +498,93 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
                                                 </button>
                                             </div>
                                         ) : comment.addingImage ? (
-                                            <div className="flex items-center gap-2">
-                                                <input
-                                                    autoFocus
-                                                    value={comment.imageDraft}
-                                                    onChange={(e) => updateComment(comment.localId, "imageDraft", e.target.value)}
-                                                    placeholder={t("social.postComposerCommentImagePlaceholder", "Collez l'URL de l'image...")}
-                                                    className="flex-1 bg-white dark:bg-black/30 border border-slate-300 dark:border-white/10 rounded-md p-2 text-xs text-slate-900 dark:text-white"
-                                                />
-                                                <button
-                                                    type="button"
-                                                    onClick={() => {
-                                                        updateComment(comment.localId, "imageUrl", comment.imageDraft.trim());
-                                                        updateComment(comment.localId, "addingImage", false);
+                                            <div className="space-y-2">
+                                                <label
+                                                    htmlFor={`comment-image-file-${comment.localId}`}
+                                                    onDragOver={(e) => {
+                                                        e.preventDefault();
+                                                        updateComment(comment.localId, "isDraggingImage", true);
                                                     }}
-                                                    disabled={!comment.imageDraft.trim()}
-                                                    className="px-2 py-2 rounded-md bg-primary text-white disabled:opacity-40"
+                                                    onDragLeave={() => updateComment(comment.localId, "isDraggingImage", false)}
+                                                    onDrop={(e) => handleCommentImageDrop(comment.localId, e)}
+                                                    className={`flex flex-col items-center justify-center gap-1 p-4 rounded-md border-2 border-dashed cursor-pointer transition-colors ${
+                                                        comment.isDraggingImage
+                                                            ? "border-primary bg-primary/10"
+                                                            : "border-slate-300 dark:border-white/20 hover:border-primary/60"
+                                                    }`}
                                                 >
-                                                    <Check size={14} />
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    onClick={() => {
-                                                        updateComment(comment.localId, "addingImage", false);
-                                                        updateComment(comment.localId, "imageDraft", "");
-                                                    }}
-                                                    className="px-2 py-2 rounded-md bg-slate-200 dark:bg-white/10 text-slate-600 dark:text-zinc-300"
-                                                >
-                                                    <X size={14} />
-                                                </button>
+                                                    <input
+                                                        id={`comment-image-file-${comment.localId}`}
+                                                        type="file"
+                                                        accept="image/*"
+                                                        className="hidden"
+                                                        disabled={comment.imageUploading}
+                                                        onChange={(e) => {
+                                                            const file = e.target.files?.[0];
+                                                            e.target.value = "";
+                                                            if (file) uploadCommentImage(comment.localId, file);
+                                                        }}
+                                                    />
+                                                    {comment.imageUploading ? (
+                                                        <>
+                                                            <Loader2 size={18} className="animate-spin text-primary" />
+                                                            <span className="text-[11px] text-slate-500 dark:text-zinc-400">
+                                                                {t("social.postComposerCommentImageUploading", "Envoi en cours...")}
+                                                            </span>
+                                                        </>
+                                                    ) : (
+                                                        <>
+                                                            <ImageIcon size={18} className="text-slate-400 dark:text-zinc-500" />
+                                                            <span className="text-[11px] text-slate-500 dark:text-zinc-400 text-center">
+                                                                {t(
+                                                                    "social.postComposerCommentImageDropzone",
+                                                                    "Glissez une image ici, ou cliquez pour parcourir"
+                                                                )}
+                                                            </span>
+                                                        </>
+                                                    )}
+                                                </label>
+
+                                                {comment.imageError ? <p className="text-[11px] text-rose-500">{comment.imageError}</p> : null}
+
+                                                <div className="flex items-center gap-2">
+                                                    <div className="flex-1 h-px bg-slate-200 dark:bg-white/10" />
+                                                    <span className="text-[10px] uppercase text-slate-400 dark:text-zinc-500">
+                                                        {t("common.or", "ou")}
+                                                    </span>
+                                                    <div className="flex-1 h-px bg-slate-200 dark:bg-white/10" />
+                                                </div>
+
+                                                <div className="flex items-center gap-2">
+                                                    <input
+                                                        value={comment.imageDraft}
+                                                        onChange={(e) => updateComment(comment.localId, "imageDraft", e.target.value)}
+                                                        placeholder={t("social.postComposerCommentImagePlaceholder", "Collez l'URL de l'image...")}
+                                                        className="flex-1 bg-white dark:bg-black/30 border border-slate-300 dark:border-white/10 rounded-md p-2 text-xs text-slate-900 dark:text-white"
+                                                    />
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => {
+                                                            updateComment(comment.localId, "imageUrl", comment.imageDraft.trim());
+                                                            updateComment(comment.localId, "addingImage", false);
+                                                        }}
+                                                        disabled={!comment.imageDraft.trim()}
+                                                        className="px-2 py-2 rounded-md bg-primary text-white disabled:opacity-40"
+                                                    >
+                                                        <Check size={14} />
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => {
+                                                            updateComment(comment.localId, "addingImage", false);
+                                                            updateComment(comment.localId, "imageDraft", "");
+                                                            updateComment(comment.localId, "imageError", "");
+                                                        }}
+                                                        className="px-2 py-2 rounded-md bg-slate-200 dark:bg-white/10 text-slate-600 dark:text-zinc-300"
+                                                    >
+                                                        <X size={14} />
+                                                    </button>
+                                                </div>
                                             </div>
                                         ) : (
                                             <button

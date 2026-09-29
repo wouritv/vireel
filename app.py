@@ -10496,6 +10496,80 @@ async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotate
     }
 
 
+_COMMENT_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+_COMMENT_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+# Longest a presigned S3 URL signed with static IAM credentials (SigV4) can
+# live -- AWS's own hard cap, not a choice made here. A comment's image_url
+# is stored as-is in the publish job's payload (see _schedule_social_post_job)
+# and only resolved by Facebook/LinkedIn when the scheduled post actually
+# goes out, so a post scheduled further out than this window would find its
+# comment image link expired by then.
+_COMMENT_IMAGE_URL_EXPIRATION_SECONDS = 7 * 24 * 3600
+
+
+def _validate_comment_image_upload(file: Optional[UploadFile]) -> None:
+    if not file:
+        raise HTTPException(status_code=400, detail="Missing image file")
+    content_type = str(file.content_type or "").lower()
+    if content_type and not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Invalid image content type")
+
+
+async def _save_comment_image_upload(file: UploadFile, local_path: str) -> None:
+    async with aiofiles.open(local_path, "wb") as buffer:
+        total = 0
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _COMMENT_IMAGE_MAX_BYTES:
+                raise HTTPException(status_code=400, detail="Image is too large (max 10 MB)")
+            await buffer.write(chunk)
+
+
+@app.post("/api/social/comment-image/upload", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 503: {"description": "Service Unavailable"}})
+async def upload_social_comment_image(
+    user_id: Annotated[str, Depends(get_user_id_header)],
+    file: Annotated[UploadFile, File()],
+):
+    """Uploads an image drag-and-dropped (or picked) onto a follow-up comment
+    in the "Faire une publication" composer (see SocialPostComposerModal)
+    and returns a URL Facebook can fetch server-side as the comment's
+    attachment_url -- a local blob: URL wouldn't survive the browser tab
+    closing, let alone a post scheduled for later."""
+    _validate_comment_image_upload(file)
+
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket:
+        raise HTTPException(status_code=503, detail="AWS_S3_BUCKET is required for image uploads")
+
+    safe_name = _sanitize_input_filename(file.filename) or "image.jpg"
+    ext = os.path.splitext(safe_name)[1].lower()
+    if ext not in _COMMENT_IMAGE_EXTENSIONS:
+        ext = ".jpg"
+
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    local_path = os.path.join(UPLOAD_DIR, f"comment_image_{uuid.uuid4().hex}{ext}")
+    try:
+        await _save_comment_image_upload(file, local_path)
+        s3_key = f"social_comment_images/{user_id}/{uuid.uuid4().hex}{ext}"
+        if not upload_file_to_s3(local_path, bucket, s3_key):
+            raise HTTPException(status_code=503, detail="Failed to upload image")
+    finally:
+        try:
+            if os.path.exists(local_path):
+                os.remove(local_path)
+        except Exception:
+            pass
+
+    image_url = generate_presigned_url(bucket, s3_key, expiration=_COMMENT_IMAGE_URL_EXPIRATION_SECONDS) or ""
+    if not image_url:
+        raise HTTPException(status_code=503, detail="Failed to generate image URL")
+
+    return {"image_url": image_url}
+
+
 async def _publish_caption_now(user_id: str, platform_name: str, publish_priority: int, final_title: str, final_description: str, media_url: str) -> Dict[str, Any]:
     publish_job_id = await _insert_publish_job(
         user_id=user_id,
