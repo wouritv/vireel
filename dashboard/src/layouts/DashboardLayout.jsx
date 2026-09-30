@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { ChevronRight, LogOut, Menu } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Bell, CreditCard, FileText, LogOut, Menu, Settings as SettingsIcon } from "lucide-react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { fetchAppConfig, getDefaultHideSocialPlatforms } from "../config";
 import { DASHBOARD_SIDEBAR_ITEMS } from "../lib/dashboard-nav";
@@ -20,11 +20,16 @@ export default function DashboardLayout() {
     // default of true) until /api/config resolves, same optimistic-then-
     // confirm pattern as hideSocialPlatforms above.
     const [filmSummaryEnabled, setFilmSummaryEnabled] = useState(true);
+    const [isNotificationsOpen, setIsNotificationsOpen] = useState(false);
+    const [isUserMenuOpen, setIsUserMenuOpen] = useState(false);
+    const notificationsRef = useRef(null);
+    const userMenuRef = useRef(null);
     const displayName =
         user?.user_metadata?.full_name ||
         user?.user_metadata?.name ||
         user?.email?.split("@")[0] ||
         t("settings.user", "Utilisateur");
+    const avatarLetter = (displayName || user?.email || "?").trim().charAt(0).toUpperCase() || "?";
 
     useEffect(() => {
         let active = true;
@@ -74,6 +79,25 @@ export default function DashboardLayout() {
         return () => window.removeEventListener("keydown", onEscape);
     }, [isDesktopLike, isSidebarOpen]);
 
+    useEffect(() => {
+        if (!isNotificationsOpen && !isUserMenuOpen) return undefined;
+        const onClickOutside = (event) => {
+            if (isNotificationsOpen && notificationsRef.current && !notificationsRef.current.contains(event.target)) {
+                setIsNotificationsOpen(false);
+            }
+            if (isUserMenuOpen && userMenuRef.current && !userMenuRef.current.contains(event.target)) {
+                setIsUserMenuOpen(false);
+            }
+        };
+        document.addEventListener("mousedown", onClickOutside);
+        return () => document.removeEventListener("mousedown", onClickOutside);
+    }, [isNotificationsOpen, isUserMenuOpen]);
+
+    useEffect(() => {
+        setIsNotificationsOpen(false);
+        setIsUserMenuOpen(false);
+    }, [location.pathname]);
+
     const sidebarItems = useMemo(
         () => DASHBOARD_SIDEBAR_ITEMS.filter((item) => {
             if (hideSocialPlatforms && item.key === "social-publications") return false;
@@ -114,12 +138,7 @@ export default function DashboardLayout() {
 
                     </div>
 
-                    <div className="mt-5 rounded-2xl border border-slate-300 dark:border-white/10 bg-white/5 p-4 mx-4 flex flex-col items-start gap-1">
-                        <p className="text-sm font-medium text-white">{displayName}</p>
-                        <p className="mt-1 text-xs text-slate-500 dark:text-zinc-400">{user?.email || "Aucune adresse email"}</p>
-                    </div>
-
-                    <nav className="flex-1 px-4 py-4 space-y-2 overflow-y-auto custom-scrollbar">
+                    <nav className="mt-5 flex-1 px-4 py-4 space-y-2 overflow-y-auto custom-scrollbar">
                         {sidebarItems.map((item) => {
                             const ItemIcon = item.icon;
                             /*if (item.key === "reels" || item.key === "captions") {
@@ -181,20 +200,121 @@ export default function DashboardLayout() {
                 </aside>
 
                 <main className={`flex-1 flex flex-col h-full relative ${isDesktopLike ? "overflow-hidden" : "overflow-visible"}`}>
-                    {!isDesktopLike && (
-                        <button
-                            type="button"
-                            aria-label={t("sidebar.open", "Ouvrir le menu")}
-                            onClick={() => setIsSidebarOpen(true)}
-                            className="absolute left-4 top-4 z-20 inline-flex h-10 w-10 items-center justify-center rounded-xl border border-slate-300 dark:border-white/10 bg-surface/95 text-white shadow-lg backdrop-blur-sm"
-                        >
-                            <Menu size={18} />
-                        </button>
-                    )}
                     <div className="absolute inset-0 overflow-hidden -z-10 pointer-events-none">
                         <div className="absolute -top-[10%] -right-[10%] w-[50%] h-[50%] bg-primary/5 rounded-full blur-[120px]" />
                     </div>
-                    <div className={`h-full min-h-0 flex flex-col ${isDesktopLike ? "" : "pt-16"}`}>
+
+                    <header className="shrink-0 h-16 flex items-center justify-between gap-3 px-4 lg:px-6 border-b border-slate-200 dark:border-white/5 bg-surface/70 backdrop-blur-sm">
+                        <div className="flex items-center gap-3 min-w-0">
+                            {!isDesktopLike && (
+                                <button
+                                    type="button"
+                                    aria-label={t("sidebar.open", "Ouvrir le menu")}
+                                    onClick={() => setIsSidebarOpen(true)}
+                                    className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-slate-300 dark:border-white/10 bg-surface/95 text-white shadow-sm"
+                                >
+                                    <Menu size={18} />
+                                </button>
+                            )}
+                        </div>
+
+                        <div className="flex items-center gap-3 shrink-0">
+                            <span className="hidden sm:block text-sm font-medium text-slate-700 dark:text-zinc-200 truncate max-w-[10rem]">
+                                {displayName}
+                            </span>
+
+                            <div className="relative" ref={notificationsRef}>
+                                <button
+                                    type="button"
+                                    aria-label={t("header.notifications", "Notifications")}
+                                    onClick={() => {
+                                        setIsNotificationsOpen((prev) => !prev);
+                                        setIsUserMenuOpen(false);
+                                    }}
+                                    className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 dark:border-white/10 text-slate-600 dark:text-zinc-300 hover:bg-white/5 transition-colors"
+                                >
+                                    <Bell size={18} />
+                                </button>
+                                {isNotificationsOpen ? (
+                                    <div className="absolute right-0 mt-2 w-72 rounded-xl border border-slate-200 dark:border-white/10 bg-surface shadow-2xl z-50">
+                                        <p className="px-4 pt-3 text-xs font-bold uppercase tracking-wider text-slate-400 dark:text-zinc-500">
+                                            {t("header.notifications", "Notifications")}
+                                        </p>
+                                        <p className="px-4 py-6 text-center text-sm text-slate-500 dark:text-zinc-400">
+                                            {t("header.noNotifications", "Aucune notification pour le moment.")}
+                                        </p>
+                                    </div>
+                                ) : null}
+                            </div>
+
+                            <div className="relative" ref={userMenuRef}>
+                                <button
+                                    type="button"
+                                    aria-label={t("header.account", "Compte")}
+                                    onClick={() => {
+                                        setIsUserMenuOpen((prev) => !prev);
+                                        setIsNotificationsOpen(false);
+                                    }}
+                                    className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-primary/15 text-primary font-bold text-sm border border-primary/20 hover:bg-primary/20 transition-colors"
+                                >
+                                    {avatarLetter}
+                                </button>
+                                {isUserMenuOpen ? (
+                                    <div className="absolute right-0 mt-2 w-64 rounded-xl border border-slate-200 dark:border-white/10 bg-surface shadow-2xl z-50 overflow-hidden">
+                                        <div className="p-4 flex items-center gap-3">
+                                            <div className="h-10 w-10 shrink-0 inline-flex items-center justify-center rounded-full bg-primary/15 text-primary font-bold text-sm border border-primary/20">
+                                                {avatarLetter}
+                                            </div>
+                                            <div className="min-w-0">
+                                                <p className="text-sm font-semibold text-white truncate">{displayName}</p>
+                                                <p className="text-xs text-slate-500 dark:text-zinc-400 truncate">{user?.email || ""}</p>
+                                            </div>
+                                        </div>
+
+                                        <div className="border-t border-slate-200 dark:border-white/10" />
+
+                                        <nav className="p-2">
+                                            <NavLink
+                                                to="/dashboard/settings"
+                                                onClick={() => setIsUserMenuOpen(false)}
+                                                className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-slate-700 dark:text-zinc-200 hover:bg-white/5"
+                                            >
+                                                <SettingsIcon size={16} /> {t("settings.title", "Paramètres")}
+                                            </NavLink>
+                                            <NavLink
+                                                to="/dashboard/abonnements"
+                                                onClick={() => setIsUserMenuOpen(false)}
+                                                className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-slate-700 dark:text-zinc-200 hover:bg-white/5"
+                                            >
+                                                <CreditCard size={16} /> {t("nav.abonnements", "Abonnement")}
+                                            </NavLink>
+                                            <a
+                                                href="https://docs.vireel.co/"
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                onClick={() => setIsUserMenuOpen(false)}
+                                                className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-slate-700 dark:text-zinc-200 hover:bg-white/5"
+                                            >
+                                                <FileText size={16} /> {t("nav.documents", "Documents")}
+                                            </a>
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    setIsUserMenuOpen(false);
+                                                    logout();
+                                                }}
+                                                className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-red-500 hover:bg-red-500/10 transition-colors"
+                                            >
+                                                <LogOut size={16} /> {t("settings.logout", "Se déconnecter")}
+                                            </button>
+                                        </nav>
+                                    </div>
+                                ) : null}
+                            </div>
+                        </div>
+                    </header>
+
+                    <div className="flex-1 min-h-0 flex flex-col">
                         <Outlet />
                     </div>
                 </main>

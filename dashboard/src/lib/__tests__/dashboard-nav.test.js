@@ -26,6 +26,8 @@ describe('DASHBOARD_SIDEBAR_ITEMS', () => {
     });
 
     it('exposes expected navigation entries', () => {
+        // abonnements/settings are reached from the header's account menu
+        // now (see DashboardLayout.jsx), not the sidebar.
         const keys = DASHBOARD_SIDEBAR_ITEMS.map((item) => item.key);
         expect(keys).toEqual([
             'dashboard',
@@ -34,8 +36,6 @@ describe('DASHBOARD_SIDEBAR_ITEMS', () => {
             'anonymous-stories',
             'film-summaries',
             'social-publications',
-            'abonnements',
-            'settings',
         ]);
     });
 });

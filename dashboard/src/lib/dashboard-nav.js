@@ -1,11 +1,9 @@
 import {
     Clapperboard,
-    CreditCardIcon,
     Home,
     LayoutGrid,
     MessageSquareText,
     Quote,
-    Settings,
     Share2,
 } from "lucide-react";
 
@@ -81,29 +79,5 @@ export const DASHBOARD_SIDEBAR_ITEMS = [
         badge: "Monitoring",
         category: "service",
         path: "/dashboard/social-publications",
-    },
-    {
-        key: "abonnements",
-        title: "Abonnements",
-        sidebarLabel: "Abonnements",
-        icon: CreditCardIcon,
-        activeClassName: "bg-orange-500/10 text-orange-400",
-        inactiveClassName: "text-slate-500 dark:text-zinc-400 hover:text-white hover:bg-white/5",
-        description: "Choisis la formule qui te conviens, et active les services que tu souhaites utiliser.",
-        badge: "Config",
-        category: "utility",
-        path: "/dashboard/abonnements",
-    },
-    {
-        key: "settings",
-        title: "Paramètres",
-        sidebarLabel: "Paramètres",
-        icon: Settings,
-        activeClassName: "bg-primary/10 text-primary",
-        inactiveClassName: "text-slate-500 dark:text-zinc-400 hover:text-white hover:bg-white/5",
-        description: "Configure et adminsitre tes préférences",
-        badge: "Config",
-        category: "utility",
-        path: "/dashboard/settings",
     },
 ];
