@@ -7815,7 +7815,7 @@ class SocialPostRequest(BaseModel):
     job_id: str
     clip_index: int
     user_id: Optional[str] = None
-    platforms: Optional[List[str]] = None # ["tiktok", "instagram", "youtube"]
+    account_ids: List[str] = []
     # Optional overrides if frontend wants to edit them
     title: Optional[str] = None
     description: Optional[str] = None
@@ -7841,20 +7841,38 @@ def _resolve_request_user_id(explicit_user_id: Optional[str], user_id: str) -> s
     return resolved
 
 
-def _resolve_social_platforms(platforms: Optional[List[str]]) -> List[str]:
-    allowed = {"tiktok", "instagram", "youtube", "facebook", "linkedin"}
-    candidate = [p.strip().lower() for p in (platforms or []) if isinstance(p, str) and p.strip()]
-    if not candidate:
-        env_value = os.getenv("SOCIAL_DEFAULT_PLATFORMS", "tiktok,instagram,youtube")
-        candidate = [p.strip().lower() for p in env_value.split(",") if p.strip()]
+_SHARE_PLATFORMS = {"tiktok", "instagram", "youtube", "facebook", "linkedin"}
+_SOCIAL_POST_PLATFORMS = {"facebook", "linkedin"}
 
-    deduped = []
-    for p in candidate:
-        if p in allowed and p not in deduped:
-            deduped.append(p)
-    if not deduped:
-        raise HTTPException(status_code=400, detail="No valid social platforms selected")
-    return deduped
+
+async def _resolve_accounts_for_publish(
+    user_id: str, account_ids: Optional[List[str]], allowed_platforms: set,
+) -> List[Dict[str, Any]]:
+    """Resolves each requested account id to its connected-account row,
+    ownership-checked -- lets a single publish/share/schedule request target
+    several specific connected accounts at once (e.g. two Facebook Pages),
+    each billed and tracked as its own publish_jobs row. Shared by every
+    publish surface (composer, reel/caption/film-summary share, anonymous
+    stories); only the allowed platform set differs per surface."""
+    ids: List[str] = []
+    seen = set()
+    for raw in account_ids or []:
+        account_id = str(raw or "").strip()
+        if account_id and account_id not in seen:
+            seen.add(account_id)
+            ids.append(account_id)
+    if not ids:
+        raise HTTPException(status_code=400, detail="account_ids must include at least one connected account")
+
+    accounts: List[Dict[str, Any]] = []
+    for account_id in ids:
+        account = await _get_social_account_by_id(user_id, account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail=f"Connected account not found: {account_id}")
+        if account.get("platform") not in allowed_platforms:
+            raise HTTPException(status_code=400, detail=f"Unsupported platform for account {account_id}")
+        accounts.append(account)
+    return accounts
 
 
 def _resolve_local_video_path(job_id: str, video_ref: str, clip_index: int) -> Optional[str]:
@@ -7904,12 +7922,12 @@ def _resolve_public_video_url(video_ref: str, request: Request, job_id: str) -> 
     return f"{base_url}/videos/{job_id}/{ref}"
 
 async def _schedule_reel_social_post_job(
-    user_id: str, platform_name: str, req: "SocialPostRequest", publish_priority: int,
+    user_id: str, account: Dict[str, Any], req: "SocialPostRequest", publish_priority: int,
     scheduled_for, final_title: str, final_description: str, public_video_url: str,
 ) -> Dict[str, Any]:
     publish_job_id = await _insert_publish_job(
         user_id=user_id,
-        platform=platform_name,
+        platform=str(account.get("platform") or ""),
         external_id="scheduled",
         status="queued",
         priority=publish_priority,
@@ -7917,6 +7935,7 @@ async def _schedule_reel_social_post_job(
         timezone=req.timezone or "UTC",
         payload={
             "source_type": "job_clip",
+            "account_id": account.get("id"),
             "source_id": req.job_id,
             "clip_index": req.clip_index,
             "title": final_title,
@@ -7933,14 +7952,11 @@ async def _schedule_reel_social_post_job(
 
 
 async def _publish_reel_social_post_now(
-    user_id: str, platform_name: str, publish_priority: int,
+    user_id: str, account: Dict[str, Any], publish_priority: int,
     final_title: str, final_description: str, public_video_url: str, local_video_path: str,
 ) -> Dict[str, Any]:
+    platform_name = str(account.get("platform") or "")
     try:
-        account = await _get_social_account(user_id, platform_name)
-        if not account:
-            raise HTTPException(status_code=404, detail=f"No connected {platform_name} account found")
-
         # Sonar false positive (S5332): validates the URL is absolute (any
         # scheme) before submitting it to the platform API -- not a
         # hardcoded http:// request of our own.
@@ -7979,8 +7995,8 @@ async def _publish_reel_social_post_now(
 
 @app.post("/api/social/post", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def post_to_socials(req: SocialPostRequest, request: Request, user_id_header: Annotated[str, Depends(get_user_id_header)]):
-    selected_platforms = _resolve_social_platforms(req.platforms)
     user_id = _resolve_request_user_id(req.user_id, user_id_header)
+    accounts = await _resolve_accounts_for_publish(user_id, req.account_ids, _SHARE_PLATFORMS)
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(req.scheduled_date, req.timezone)
     if req.scheduled_date and not scheduled_for:
@@ -8002,17 +8018,18 @@ async def post_to_socials(req: SocialPostRequest, request: Request, user_id_head
     results: Dict[str, Any] = {}
     overall_success = True
 
-    for platform_name in selected_platforms:
+    for account in accounts:
+        result_key = str(account.get("id") or account.get("platform"))
         if is_scheduled:
-            results[platform_name] = await _schedule_reel_social_post_job(
-                user_id, platform_name, req, publish_priority, scheduled_for, final_title, final_description, public_video_url,
+            results[result_key] = await _schedule_reel_social_post_job(
+                user_id, account, req, publish_priority, scheduled_for, final_title, final_description, public_video_url,
             )
             continue
 
         result = await _publish_reel_social_post_now(
-            user_id, platform_name, publish_priority, final_title, final_description, public_video_url, local_video_path,
+            user_id, account, publish_priority, final_title, final_description, public_video_url, local_video_path,
         )
-        results[platform_name] = result
+        results[result_key] = result
         if not result["success"]:
             overall_success = False
 
@@ -8457,7 +8474,7 @@ def thumbnail_publish_status(publish_id: str, user_id: Annotated[str, Depends(ge
 
 
 class ReelShareRequest(BaseModel):
-    platforms: Optional[List[str]] = None
+    account_ids: List[str] = []
     title: Optional[str] = None
     description: Optional[str] = None
     scheduled_date: Optional[str] = None
@@ -9417,7 +9434,7 @@ class AnonymousStoryUpdateRequest(BaseModel):
 
 
 class AnonymousStoryPublishRequest(BaseModel):
-    platforms: List[str]
+    account_ids: List[str] = []
     background_id: Optional[str] = None
     scheduled_date: Optional[str] = None
     timezone: Optional[str] = "UTC"
@@ -10077,24 +10094,14 @@ async def regenerate_anonymous_story_endpoint(story_id: str, user_id: Annotated[
 # explicitly asked for ("la publication dois se faire entre facebook et
 # Linkedin") -- unlike reels/captions, which fan out to whatever the
 # account has connected among tiktok/instagram/youtube/facebook/linkedin.
-_ANONYMOUS_STORY_PUBLISH_PLATFORMS = {"facebook", "linkedin"}
-
-
-def _resolve_anonymous_story_platforms(platforms: Optional[List[str]]) -> List[str]:
-    candidate = [p.strip().lower() for p in (platforms or []) if isinstance(p, str) and p.strip()]
-    result: List[str] = []
-    for p in candidate:
-        if p in _ANONYMOUS_STORY_PUBLISH_PLATFORMS and p not in result:
-            result.append(p)
-    if not result:
-        raise HTTPException(status_code=400, detail="platforms must include at least one of: facebook, linkedin")
-    return result
+# Reuses _SOCIAL_POST_PLATFORMS (the composer's own set is identical).
 
 
 async def _publish_anonymous_story_now(
-    user_id: str, platform_name: str, publish_priority: int, text_value: str,
+    user_id: str, account: Dict[str, Any], publish_priority: int, text_value: str,
     background_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    platform_name = str(account.get("platform") or "")
     publish_job_id = await _insert_publish_job(
         user_id=user_id,
         platform=platform_name,
@@ -10104,9 +10111,6 @@ async def _publish_anonymous_story_now(
     )
     try:
         await _update_publish_job_status(publish_job_id, "processing")
-        account = await _get_social_account(user_id, platform_name)
-        if not account:
-            raise HTTPException(status_code=404, detail=f"No connected {platform_name} account found")
 
         publish_payload = PublishRequest(
             user_id=user_id,
@@ -10149,24 +10153,25 @@ def _resolve_anonymous_story_schedule(payload: "AnonymousStoryPublishRequest"):
 
 async def _dispatch_anonymous_story_publish(
     user_id: str, story_id: str, story_title: str, text_value: str, background_id: str,
-    selected_platforms: List[str], publish_priority: int, scheduled_for, timezone: Optional[str],
+    accounts: List[Dict[str, Any]], publish_priority: int, scheduled_for, timezone: Optional[str],
     is_scheduled: bool,
 ) -> Dict[str, Any]:
-    """Publish (or schedule) the story across every selected platform.
+    """Publish (or schedule) the story across every selected account.
     Pulled out of publish_anonymous_story_endpoint to keep its cognitive
     complexity down."""
     results: Dict[str, Any] = {}
-    for platform_name in selected_platforms:
+    for account in accounts:
+        result_key = str(account.get("id") or account.get("platform"))
         if is_scheduled:
-            results[platform_name] = await _schedule_share_publish_job(
-                user_id, platform_name, "anonymous_story", story_id, publish_priority,
+            results[result_key] = await _schedule_share_publish_job(
+                user_id, account, "anonymous_story", story_id, publish_priority,
                 scheduled_for, timezone, story_title, text_value, "",
                 background_id=background_id,
             )
             continue
 
-        results[platform_name] = await _publish_anonymous_story_now(
-            user_id, platform_name, publish_priority, text_value, background_id,
+        results[result_key] = await _publish_anonymous_story_now(
+            user_id, account, publish_priority, text_value, background_id,
         )
     return results
 
@@ -10188,14 +10193,14 @@ async def publish_anonymous_story_endpoint(
     if not text_value:
         raise HTTPException(status_code=400, detail="Story has no generated text to publish yet")
 
-    selected_platforms = _resolve_anonymous_story_platforms(payload.platforms)
+    accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SOCIAL_POST_PLATFORMS)
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for, is_scheduled = _resolve_anonymous_story_schedule(payload)
     background_id = payload.background_id or anonymous_stories.BACKGROUND_PRESETS[0]["id"]
 
     results = await _dispatch_anonymous_story_publish(
         user_id, story_id, str(row.get("title") or "Vireel"), text_value, background_id,
-        selected_platforms, publish_priority, scheduled_for, payload.timezone, is_scheduled,
+        accounts, publish_priority, scheduled_for, payload.timezone, is_scheduled,
     )
     overall_success = all(result.get("success") for result in results.values())
 
@@ -10211,13 +10216,13 @@ async def publish_anonymous_story_endpoint(
 
 
 async def _schedule_share_publish_job(
-    user_id: str, platform_name: str, source_type: str, source_id: str, publish_priority: int,
+    user_id: str, account: Dict[str, Any], source_type: str, source_id: str, publish_priority: int,
     scheduled_for, timezone: Optional[str], final_title: str, final_description: str, media_url: str,
     background_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     publish_job_id = await _insert_publish_job(
         user_id=user_id,
-        platform=platform_name,
+        platform=str(account.get("platform") or ""),
         external_id="scheduled",
         status="queued",
         priority=publish_priority,
@@ -10225,6 +10230,7 @@ async def _schedule_share_publish_job(
         timezone=timezone or "UTC",
         payload={
             "source_type": source_type,
+            "account_id": account.get("id"),
             "source_id": source_id,
             "title": final_title,
             "description": final_description,
@@ -10271,9 +10277,6 @@ async def _debit_publish_credits_after_share(user_id: str, operation_id: str, re
 # own cost.
 # ---------------------------------------------------------------------------
 
-_SOCIAL_POST_PLATFORMS = {"facebook", "linkedin"}
-
-
 class SocialPostCommentInput(BaseModel):
     text: str = ""
     link: Optional[str] = None
@@ -10287,32 +10290,6 @@ class CreateSocialPostRequest(BaseModel):
     comments: List[SocialPostCommentInput] = []
     scheduled_date: Optional[str] = None
     timezone: Optional[str] = "UTC"
-
-
-async def _resolve_social_post_accounts(user_id: str, account_ids: Optional[List[str]]) -> List[Dict[str, Any]]:
-    """Resolves each requested account id to its connected-account row,
-    ownership-checked -- lets the composer publish the same post to several
-    accounts at once (e.g. two Facebook Pages), each billed and tracked as
-    its own publish_jobs row."""
-    ids: List[str] = []
-    seen = set()
-    for raw in account_ids or []:
-        account_id = str(raw or "").strip()
-        if account_id and account_id not in seen:
-            seen.add(account_id)
-            ids.append(account_id)
-    if not ids:
-        raise HTTPException(status_code=400, detail="account_ids must include at least one connected account")
-
-    accounts: List[Dict[str, Any]] = []
-    for account_id in ids:
-        account = await _get_social_account_by_id(user_id, account_id)
-        if not account:
-            raise HTTPException(status_code=404, detail=f"Connected account not found: {account_id}")
-        if account.get("platform") not in _SOCIAL_POST_PLATFORMS:
-            raise HTTPException(status_code=400, detail=f"Unsupported platform for account {account_id}")
-        accounts.append(account)
-    return accounts
 
 
 def _build_comment_message(comment: "SocialPostCommentInput") -> str:
@@ -10527,7 +10504,7 @@ async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotate
     if not text_value:
         raise HTTPException(status_code=400, detail="text is required")
 
-    accounts = await _resolve_social_post_accounts(user_id, payload.account_ids)
+    accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SOCIAL_POST_PLATFORMS)
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
     if payload.scheduled_date and not scheduled_for:
@@ -10639,7 +10616,8 @@ async def upload_social_comment_image(
     return {"image_url": image_url}
 
 
-async def _publish_caption_now(user_id: str, platform_name: str, publish_priority: int, final_title: str, final_description: str, media_url: str) -> Dict[str, Any]:
+async def _publish_caption_now(user_id: str, account: Dict[str, Any], publish_priority: int, final_title: str, final_description: str, media_url: str) -> Dict[str, Any]:
+    platform_name = str(account.get("platform") or "")
     publish_job_id = await _insert_publish_job(
         user_id=user_id,
         platform=platform_name,
@@ -10649,9 +10627,6 @@ async def _publish_caption_now(user_id: str, platform_name: str, publish_priorit
     )
     try:
         await _update_publish_job_status(publish_job_id, "processing")
-        account = await _get_social_account(user_id, platform_name)
-        if not account:
-            raise HTTPException(status_code=404, detail=f"No connected {platform_name} account found")
 
         publish_payload = PublishRequest(
             user_id=user_id,
@@ -10695,7 +10670,7 @@ async def share_caption(caption_id: str, payload: ReelShareRequest, user_id: Ann
 
     final_title = payload.title or row.get("caption_title") or "Sous-titres"
     final_description = payload.description or row.get("caption_description") or ""
-    selected_platforms = _resolve_social_platforms(payload.platforms)
+    accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SHARE_PLATFORMS)
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
     if payload.scheduled_date and not scheduled_for:
@@ -10704,15 +10679,16 @@ async def share_caption(caption_id: str, payload: ReelShareRequest, user_id: Ann
 
     results: Dict[str, Any] = {}
     overall_success = True
-    for platform_name in selected_platforms:
+    for account in accounts:
+        result_key = str(account.get("id") or account.get("platform"))
         if is_scheduled:
-            results[platform_name] = await _schedule_share_publish_job(
-                user_id, platform_name, "caption", caption_id, publish_priority, scheduled_for, payload.timezone, final_title, final_description, media_url,
+            results[result_key] = await _schedule_share_publish_job(
+                user_id, account, "caption", caption_id, publish_priority, scheduled_for, payload.timezone, final_title, final_description, media_url,
             )
             continue
 
-        result = await _publish_caption_now(user_id, platform_name, publish_priority, final_title, final_description, media_url)
-        results[platform_name] = result
+        result = await _publish_caption_now(user_id, account, publish_priority, final_title, final_description, media_url)
+        results[result_key] = result
         if not result["success"]:
             overall_success = False
 
@@ -12023,20 +11999,18 @@ async def delete_film_summary_endpoint(film_summary_id: str, user_id: Annotated[
 
 
 async def _publish_film_summary_now(
-    user_id: str, platform_name: str, publish_priority: int, final_title: str, final_description: str, media_url: str,
+    user_id: str, account: Dict[str, Any], publish_priority: int, final_title: str, final_description: str, media_url: str,
 ) -> Dict[str, Any]:
     """Same immediate-publish flow as _publish_caption_now/_publish_reel_now
     (share_caption/share_reel) -- the only thing that differs per feature is
     where media_url/title/description come from, so this mirrors them
     exactly rather than introducing a fourth, subtly different variant."""
+    platform_name = str(account.get("platform") or "")
     publish_job_id = await _insert_publish_job(
         user_id=user_id, platform=platform_name, external_id="n/a", status="queued", priority=publish_priority,
     )
     try:
         await _update_publish_job_status(publish_job_id, "processing")
-        account = await _get_social_account(user_id, platform_name)
-        if not account:
-            raise HTTPException(status_code=404, detail=f"No connected {platform_name} account found")
 
         publish_payload = PublishRequest(
             user_id=user_id, title=final_title, description=final_description,
@@ -12073,7 +12047,7 @@ async def share_film_summary(film_summary_id: str, payload: ReelShareRequest, us
 
     final_title = payload.title or row.get("title") or "Resume de film"
     final_description = payload.description or ""
-    selected_platforms = _resolve_social_platforms(payload.platforms)
+    accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SHARE_PLATFORMS)
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
     if payload.scheduled_date and not scheduled_for:
@@ -12082,16 +12056,17 @@ async def share_film_summary(film_summary_id: str, payload: ReelShareRequest, us
 
     results: Dict[str, Any] = {}
     overall_success = True
-    for platform_name in selected_platforms:
+    for account in accounts:
+        result_key = str(account.get("id") or account.get("platform"))
         if is_scheduled:
-            results[platform_name] = await _schedule_share_publish_job(
-                user_id, platform_name, "film_summary", film_summary_id, publish_priority,
+            results[result_key] = await _schedule_share_publish_job(
+                user_id, account, "film_summary", film_summary_id, publish_priority,
                 scheduled_for, payload.timezone, final_title, final_description, media_url,
             )
             continue
 
-        result = await _publish_film_summary_now(user_id, platform_name, publish_priority, final_title, final_description, media_url)
-        results[platform_name] = result
+        result = await _publish_film_summary_now(user_id, account, publish_priority, final_title, final_description, media_url)
+        results[result_key] = result
         if not result["success"]:
             overall_success = False
 
@@ -12472,12 +12447,9 @@ async def delete_reel(reel_id: str, user_id: Annotated[str, Depends(get_user_id_
     return {"deleted": True}
 
 
-async def _publish_reel_now(user_id: str, platform_name: str, publish_priority: int, final_title: str, final_description: str, media_url: str) -> Dict[str, Any]:
+async def _publish_reel_now(user_id: str, account: Dict[str, Any], publish_priority: int, final_title: str, final_description: str, media_url: str) -> Dict[str, Any]:
+    platform_name = str(account.get("platform") or "")
     try:
-        account = await _get_social_account(user_id, platform_name)
-        if not account:
-            raise HTTPException(status_code=404, detail=f"No connected {platform_name} account found")
-
         publish_payload = PublishRequest(
             user_id=user_id,
             title=final_title,
@@ -12521,7 +12493,7 @@ async def share_reel(reel_id: str, payload: ReelShareRequest, user_id: Annotated
 
     final_title = payload.title or row.get("reel_title") or "Vireel"
     final_description = payload.description or row.get("reel_description") or ""
-    selected_platforms = _resolve_social_platforms(payload.platforms)
+    accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SHARE_PLATFORMS)
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
     if payload.scheduled_date and not scheduled_for:
@@ -12530,15 +12502,16 @@ async def share_reel(reel_id: str, payload: ReelShareRequest, user_id: Annotated
 
     results: Dict[str, Any] = {}
     overall_success = True
-    for platform_name in selected_platforms:
+    for account in accounts:
+        result_key = str(account.get("id") or account.get("platform"))
         if is_scheduled:
-            results[platform_name] = await _schedule_share_publish_job(
-                user_id, platform_name, "reel", reel_id, publish_priority, scheduled_for, payload.timezone, final_title, final_description, media_url,
+            results[result_key] = await _schedule_share_publish_job(
+                user_id, account, "reel", reel_id, publish_priority, scheduled_for, payload.timezone, final_title, final_description, media_url,
             )
             continue
 
-        result = await _publish_reel_now(user_id, platform_name, publish_priority, final_title, final_description, media_url)
-        results[platform_name] = result
+        result = await _publish_reel_now(user_id, account, publish_priority, final_title, final_description, media_url)
+        results[result_key] = result
         if not result["success"]:
             overall_success = False
 
@@ -13031,7 +13004,13 @@ async def _execute_scheduled_publish_job(job_row: Dict[str, Any]) -> None:
     try:
         await _update_publish_job_status(job_id, "processing", error_message=None)
 
-        account = await _get_social_account(user_id, platform)
+        # account_id is only present on jobs scheduled after multi-account
+        # support was added -- fall back to "any account of this platform"
+        # for older in-flight jobs that don't have it.
+        account_id = task_payload.get("account_id")
+        account = await _get_social_account_by_id(user_id, account_id) if account_id else None
+        if not account:
+            account = await _get_social_account(user_id, platform)
         if not account:
             raise HTTPException(status_code=404, detail=f"No connected {platform} account found")
 
