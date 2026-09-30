@@ -13827,7 +13827,7 @@ async def _finalize_oauth_callback_identity(key: str, state_data: dict, token_da
     return _oauth_popup_response(True, key)
 
 
-@app.get("/api/auth/{platform}/callback", responses={404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/auth/{platform}/callback", responses={403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def callback(platform: str, code: Optional[str] = None, state: str = "", error: Optional[str] = None):
     key = (platform or "").strip().lower()
 
@@ -15111,6 +15111,33 @@ def _empty_social_insights_metrics() -> Dict[str, Optional[int]]:
     return dict.fromkeys(_SOCIAL_INSIGHTS_METRIC_KEYS)
 
 
+def _latest_facebook_fans_value(value_entries: List[Dict[str, Any]], last_day: Optional[str], last_value: Any) -> Tuple[Optional[str], Any]:
+    # page_fans is a running total, not a daily delta -- track the last day only.
+    for value_entry in value_entries:
+        day = (value_entry.get("end_time") or "")[:10]
+        if not day:
+            continue
+        if last_day is None or day >= last_day:
+            last_day = day
+            last_value = value_entry.get("value") or 0
+    return last_day, last_value
+
+
+def _accumulate_facebook_daily_metric(daily_by_date: Dict[str, Dict[str, Any]], name: Optional[str], value_entry: Dict[str, Any]) -> Tuple[int, int]:
+    day = (value_entry.get("end_time") or "")[:10]
+    value = int(value_entry.get("value") or 0)
+    if not day:
+        return 0, 0
+    bucket = daily_by_date.setdefault(day, {"date": day})
+    if name == "page_impressions":
+        bucket["impressions"] = bucket.get("impressions", 0) + value
+        return value, 0
+    if name in ("page_engaged_users", "page_post_engagements"):
+        bucket["engagement"] = bucket.get("engagement", 0) + value
+        return 0, value
+    return 0, 0
+
+
 def _parse_facebook_insights_metrics(metric_entries: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], int, int, Optional[int]]:
     daily_by_date: Dict[str, Dict[str, Any]] = {}
     total_impressions = 0
@@ -15120,25 +15147,14 @@ def _parse_facebook_insights_metrics(metric_entries: List[Dict[str, Any]]) -> Tu
 
     for metric_entry in metric_entries:
         name = metric_entry.get("name")
-        for value_entry in (metric_entry.get("values") or []):
-            end_time = value_entry.get("end_time") or ""
-            day = end_time[:10]
-            value = value_entry.get("value") or 0
-            if not day:
-                continue
-            if name == "page_fans":
-                # Running total, not a daily delta -- track the last day only.
-                if last_fans_day is None or day >= last_fans_day:
-                    last_fans_day = day
-                    last_fans_value = value
-                continue
-            bucket = daily_by_date.setdefault(day, {"date": day})
-            if name == "page_impressions":
-                bucket["impressions"] = bucket.get("impressions", 0) + int(value)
-                total_impressions += int(value)
-            elif name in ("page_engaged_users", "page_post_engagements"):
-                bucket["engagement"] = bucket.get("engagement", 0) + int(value)
-                total_engagement += int(value)
+        value_entries = metric_entry.get("values") or []
+        if name == "page_fans":
+            last_fans_day, last_fans_value = _latest_facebook_fans_value(value_entries, last_fans_day, last_fans_value)
+            continue
+        for value_entry in value_entries:
+            impressions_delta, engagement_delta = _accumulate_facebook_daily_metric(daily_by_date, name, value_entry)
+            total_impressions += impressions_delta
+            total_engagement += engagement_delta
 
     followers = int(last_fans_value) if last_fans_value is not None else None
     return daily_by_date, total_impressions, total_engagement, followers
