@@ -6435,6 +6435,7 @@ def test_fetch_youtube_analytics_parses_rows(monkeypatch):
         ],
     }
     channels_body = {"items": [{"statistics": {"subscriberCount": "4210"}}]}
+    monetization_body = {"rows": [[12.5, 1000, 4.2]]}
 
     class _FakeAsyncClient:
         def __init__(self, *args, **kwargs):
@@ -6448,8 +6449,12 @@ def test_fetch_youtube_analytics_parses_rows(monkeypatch):
 
         async def get(self, url, params=None):
             request = app.httpx.Request("GET", url)
-            body = channels_body if "channels" in url else reports_body
-            return app.httpx.Response(200, json=body, request=request)
+            params = params or {}
+            if "channels" in url:
+                return app.httpx.Response(200, json=channels_body, request=request)
+            if params.get("metrics") == "estimatedAdRevenue,adImpressions,cpm":
+                return app.httpx.Response(200, json=monetization_body, request=request)
+            return app.httpx.Response(200, json=reports_body, request=request)
 
     monkeypatch.setattr(app.httpx, "AsyncClient", _FakeAsyncClient)
 
@@ -6468,3 +6473,43 @@ def test_fetch_youtube_analytics_parses_rows(monkeypatch):
         {"date": "2026-08-01", "views": 120, "watch_time_minutes": 45, "subscribers_gained": 3, "subscribers_lost": 1, "likes": 10, "comments": 2},
         {"date": "2026-08-02", "views": 80, "watch_time_minutes": 30, "subscribers_gained": 1, "subscribers_lost": 0, "likes": 5, "comments": 1},
     ]
+
+    assert result["monetization"]["supported"] is True
+    assert result["monetization"]["available"] is True
+    assert result["monetization"]["ad_impressions"] == 1000
+    assert result["monetization"]["ad_earnings_cents"] == 1250
+    assert result["monetization"]["ad_cpm_cents"] == 420
+
+
+def test_fetch_youtube_monetization_unavailable_without_scope_or_data(monkeypatch):
+    # Simulates an account that hasn't reconnected to grant
+    # yt-analytics-monetary.readonly, or a non-monetized channel -- Google
+    # returns a 403, which must degrade to available=False rather than
+    # raising and breaking the already-working views/subscribers data.
+    app = _import_app_with_stubs(monkeypatch)
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, params=None):
+            request = app.httpx.Request("GET", url)
+            return app.httpx.Response(403, json={"error": {"message": "insufficient scope"}}, request=request)
+
+    monkeypatch.setattr(app.httpx, "AsyncClient", _FakeAsyncClient)
+
+    result = asyncio.run(app._fetch_youtube_monetization(
+        "token-1", "2026-08-01T00:00:00+00:00", "2026-08-02T23:59:59+00:00",
+    ))
+
+    assert result["supported"] is True
+    assert result["available"] is False
+    assert result["ad_impressions"] is None
+    assert result["ad_earnings_cents"] is None
+    assert result["ad_cpm_cents"] is None

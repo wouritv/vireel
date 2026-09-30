@@ -100,9 +100,15 @@ function TrendBadge({ trend }) {
 }
 
 function MonetizationCard({ monetization, t }) {
-    if (!monetization) return null;
+    // supported === false means the platform's API doesn't offer this at
+    // all (e.g. Instagram has no public monetization API) -- hide the
+    // block entirely rather than explain that absence. available === false
+    // with supported === true means the feature could work but has no data
+    // right now (not enrolled in the program, missing scope, no data for
+    // the period) -- that's still worth a quiet explanatory note.
+    if (!monetization || monetization.supported === false) return null;
 
-    if (monetization.supported === false || monetization.available === false) {
+    if (monetization.available === false) {
         return (
             <div className={`${CARD_CLASS} p-4 flex items-center gap-3 bg-slate-50 dark:bg-white/[0.02]`}>
                 <span className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-slate-100 dark:bg-white/5 text-slate-500 dark:text-zinc-400 shrink-0">
@@ -192,7 +198,7 @@ function ComingSoonCard({ platform, t }) {
             <div>
                 <p className="text-sm font-semibold text-slate-700 dark:text-zinc-200">{PLATFORM_LABELS[platform]}</p>
                 <p className="text-xs text-slate-500 dark:text-zinc-400">
-                    {t("dashboard.analyticsComingSoon", "Bientot disponible : necessite un partenariat API {{platform}} non encore disponible", { platform: PLATFORM_LABELS[platform] })}
+                    {t("dashboard.analyticsComingSoon", "Bientot disponible, en cours de developpement")}
                 </p>
             </div>
         </div>

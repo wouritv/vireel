@@ -388,10 +388,17 @@ PLATFORM_CONFIG = {
         # yt-analytics.readonly is required for the separate YouTube
         # Analytics API (_fetch_youtube_analytics) -- youtube.readonly only
         # covers the Data API and does not grant access to Analytics reports.
+        # yt-analytics-monetary.readonly is a further separate scope needed
+        # only for revenue/ad metrics (_fetch_youtube_monetization) -- Google
+        # treats it as sensitive, so accounts connected before this scope was
+        # added must reconnect to grant it, and it also requires the channel
+        # to be a YouTube Partner Program member; missing either just means
+        # no monetization data, not an error (see _fetch_youtube_monetization).
         "scopes": [
             "https://www.googleapis.com/auth/youtube.upload",
             "https://www.googleapis.com/auth/youtube.readonly",
             "https://www.googleapis.com/auth/yt-analytics.readonly",
+            "https://www.googleapis.com/auth/yt-analytics-monetary.readonly",
         ],
     },
     "tiktok": {
@@ -15620,6 +15627,60 @@ async def _fetch_youtube_subscriber_count(access_token: str) -> Optional[int]:
         return None
 
 
+_YOUTUBE_MONETIZATION_METRICS = ("estimatedAdRevenue", "adImpressions", "cpm")
+_YOUTUBE_MONETIZATION_UNAVAILABLE_REASON = (
+    "Aucune donnee de monetisation disponible (chaine non inscrite au programme "
+    "Partenaire YouTube, scope de monetisation non accorde -- reconnectez la chaine -- "
+    "ou aucune donnee sur cette periode)."
+)
+
+
+async def _fetch_youtube_monetization(access_token: str, since_date: str, until_date: str) -> Dict[str, Any]:
+    """Revenue metrics need the separate yt-analytics-monetary.readonly
+    scope (accounts connected before it was added must reconnect) and
+    channel membership in the YouTube Partner Program. Google returns a
+    plain 403 for a missing scope, same as for a non-monetized channel --
+    unlike the main analytics call, this must never raise: it's an add-on
+    to already-working views/subscribers data, not a hard requirement."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                "https://youtubeanalytics.googleapis.com/v2/reports",
+                params={
+                    "ids": "channel==MINE",
+                    "startDate": since_date[:10],
+                    "endDate": until_date[:10],
+                    "metrics": ",".join(_YOUTUBE_MONETIZATION_METRICS),
+                    "access_token": access_token,
+                },
+            )
+        response.raise_for_status()
+        rows = response.json().get("rows") or []
+    except Exception as exc:
+        logger.warning("Failed to fetch YouTube monetization: %s", exc)
+        rows = []
+
+    if not rows:
+        return {
+            "supported": True,
+            "available": False,
+            "reason": _YOUTUBE_MONETIZATION_UNAVAILABLE_REASON,
+            "ad_impressions": None,
+            "ad_earnings_cents": None,
+            "ad_cpm_cents": None,
+        }
+
+    ad_earnings, ad_impressions, cpm = rows[0][:3]
+    return {
+        "supported": True,
+        "available": True,
+        "reason": None,
+        "ad_impressions": int(ad_impressions or 0),
+        "ad_earnings_cents": round(float(ad_earnings or 0) * 100),
+        "ad_cpm_cents": round(float(cpm or 0) * 100),
+    }
+
+
 async def _fetch_youtube_analytics(access_token: str, since_date: str, until_date: str) -> Dict[str, Any]:
     since_date = since_date[:10]
     until_date = until_date[:10]
@@ -15644,8 +15705,9 @@ async def _fetch_youtube_analytics(access_token: str, since_date: str, until_dat
     metrics = _empty_social_insights_metrics()
     metrics.update(totals)
     metrics["followers"] = await _fetch_youtube_subscriber_count(access_token)
+    monetization = await _fetch_youtube_monetization(access_token, since_date, until_date)
 
-    return {"metrics": metrics, "daily": daily}
+    return {"metrics": metrics, "daily": daily, "monetization": monetization}
 
 
 async def _get_social_insights_for_account(account: Dict[str, Any], since_iso: str, until_iso: str) -> Dict[str, Any]:
