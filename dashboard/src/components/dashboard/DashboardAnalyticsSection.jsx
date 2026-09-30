@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
 import {
     AlertTriangle,
     Coins,
@@ -7,7 +6,6 @@ import {
     Instagram,
     Linkedin,
     Loader2,
-    Lock,
     Minus,
     Twitch,
     TrendingDown,
@@ -167,25 +165,6 @@ async function fetchInsights(userId, accountId, range) {
     });
     if (!response.ok) throw new Error("Unable to load insights");
     return response.json();
-}
-
-function UpsellCard({ t, navigate }) {
-    return (
-        <div className={`${CARD_CLASS} p-8 flex flex-col items-center text-center gap-3`}>
-            <span className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-amber-500/10 text-amber-400">
-                <Lock size={22} />
-            </span>
-            <p className="text-sm text-slate-600 dark:text-zinc-300 max-w-md">
-                {t("dashboard.analyticsGoldOnly", "Les analyses sont reservees aux abonnements Gold et Ultimate.")}
-            </p>
-            <button
-                onClick={() => navigate("/dashboard/abonnements")}
-                className="mt-1 px-4 py-2 rounded-lg bg-primary text-white text-sm font-semibold hover:bg-primary/90 transition"
-            >
-                {t("dashboard.analyticsUpgradeCta", "Voir les abonnements")}
-            </button>
-        </div>
-    );
 }
 
 function ComingSoonCard({ platform, t }) {
@@ -443,7 +422,10 @@ function AnalyticsBody({ range, t }) {
 export default function DashboardAnalyticsSection({ range }) {
     const { hasAnalyticsAccess } = useUserCredits();
     const { t } = useTranslation();
-    const navigate = useNavigate();
+
+    // Silver subscribers don't get an upsell card here -- the whole block
+    // (including its header) is simply absent for them.
+    if (hasAnalyticsAccess === false) return null;
 
     return (
         <section className="space-y-6 rounded-3xl border border-slate-300 dark:border-white/10 p-6 bg-slate-50/60 dark:bg-white/[0.02]">
@@ -454,11 +436,7 @@ export default function DashboardAnalyticsSection({ range }) {
                 <h3 className="mt-2 text-xl font-bold">{t("dashboard.analyticsTitle", "Analyses des reseaux sociaux")}</h3>
             </div>
 
-            {hasAnalyticsAccess === null ? null : hasAnalyticsAccess === false ? (
-                <UpsellCard t={t} navigate={navigate} />
-            ) : (
-                <AnalyticsBody range={range} t={t} />
-            )}
+            {hasAnalyticsAccess === null ? null : <AnalyticsBody range={range} t={t} />}
         </section>
     );
 }
