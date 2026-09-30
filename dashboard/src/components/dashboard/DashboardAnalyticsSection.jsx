@@ -22,13 +22,6 @@ const COMING_SOON_PLATFORMS = ["linkedin", "tiktok"];
 
 const PLATFORM_ICONS = { facebook: Facebook, instagram: Instagram, youtube: Youtube, linkedin: Linkedin, tiktok: Twitch };
 const PLATFORM_LABELS = { facebook: "Facebook", instagram: "Instagram", youtube: "YouTube", linkedin: "LinkedIn", tiktok: "TikTok" };
-const PLATFORM_BRAND_COLORS = {
-    facebook: "#1877F2",
-    instagram: "#E4405F",
-    youtube: "#FF0000",
-    linkedin: "#0A66C2",
-    tiktok: "#0f172a",
-};
 
 const METRIC_DEFS = [
     { key: "followers", labelKey: "dashboard.metricFollowers", fallback: "Abonnés" },
@@ -46,22 +39,20 @@ const METRIC_DEFS = [
 
 const CARD_CLASS = "rounded-xl border border-slate-300 dark:border-white/10 bg-white dark:bg-white/[0.03]";
 
-function clamp(value) {
-    return Math.max(0, Math.min(255, value));
-}
-
-// Lightens (positive) or darkens (negative) a hex color -- used to derive a
-// secondary/tertiary line color for a per-account chart that must stay
-// within that platform's own brand hue rather than the generic categorical
-// palette (see spec: "staying within one platform's brand hue... reads
-// better than borrowing the generic categorical palette").
-function shadeColor(hex, percent) {
-    const num = parseInt(hex.replace("#", ""), 16);
-    const r = clamp(((num >> 16) & 0xff) + Math.round(255 * percent));
-    const g = clamp(((num >> 8) & 0xff) + Math.round(255 * percent));
-    const b = clamp((num & 0xff) + Math.round(255 * percent));
-    return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)}`;
-}
+// A diverse categorical palette for the per-account chart's series -- one
+// hue per line so metrics stay visually distinct even when a platform
+// exposes many of them at once (e.g. YouTube's 6 metrics), rather than
+// shades of a single platform brand color which read as near-identical.
+const CHART_LINE_COLORS = [
+    "#3b82f6", // blue
+    "#f59e0b", // amber
+    "#10b981", // emerald
+    "#ef4444", // red
+    "#8b5cf6", // violet
+    "#06b6d4", // cyan
+    "#ec4899", // pink
+    "#84cc16", // lime
+];
 
 async function fetchSocialAccounts(userId) {
     const response = await fetch(getApiUrl("/api/social/accounts"), {
@@ -142,9 +133,7 @@ function AccountPicker({ accounts, selectedId, onSelect }) {
     );
 }
 
-function AccountInsightsCard({ account, insights, loading, t }) {
-    const brandColor = PLATFORM_BRAND_COLORS[account.platform] || "#64748b";
-
+function AccountInsightsCard({ insights, loading, t }) {
     const availableMetrics = useMemo(() => {
         if (!insights?.metrics) return [];
         return METRIC_DEFS.filter((def) => insights.metrics[def.key] !== null && insights.metrics[def.key] !== undefined);
@@ -208,17 +197,16 @@ function AccountInsightsCard({ account, insights, loading, t }) {
                                 <XAxis dataKey="date" tick={{ fontSize: 11 }} />
                                 <YAxis tick={{ fontSize: 11 }} />
                                 <Tooltip />
-                                <Legend />
+                                <Legend wrapperStyle={{ fontSize: 11 }} />
                                 {dailySeriesKeys.map((key, index) => {
                                     const metricDef = METRIC_DEFS.find((def) => def.key === key);
-                                    const shade = index === 0 ? 0 : (index % 2 === 1 ? -0.2 : 0.25) * Math.ceil(index / 2);
                                     return (
                                         <Line
                                             key={key}
                                             type="monotone"
                                             dataKey={key}
                                             name={metricDef ? t(metricDef.labelKey, metricDef.fallback) : key}
-                                            stroke={shadeColor(brandColor, shade)}
+                                            stroke={CHART_LINE_COLORS[index % CHART_LINE_COLORS.length]}
                                             strokeWidth={2}
                                             dot={false}
                                         />
@@ -325,7 +313,6 @@ function AnalyticsBody({ range, t }) {
                     <AccountPicker accounts={insightAccounts} selectedId={selectedAccountId} onSelect={setSelectedAccountId} />
                     {selectedAccount && (
                         <AccountInsightsCard
-                            account={selectedAccount}
                             insights={insightsByAccount[selectedAccountId]}
                             loading={insightsLoading}
                             t={t}

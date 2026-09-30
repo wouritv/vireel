@@ -6138,10 +6138,10 @@ def test_get_social_insights_returns_unsupported_for_linkedin(monkeypatch):
 def test_fetch_facebook_page_insights_parses_daily_series(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
 
-    body = {
+    insights_body = {
         "data": [
             {
-                "name": "page_impressions",
+                "name": "page_media_view",
                 "period": "day",
                 "values": [
                     {"value": 100, "end_time": "2026-09-01T07:00:00+0000"},
@@ -6156,16 +6156,9 @@ def test_fetch_facebook_page_insights_parses_daily_series(monkeypatch):
                     {"value": 20, "end_time": "2026-09-02T07:00:00+0000"},
                 ],
             },
-            {
-                "name": "page_fans",
-                "period": "day",
-                "values": [
-                    {"value": 500, "end_time": "2026-09-01T07:00:00+0000"},
-                    {"value": 510, "end_time": "2026-09-02T07:00:00+0000"},
-                ],
-            },
         ]
     }
+    profile_body = {"followers_count": 510}
 
     class _FakeAsyncClient:
         def __init__(self, *args, **kwargs):
@@ -6179,6 +6172,7 @@ def test_fetch_facebook_page_insights_parses_daily_series(monkeypatch):
 
         async def get(self, url, params=None):
             request = app.httpx.Request("GET", url)
+            body = insights_body if url.endswith("/insights") else profile_body
             return app.httpx.Response(200, json=body, request=request)
 
     monkeypatch.setattr(app.httpx, "AsyncClient", _FakeAsyncClient)
