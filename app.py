@@ -10803,8 +10803,13 @@ async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotate
     await _assert_user_has_active_subscription_for_publish(user_id)
 
     text_value = (payload.text or "").strip()
-    if not text_value:
-        raise HTTPException(status_code=400, detail="text is required")
+    media_url = (payload.media_url or "").strip() or None
+    # Meta's own APIs only require text on a plain text-only post (Graph API
+    # rejects an empty /feed message with no attachment) -- a photo or video
+    # carries the caption/message as optional, so text is only mandatory
+    # here when there is no media to publish instead.
+    if not text_value and not media_url:
+        raise HTTPException(status_code=400, detail="text is required when no media is attached")
 
     accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SOCIAL_POST_PLATFORMS)
     publish_priority = await _resolve_user_job_priority(user_id)
@@ -10812,7 +10817,6 @@ async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotate
     if payload.scheduled_date and not scheduled_for:
         raise HTTPException(status_code=400, detail=_INVALID_SCHEDULED_DATE)
     is_scheduled = bool(scheduled_for and scheduled_for > _utcnow())
-    media_url = (payload.media_url or "").strip() or None
     media_type = payload.media_type if media_url else None
     # A background can't be combined with a photo/video (Facebook drops the
     # background style the moment media is attached), so only default to

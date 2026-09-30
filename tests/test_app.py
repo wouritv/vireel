@@ -5749,6 +5749,36 @@ def test_create_social_post_publishes_attached_photo(monkeypatch):
     assert queued_payload["media_type"] == "image"
 
 
+def test_create_social_post_allows_empty_text_with_attached_media(monkeypatch):
+    # Meta's APIs only require text on a plain text-only post -- a photo
+    # or video carries the caption as optional, so no text must be allowed
+    # once media is attached.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value=_social_post_account()))
+    monkeypatch.setattr(app, "get_valid_token", AsyncMock(return_value="page-token"))
+    monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "1234_5678"}))
+    monkeypatch.setattr(app, "_insert_publish_job", AsyncMock(return_value="job-1"))
+    monkeypatch.setattr(app, "_update_publish_job_status", AsyncMock())
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/social/posts",
+            json={
+                "text": "   ",
+                "account_ids": ["acct-1"],
+                "media_url": "https://example.com/video.mp4",
+                "media_type": "video",
+            },
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["success"] is True
+
+
 def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
