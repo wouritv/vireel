@@ -67,6 +67,7 @@ export function UserCreditsProvider({ children }) {
         storageRatio:     (credits?.stockage_max ?? 0) > 0 ? (credits?.stockage ?? 0) / (credits?.stockage_max ?? 1) : 0,
         hasCredits:       credits ? credits.credit > 0 : null,  // null = unknown
         hasActiveSubscription: credits ? Boolean(credits.has_active_subscription) : null,  // null = unknown
+        hasAnalyticsAccess: credits ? Boolean(credits.has_analytics_access) : null,  // null = unknown
         aboCosts:         credits?.abo_costs ?? {},
         defaultCosts:     credits?.default_costs ?? {},
         loading,

@@ -7,6 +7,8 @@ import { normalizeFrontendStatus, statusMeta } from "../lib/status";
 import { readGenerationSession, SESSION_KEY } from "../lib/session";
 import { useTranslation } from "../state/LanguageContext";
 import { getAuthHeaders } from "../lib/apiAuth";
+import DashboardStatsSection from "../components/dashboard/DashboardStatsSection";
+import DashboardAnalyticsSection from "../components/dashboard/DashboardAnalyticsSection";
 
 export default function Dashboard() {
 
@@ -14,12 +16,7 @@ export default function Dashboard() {
     const navigate = useNavigate();
     const { t } = useTranslation();
     const [generationSession, setGenerationSession] = useState(() => readGenerationSession());
-
-    const displayName =
-        user?.user_metadata?.full_name ||
-        user?.user_metadata?.name ||
-        user?.email?.split("@")[0] ||
-        "Utilisateur";
+    const [range, setRange] = useState("30d");
 
     useEffect(() => {
         const syncSession = () => setGenerationSession(readGenerationSession());
@@ -65,88 +62,62 @@ export default function Dashboard() {
 
     return (
         <div className="flex-1 overflow-y-auto p-8 space-y-10">
-            <section className="flex flex-col gap-4 rounded-3xl border border-slate-300 dark:border-white/10 bg-gradient-to-br from-primary/15 via-violet-500/10 to-transparent p-6 md:flex-row md:items-end md:justify-between">
-                <div className="max-w-2xl space-y-3">
-                    <p className="inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em] text-primary">
-                        <Sparkles size={14} />
-                        {t("dashboard.welcomeBack", "Bienvenue de retour")}
-                    </p>
-                    <h2 className="text-3xl font-black tracking-tight">{t("dashboard.hello", "Bonjour")} {displayName}</h2>
-                    <p className="text-sm leading-6 text-slate-700 dark:text-zinc-300">
-                        {t("dashboard.startWorkflow", "Lance un workflow puis retrouve tous les resultats dans les galeries de services.")}
-                    </p>
-                </div>
-            </section>
-
-            <section className="space-y-6">
+            <section className="space-y-4">
                 <div>
                     <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-400 dark:text-zinc-500">{t("dashboard.startAction","Demarrer une action")}</p>
                     <h3 className="mt-2 text-xl font-bold">{t("dashboard.generationJourney","Parcours de generation")}</h3>
                 </div>
 
-                <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                     <button
                         onClick={() => navigate("/dashboard/reel-generator")}
-                        className="group rounded-2xl border border-slate-300 dark:border-white/10 bg-white/5 p-5 text-left hover:bg-white/10 transition"
+                        className="group flex items-center gap-3 rounded-xl border border-slate-300 dark:border-white/10 bg-white/5 p-3 text-left hover:bg-white/10 transition"
                     >
-                        <div className="flex items-center justify-between">
-                            <span className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-violet-500/10 text-violet-400">
-                                <Sparkles size={18} />
-                            </span>
-                            <ArrowRight size={16} className="text-slate-400 dark:text-zinc-500 group-hover:text-white" />
-                        </div>
-                        <h4 className="title-contrast mt-5 text-lg font-semibold">{t("dashboard.reelgenerator","Générer des reels")}</h4>
-                        <p className="mt-2 text-sm leading-6 text-slate-500 dark:text-zinc-400">{t("dashboard.reelgeneratorSubtitle","Upload une video et laisse le systeme boosté à l'IA extraire les moments réels.")}</p>
+                        <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-violet-500/10 text-violet-400">
+                            <Sparkles size={16} />
+                        </span>
+                        <h4 className="title-contrast flex-1 text-sm font-semibold truncate">{t("dashboard.reelgenerator","Générer des reels")}</h4>
+                        <ArrowRight size={14} className="shrink-0 text-slate-400 dark:text-zinc-500 group-hover:text-white" />
                     </button>
 
                     <button
                         onClick={() => navigate("/dashboard/captions/new")}
-                        className="group rounded-2xl border border-slate-300 dark:border-white/10 bg-white/5 p-5 text-left hover:bg-white/10 transition"
+                        className="group flex items-center gap-3 rounded-xl border border-slate-300 dark:border-white/10 bg-white/5 p-3 text-left hover:bg-white/10 transition"
                     >
-                        <div className="flex items-center justify-between">
-                            <span className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-400">
-                                <MessageSquareText size={18} />
-                            </span>
-                            <ArrowRight size={16} className="text-slate-400 dark:text-zinc-500 group-hover:text-white" />
-                        </div>
-                        <h4 className="title-contrast mt-5 text-lg font-semibold">{t("dashboard.captionGenerator","Générer des sous-titres")}</h4>
-                        <p className="mt-2 text-sm leading-6 text-slate-500 dark:text-zinc-400">{t("dashboard.captionGeneratorSubtitle","Upload une vidéo locale puis génère automatiquement les sous-titres.")}</p>
+                        <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-emerald-500/10 text-emerald-400">
+                            <MessageSquareText size={16} />
+                        </span>
+                        <h4 className="title-contrast flex-1 text-sm font-semibold truncate">{t("dashboard.captionGenerator","Générer des sous-titres")}</h4>
+                        <ArrowRight size={14} className="shrink-0 text-slate-400 dark:text-zinc-500 group-hover:text-white" />
                     </button>
 
                     <button
                         onClick={() => navigate("/dashboard/anonymous-stories/new")}
-                        className="group rounded-2xl border border-slate-300 dark:border-white/10 bg-white/5 p-5 text-left hover:bg-white/10 transition"
+                        className="group flex items-center gap-3 rounded-xl border border-slate-300 dark:border-white/10 bg-white/5 p-3 text-left hover:bg-white/10 transition"
                     >
-                        <div className="flex items-center justify-between">
-                            <span className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-pink-500/10 text-pink-400">
-                                <Quote size={18} />
-                            </span>
-                            <ArrowRight size={16} className="text-slate-400 dark:text-zinc-500 group-hover:text-white" />
-                        </div>
-                        <h4 className="title-contrast mt-5 text-lg font-semibold">{t("dashboard.anonymousStoryGenerator", "Générer une histoire")}</h4>
-                        <p className="mt-2 text-sm leading-6 text-slate-500 dark:text-zinc-400">{t("dashboard.anonymousStoryGeneratorSubtitle", "Transforme une vidéo témoignage en histoire écrite anonymisée, prête à publier.")}</p>
+                        <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-pink-500/10 text-pink-400">
+                            <Quote size={16} />
+                        </span>
+                        <h4 className="title-contrast flex-1 text-sm font-semibold truncate">{t("dashboard.anonymousStoryGenerator", "Générer une histoire")}</h4>
+                        <ArrowRight size={14} className="shrink-0 text-slate-400 dark:text-zinc-500 group-hover:text-white" />
                     </button>
 
                     <button
                         onClick={() => navigate("/dashboard/film-summaries/new")}
-                        className="group rounded-2xl border border-slate-300 dark:border-white/10 bg-white/5 p-5 text-left hover:bg-white/10 transition"
+                        className="group flex items-center gap-3 rounded-xl border border-slate-300 dark:border-white/10 bg-white/5 p-3 text-left hover:bg-white/10 transition"
                     >
-                        <div className="flex items-center justify-between">
-                            <span className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-teal-500/10 text-teal-400">
-                                <Clapperboard size={18} />
-                            </span>
-                            <ArrowRight size={16} className="text-slate-400 dark:text-zinc-500 group-hover:text-white" />
-                        </div>
-                        <h4 className="title-contrast mt-5 text-lg font-semibold">{t("dashboard.filmSummaryGenerator", "Générer un résumé de film")}</h4>
-                        <p className="mt-2 text-sm leading-6 text-slate-500 dark:text-zinc-400">{t("dashboard.filmSummaryGeneratorSubtitle", "Transforme un film complet en résumé monté et narré, prêt à revoir avant génération.")}</p>
+                        <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-teal-500/10 text-teal-400">
+                            <Clapperboard size={16} />
+                        </span>
+                        <h4 className="title-contrast flex-1 text-sm font-semibold truncate">{t("dashboard.filmSummaryGenerator", "Générer un résumé de film")}</h4>
+                        <ArrowRight size={14} className="shrink-0 text-slate-400 dark:text-zinc-500 group-hover:text-white" />
                     </button>
-
                 </div>
-
-
             </section>
 
+            <DashboardStatsSection range={range} onRangeChange={setRange} />
 
+            <DashboardAnalyticsSection range={range} />
         </div>
 
     );
