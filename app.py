@@ -9079,7 +9079,45 @@ async def resume_souscription(user_id: Annotated[str, Depends(get_user_id_header
     )
 
 
-@app.post("/api/souscription/change-plan", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def _assert_plan_change_within_limits(user_id: str, new_plan: Dict[str, Any]) -> None:
+    """Blocks a plan change that would leave the account over the new
+    plan's allowances. The new plan's resources aren't allocated until
+    this passes (see _allocate_plan_resources) -- without this check a
+    downgrade would silently leave, say, 5 connected Facebook accounts
+    against a plan that only allows 1, or more storage in use than the
+    new plan grants, with no way for the user to know until something
+    mysteriously stops working."""
+    new_max_social = max(1, int(new_plan.get("max_social_account") or 1))
+    counts = await _count_social_accounts_by_platform(user_id)
+    over_limit_platforms = {platform: count for platform, count in counts.items() if count > new_max_social}
+    if over_limit_platforms:
+        details = ", ".join(f"{platform} ({count}/{new_max_social})" for platform, count in over_limit_platforms.items())
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cette offre autorise au maximum {new_max_social} compte(s) par reseau social. "
+                f"Supprimez les comptes en surplus avant de changer d'offre : {details}."
+            ),
+        )
+
+    user_data = await supabase_get_user_data(user_id)
+    if not user_data:
+        return
+    storage_max = float(user_data.get("stockage_max") or 0.0)
+    storage_left = float(user_data.get("stockage") or 0.0)
+    storage_used = max(0.0, storage_max - storage_left)
+    new_storage_allowance = float(new_plan.get("stockage") or 0.0)
+    if storage_used > new_storage_allowance:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cette offre inclut {new_storage_allowance:.1f} Go de stockage, mais vous utilisez "
+                f"actuellement {storage_used:.1f} Go. Supprimez du contenu avant de changer d'offre."
+            ),
+        )
+
+
+@app.post("/api/souscription/change-plan", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def change_souscription_plan(
     payload: ChangeSubscriptionPlanRequest, user_id: Annotated[str, Depends(get_user_id_header)],
 ):
@@ -9097,6 +9135,8 @@ async def change_souscription_plan(
     new_plan = await supabase_get_abonnement(payload.plan_id)
     if not new_plan:
         raise HTTPException(status_code=404, detail="Subscription plan not found")
+
+    await _assert_plan_change_within_limits(user_id, new_plan)
 
     try:
         unit_amount = int(round(float(new_plan.get("price") or 0) * 100))
@@ -12733,16 +12773,85 @@ async def _extract_token_data(platform: str, token_data: Dict[str, Any]) -> Dict
     }
 
 async def _get_social_account(user_id: str, platform: str) -> Optional[Dict[str, Any]]:
+    """Returns one representative account for this platform (the most
+    recently touched one) -- used by call sites that haven't yet been
+    updated to let the user pick a specific one of several connected
+    accounts of the same platform. Prefer _get_social_account_by_id or
+    _list_social_accounts in any new code."""
+    accounts = await _list_social_accounts(user_id, platform)
+    return accounts[0] if accounts else None
+
+
+async def _list_social_accounts(user_id: str, platform: Optional[str] = None) -> List[Dict[str, Any]]:
+    client = await supabase_get_client()
+    query = client.table(SUPABASE_SOCIAL_ACCOUNTS_TABLE).select("*").eq("user_id", user_id)
+    if platform:
+        query = query.eq("platform", platform)
+    response = await query.order("updated_at", desc=True).execute()
+    return response.data or []
+
+
+async def _get_social_account_by_id(user_id: str, account_id: str) -> Optional[Dict[str, Any]]:
+    """Scoped to user_id so one user can never target another's connected
+    account by guessing/reusing an id."""
+    if not account_id:
+        return None
     client = await supabase_get_client()
     response = (
         await client.table(SUPABASE_SOCIAL_ACCOUNTS_TABLE)
         .select("*")
+        .eq("id", account_id)
         .eq("user_id", user_id)
-        .eq("platform", platform)
-        .order("created_at", desc=True)
         .limit(1)
         .execute()
     )
+    rows = response.data or []
+    return rows[0] if rows else None
+
+
+async def _count_social_accounts_by_platform(user_id: str) -> Dict[str, int]:
+    client = await supabase_get_client()
+    response = (
+        await client.table(SUPABASE_SOCIAL_ACCOUNTS_TABLE)
+        .select("platform")
+        .eq("user_id", user_id)
+        .execute()
+    )
+    counts: Dict[str, int] = {}
+    for row in response.data or []:
+        platform = str(row.get("platform") or "")
+        if platform:
+            counts[platform] = counts.get(platform, 0) + 1
+    return counts
+
+
+async def _get_active_plan_for_user(user_id: str) -> Optional[Dict[str, Any]]:
+    subscription = await get_user_abonnement(user_id)
+    abonnement_id = str((subscription or {}).get("abonnement") or "").strip()
+    if not abonnement_id:
+        return None
+    return await supabase_get_abonnement(abonnement_id)
+
+
+async def _get_user_max_social_accounts(user_id: str) -> int:
+    """How many accounts of EACH platform the user's active plan allows --
+    defaults to 1 (the lowest tier) with no active paid subscription,
+    matching get_user_abonnement's own priorite fallback."""
+    plan = await _get_active_plan_for_user(user_id)
+    try:
+        return max(1, int((plan or {}).get("max_social_account") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+async def _find_social_account_by_platform_user(
+    user_id: str, platform: str, platform_user_id: str
+) -> Optional[Dict[str, Any]]:
+    client = await supabase_get_client()
+    query = client.table(SUPABASE_SOCIAL_ACCOUNTS_TABLE).select("*").eq("user_id", user_id).eq("platform", platform)
+    if platform_user_id:
+        query = query.eq("platform_user_id", platform_user_id)
+    response = await query.order("updated_at", desc=True).limit(1).execute()
     rows = response.data or []
     return rows[0] if rows else None
 
@@ -12757,6 +12866,13 @@ async def _upsert_social_account(
     platform_account_name: str,
     scopes: str,
 ) -> None:
+    """Reconnecting/reauthorizing the same external account (matched on
+    platform_user_id) always just refreshes its row. Connecting a genuinely
+    new one for this platform is gated behind the user's plan allowance
+    (see _get_user_max_social_accounts) -- e.g. Silver allows 1 Facebook
+    Page, Gold 3, Ultimate 10 -- so the only way to connect more is to
+    upgrade, and downgrading below what's already connected is blocked in
+    change_souscription_plan instead of silently dropping accounts here."""
     client = await supabase_get_client()
     expires_at = datetime.fromtimestamp(time.time() + max(expires_in, 60), tz=timezone.utc).isoformat()
     payload = {
@@ -12771,7 +12887,7 @@ async def _upsert_social_account(
         "updated_at": _utcnow_iso(),
     }
 
-    existing = await _get_social_account(user_id, platform)
+    existing = await _find_social_account_by_platform_user(user_id, platform, platform_user_id)
     if existing and existing.get("id"):
         await (
             client.table(SUPABASE_SOCIAL_ACCOUNTS_TABLE)
@@ -12779,8 +12895,20 @@ async def _upsert_social_account(
             .eq("id", existing["id"])
             .execute()
         )
-    else:
-        await client.table(SUPABASE_SOCIAL_ACCOUNTS_TABLE).insert(payload).execute()
+        return
+
+    counts = await _count_social_accounts_by_platform(user_id)
+    max_allowed = await _get_user_max_social_accounts(user_id)
+    if counts.get(platform, 0) >= max_allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Votre offre autorise au maximum {max_allowed} compte(s) {platform} connecte(s). "
+                "Supprimez-en un dans Parametres avant d'en ajouter un nouveau, ou passez a une offre superieure."
+            ),
+        )
+
+    await client.table(SUPABASE_SOCIAL_ACCOUNTS_TABLE).insert(payload).execute()
 
 
 async def _insert_publish_job(
@@ -12972,20 +13100,27 @@ async def list_social_accounts(user_id: Annotated[str, Depends(get_user_id_heade
         }
         for row in rows
     ]
-    return {"accounts": accounts}
+    # Included here (rather than a separate call) so the Settings page can
+    # disable/annotate each network's "+ Connecter" button with how many
+    # more accounts of that platform the current plan still allows.
+    max_social_account = await _get_user_max_social_accounts(user_id)
+    return {"accounts": accounts, "max_social_account": max_social_account}
 
 
-@app.delete("/api/social/accounts/{platform}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
-async def disconnect_social_account(platform: str, user_id: Annotated[str, Depends(get_user_id_header)]):
-    key = (platform or "").strip().lower()
-    if key not in PLATFORM_CONFIG:
-        raise HTTPException(status_code=404, detail=_UNSUPPORTED_PLATFORM)
+@app.delete("/api/social/accounts/{account_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
+async def disconnect_social_account(account_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Disconnects one specific connected account (e.g. one Facebook Page
+    among several) -- scoped by id rather than platform now that a user can
+    have more than one account per platform (see _upsert_social_account)."""
+    account = await _get_social_account_by_id(user_id, account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Social account not found")
     client = await supabase_get_client()
     response = (
         await client.table(SUPABASE_SOCIAL_ACCOUNTS_TABLE)
         .delete()
+        .eq("id", account_id)
         .eq("user_id", user_id)
-        .eq("platform", key)
         .execute()
     )
     return {"deleted": bool(response.data)}

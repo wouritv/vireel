@@ -4862,7 +4862,9 @@ def test_change_souscription_plan_swaps_price_and_resets_resources(monkeypatch):
     )
     fake_stripe.Subscription.modify.return_value = {"current_period_end": 1700000000}
 
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "new-plan", "name": "Premium", "price": 49.99}))
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "new-plan", "name": "Premium", "price": 49.99, "max_social_account": 3}))
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
     insert_mock = AsyncMock(return_value={"id": "sous-2"})
     monkeypatch.setattr(app, "supabase_insert_souscription", insert_mock)
     allocate_mock = AsyncMock()
@@ -4912,6 +4914,61 @@ def test_change_souscription_plan_404_for_unknown_plan(monkeypatch):
     assert exc_info.value.status_code == 404
 
 
+def test_change_souscription_plan_blocks_when_over_social_account_limit(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "silver", "name": "Silver", "max_social_account": 1}))
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={"facebook": 5, "instagram": 1}))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
+
+    coro = app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+    assert "facebook" in exc_info.value.detail
+    assert "instagram" not in exc_info.value.detail
+
+
+def test_change_souscription_plan_blocks_when_over_storage_limit(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "silver", "name": "Silver", "max_social_account": 1, "stockage": 5.0}))
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
+    # stockage is the remaining balance, stockage_max the plan allowance --
+    # 20 Go used (30 max - 10 left) against a 5 Go new plan must block.
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"stockage": 10.0, "stockage_max": 30.0}))
+
+    coro = app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+    assert "stockage" in exc_info.value.detail.lower() or "Go" in exc_info.value.detail
+
+
+def test_change_souscription_plan_allows_when_within_limits(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe, _ = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    fake_stripe.Subscription.retrieve.return_value = _FakeStripeSubscriptionObject(
+        {"items": {"data": [{"id": "si_123"}]}},
+        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
+    )
+    fake_stripe.Subscription.modify.return_value = {"current_period_end": 1700000000}
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "gold", "name": "Gold", "price": 49.99, "max_social_account": 3, "stockage": 100.0}))
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={"facebook": 2}))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"stockage": 50.0, "stockage_max": 100.0}))
+    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-2"}))
+    monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
+
+    result = asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="gold"), user_id="u1",
+    ))
+    assert result == {"id": "sous-2"}
+
+
 # ---------------------------------------------------------------------------
 # Social posts: a user-authored post + follow-up comments, published (or
 # scheduled) by the connected Facebook/LinkedIn account itself.
@@ -4954,6 +5011,196 @@ def _install_fake_httpx_post(monkeypatch, app, response):
     _FakeHttpxAsyncClient.next_response = response
     monkeypatch.setattr(app.httpx, "AsyncClient", _FakeHttpxAsyncClient)
     return _FakeHttpxAsyncClient
+
+
+class _FakeSocialAccountsTable:
+    """Minimal chainable stand-in for the postgrest query builder, just
+    enough for _upsert_social_account's insert/update calls, plus select
+    (returns select_rows) and delete (records into deleted)."""
+
+    def __init__(self, select_rows=None):
+        self.inserted = []
+        self.updated = []
+        self.deleted = []
+        self._select_rows = select_rows if select_rows is not None else []
+        self._pending_update = None
+        self._pending_delete = False
+
+    def insert(self, payload):
+        self.inserted.append(payload)
+        return self
+
+    def update(self, payload):
+        self._pending_update = payload
+        return self
+
+    def select(self, *_args, **_kwargs):
+        return self
+
+    def delete(self):
+        self._pending_delete = True
+        return self
+
+    def order(self, *_args, **_kwargs):
+        return self
+
+    def eq(self, field, value):
+        self.deleted.append((field, value)) if self._pending_delete else None
+        return self
+
+    async def execute(self):
+        if self._pending_update is not None:
+            self.updated.append(self._pending_update)
+            self._pending_update = None
+            return types.SimpleNamespace(data=[])
+        if self._pending_delete:
+            self._pending_delete = False
+            return types.SimpleNamespace(data=[{"id": "deleted"}])
+        return types.SimpleNamespace(data=self._select_rows)
+
+
+class _FakeSupabaseClient:
+    def __init__(self, table):
+        self._table = table
+
+    def table(self, _name):
+        return self._table
+
+
+def test_upsert_social_account_inserts_new_account_within_limit(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    table = _FakeSocialAccountsTable()
+    monkeypatch.setattr(app, "supabase_get_client", AsyncMock(return_value=_FakeSupabaseClient(table)))
+    monkeypatch.setattr(app, "_find_social_account_by_platform_user", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={"facebook": 1}))
+    monkeypatch.setattr(app, "_get_user_max_social_accounts", AsyncMock(return_value=3))
+
+    asyncio.run(app._upsert_social_account(
+        user_id="u1", platform="facebook", access_token="tok", refresh_token=None,
+        expires_in=3600, platform_user_id="page-2", platform_account_name="Page 2", scopes="pages_show_list",
+    ))
+
+    assert len(table.inserted) == 1
+    assert table.inserted[0]["platform_user_id"] == "page-2"
+    assert table.updated == []
+
+
+def test_upsert_social_account_updates_existing_match_without_limit_check(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    table = _FakeSocialAccountsTable()
+    monkeypatch.setattr(app, "supabase_get_client", AsyncMock(return_value=_FakeSupabaseClient(table)))
+    monkeypatch.setattr(app, "_find_social_account_by_platform_user", AsyncMock(return_value={"id": "acct-1"}))
+    count_mock = AsyncMock()
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", count_mock)
+
+    asyncio.run(app._upsert_social_account(
+        user_id="u1", platform="facebook", access_token="tok", refresh_token=None,
+        expires_in=3600, platform_user_id="page-1", platform_account_name="Page 1", scopes="pages_show_list",
+    ))
+
+    assert len(table.updated) == 1
+    assert table.inserted == []
+    count_mock.assert_not_called()
+
+
+def test_upsert_social_account_rejects_new_account_over_plan_limit(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    table = _FakeSocialAccountsTable()
+    monkeypatch.setattr(app, "supabase_get_client", AsyncMock(return_value=_FakeSupabaseClient(table)))
+    monkeypatch.setattr(app, "_find_social_account_by_platform_user", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={"facebook": 1}))
+    monkeypatch.setattr(app, "_get_user_max_social_accounts", AsyncMock(return_value=1))
+
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(app._upsert_social_account(
+            user_id="u1", platform="facebook", access_token="tok", refresh_token=None,
+            expires_in=3600, platform_user_id="page-2", platform_account_name="Page 2", scopes="pages_show_list",
+        ))
+    assert exc_info.value.status_code == 403
+    assert table.inserted == []
+
+
+def test_get_user_max_social_accounts_defaults_to_one_without_active_plan(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+
+    result = asyncio.run(app._get_user_max_social_accounts("u1"))
+
+    assert result == 1
+
+
+def test_get_user_max_social_accounts_reads_active_plan(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value={"abonnement": "gold-plan"}))
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"max_social_account": 3}))
+
+    result = asyncio.run(app._get_user_max_social_accounts("u1"))
+
+    assert result == 3
+
+
+def test_count_social_accounts_by_platform_groups_rows(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    class _CountTable:
+        def table(self, _name):
+            return self
+
+        def select(self, _cols):
+            return self
+
+        def eq(self, *_a, **_k):
+            return self
+
+        async def execute(self):
+            return types.SimpleNamespace(data=[
+                {"platform": "facebook"}, {"platform": "facebook"}, {"platform": "instagram"},
+            ])
+
+    monkeypatch.setattr(app, "supabase_get_client", AsyncMock(return_value=_CountTable()))
+
+    result = asyncio.run(app._count_social_accounts_by_platform("u1"))
+
+    assert result == {"facebook": 2, "instagram": 1}
+
+
+def test_list_social_accounts_returns_accounts_and_plan_limit(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    table = _FakeSocialAccountsTable(select_rows=[
+        {"id": "acct-1", "platform": "facebook", "platform_account_name": "Page A"},
+        {"id": "acct-2", "platform": "facebook", "platform_account_name": "Page B"},
+    ])
+    monkeypatch.setattr(app, "supabase_get_client", AsyncMock(return_value=_FakeSupabaseClient(table)))
+    monkeypatch.setattr(app, "_get_user_max_social_accounts", AsyncMock(return_value=3))
+
+    result = asyncio.run(app.list_social_accounts(user_id="u1"))
+
+    assert result["max_social_account"] == 3
+    assert len(result["accounts"]) == 2
+    assert all(a["connected"] is True for a in result["accounts"])
+
+
+def test_disconnect_social_account_deletes_owned_account(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    table = _FakeSocialAccountsTable()
+    monkeypatch.setattr(app, "supabase_get_client", AsyncMock(return_value=_FakeSupabaseClient(table)))
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "acct-1", "user_id": "u1"}))
+
+    result = asyncio.run(app.disconnect_social_account(account_id="acct-1", user_id="u1"))
+
+    assert result == {"deleted": True}
+    assert ("id", "acct-1") in table.deleted
+    assert ("user_id", "u1") in table.deleted
+
+
+def test_disconnect_social_account_404_when_not_owned(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value=None))
+
+    coro = app.disconnect_social_account(account_id="acct-1", user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 404
 
 
 def test_post_facebook_comment_sends_message_and_attachment(monkeypatch):
