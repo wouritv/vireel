@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   User, Mail, Copy, Check, Moon, Sun, Monitor, Linkedin, Twitch, Youtube, Facebook, Instagram,
-  CreditCardIcon, History, Plus, Minus, Loader2, AlertTriangle, Coins, PauseCircle, PlayCircle, RefreshCw
+  CreditCardIcon, History, Plus, Minus, Loader2, AlertTriangle, Coins, PauseCircle, PlayCircle, RefreshCw,
+  ChevronDown, Trash2,
 } from 'lucide-react';
 import { useAuth } from '../state/AuthContext';
 import { useTheme } from '../state/ThemeContext';
@@ -74,6 +75,8 @@ export default function SettingsPage() {
   const [socialAccounts, setSocialAccounts] = useState([]);
   const [oauthLoading, setOauthLoading] = useState({});
   const [socialError, setSocialError] = useState('');
+  const [maxSocialAccount, setMaxSocialAccount] = useState(1);
+  const [openAccountMenuId, setOpenAccountMenuId] = useState(null);
 
   // Credit history state
   const [history, setHistory] = useState([]);
@@ -102,12 +105,14 @@ export default function SettingsPage() {
   const creditsToAdd = Math.round(buyAmount * CREDIT_RATE);
   const canBuyCredits = Boolean(subscription);
 
-  const accountByPlatform = useMemo(() => {
+  // Grouped by network so each block can list every connected page/profile
+  // for that platform, not just one -- a plan can allow several (see
+  // max_social_account).
+  const accountsByPlatform = useMemo(() => {
     const next = {};
     for (const account of socialAccounts) {
-      if (account?.platform && !next[account.platform]) {
-        next[account.platform] = account;
-      }
+      if (!account?.platform) continue;
+      (next[account.platform] ||= []).push(account);
     }
     return next;
   }, [socialAccounts]);
@@ -152,6 +157,7 @@ export default function SettingsPage() {
       const data = await response.json();
       const accounts = Array.isArray(data?.accounts) ? data.accounts : [];
       setSocialAccounts(accounts);
+      setMaxSocialAccount(Number.isFinite(Number(data?.max_social_account)) ? Number(data.max_social_account) : 1);
       syncConnectedNetworksCache(accounts);
     } catch (error) {
       setSocialError(error.message || t("settings.socialError","Impossible de charger les comptes sociaux."));
@@ -444,11 +450,12 @@ export default function SettingsPage() {
     }
   };
 
-  const disconnectPlatform = async (platform) => {
-    if (!user?.id) return;
-    setOauthLoading((prev) => ({ ...prev, [platform]: true }));
+  const disconnectAccount = async (accountId, platform) => {
+    if (!user?.id || !accountId) return;
+    setOpenAccountMenuId(null);
+    setOauthLoading((prev) => ({ ...prev, [accountId]: true }));
     try {
-      const response = await fetch(getApiUrl(`/api/social/accounts/${platform}?user_id=${encodeURIComponent(user.id)}`), {
+      const response = await fetch(getApiUrl(`/api/social/accounts/${accountId}?user_id=${encodeURIComponent(user.id)}`), {
         method: 'DELETE',
         headers: getAuthHeaders(user.id),
       });
@@ -460,7 +467,7 @@ export default function SettingsPage() {
     } catch (error) {
       setSocialError(error.message || `Unable to disconnect ${platform}`);
     } finally {
-      setOauthLoading((prev) => ({ ...prev, [platform]: false }));
+      setOauthLoading((prev) => ({ ...prev, [accountId]: false }));
     }
   };
 
@@ -653,9 +660,10 @@ export default function SettingsPage() {
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {SOCIAL_NETWORKS.map((network) => {
             const NetworkIcon = network.icon;
-            const isConnected = Boolean(connectedNetworks[network.id]);
-            const account = accountByPlatform[network.id];
-            const isBusy = Boolean(oauthLoading[network.id]);
+            const accounts = accountsByPlatform[network.id] || [];
+            const isConnected = accounts.length > 0;
+            const isAtLimit = accounts.length >= maxSocialAccount;
+            const isConnectBusy = Boolean(oauthLoading[network.id]);
 
             return (
               <div
@@ -678,35 +686,66 @@ export default function SettingsPage() {
                   </div>
                   {isConnected && (
                     <div className="px-2 py-1 rounded text-xs font-medium flex items-center gap-1 bg-emerald-100 dark:bg-green-500/20 border border-emerald-300 dark:border-green-500/30 text-emerald-800 dark:text-green-400">
-                      <Check size={12} /> {t('settings.connected', 'Connected')}
+                      <Check size={12} /> {accounts.length}/{maxSocialAccount}
                     </div>
                   )}
                 </div>
 
-                <div className="flex items-center justify-between gap-2">
-                  <p className="text-xs text-slate-600 dark:text-zinc-400 truncate">
-                    {account?.platform_account_name || (isConnected ? t('settings.connected', 'Connected') : t('settings.notConnected', 'Not connected'))}
-                  </p>
-                  {isConnected ? (
-                    <button
-                      type="button"
-                      disabled={isBusy}
-                      onClick={() => disconnectPlatform(network.id)}
-                      className="rounded-md border border-rose-300 dark:border-red-500/30 bg-rose-100 dark:bg-red-500/10 px-2 py-1 text-xs text-rose-800 dark:text-red-300 hover:bg-rose-200 dark:hover:bg-red-500/20 disabled:opacity-60"
-                    >
-                      {isBusy ? '...' : t('settings.disconnect', 'Disconnect')}
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      disabled={isBusy}
-                      onClick={() => connectPlatform(network.id)}
-                      className="rounded-md bg-primary px-2 py-1 text-xs font-semibold text-white hover:bg-blue-500 disabled:opacity-60"
-                    >
-                      {isBusy ? '...' : t('settings.connect', 'Connect')}
-                    </button>
-                  )}
-                </div>
+                {accounts.length > 0 ? (
+                  <div className="space-y-1.5 mb-3">
+                    {accounts.map((account) => {
+                      const isMenuOpen = openAccountMenuId === account.id;
+                      const isAccountBusy = Boolean(oauthLoading[account.id]);
+                      return (
+                        <div key={account.id} className="rounded-md border border-slate-200 dark:border-white/10 bg-white/60 dark:bg-black/20 overflow-hidden">
+                          <button
+                            type="button"
+                            onClick={() => setOpenAccountMenuId(isMenuOpen ? null : account.id)}
+                            className="w-full flex items-center justify-between gap-2 px-2 py-1.5 text-left"
+                          >
+                            <span className="text-xs text-slate-700 dark:text-zinc-200 truncate">
+                              {account.platform_account_name || t('settings.connected', 'Connected')}
+                            </span>
+                            <ChevronDown size={13} className={`shrink-0 text-slate-400 transition-transform ${isMenuOpen ? 'rotate-180' : ''}`} />
+                          </button>
+                          {isMenuOpen ? (
+                            <div className="flex items-center gap-2 px-2 pb-2">
+                              <button
+                                type="button"
+                                disabled={isConnectBusy}
+                                onClick={() => connectPlatform(network.id)}
+                                className="flex-1 inline-flex items-center justify-center gap-1 rounded-md border border-slate-300 dark:border-white/10 bg-white dark:bg-white/5 px-2 py-1 text-[11px] font-medium text-slate-700 dark:text-zinc-200 hover:bg-slate-100 dark:hover:bg-white/10 disabled:opacity-60"
+                              >
+                                <RefreshCw size={11} /> {t('settings.reauthorize', 'Reautoriser la connexion')}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={isAccountBusy}
+                                onClick={() => disconnectAccount(account.id, network.id)}
+                                className="flex-1 inline-flex items-center justify-center gap-1 rounded-md border border-rose-300 dark:border-red-500/30 bg-rose-100 dark:bg-red-500/10 px-2 py-1 text-[11px] font-medium text-rose-800 dark:text-red-300 hover:bg-rose-200 dark:hover:bg-red-500/20 disabled:opacity-60"
+                              >
+                                <Trash2 size={11} /> {isAccountBusy ? '...' : t('settings.deleteConnection', 'Supprimer la connexion')}
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <p className="text-xs text-slate-600 dark:text-zinc-400 mb-3">{t('settings.notConnected', 'Not connected')}</p>
+                )}
+
+                <button
+                  type="button"
+                  disabled={isConnectBusy || isAtLimit}
+                  title={isAtLimit ? t('settings.socialLimitReached', "Limite de votre offre atteinte pour ce reseau.") : undefined}
+                  onClick={() => connectPlatform(network.id)}
+                  className="w-full rounded-md bg-primary px-2 py-1.5 text-xs font-semibold text-white hover:bg-blue-500 disabled:opacity-40 inline-flex items-center justify-center gap-1"
+                >
+                  <Plus size={13} />
+                  {isConnectBusy ? '...' : t('settings.connectAnother', '+ Connecter')}
+                </button>
               </div>
             );
           })}
