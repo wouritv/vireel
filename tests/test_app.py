@@ -5342,17 +5342,45 @@ def test_post_linkedin_comment_sends_actor_and_encoded_urn(monkeypatch):
     assert call["json"]["message"]["text"] == "Nice post"
 
 
-def test_resolve_social_post_platforms_rejects_when_none_recognized(monkeypatch):
+def test_resolve_social_post_accounts_rejects_empty_list(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
+    coro = app._resolve_social_post_accounts("u1", [])
     with pytest.raises(app.HTTPException) as exc_info:
-        app._resolve_social_post_platforms(["tiktok", "youtube"])
+        asyncio.run(coro)
     assert exc_info.value.status_code == 400
 
 
-def test_resolve_social_post_platforms_dedupes_and_filters(monkeypatch):
+def test_resolve_social_post_accounts_rejects_unowned_or_missing_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    result = app._resolve_social_post_platforms(["facebook", "FACEBOOK", "linkedin", "tiktok"])
-    assert result == ["facebook", "linkedin"]
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value=None))
+
+    coro = app._resolve_social_post_accounts("u1", ["acct-1"])
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 404
+
+
+def test_resolve_social_post_accounts_rejects_unsupported_platform(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "acct-1", "platform": "tiktok"}))
+
+    coro = app._resolve_social_post_accounts("u1", ["acct-1"])
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 400
+
+
+def test_resolve_social_post_accounts_dedupes_and_resolves_each(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    accounts_by_id = {
+        "acct-1": {"id": "acct-1", "platform": "facebook"},
+        "acct-2": {"id": "acct-2", "platform": "linkedin"},
+    }
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(side_effect=lambda _uid, aid: accounts_by_id.get(aid)))
+
+    result = asyncio.run(app._resolve_social_post_accounts("u1", ["acct-1", "acct-1", "acct-2"]))
+
+    assert [a["id"] for a in result] == ["acct-1", "acct-2"]
 
 
 def test_build_comment_message_appends_link_when_missing(monkeypatch):
@@ -5378,20 +5406,21 @@ def test_create_social_post_rejects_empty_text(monkeypatch):
     with TestClient(app.app) as client:
         resp = client.post(
             "/api/social/posts",
-            json={"text": "   ", "platforms": ["facebook"]},
+            json={"text": "   ", "account_ids": ["acct-1"]},
             headers=_auth_headers("u1"),
         )
     assert resp.status_code == 400
 
 
-def test_create_social_post_rejects_unsupported_platforms(monkeypatch):
+def test_create_social_post_rejects_unsupported_platform_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "acct-1", "platform": "tiktok"}))
 
     with TestClient(app.app) as client:
         resp = client.post(
             "/api/social/posts",
-            json={"text": "Hello", "platforms": ["tiktok"]},
+            json={"text": "Hello", "account_ids": ["acct-1"]},
             headers=_auth_headers("u1"),
         )
     assert resp.status_code == 400
@@ -5402,7 +5431,7 @@ def test_create_social_post_publishes_now_and_posts_comments(monkeypatch):
     monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
-    monkeypatch.setattr(app, "_get_social_account", AsyncMock(return_value=_social_post_account()))
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value=_social_post_account()))
     monkeypatch.setattr(app, "get_valid_token", AsyncMock(return_value="page-token"))
     monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "1234_5678"}))
     insert_job_mock = AsyncMock(return_value="job-1")
@@ -5419,7 +5448,7 @@ def test_create_social_post_publishes_now_and_posts_comments(monkeypatch):
             "/api/social/posts",
             json={
                 "text": "Big announcement!",
-                "platforms": ["facebook"],
+                "account_ids": ["acct-1"],
                 "comments": [
                     {"text": "First comment", "link": "https://example.com"},
                     {"text": "Second comment", "image_url": "https://example.com/img.png"},
@@ -5432,7 +5461,7 @@ def test_create_social_post_publishes_now_and_posts_comments(monkeypatch):
     data = resp.json()
     assert data["success"] is True
     assert data["scheduled"] is False
-    fb_result = data["results"]["facebook"]
+    fb_result = data["results"]["acct-1"]
     assert fb_result["success"] is True
     assert fb_result["comments_results"] == [
         {"success": True, "id": "c1", "text": "First comment"},
@@ -5449,7 +5478,7 @@ def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
     monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
-    monkeypatch.setattr(app, "_get_social_account", AsyncMock(return_value=_social_post_account()))
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value=_social_post_account()))
     monkeypatch.setattr(app, "get_valid_token", AsyncMock(return_value="page-token"))
     monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "1234_5678"}))
     monkeypatch.setattr(app, "_insert_publish_job", AsyncMock(return_value="job-1"))
@@ -5466,7 +5495,7 @@ def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
             "/api/social/posts",
             json={
                 "text": "Big announcement!",
-                "platforms": ["facebook"],
+                "account_ids": ["acct-1"],
                 "comments": [{"text": "First"}, {"text": "Second"}],
             },
             headers=_auth_headers("u1"),
@@ -5475,7 +5504,7 @@ def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
     assert resp.status_code == 200
     data = resp.json()
     assert data["success"] is True  # the post itself succeeded even though one comment failed
-    comments_results = data["results"]["facebook"]["comments_results"]
+    comments_results = data["results"]["acct-1"]["comments_results"]
     assert comments_results[0]["success"] is False
     assert "rate limited" in comments_results[0]["error"]
     assert comments_results[1] == {"success": True, "id": "c2", "text": "Second"}
@@ -5485,6 +5514,11 @@ def test_create_social_post_schedules_job_without_publishing(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
+    accounts_by_id = {
+        "fb-acct": {"id": "fb-acct", "platform": "facebook"},
+        "li-acct": {"id": "li-acct", "platform": "linkedin"},
+    }
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(side_effect=lambda _uid, aid: accounts_by_id.get(aid)))
     insert_job_mock = AsyncMock(return_value="job-scheduled-1")
     monkeypatch.setattr(app, "_insert_publish_job", insert_job_mock)
     publish_post_mock = AsyncMock()
@@ -5499,7 +5533,7 @@ def test_create_social_post_schedules_job_without_publishing(monkeypatch):
             "/api/social/posts",
             json={
                 "text": "Scheduled announcement",
-                "platforms": ["facebook", "linkedin"],
+                "account_ids": ["fb-acct", "li-acct"],
                 "background_id": "some-preset",
                 "comments": [{"text": "Follow-up"}],
                 "scheduled_date": future_iso,
@@ -5514,11 +5548,13 @@ def test_create_social_post_schedules_job_without_publishing(monkeypatch):
     assert data["success"] is True
     publish_post_mock.assert_not_awaited()
     debit_mock.assert_not_awaited()
-    assert insert_job_mock.await_count == 2  # one job per platform
+    assert insert_job_mock.await_count == 2  # one job per account
+    assert set(data["results"].keys()) == {"fb-acct", "li-acct"}
 
     inserted_payloads = [call.kwargs["payload"] for call in insert_job_mock.await_args_list]
     for payload in inserted_payloads:
         assert payload["source_type"] == "social_post"
+        assert payload["account_id"] in {"fb-acct", "li-acct"}
         assert payload["text"] == "Scheduled announcement"
         assert payload["background_id"] == "some-preset"
         assert payload["comments"] == [{"text": "Follow-up", "link": None, "image_url": None}]

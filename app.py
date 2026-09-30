@@ -10282,22 +10282,37 @@ class SocialPostCommentInput(BaseModel):
 
 class CreateSocialPostRequest(BaseModel):
     text: str
-    platforms: List[str]
+    account_ids: List[str] = []
     background_id: Optional[str] = None
     comments: List[SocialPostCommentInput] = []
     scheduled_date: Optional[str] = None
     timezone: Optional[str] = "UTC"
 
 
-def _resolve_social_post_platforms(platforms: Optional[List[str]]) -> List[str]:
-    candidate = [p.strip().lower() for p in (platforms or []) if isinstance(p, str) and p.strip()]
-    result: List[str] = []
-    for p in candidate:
-        if p in _SOCIAL_POST_PLATFORMS and p not in result:
-            result.append(p)
-    if not result:
-        raise HTTPException(status_code=400, detail="platforms must include at least one of: facebook, linkedin")
-    return result
+async def _resolve_social_post_accounts(user_id: str, account_ids: Optional[List[str]]) -> List[Dict[str, Any]]:
+    """Resolves each requested account id to its connected-account row,
+    ownership-checked -- lets the composer publish the same post to several
+    accounts at once (e.g. two Facebook Pages), each billed and tracked as
+    its own publish_jobs row."""
+    ids: List[str] = []
+    seen = set()
+    for raw in account_ids or []:
+        account_id = str(raw or "").strip()
+        if account_id and account_id not in seen:
+            seen.add(account_id)
+            ids.append(account_id)
+    if not ids:
+        raise HTTPException(status_code=400, detail="account_ids must include at least one connected account")
+
+    accounts: List[Dict[str, Any]] = []
+    for account_id in ids:
+        account = await _get_social_account_by_id(user_id, account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail=f"Connected account not found: {account_id}")
+        if account.get("platform") not in _SOCIAL_POST_PLATFORMS:
+            raise HTTPException(status_code=400, detail=f"Unsupported platform for account {account_id}")
+        accounts.append(account)
+    return accounts
 
 
 def _build_comment_message(comment: "SocialPostCommentInput") -> str:
@@ -10396,22 +10411,20 @@ def _build_social_post_publish_payload(text_value: str, background_id: Optional[
 
 
 async def _publish_social_post_now(
-    user_id: str, platform_name: str, publish_priority: int, text_value: str,
+    user_id: str, account: Dict[str, Any], publish_priority: int, text_value: str,
     background_id: Optional[str], comments: List["SocialPostCommentInput"],
 ) -> Dict[str, Any]:
+    platform_name = str(account.get("platform") or "")
     publish_job_id = await _insert_publish_job(
         user_id=user_id,
         platform=platform_name,
         external_id="n/a",
         status="queued",
         priority=publish_priority,
-        payload={"source_type": "social_post", "comments": [c.model_dump() for c in comments]},
+        payload={"source_type": "social_post", "account_id": account.get("id"), "comments": [c.model_dump() for c in comments]},
     )
     try:
         await _update_publish_job_status(publish_job_id, "processing")
-        account = await _get_social_account(user_id, platform_name)
-        if not account:
-            raise HTTPException(status_code=404, detail=f"No connected {platform_name} account found")
 
         publish_payload = _build_social_post_publish_payload(text_value, background_id)
         publish_payload.user_id = user_id
@@ -10442,12 +10455,12 @@ async def _publish_social_post_now(
 
 
 async def _schedule_social_post_job(
-    user_id: str, platform_name: str, publish_priority: int, scheduled_for, timezone: Optional[str],
+    user_id: str, account: Dict[str, Any], publish_priority: int, scheduled_for, timezone: Optional[str],
     text_value: str, background_id: Optional[str], comments: List["SocialPostCommentInput"],
 ) -> Dict[str, Any]:
     publish_job_id = await _insert_publish_job(
         user_id=user_id,
-        platform=platform_name,
+        platform=str(account.get("platform") or ""),
         external_id="scheduled",
         status="queued",
         priority=publish_priority,
@@ -10455,6 +10468,7 @@ async def _schedule_social_post_job(
         timezone=timezone or "UTC",
         payload={
             "source_type": "social_post",
+            "account_id": account.get("id"),
             "text": text_value,
             "background_id": background_id,
             "comments": [c.model_dump() for c in comments],
@@ -10472,7 +10486,13 @@ async def _execute_scheduled_social_post_job(job_id: str, user_id: str, platform
     try:
         await _update_publish_job_status(job_id, "processing", error_message=None)
 
-        account = await _get_social_account(user_id, platform)
+        # account_id is only present on jobs scheduled after multi-account
+        # support was added -- fall back to "any account of this platform"
+        # for older in-flight jobs that don't have it.
+        account_id = task_payload.get("account_id")
+        account = await _get_social_account_by_id(user_id, account_id) if account_id else None
+        if not account:
+            account = await _get_social_account(user_id, platform)
         if not account:
             raise HTTPException(status_code=404, detail=f"No connected {platform} account found")
 
@@ -10507,7 +10527,7 @@ async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotate
     if not text_value:
         raise HTTPException(status_code=400, detail="text is required")
 
-    selected_platforms = _resolve_social_post_platforms(payload.platforms)
+    accounts = await _resolve_social_post_accounts(user_id, payload.account_ids)
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
     if payload.scheduled_date and not scheduled_for:
@@ -10516,16 +10536,20 @@ async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotate
     background_id = payload.background_id or anonymous_stories.BACKGROUND_PRESETS[0]["id"]
     comments = payload.comments or []
 
+    # Keyed by account id (not platform) so publishing to several accounts
+    # of the same platform (e.g. two Facebook Pages) reports each one
+    # separately instead of the second silently overwriting the first.
     results: Dict[str, Any] = {}
-    for platform_name in selected_platforms:
+    for account in accounts:
+        result_key = str(account.get("id") or account.get("platform"))
         if is_scheduled:
-            results[platform_name] = await _schedule_social_post_job(
-                user_id, platform_name, publish_priority, scheduled_for, payload.timezone,
+            results[result_key] = await _schedule_social_post_job(
+                user_id, account, publish_priority, scheduled_for, payload.timezone,
                 text_value, background_id, comments,
             )
             continue
-        results[platform_name] = await _publish_social_post_now(
-            user_id, platform_name, publish_priority, text_value, background_id, comments,
+        results[result_key] = await _publish_social_post_now(
+            user_id, account, publish_priority, text_value, background_id, comments,
         )
 
     overall_success = all(result.get("success") for result in results.values())
