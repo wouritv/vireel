@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, Check, Loader2, MessageSquareText, Palette, Plus, RotateCcw, Trash2, X } from 'lucide-react';
+import { ArrowLeft, Check, Loader2, MessageSquareText, Palette, Plus, RotateCcw, Save, Trash2, X } from 'lucide-react';
 import { getApiUrl } from '../config';
 import RemotionPreview from './RemotionPreview';
 import { ANIMATION_OPTIONS, COLOR_PRESETS, HIGHLIGHT_COLOR_PRESETS, FONT_OPTIONS } from '../lib/subtitleOptions';
@@ -248,6 +248,7 @@ export default function CaptionsModal({
   const [saveThemeName, setSaveThemeName] = useState('');
   const [isSavingTheme, setIsSavingTheme] = useState(false);
   const [saveThemeMessage, setSaveThemeMessage] = useState('');
+  const [showInlineThemeNamePrompt, setShowInlineThemeNamePrompt] = useState(false);
   const [isSavingDefaultStyle, setIsSavingDefaultStyle] = useState(false);
   const [saveDefaultStyleMessage, setSaveDefaultStyleMessage] = useState('');
   const [deletingThemeId, setDeletingThemeId] = useState(null);
@@ -272,6 +273,17 @@ export default function CaptionsModal({
   // Every line's `.style` is kept in sync on every edit so that
   // subtitleConfig.style, sourced from lines[0].style, always reflects it.
   const currentStyle = useMemo(() => ({ ...DEFAULT_STYLE, ...(lines[0]?.style || {}) }), [lines]);
+
+  // Which of the user's own saved themes (if any) the style editor is
+  // currently "on" -- null when activeThemeId points at a built-in,
+  // ready-to-use theme instead, or when no theme has been applied at all
+  // (the default view / a from-scratch manual edit). Drives whether the
+  // "Enregistrer" button below overwrites this theme directly or first
+  // asks for a name to save a new one under.
+  const activeCustomTheme = useMemo(
+    () => customThemes.find((theme) => theme.id === activeThemeId) || null,
+    [customThemes, activeThemeId]
+  );
 
   const subtitleConfig = useMemo(() => ({
     captions: flattenedCaptions,
@@ -343,11 +355,18 @@ export default function CaptionsModal({
     setActiveThemeId(theme.id || null);
     setSaveThemeName(isCustom ? theme.name || '' : '');
     setSaveThemeMessage('');
+    setShowInlineThemeNamePrompt(false);
     focusSelectedPreview();
   };
 
-  const handleSaveTheme = async () => {
-    const name = saveThemeName.trim();
+  // `nameOverride` lets the "Enregistrer" button next to "Definir comme
+  // style par defaut" update the currently active custom theme directly
+  // (its own name, no prompt) while still sharing this same save path with
+  // the name-input row below, whose button calls this with no argument
+  // (its click handler passes the DOM event, not a string, so that falls
+  // back to saveThemeName as before).
+  const handleSaveTheme = async (nameOverride) => {
+    const name = (typeof nameOverride === 'string' ? nameOverride : saveThemeName).trim();
     if (!name) return;
     setIsSavingTheme(true);
     setSaveThemeMessage('');
@@ -367,12 +386,28 @@ export default function CaptionsModal({
       const saved = await res.json();
       setCustomThemes((prev) => [saved, ...prev.filter((theme) => theme.id !== saved.id)]);
       setActiveThemeId(saved.id);
+      setSaveThemeName(saved.name || name);
       setSaveThemeMessage(t('captionsModal.themeSaved', 'Theme enregistre.'));
+      setShowInlineThemeNamePrompt(false);
     } catch (error) {
       setSaveThemeMessage(error.message || t('captionsModal.themeSaveFailed', "Echec de l'enregistrement du theme."));
     } finally {
       setIsSavingTheme(false);
     }
+  };
+
+  // The single "Enregistrer" button next to "Definir comme style par
+  // defaut": on one of the user's own themes, it overwrites it right away;
+  // on a ready-to-use built-in theme or the default/manual view, there is
+  // no existing name to reuse, so it opens the inline prompt below instead.
+  const handleSaveButtonClick = () => {
+    if (activeCustomTheme) {
+      handleSaveTheme(activeCustomTheme.name);
+      return;
+    }
+    setSaveThemeMessage('');
+    setSaveThemeName('');
+    setShowInlineThemeNamePrompt(true);
   };
 
   // Replaces what new reels/captions get auto-captioned with, going
@@ -655,17 +690,73 @@ export default function CaptionsModal({
                 <h4 className="text-sm font-bold text-slate-900 dark:text-white">{t('captionsModal.styleEditor', 'Edition de style')}</h4>
               </div>
 
-              <div className="mb-4 flex items-center justify-between gap-2">
-                <button
-                  type="button"
-                  onClick={handleSetAsDefaultStyle}
-                  disabled={isSavingDefaultStyle}
-                  className="rounded-lg border border-emerald-400/60 dark:border-emerald-500/40 bg-emerald-50 dark:bg-emerald-500/10 hover:bg-emerald-100 dark:hover:bg-emerald-500/20 px-3 py-1.5 text-xs font-semibold text-emerald-700 dark:text-emerald-200 disabled:opacity-40 inline-flex items-center gap-1"
-                >
-                  {isSavingDefaultStyle ? <Loader2 size={12} className="animate-spin" /> : null}
-                  {t('captionsModal.setAsDefault', 'Definir comme style par defaut')}
-                </button>
+              <div className="mb-4 space-y-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleSetAsDefaultStyle}
+                    disabled={isSavingDefaultStyle}
+                    className="rounded-lg border border-emerald-400/60 dark:border-emerald-500/40 bg-emerald-50 dark:bg-emerald-500/10 hover:bg-emerald-100 dark:hover:bg-emerald-500/20 px-3 py-1.5 text-xs font-semibold text-emerald-700 dark:text-emerald-200 disabled:opacity-40 inline-flex items-center gap-1"
+                  >
+                    {isSavingDefaultStyle ? <Loader2 size={12} className="animate-spin" /> : null}
+                    {t('captionsModal.setAsDefault', 'Definir comme style par defaut')}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleSaveButtonClick}
+                    disabled={isSavingTheme}
+                    title={
+                      activeCustomTheme
+                        ? t('captionsModal.updateThemeHint', 'Met a jour le theme "{{name}}" avec le style actuel', { name: activeCustomTheme.name })
+                        : t('captionsModal.saveAsNewThemeHint', 'Enregistrer le style actuel comme nouveau theme')
+                    }
+                    className="rounded-lg border border-sky-400/60 dark:border-sky-500/40 bg-sky-50 dark:bg-sky-500/10 hover:bg-sky-100 dark:hover:bg-sky-500/20 px-3 py-1.5 text-xs font-semibold text-sky-700 dark:text-sky-200 disabled:opacity-40 inline-flex items-center gap-1"
+                  >
+                    {isSavingTheme ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
+                    {activeCustomTheme
+                      ? t('captionsModal.updateTheme', 'Enregistrer ({{name}})', { name: activeCustomTheme.name })
+                      : t('captionsModal.save', 'Enregistrer')}
+                  </button>
+                </div>
+
                 {saveDefaultStyleMessage ? <p className="text-[11px] text-slate-500 dark:text-slate-400">{saveDefaultStyleMessage}</p> : null}
+
+                {showInlineThemeNamePrompt && !activeCustomTheme ? (
+                  <div className="flex items-center gap-2">
+                    <input
+                      autoFocus
+                      type="text"
+                      value={saveThemeName}
+                      onChange={(e) => setSaveThemeName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') handleSaveTheme();
+                        if (e.key === 'Escape') setShowInlineThemeNamePrompt(false);
+                      }}
+                      placeholder={t('captionsModal.themeNamePlaceholder', 'Nom du theme')}
+                      className="flex-1 bg-white dark:bg-black/40 border border-slate-300 dark:border-white/10 rounded-md px-2 py-1.5 text-xs text-slate-900 dark:text-zinc-100"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => handleSaveTheme()}
+                      disabled={isSavingTheme || !saveThemeName.trim()}
+                      className="rounded-md bg-emerald-500/20 border border-emerald-500/40 px-3 py-1.5 text-xs font-semibold text-emerald-700 dark:text-emerald-200 disabled:opacity-50 inline-flex items-center gap-1"
+                    >
+                      <Check size={12} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowInlineThemeNamePrompt(false)}
+                      className="rounded-md bg-slate-200 dark:bg-white/10 px-2 py-1.5 text-xs text-slate-600 dark:text-zinc-300"
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                ) : null}
+
+                {saveThemeMessage && !showInlineThemeNamePrompt ? (
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400">{saveThemeMessage}</p>
+                ) : null}
               </div>
 
               <div className="space-y-4">

@@ -352,7 +352,7 @@
       "nature": "Nature",
       "flags": "Drapeaux"
     },
-    "lineSize": "Taille de la ligne",
+    "lineSize": "Taille de la police",
     "lineFont": "Police de la ligne",
     "positionY": "Position verticale",
     "positionX": "Position horizontale",
