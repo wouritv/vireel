@@ -17,7 +17,7 @@ import re
 import ipaddress
 import socket
 import sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from typing import Dict, Optional, List, Any, Annotated, Tuple
@@ -166,6 +166,7 @@ _JOB_NOT_FOUND = "Job not found"
 _INVALID_INPUT_FILENAME = "Invalid input filename"
 _CLIP_NOT_FOUND = "Clip not found"
 _FACEBOOK_TOKEN_EXPIRED_OR_MISSING = "Facebook page access token expired or missing"
+_FACEBOOK_TARGET_ID_MISSING = "Connected Facebook target id is missing"
 _METADATA_NOT_FOUND = "Metadata not found"
 _HTTPS_SCHEME_PREFIX = "https://"
 _INVALID_SCHEDULED_DATE = "Invalid scheduled_date (expected ISO-8601)"
@@ -9414,6 +9415,89 @@ def _bucket_credit_history_by_day(rows: List[Dict[str, Any]]) -> Dict[str, float
     return buckets
 
 
+async def _fetch_dashboard_publish_rows(client, user_id: str, since_iso: Optional[str]) -> List[Dict[str, Any]]:
+    query = client.table(SUPABASE_SOCIAL_PUBLISH_JOBS_TABLE).select("platform, created_at, status").eq("user_id", user_id)
+    if since_iso:
+        query = query.gte("created_at", since_iso)
+    response = await query.execute()
+    return response.data or []
+
+
+async def _fetch_dashboard_credit_rows(client, user_id: str, since_iso: Optional[str]) -> List[Dict[str, Any]]:
+    query = (
+        client.table(SUPABASE_USER_DATA_HISTORY_TABLE)
+        .select("credit, created_at, operation")
+        .eq("user_id", user_id)
+        .eq("operation", "output")
+    )
+    if since_iso:
+        query = query.gte("created_at", since_iso)
+    response = await query.execute()
+    return response.data or []
+
+
+def _aggregate_publication_rows(publish_rows: List[Dict[str, Any]]) -> Tuple[Dict[str, int], int, int, List[Dict[str, Any]]]:
+    publications_daily: Dict[str, int] = {}
+    publications_done = 0
+    publications_failed = 0
+    platform_counts: Dict[str, int] = {}
+    for row in publish_rows:
+        status = row.get("status")
+        platform = str(row.get("platform") or "")
+        if status == "done":
+            publications_done += 1
+            if platform:
+                platform_counts[platform] = platform_counts.get(platform, 0) + 1
+        elif status == "failed":
+            publications_failed += 1
+        ts = row.get("created_at")
+        if ts and len(ts) >= 10:
+            day = ts[:10]
+            publications_daily[day] = publications_daily.get(day, 0) + 1
+
+    publications_by_platform = sorted(
+        ({"platform": platform, "count": count} for platform, count in platform_counts.items()),
+        key=lambda entry: entry["count"],
+        reverse=True,
+    )
+    return publications_daily, publications_done, publications_failed, publications_by_platform
+
+
+def _resolve_dashboard_stats_start_date(since_dt: Optional[datetime], *daily_maps: Dict[str, Any]) -> Optional[date]:
+    if since_dt is not None:
+        return since_dt.date()
+    all_days: set = set()
+    for daily_map in daily_maps:
+        all_days |= set(daily_map)
+    if not all_days:
+        return None
+    return min(datetime.fromisoformat(day).date() for day in all_days)
+
+
+def _build_dashboard_daily_series(
+    start_date: date, today: date, reel_daily: Dict[str, int], caption_daily: Dict[str, int],
+    story_daily: Dict[str, int], film_daily: Dict[str, int], publications_daily: Dict[str, int],
+    credits_daily: Dict[str, float],
+) -> List[Dict[str, Any]]:
+    daily: List[Dict[str, Any]] = []
+    day_cursor = start_date
+    while day_cursor <= today:
+        date_str = day_cursor.isoformat()
+        daily.append({
+            "date": date_str,
+            "reels": reel_daily.get(date_str, 0),
+            "captions": caption_daily.get(date_str, 0),
+            "anonymous_stories": story_daily.get(date_str, 0),
+            "film_summaries": film_daily.get(date_str, 0),
+            "publications": publications_daily.get(date_str, 0),
+            "credits_consumed": credits_daily.get(date_str, 0.0),
+        })
+        day_cursor += timedelta(days=1)
+    if len(daily) > _DASHBOARD_STATS_MAX_DAILY_ENTRIES:
+        daily = daily[-_DASHBOARD_STATS_MAX_DAILY_ENTRIES:]
+    return daily
+
+
 @app.get("/api/dashboard/stats", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
 async def get_dashboard_stats(
     user_id: Annotated[str, Depends(get_user_id_header)],
@@ -9444,9 +9528,7 @@ async def get_dashboard_stats(
             "publications_by_platform": [],
         }
 
-    since_dt: Optional[datetime] = None
-    if range != "all":
-        since_dt = _utcnow() - timedelta(days=_DASHBOARD_STATS_RANGE_TO_DAYS[range])
+    since_dt: Optional[datetime] = None if range == "all" else _utcnow() - timedelta(days=_DASHBOARD_STATS_RANGE_TO_DAYS[range])
     since_iso = since_dt.isoformat() if since_dt else None
 
     reel_dates, caption_dates, story_dates, film_dates = await asyncio.gather(
@@ -9457,51 +9539,14 @@ async def get_dashboard_stats(
     )
 
     client = await supabase_get_client()
-
-    pub_query = (
-        client.table(SUPABASE_SOCIAL_PUBLISH_JOBS_TABLE)
-        .select("platform, created_at, status")
-        .eq("user_id", user_id)
-    )
-    if since_iso:
-        pub_query = pub_query.gte("created_at", since_iso)
-    pub_response = await pub_query.execute()
-    publish_rows = pub_response.data or []
-
-    history_query = (
-        client.table(SUPABASE_USER_DATA_HISTORY_TABLE)
-        .select("credit, created_at, operation")
-        .eq("user_id", user_id)
-        .eq("operation", "output")
-    )
-    if since_iso:
-        history_query = history_query.gte("created_at", since_iso)
-    history_response = await history_query.execute()
-    credit_rows = history_response.data or []
+    publish_rows = await _fetch_dashboard_publish_rows(client, user_id, since_iso)
+    credit_rows = await _fetch_dashboard_credit_rows(client, user_id, since_iso)
 
     reel_daily = _bucket_timestamps_by_day(reel_dates)
     caption_daily = _bucket_timestamps_by_day(caption_dates)
     story_daily = _bucket_timestamps_by_day(story_dates)
     film_daily = _bucket_timestamps_by_day(film_dates)
-
-    publications_daily: Dict[str, int] = {}
-    publications_done = 0
-    publications_failed = 0
-    platform_counts: Dict[str, int] = {}
-    for row in publish_rows:
-        status = row.get("status")
-        platform = str(row.get("platform") or "")
-        if status == "done":
-            publications_done += 1
-            if platform:
-                platform_counts[platform] = platform_counts.get(platform, 0) + 1
-        elif status == "failed":
-            publications_failed += 1
-        ts = row.get("created_at")
-        if ts and len(ts) >= 10:
-            day = ts[:10]
-            publications_daily[day] = publications_daily.get(day, 0) + 1
-
+    publications_daily, publications_done, publications_failed, publications_by_platform = _aggregate_publication_rows(publish_rows)
     credits_daily = _bucket_credit_history_by_day(credit_rows)
 
     totals = {
@@ -9514,43 +9559,21 @@ async def get_dashboard_stats(
         "credits_consumed": sum(credits_daily.values()),
     }
 
-    publications_by_platform = sorted(
-        ({"platform": platform, "count": count} for platform, count in platform_counts.items()),
-        key=lambda entry: entry["count"],
-        reverse=True,
+    start_date = _resolve_dashboard_stats_start_date(
+        since_dt, reel_daily, caption_daily, story_daily, film_daily, publications_daily, credits_daily,
     )
+    if start_date is None:
+        return {
+            "range": range,
+            "totals": totals,
+            "daily": [],
+            "publications_by_platform": publications_by_platform,
+        }
 
-    today = _utcnow().date()
-    if since_dt is not None:
-        start_date = since_dt.date()
-    else:
-        all_days = set(reel_daily) | set(caption_daily) | set(story_daily) | set(film_daily) | set(publications_daily) | set(credits_daily)
-        if not all_days:
-            return {
-                "range": range,
-                "totals": totals,
-                "daily": [],
-                "publications_by_platform": publications_by_platform,
-            }
-        start_date = min(datetime.fromisoformat(day).date() for day in all_days)
-
-    daily: List[Dict[str, Any]] = []
-    day_cursor = start_date
-    while day_cursor <= today:
-        date_str = day_cursor.isoformat()
-        daily.append({
-            "date": date_str,
-            "reels": reel_daily.get(date_str, 0),
-            "captions": caption_daily.get(date_str, 0),
-            "anonymous_stories": story_daily.get(date_str, 0),
-            "film_summaries": film_daily.get(date_str, 0),
-            "publications": publications_daily.get(date_str, 0),
-            "credits_consumed": credits_daily.get(date_str, 0.0),
-        })
-        day_cursor += timedelta(days=1)
-
-    if len(daily) > _DASHBOARD_STATS_MAX_DAILY_ENTRIES:
-        daily = daily[-_DASHBOARD_STATS_MAX_DAILY_ENTRIES:]
+    daily = _build_dashboard_daily_series(
+        start_date, _utcnow().date(), reel_daily, caption_daily, story_daily, film_daily,
+        publications_daily, credits_daily,
+    )
 
     return {
         "range": range,
@@ -13644,7 +13667,7 @@ class SelectFacebookPageRequest(BaseModel):
     page_id: str
 
 
-@app.post("/api/auth/facebook/select-page", responses={400: {"description": "Bad Request"}, 404: {"description": "Not Found"}})
+@app.post("/api/auth/facebook/select-page", responses={400: {"description": "Bad Request"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def select_facebook_page(payload: SelectFacebookPageRequest):
     try:
         data = _page_selection_serializer.loads(payload.selection_token, max_age=_PAGE_SELECTION_TTL_SECONDS)
@@ -14546,7 +14569,7 @@ async def poll_tiktok_status(
 
 async def publish_to_facebook_video(access_token: str, target_id: str, video_url: str, message: str, title: str, description: str):
     if not target_id:
-        raise HTTPException(status_code=400, detail="Connected Facebook target id is missing")
+        raise HTTPException(status_code=400, detail=_FACEBOOK_TARGET_ID_MISSING)
     if not access_token:
         raise HTTPException(status_code=401, detail=_FACEBOOK_TOKEN_EXPIRED_OR_MISSING)
 
@@ -14561,7 +14584,7 @@ async def publish_to_facebook_video(access_token: str, target_id: str, video_url
 
 async def publish_to_facebook_photo(access_token: str, target_id: str, image_url: str, message: str) -> Dict[str, Any]:
     if not target_id:
-        raise HTTPException(status_code=400, detail="Connected Facebook target id is missing")
+        raise HTTPException(status_code=400, detail=_FACEBOOK_TARGET_ID_MISSING)
     if not access_token:
         raise HTTPException(status_code=401, detail=_FACEBOOK_TOKEN_EXPIRED_OR_MISSING)
 
@@ -14584,7 +14607,7 @@ async def publish_to_facebook_text_with_background(
     moment any media is attached, so this only ever sends message +
     text_format_preset_id."""
     if not page_id:
-        raise HTTPException(status_code=400, detail="Connected Facebook target id is missing")
+        raise HTTPException(status_code=400, detail=_FACEBOOK_TARGET_ID_MISSING)
     if not access_token:
         raise HTTPException(status_code=401, detail=_FACEBOOK_TOKEN_EXPIRED_OR_MISSING)
 
@@ -15085,34 +15108,17 @@ _SOCIAL_INSIGHTS_METRIC_KEYS = (
 
 
 def _empty_social_insights_metrics() -> Dict[str, Optional[int]]:
-    return {key: None for key in _SOCIAL_INSIGHTS_METRIC_KEYS}
+    return dict.fromkeys(_SOCIAL_INSIGHTS_METRIC_KEYS)
 
 
-async def _fetch_facebook_page_insights(access_token: str, page_id: str, since_iso: str, until_iso: str) -> Dict[str, Any]:
-    since_unix = int(datetime.fromisoformat(since_iso).timestamp())
-    until_unix = int(datetime.fromisoformat(until_iso).timestamp())
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(
-            f"https://graph.facebook.com/v19.0/{page_id}/insights",
-            params={
-                "metric": "page_impressions,page_engaged_users,page_post_engagements,page_fans",
-                "period": "day",
-                "since": since_unix,
-                "until": until_unix,
-                "access_token": access_token,
-            },
-        )
-    await _raise_for_status_or_502(response, "Facebook")
-
-    metrics = _empty_social_insights_metrics()
+def _parse_facebook_insights_metrics(metric_entries: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], int, int, Optional[int]]:
     daily_by_date: Dict[str, Dict[str, Any]] = {}
     total_impressions = 0
     total_engagement = 0
     last_fans_day = None
     last_fans_value = None
 
-    for metric_entry in (response.json().get("data") or []):
+    for metric_entry in metric_entries:
         name = metric_entry.get("name")
         for value_entry in (metric_entry.get("values") or []):
             end_time = value_entry.get("end_time") or ""
@@ -15134,8 +15140,33 @@ async def _fetch_facebook_page_insights(access_token: str, page_id: str, since_i
                 bucket["engagement"] = bucket.get("engagement", 0) + int(value)
                 total_engagement += int(value)
 
-    if last_fans_value is not None:
-        metrics["followers"] = int(last_fans_value)
+    followers = int(last_fans_value) if last_fans_value is not None else None
+    return daily_by_date, total_impressions, total_engagement, followers
+
+
+async def _fetch_facebook_page_insights(access_token: str, page_id: str, since_iso: str, until_iso: str) -> Dict[str, Any]:
+    since_unix = int(datetime.fromisoformat(since_iso).timestamp())
+    until_unix = int(datetime.fromisoformat(until_iso).timestamp())
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            f"https://graph.facebook.com/v19.0/{page_id}/insights",
+            params={
+                "metric": "page_impressions,page_engaged_users,page_post_engagements,page_fans",
+                "period": "day",
+                "since": since_unix,
+                "until": until_unix,
+                "access_token": access_token,
+            },
+        )
+    await _raise_for_status_or_502(response, "Facebook")
+
+    daily_by_date, total_impressions, total_engagement, followers = _parse_facebook_insights_metrics(
+        response.json().get("data") or []
+    )
+
+    metrics = _empty_social_insights_metrics()
+    metrics["followers"] = followers
     metrics["impressions"] = total_impressions
     metrics["engagement"] = total_engagement
 
@@ -15143,16 +15174,40 @@ async def _fetch_facebook_page_insights(access_token: str, page_id: str, since_i
     return {"metrics": metrics, "daily": daily}
 
 
-async def _fetch_instagram_insights(access_token: str, ig_user_id: str, since_iso: str, until_iso: str) -> Dict[str, Any]:
-    since_unix = int(datetime.fromisoformat(since_iso).timestamp())
-    until_unix = int(datetime.fromisoformat(until_iso).timestamp())
-
-    metrics = _empty_social_insights_metrics()
+def _parse_instagram_insights_metrics(metric_entries: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
     daily_by_date: Dict[str, Dict[str, Any]] = {}
+    total_reach = 0
+    total_engagement = 0
+    for metric_entry in metric_entries:
+        name = metric_entry.get("name")
+        for value_entry in (metric_entry.get("values") or []):
+            end_time = value_entry.get("end_time") or ""
+            day = end_time[:10]
+            value = value_entry.get("value") or 0
+            if not day:
+                continue
+            bucket = daily_by_date.setdefault(day, {"date": day})
+            if name == "reach":
+                bucket["reach"] = bucket.get("reach", 0) + int(value)
+                total_reach += int(value)
+            elif name == "profile_views":
+                bucket["profile_views"] = bucket.get("profile_views", 0) + int(value)
+            elif name == "website_clicks":
+                bucket["engagement"] = bucket.get("engagement", 0) + int(value)
+                total_engagement += int(value)
+    return daily_by_date, total_reach, total_engagement
 
+
+async def _fetch_instagram_reach_insights(
+    access_token: str, ig_user_id: str, since_unix: int, until_unix: int,
+) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
+    """Best-effort: returns ({}, 0, 0) on any failure except an actual
+    token/permission error, which is re-raised so the caller can
+    distinguish it from a partial-data failure (see
+    _get_social_insights_for_account)."""
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            insights_response = await client.get(
+            response = await client.get(
                 f"https://graph.facebook.com/v19.0/{ig_user_id}/insights",
                 params={
                     "metric": "reach,profile_views,website_clicks",
@@ -15162,64 +15217,105 @@ async def _fetch_instagram_insights(access_token: str, ig_user_id: str, since_is
                     "access_token": access_token,
                 },
             )
-        if insights_response.status_code in (401, 403):
-            # Invalid/expired token -- let the caller distinguish this from a
-            # partial data failure (see _get_social_insights_for_account).
-            await _raise_for_status_or_502(insights_response, "Instagram")
-        insights_response.raise_for_status()
-
-        total_reach = 0
-        total_engagement = 0
-        for metric_entry in (insights_response.json().get("data") or []):
-            name = metric_entry.get("name")
-            for value_entry in (metric_entry.get("values") or []):
-                end_time = value_entry.get("end_time") or ""
-                day = end_time[:10]
-                value = value_entry.get("value") or 0
-                if not day:
-                    continue
-                bucket = daily_by_date.setdefault(day, {"date": day})
-                if name == "reach":
-                    bucket["reach"] = bucket.get("reach", 0) + int(value)
-                    total_reach += int(value)
-                elif name == "profile_views":
-                    bucket["profile_views"] = bucket.get("profile_views", 0) + int(value)
-                elif name == "website_clicks":
-                    bucket["engagement"] = bucket.get("engagement", 0) + int(value)
-                    total_engagement += int(value)
-        metrics["reach"] = total_reach
-        metrics["engagement"] = total_engagement
+        if response.status_code in (401, 403):
+            await _raise_for_status_or_502(response, "Instagram")
+        response.raise_for_status()
+        return _parse_instagram_insights_metrics(response.json().get("data") or [])
     except HTTPException:
         raise
     except Exception as exc:
         logger.warning("Failed to fetch Instagram insights for %s: %s", ig_user_id, exc)
+        return {}, 0, 0
 
+
+async def _fetch_instagram_followers_count(access_token: str, ig_user_id: str) -> Optional[int]:
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            profile_response = await client.get(
+            response = await client.get(
                 f"https://graph.facebook.com/v19.0/{ig_user_id}",
                 params={"fields": "followers_count,media_count", "access_token": access_token},
             )
-        if profile_response.status_code in (401, 403):
-            await _raise_for_status_or_502(profile_response, "Instagram")
-        profile_response.raise_for_status()
-        followers_count = profile_response.json().get("followers_count")
-        if followers_count is not None:
-            metrics["followers"] = int(followers_count)
+        if response.status_code in (401, 403):
+            await _raise_for_status_or_502(response, "Instagram")
+        response.raise_for_status()
+        followers_count = response.json().get("followers_count")
+        return int(followers_count) if followers_count is not None else None
     except HTTPException:
         raise
     except Exception as exc:
         logger.warning("Failed to fetch Instagram profile for %s: %s", ig_user_id, exc)
+        return None
+
+
+async def _fetch_instagram_insights(access_token: str, ig_user_id: str, since_iso: str, until_iso: str) -> Dict[str, Any]:
+    since_unix = int(datetime.fromisoformat(since_iso).timestamp())
+    until_unix = int(datetime.fromisoformat(until_iso).timestamp())
+
+    metrics = _empty_social_insights_metrics()
+    daily_by_date, total_reach, total_engagement = await _fetch_instagram_reach_insights(
+        access_token, ig_user_id, since_unix, until_unix,
+    )
+    metrics["reach"] = total_reach
+    metrics["engagement"] = total_engagement
+    metrics["followers"] = await _fetch_instagram_followers_count(access_token, ig_user_id)
 
     daily = [daily_by_date[day] for day in sorted(daily_by_date)]
     return {"metrics": metrics, "daily": daily}
 
 
+_YOUTUBE_COLUMN_TO_METRIC_KEY = {
+    "views": "views",
+    "estimatedMinutesWatched": "watch_time_minutes",
+    "subscribersGained": "subscribers_gained",
+    "subscribersLost": "subscribers_lost",
+    "likes": "likes",
+    "comments": "comments",
+}
+
+
+def _parse_youtube_analytics_report(body: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    headers = [header.get("name") for header in (body.get("columnHeaders") or [])]
+    column_index = {name: idx for idx, name in enumerate(headers)}
+
+    daily: List[Dict[str, Any]] = []
+    totals = dict.fromkeys(_YOUTUBE_COLUMN_TO_METRIC_KEY.values(), 0)
+
+    for row in (body.get("rows") or []):
+        day_idx = column_index.get("day")
+        entry: Dict[str, Any] = {"date": row[day_idx] if day_idx is not None else None}
+        for column_name, metric_key in _YOUTUBE_COLUMN_TO_METRIC_KEY.items():
+            idx = column_index.get(column_name)
+            if idx is None:
+                continue
+            value = int(row[idx] or 0)
+            entry[metric_key] = value
+            totals[metric_key] += value
+        daily.append(entry)
+
+    return daily, totals
+
+
+async def _fetch_youtube_subscriber_count(access_token: str) -> Optional[int]:
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                "https://www.googleapis.com/youtube/v3/channels",
+                params={"part": "statistics", "mine": "true", "access_token": access_token},
+            )
+        response.raise_for_status()
+        items = response.json().get("items") or []
+        if not items:
+            return None
+        subscriber_count = items[0].get("statistics", {}).get("subscriberCount")
+        return int(subscriber_count) if subscriber_count is not None else None
+    except Exception as exc:
+        logger.warning("Failed to fetch YouTube subscriber count: %s", exc)
+        return None
+
+
 async def _fetch_youtube_analytics(access_token: str, since_date: str, until_date: str) -> Dict[str, Any]:
     since_date = since_date[:10]
     until_date = until_date[:10]
-
-    metrics = _empty_social_insights_metrics()
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(
@@ -15236,57 +15332,11 @@ async def _fetch_youtube_analytics(access_token: str, since_date: str, until_dat
         )
     await _raise_for_status_or_502(response, "YouTube")
 
-    body = response.json()
-    headers = [header.get("name") for header in (body.get("columnHeaders") or [])]
-    column_index = {name: idx for idx, name in enumerate(headers)}
+    daily, totals = _parse_youtube_analytics_report(response.json())
 
-    daily: List[Dict[str, Any]] = []
-    totals = {
-        "views": 0, "watch_time_minutes": 0, "subscribers_gained": 0,
-        "subscribers_lost": 0, "likes": 0, "comments": 0,
-    }
-    column_to_metric_key = {
-        "views": "views",
-        "estimatedMinutesWatched": "watch_time_minutes",
-        "subscribersGained": "subscribers_gained",
-        "subscribersLost": "subscribers_lost",
-        "likes": "likes",
-        "comments": "comments",
-    }
-
-    for row in (body.get("rows") or []):
-        day_idx = column_index.get("day")
-        entry: Dict[str, Any] = {"date": row[day_idx] if day_idx is not None else None}
-        for column_name, metric_key in column_to_metric_key.items():
-            idx = column_index.get(column_name)
-            if idx is None:
-                continue
-            value = int(row[idx] or 0)
-            entry[metric_key] = value
-            totals[metric_key] += value
-        daily.append(entry)
-
-    metrics["views"] = totals["views"]
-    metrics["watch_time_minutes"] = totals["watch_time_minutes"]
-    metrics["subscribers_gained"] = totals["subscribers_gained"]
-    metrics["subscribers_lost"] = totals["subscribers_lost"]
-    metrics["likes"] = totals["likes"]
-    metrics["comments"] = totals["comments"]
-
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            channels_response = await client.get(
-                "https://www.googleapis.com/youtube/v3/channels",
-                params={"part": "statistics", "mine": "true", "access_token": access_token},
-            )
-        channels_response.raise_for_status()
-        items = channels_response.json().get("items") or []
-        if items:
-            subscriber_count = items[0].get("statistics", {}).get("subscriberCount")
-            if subscriber_count is not None:
-                metrics["followers"] = int(subscriber_count)
-    except Exception as exc:
-        logger.warning("Failed to fetch YouTube subscriber count: %s", exc)
+    metrics = _empty_social_insights_metrics()
+    metrics.update(totals)
+    metrics["followers"] = await _fetch_youtube_subscriber_count(access_token)
 
     return {"metrics": metrics, "daily": daily}
 

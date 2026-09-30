@@ -5252,11 +5252,12 @@ def test_upsert_social_account_rejects_new_account_over_plan_limit(monkeypatch):
     monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={"facebook": 1}))
     monkeypatch.setattr(app, "_get_user_max_social_accounts", AsyncMock(return_value=1))
 
+    coro = app._upsert_social_account(
+        user_id="u1", platform="facebook", access_token="tok", refresh_token=None,
+        expires_in=3600, platform_user_id="page-2", platform_account_name="Page 2", scopes="pages_show_list",
+    )
     with pytest.raises(app.HTTPException) as exc_info:
-        asyncio.run(app._upsert_social_account(
-            user_id="u1", platform="facebook", access_token="tok", refresh_token=None,
-            expires_in=3600, platform_user_id="page-2", platform_account_name="Page 2", scopes="pages_show_list",
-        ))
+        asyncio.run(coro)
     assert exc_info.value.status_code == 403
     assert table.inserted == []
 
@@ -5266,8 +5267,9 @@ def test_assert_user_has_active_subscription_for_publish_blocks_without_subscrip
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
 
+    coro = app._assert_user_has_active_subscription_for_publish("u1")
     with pytest.raises(app.HTTPException) as exc_info:
-        asyncio.run(app._assert_user_has_active_subscription_for_publish("u1"))
+        asyncio.run(coro)
 
     assert exc_info.value.status_code == 402
 
@@ -6064,8 +6066,9 @@ def test_assert_user_can_access_analytics_blocks_silver_plan(monkeypatch):
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "_get_active_plan_for_user", AsyncMock(return_value={"priorite": 1}))
 
+    coro = app._assert_user_can_access_analytics("u1")
     with pytest.raises(app.HTTPException) as exc_info:
-        asyncio.run(app._assert_user_can_access_analytics("u1"))
+        asyncio.run(coro)
 
     assert exc_info.value.status_code == 403
 
