@@ -30,6 +30,7 @@ const METRIC_DEFS = [
     { key: "engagement", labelKey: "dashboard.metricEngagement", fallback: "Engagement" },
     { key: "profile_views", labelKey: "dashboard.metricProfileViews", fallback: "Vues du profil" },
     { key: "views", labelKey: "dashboard.metricViews", fallback: "Vues" },
+    { key: "follows", labelKey: "dashboard.metricFollows", fallback: "Nouveaux abonnés" },
     { key: "watch_time_minutes", labelKey: "dashboard.metricWatchTime", fallback: "Minutes visionnées" },
     { key: "subscribers_gained", labelKey: "dashboard.metricSubscribersGained", fallback: "Abonnés gagnés" },
     { key: "subscribers_lost", labelKey: "dashboard.metricSubscribersLost", fallback: "Abonnés perdus" },

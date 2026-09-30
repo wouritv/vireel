@@ -15102,7 +15102,7 @@ _PLATFORM_HANDLERS = {
 # --------------------------------------------------------------------------
 
 _SOCIAL_INSIGHTS_METRIC_KEYS = (
-    "followers", "impressions", "reach", "engagement", "profile_views", "views",
+    "followers", "impressions", "reach", "engagement", "profile_views", "views", "follows",
     "watch_time_minutes", "subscribers_gained", "subscribers_lost", "likes", "comments",
 )
 
@@ -15111,67 +15111,126 @@ def _empty_social_insights_metrics() -> Dict[str, Optional[int]]:
     return dict.fromkeys(_SOCIAL_INSIGHTS_METRIC_KEYS)
 
 
-def _accumulate_facebook_daily_metric(daily_by_date: Dict[str, Dict[str, Any]], name: Optional[str], value_entry: Dict[str, Any]) -> Tuple[int, int]:
+# Meta has repeatedly retired individual Page Insights metrics (page_fans,
+# page_impressions, ...) without warning, and each replacement name is a
+# guess against third-party docs until proven against a live token -- so
+# each metric is requested/parsed on its own, and a rejected one is logged
+# by name and skipped rather than zeroing out every other metric too.
+_FACEBOOK_METRIC_TO_BUCKET = {
+    "page_media_view": "impressions",  # replaces the retired page_impressions
+    "page_engaged_users": "engagement",
+    "page_post_engagements": "engagement",
+    "page_views_total": "profile_views",
+    "page_video_views_unique": "views",
+    "page_follows": "follows",  # replaces the retired page_fans (net daily change, not a running total)
+}
+_FACEBOOK_DAILY_METRICS = tuple(_FACEBOOK_METRIC_TO_BUCKET)
+
+
+def _accumulate_facebook_daily_metric(daily_by_date: Dict[str, Dict[str, Any]], name: Optional[str], value_entry: Dict[str, Any]) -> None:
+    bucket_key = _FACEBOOK_METRIC_TO_BUCKET.get(name)
+    if bucket_key is None:
+        return
     day = (value_entry.get("end_time") or "")[:10]
-    value = int(value_entry.get("value") or 0)
     if not day:
-        return 0, 0
+        return
+    value = int(value_entry.get("value") or 0)
     bucket = daily_by_date.setdefault(day, {"date": day})
-    # Meta retired page_impressions in favor of page_media_view in late 2025.
-    if name == "page_media_view":
-        bucket["impressions"] = bucket.get("impressions", 0) + value
-        return value, 0
-    if name in ("page_engaged_users", "page_post_engagements"):
-        bucket["engagement"] = bucket.get("engagement", 0) + value
-        return 0, value
-    return 0, 0
+    bucket[bucket_key] = bucket.get(bucket_key, 0) + value
 
 
-def _parse_facebook_insights_metrics(metric_entries: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
+def _parse_facebook_insights_metrics(metric_entries: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
     daily_by_date: Dict[str, Dict[str, Any]] = {}
-    total_impressions = 0
-    total_engagement = 0
-
     for metric_entry in metric_entries:
         name = metric_entry.get("name")
         for value_entry in (metric_entry.get("values") or []):
-            impressions_delta, engagement_delta = _accumulate_facebook_daily_metric(daily_by_date, name, value_entry)
-            total_impressions += impressions_delta
-            total_engagement += engagement_delta
+            _accumulate_facebook_daily_metric(daily_by_date, name, value_entry)
 
-    return daily_by_date, total_impressions, total_engagement
+    totals: Dict[str, int] = {}
+    for bucket in daily_by_date.values():
+        for key, value in bucket.items():
+            if key == "date":
+                continue
+            totals[key] = totals.get(key, 0) + value
+    return daily_by_date, totals
+
+
+def _merge_facebook_daily(daily_by_date: Dict[str, Dict[str, Any]], other_daily: Dict[str, Dict[str, Any]]) -> None:
+    for day, other_bucket in other_daily.items():
+        bucket = daily_by_date.setdefault(day, {"date": day})
+        for key, value in other_bucket.items():
+            if key == "date":
+                continue
+            bucket[key] = bucket.get(key, 0) + value
+
+
+async def _request_facebook_insights_metrics(
+    access_token: str, page_id: str, metrics: Tuple[str, ...], since_unix: int, until_unix: int,
+) -> List[Dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            f"https://graph.facebook.com/v19.0/{page_id}/insights",
+            params={
+                "metric": ",".join(metrics),
+                "period": "day",
+                "since": since_unix,
+                "until": until_unix,
+                "access_token": access_token,
+            },
+        )
+    if response.status_code in (401, 403):
+        await _raise_for_status_or_502(response, "Facebook")
+    response.raise_for_status()
+    return response.json().get("data") or []
+
+
+async def _fetch_one_facebook_metric(
+    access_token: str, page_id: str, metric: str, since_unix: int, until_unix: int,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
+    try:
+        data = await _request_facebook_insights_metrics(access_token, page_id, (metric,), since_unix, until_unix)
+        return _parse_facebook_insights_metrics(data)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Facebook insights metric %r rejected for page %s: %s", metric, page_id, exc)
+        return {}, {}
+
+
+async def _fetch_facebook_metrics_individually(
+    access_token: str, page_id: str, metrics: Tuple[str, ...], since_unix: int, until_unix: int,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
+    daily_by_date: Dict[str, Dict[str, Any]] = {}
+    totals: Dict[str, int] = {}
+    for metric in metrics:
+        metric_daily, metric_totals = await _fetch_one_facebook_metric(access_token, page_id, metric, since_unix, until_unix)
+        _merge_facebook_daily(daily_by_date, metric_daily)
+        for key, value in metric_totals.items():
+            totals[key] = totals.get(key, 0) + value
+    return daily_by_date, totals
 
 
 async def _fetch_facebook_engagement_insights(
     access_token: str, page_id: str, since_unix: int, until_unix: int,
-) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
-    """Best-effort: returns ({}, 0, 0) on any failure except an actual
-    token/permission error, which is re-raised so the caller can
-    distinguish it from a partial-data failure (see
-    _get_social_insights_for_account). Meta periodically retires individual
-    Page Insights metrics (e.g. page_impressions -> page_media_view in late
-    2025) -- one rejected metric must not take down the whole fetch."""
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
+    """Tries every known-useful metric in one batch call first (the common,
+    cheap case); if Meta rejects any one of them, the whole batch fails, so
+    this falls back to requesting each metric on its own and logs exactly
+    which one(s) got rejected, rather than losing every metric to one bad
+    name. An actual token/permission error (401/403) is re-raised so the
+    caller can distinguish it from a partial-data failure (see
+    _get_social_insights_for_account)."""
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                f"https://graph.facebook.com/v19.0/{page_id}/insights",
-                params={
-                    "metric": "page_media_view,page_engaged_users,page_post_engagements",
-                    "period": "day",
-                    "since": since_unix,
-                    "until": until_unix,
-                    "access_token": access_token,
-                },
-            )
-        if response.status_code in (401, 403):
-            await _raise_for_status_or_502(response, "Facebook")
-        response.raise_for_status()
-        return _parse_facebook_insights_metrics(response.json().get("data") or [])
+        data = await _request_facebook_insights_metrics(access_token, page_id, _FACEBOOK_DAILY_METRICS, since_unix, until_unix)
+        return _parse_facebook_insights_metrics(data)
     except HTTPException:
         raise
     except Exception as exc:
-        logger.warning("Failed to fetch Facebook page insights for %s: %s", page_id, exc)
-        return {}, 0, 0
+        logger.warning(
+            "Facebook insights batch request rejected for page %s (%s); retrying metrics individually to isolate the invalid one(s)",
+            page_id, exc,
+        )
+        return await _fetch_facebook_metrics_individually(access_token, page_id, _FACEBOOK_DAILY_METRICS, since_unix, until_unix)
 
 
 async def _fetch_facebook_follower_count(access_token: str, page_id: str) -> Optional[int]:
@@ -15199,15 +15258,15 @@ async def _fetch_facebook_page_insights(access_token: str, page_id: str, since_i
     since_unix = int(datetime.fromisoformat(since_iso).timestamp())
     until_unix = int(datetime.fromisoformat(until_iso).timestamp())
 
-    daily_by_date, total_impressions, total_engagement = await _fetch_facebook_engagement_insights(
+    daily_by_date, totals = await _fetch_facebook_engagement_insights(
         access_token, page_id, since_unix, until_unix
     )
     followers = await _fetch_facebook_follower_count(access_token, page_id)
 
     metrics = _empty_social_insights_metrics()
     metrics["followers"] = followers
-    metrics["impressions"] = total_impressions
-    metrics["engagement"] = total_engagement
+    for bucket_key in set(_FACEBOOK_METRIC_TO_BUCKET.values()):
+        metrics[bucket_key] = totals.get(bucket_key, 0)
 
     daily = [daily_by_date[day] for day in sorted(daily_by_date)]
     return {"metrics": metrics, "daily": daily}

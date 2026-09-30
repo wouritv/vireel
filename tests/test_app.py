@@ -6190,6 +6190,65 @@ def test_fetch_facebook_page_insights_parses_daily_series(monkeypatch):
     ]
 
 
+def test_fetch_facebook_page_insights_falls_back_to_per_metric_on_rejected_batch(monkeypatch):
+    # Simulates Meta rejecting one metric in the combined request (error
+    # #100 "must be a valid insights metric") -- the whole batch call
+    # fails, so the fetch must retry metric-by-metric and still return the
+    # metrics Meta does accept instead of zeroing everything out.
+    app = _import_app_with_stubs(monkeypatch)
+    profile_body = {"followers_count": 42}
+
+    def _per_metric_body(url, params):
+        metric = (params or {}).get("metric", "")
+        if metric == "page_engaged_users":
+            return {
+                "data": [
+                    {
+                        "name": "page_engaged_users",
+                        "period": "day",
+                        "values": [{"value": 5, "end_time": "2026-09-01T07:00:00+0000"}],
+                    },
+                ]
+            }
+        # Every other individual metric (including the removed/invalid one)
+        # comes back empty, as Meta does for a metric with no data -- only
+        # the one batch call with ALL metrics together is rejected outright.
+        return {"data": []}
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, params=None):
+            request = app.httpx.Request("GET", url)
+            if not url.endswith("/insights"):
+                return app.httpx.Response(200, json=profile_body, request=request)
+            metric = (params or {}).get("metric", "")
+            if "," in metric:
+                return app.httpx.Response(
+                    400,
+                    json={"error": {"message": "(#100) The value must be a valid insights metric", "code": 100}},
+                    request=request,
+                )
+            return app.httpx.Response(200, json=_per_metric_body(url, params), request=request)
+
+    monkeypatch.setattr(app.httpx, "AsyncClient", _FakeAsyncClient)
+
+    result = asyncio.run(app._fetch_facebook_page_insights(
+        "token-1", "page-1", "2026-09-01T00:00:00+00:00", "2026-09-01T23:59:59+00:00",
+    ))
+
+    assert result["metrics"]["engagement"] == 5
+    assert result["metrics"]["followers"] == 42
+    assert result["daily"] == [{"date": "2026-09-01", "engagement": 5}]
+
+
 def test_fetch_youtube_analytics_parses_rows(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
 
