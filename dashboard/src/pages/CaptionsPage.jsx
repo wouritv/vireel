@@ -383,14 +383,10 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
                             navigate("/dashboard/captions/new");
                         }}
                         disabled={!canCreateCaption}
-                        className="flex items-center gap-2 p-3 bg-white/5 hover:bg-white/10 rounded-xl transition-colors group disabled:opacity-40 disabled:cursor-not-allowed"
+                        className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-sm font-bold shadow-lg shadow-blue-500/20 hover:from-blue-500 hover:to-indigo-500 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                     >
-                        <div className="w-8 h-8 rounded-full bg-primary/20 text-primary flex items-center justify-center shrink-0">
-                            <Plus size={16} />
-                        </div>
-                        <div className="hidden lg:block overflow-hidden">
-                            <p className="text-sm font-bold text-white leading-none mb-0.5">{t("app.newOperation", "New operation")}</p>
-                        </div>
+                        <Plus size={16} />
+                        {t("app.newOperation", "Nouveau projet")}
                     </button>
                 )}
             </div>

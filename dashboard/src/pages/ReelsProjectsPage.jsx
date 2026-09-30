@@ -171,12 +171,10 @@ export default function ReelsProjectsPage() {
                 <button
                     type="button"
                     onClick={() => navigate("/dashboard/reel-generator?new=1")}
-                    className="w-full md:w-auto flex items-center justify-center gap-2 p-3 bg-white/5 hover:bg-white/10 rounded-xl transition-colors"
+                    className="w-full md:w-auto flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-sm font-bold shadow-lg shadow-blue-500/20 hover:from-blue-500 hover:to-indigo-500 transition-all"
                 >
-                    <div className="w-8 h-8 rounded-full bg-primary/20 text-primary flex items-center justify-center shrink-0">
-                        <Plus size={16} />
-                    </div>
-                    <span className="text-sm font-bold text-white">{t("app.newOperation", "New operation")}</span>
+                    <Plus size={16} />
+                    {t("app.newOperation", "Nouveau projet")}
                 </button>
             </div>
 
