@@ -59,7 +59,7 @@ export const DASHBOARD_SIDEBAR_ITEMS = [
     {
         key: "film-summaries",
         title: "Résumé de film",
-        sidebarLabel: "Résumé de film",
+        sidebarLabel: "Résumé de films",
         icon: Clapperboard,
         activeClassName: "bg-teal-500/10 text-teal-400",
         inactiveClassName: "text-slate-500 dark:text-zinc-400 hover:text-white hover:bg-white/5",
