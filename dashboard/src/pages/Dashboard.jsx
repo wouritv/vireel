@@ -123,8 +123,8 @@ export default function Dashboard() {
                             </span>
                             <ArrowRight size={16} className="text-slate-400 dark:text-zinc-500 group-hover:text-white" />
                         </div>
-                        <h4 className="title-contrast mt-5 text-lg font-semibold">{t("dashboard.anonymousStoryGenerator", "Créer une histoire anonyme")}</h4>
-                        <p className="mt-2 text-sm leading-6 text-slate-500 dark:text-zinc-400">{t("dashboard.anonymousStoryGeneratorSubtitle", "Transforme une video temoignage en histoire ecrite anonymisee, prete a publier.")}</p>
+                        <h4 className="title-contrast mt-5 text-lg font-semibold">{t("dashboard.anonymousStoryGenerator", "Générer une histoire")}</h4>
+                        <p className="mt-2 text-sm leading-6 text-slate-500 dark:text-zinc-400">{t("dashboard.anonymousStoryGeneratorSubtitle", "Transforme une vidéo témoignage en histoire écrite anonymisée, prête à publier.")}</p>
                     </button>
 
                     <button
@@ -137,7 +137,7 @@ export default function Dashboard() {
                             </span>
                             <ArrowRight size={16} className="text-slate-400 dark:text-zinc-500 group-hover:text-white" />
                         </div>
-                        <h4 className="title-contrast mt-5 text-lg font-semibold">{t("dashboard.filmSummaryGenerator", "Créer un résumé de film")}</h4>
+                        <h4 className="title-contrast mt-5 text-lg font-semibold">{t("dashboard.filmSummaryGenerator", "Générer un résumé de film")}</h4>
                         <p className="mt-2 text-sm leading-6 text-slate-500 dark:text-zinc-400">{t("dashboard.filmSummaryGeneratorSubtitle", "Transforme un film complet en résumé monté et narré, prêt à revoir avant génération.")}</p>
                     </button>
 

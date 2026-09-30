@@ -252,8 +252,8 @@ export default function NewCaptionPage() {
         <div className="captions-page-shell flex-1 overflow-y-auto overflow-x-hidden md:overflow-x-visible p-8 space-y-6">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
                 <div>
-                    <h1 className="text-3xl font-black tracking-tight">{t("common.subtitles", "Sous-titres")}</h1>
-                    <p className="mt-2 text-sm text-slate-500 dark:text-zinc-400">Upload local uniquement puis generation via la file de jobs.</p>
+                    <h1 className="text-3xl font-black tracking-tight">{t("common.subtitles", "Génération des sous-titres")}</h1>
+                    <p className="mt-2 text-sm text-slate-500 dark:text-zinc-400">{t("common.subtitlesdesc", "Upload local only then generate via the job queue.")}</p>
                 </div>
 
                 <button
