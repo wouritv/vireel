@@ -118,6 +118,11 @@ from supabase_request import (
 	list_caption_style_themes as supabase_list_caption_style_themes,
 	upsert_caption_style_theme as supabase_upsert_caption_style_theme,
 	delete_caption_style_theme as supabase_delete_caption_style_theme,
+	list_reel_dates_since as supabase_list_reel_dates_since,
+	list_caption_dates_since as supabase_list_caption_dates_since,
+	list_anonymous_story_dates_since as supabase_list_anonymous_story_dates_since,
+	list_film_summary_dates_since as supabase_list_film_summary_dates_since,
+	SUPABASE_USER_DATA_HISTORY_TABLE,
 )
 import anonymous_stories
 import email_templates
@@ -319,6 +324,13 @@ PLATFORM_CONFIG = {
         "token_url": "https://www.linkedin.com/oauth/v2/accessToken",
         "client_id": os.getenv("LINKEDIN_CLIENT_ID"),
         "client_secret": os.getenv("LINKEDIN_CLIENT_SECRET"),
+        # No analytics scope is requested here: real LinkedIn analytics
+        # (page/post insights) require the LinkedIn Marketing Developer
+        # Platform, a separate partner/developer approval process that
+        # cannot be obtained by writing code -- see
+        # _get_social_insights_for_account, which reports this platform as
+        # unsupported for the analytics feature rather than silently
+        # returning nothing.
         "scopes": ["w_member_social", "openid", "profile","email"],
     },
     "facebook": {
@@ -333,9 +345,13 @@ PLATFORM_CONFIG = {
         # be requested alongside pages_manage_engagement (its App Review
         # docs state the submission must include pages_show_list and
         # pages_read_user_content to use pages_manage_engagement).
+        # read_insights is required for the Page Insights /insights edge
+        # used by the social analytics dashboard block (see
+        # _fetch_facebook_page_insights) -- pages_read_engagement alone does
+        # not cover it.
         "scopes": [
             "pages_show_list", "pages_manage_posts", "pages_read_engagement",
-            "pages_manage_engagement", "pages_read_user_content",
+            "pages_manage_engagement", "pages_read_user_content", "read_insights",
         ],
     },
     "instagram": {
@@ -351,9 +367,16 @@ PLATFORM_CONFIG = {
         # Review isn't asked to approve permissions with no real use case
         # to demonstrate. manage_insights is kept deliberately (planned
         # analytics use) despite the same gap.
+        # instagram_business_manage_insights is required by the social
+        # analytics dashboard block added alongside
+        # _fetch_instagram_insights (the /insights edge on an Instagram
+        # Business/Creator account) -- keep it even if it looks unused by
+        # publishing itself, a future cleanup pass should not remove it
+        # again.
         "scopes": [
             "instagram_business_basic",
-            "instagram_business_content_publish"
+            "instagram_business_content_publish",
+            "instagram_business_manage_insights",
         ],
     },
     "youtube": {
@@ -361,13 +384,26 @@ PLATFORM_CONFIG = {
         "token_url": "https://oauth2.googleapis.com/token",
         "client_id": os.getenv("YOUTUBE_CLIENT_ID"),
         "client_secret": os.getenv("YOUTUBE_CLIENT_SECRET"),
-        "scopes": ["https://www.googleapis.com/auth/youtube.upload","https://www.googleapis.com/auth/youtube.readonly"],
+        # yt-analytics.readonly is required for the separate YouTube
+        # Analytics API (_fetch_youtube_analytics) -- youtube.readonly only
+        # covers the Data API and does not grant access to Analytics reports.
+        "scopes": [
+            "https://www.googleapis.com/auth/youtube.upload",
+            "https://www.googleapis.com/auth/youtube.readonly",
+            "https://www.googleapis.com/auth/yt-analytics.readonly",
+        ],
     },
     "tiktok": {
         "auth_url": "https://www.tiktok.com/v2/auth/authorize",
         "token_url": "https://open.tiktokapis.com/v2/oauth/token/",
         "client_id": os.getenv("TIKTOK_CLIENT_KEY"),
         "client_secret": os.getenv("TIKTOK_CLIENT_SECRET"),
+        # No analytics scope is requested here: real TikTok analytics
+        # require the TikTok Business API, a separate partner/developer
+        # approval process that cannot be obtained by writing code -- see
+        # _get_social_insights_for_account, which reports this platform as
+        # unsupported for the analytics feature rather than silently
+        # returning nothing.
         "scopes": ["video.upload", "user.info.basic"],
     },
 }
@@ -3961,6 +3997,21 @@ async def _assert_user_has_active_subscription_for_publish(user_id: str) -> None
         raise HTTPException(
             status_code=402,
             detail="Un abonnement actif est requis pour publier sur les reseaux sociaux.",
+        )
+
+
+async def _assert_user_can_access_analytics(user_id: str) -> None:
+    """Social insights and the analytics dashboard block are restricted to
+    the gold and ultimate subscription tiers (priorite 2 and 3) -- silver
+    (priorite 1) and no active subscription are both blocked."""
+    if not is_supabase_configured():
+        return
+    plan = await _get_active_plan_for_user(user_id)
+    priorite = int((plan or {}).get("priorite") or 1)
+    if priorite < 2:
+        raise HTTPException(
+            status_code=403,
+            detail="Les analyses sont reservees aux abonnements Gold et Ultimate.",
         )
 
 
@@ -9264,6 +9315,7 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
             "storage_overage_tolerance_percent": STORAGE_OVERAGE_TOLERANCE_PERCENT,
             "has_credits": False,
             "has_active_subscription": has_active_subscription,
+            "has_analytics_access": bool(abonnement) and int(abonnement.get("priorite") or 1) >= 2,
             "abo_costs": {
                 "credit":  0.0,
                 "storage": 0.0,
@@ -9299,6 +9351,7 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
         "storage_overage_tolerance_percent": STORAGE_OVERAGE_TOLERANCE_PERCENT,
         "has_credits": credit > 0,
         "has_active_subscription": has_active_subscription,
+        "has_analytics_access": bool(abonnement) and int(abonnement.get("priorite") or 1) >= 2,
         "abo_costs": abo_costs,
         "default_costs": {
             "reel":        DEFAULT_REEL_CREDITS,
@@ -9325,6 +9378,185 @@ async def get_user_history(
         "total":     total,
         "page":      page,
         "page_size": page_size,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dashboard stats (internal KPI block) -- computed entirely from this app's
+# own DB, no external calls.
+# ---------------------------------------------------------------------------
+
+_DASHBOARD_STATS_RANGE_TO_DAYS = {"7d": 7, "30d": 30, "90d": 90}
+_DASHBOARD_STATS_MAX_DAILY_ENTRIES = 180
+
+
+def _bucket_timestamps_by_day(timestamps: List[str]) -> Dict[str, int]:
+    """Bucket a list of ISO-8601 timestamp strings into {"YYYY-MM-DD": count}.
+    Postgres timestamptz ISO output always starts with the date, so a plain
+    prefix slice is enough -- no timezone-aware parsing needed here."""
+    buckets: Dict[str, int] = {}
+    for ts in timestamps:
+        if not ts or len(ts) < 10:
+            continue
+        day = ts[:10]
+        buckets[day] = buckets.get(day, 0) + 1
+    return buckets
+
+
+def _bucket_credit_history_by_day(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+    buckets: Dict[str, float] = {}
+    for row in rows:
+        ts = row.get("created_at")
+        if not ts or len(ts) < 10:
+            continue
+        day = ts[:10]
+        buckets[day] = buckets.get(day, 0.0) + float(row.get("credit") or 0)
+    return buckets
+
+
+@app.get("/api/dashboard/stats", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
+async def get_dashboard_stats(
+    user_id: Annotated[str, Depends(get_user_id_header)],
+    range: Annotated[str, Query()] = "30d",
+):
+    """Internal KPI/stats block for the dashboard home page: reels/captions/
+    anonymous stories/film summaries created, publications by platform and
+    credit consumption, bucketed per day. Computed entirely from this app's
+    own DB -- no external (social platform) calls."""
+    if range not in {"7d", "30d", "90d", "all"}:
+        raise HTTPException(status_code=400, detail="range must be one of: 7d, 30d, 90d, all")
+
+    empty_totals = {
+        "reels": 0,
+        "captions": 0,
+        "anonymous_stories": 0,
+        "film_summaries": 0,
+        "publications_done": 0,
+        "publications_failed": 0,
+        "credits_consumed": 0.0,
+    }
+
+    if not is_supabase_configured():
+        return {
+            "range": range,
+            "totals": empty_totals,
+            "daily": [],
+            "publications_by_platform": [],
+        }
+
+    since_dt: Optional[datetime] = None
+    if range != "all":
+        since_dt = _utcnow() - timedelta(days=_DASHBOARD_STATS_RANGE_TO_DAYS[range])
+    since_iso = since_dt.isoformat() if since_dt else None
+
+    reel_dates, caption_dates, story_dates, film_dates = await asyncio.gather(
+        supabase_list_reel_dates_since(user_id, since_iso),
+        supabase_list_caption_dates_since(user_id, since_iso),
+        supabase_list_anonymous_story_dates_since(user_id, since_iso),
+        supabase_list_film_summary_dates_since(user_id, since_iso),
+    )
+
+    client = await supabase_get_client()
+
+    pub_query = (
+        client.table(SUPABASE_SOCIAL_PUBLISH_JOBS_TABLE)
+        .select("platform, created_at, status")
+        .eq("user_id", user_id)
+    )
+    if since_iso:
+        pub_query = pub_query.gte("created_at", since_iso)
+    pub_response = await pub_query.execute()
+    publish_rows = pub_response.data or []
+
+    history_query = (
+        client.table(SUPABASE_USER_DATA_HISTORY_TABLE)
+        .select("credit, created_at, operation")
+        .eq("user_id", user_id)
+        .eq("operation", "output")
+    )
+    if since_iso:
+        history_query = history_query.gte("created_at", since_iso)
+    history_response = await history_query.execute()
+    credit_rows = history_response.data or []
+
+    reel_daily = _bucket_timestamps_by_day(reel_dates)
+    caption_daily = _bucket_timestamps_by_day(caption_dates)
+    story_daily = _bucket_timestamps_by_day(story_dates)
+    film_daily = _bucket_timestamps_by_day(film_dates)
+
+    publications_daily: Dict[str, int] = {}
+    publications_done = 0
+    publications_failed = 0
+    platform_counts: Dict[str, int] = {}
+    for row in publish_rows:
+        status = row.get("status")
+        platform = str(row.get("platform") or "")
+        if status == "done":
+            publications_done += 1
+            if platform:
+                platform_counts[platform] = platform_counts.get(platform, 0) + 1
+        elif status == "failed":
+            publications_failed += 1
+        ts = row.get("created_at")
+        if ts and len(ts) >= 10:
+            day = ts[:10]
+            publications_daily[day] = publications_daily.get(day, 0) + 1
+
+    credits_daily = _bucket_credit_history_by_day(credit_rows)
+
+    totals = {
+        "reels": len(reel_dates),
+        "captions": len(caption_dates),
+        "anonymous_stories": len(story_dates),
+        "film_summaries": len(film_dates),
+        "publications_done": publications_done,
+        "publications_failed": publications_failed,
+        "credits_consumed": sum(credits_daily.values()),
+    }
+
+    publications_by_platform = sorted(
+        ({"platform": platform, "count": count} for platform, count in platform_counts.items()),
+        key=lambda entry: entry["count"],
+        reverse=True,
+    )
+
+    today = _utcnow().date()
+    if since_dt is not None:
+        start_date = since_dt.date()
+    else:
+        all_days = set(reel_daily) | set(caption_daily) | set(story_daily) | set(film_daily) | set(publications_daily) | set(credits_daily)
+        if not all_days:
+            return {
+                "range": range,
+                "totals": totals,
+                "daily": [],
+                "publications_by_platform": publications_by_platform,
+            }
+        start_date = min(datetime.fromisoformat(day).date() for day in all_days)
+
+    daily: List[Dict[str, Any]] = []
+    day_cursor = start_date
+    while day_cursor <= today:
+        date_str = day_cursor.isoformat()
+        daily.append({
+            "date": date_str,
+            "reels": reel_daily.get(date_str, 0),
+            "captions": caption_daily.get(date_str, 0),
+            "anonymous_stories": story_daily.get(date_str, 0),
+            "film_summaries": film_daily.get(date_str, 0),
+            "publications": publications_daily.get(date_str, 0),
+            "credits_consumed": credits_daily.get(date_str, 0.0),
+        })
+        day_cursor += timedelta(days=1)
+
+    if len(daily) > _DASHBOARD_STATS_MAX_DAILY_ENTRIES:
+        daily = daily[-_DASHBOARD_STATS_MAX_DAILY_ENTRIES:]
+
+    return {
+        "range": range,
+        "totals": totals,
+        "daily": daily,
+        "publications_by_platform": publications_by_platform,
     }
 
 
@@ -14835,6 +15067,281 @@ _PLATFORM_HANDLERS = {
     "youtube": _publish_youtube_platform,
     "tiktok": _publish_tiktok_platform,
 }
+
+
+# --------------------------------------------------------------------------
+# Social insights (analytics) -- Facebook / Instagram / YouTube only.
+#
+# LinkedIn and TikTok have no analytics scope requested (see PLATFORM_CONFIG)
+# since their real analytics APIs require a separate platform partner
+# approval process -- _get_social_insights_for_account reports them as
+# unsupported rather than silently returning empty data.
+# --------------------------------------------------------------------------
+
+_SOCIAL_INSIGHTS_METRIC_KEYS = (
+    "followers", "impressions", "reach", "engagement", "profile_views", "views",
+    "watch_time_minutes", "subscribers_gained", "subscribers_lost", "likes", "comments",
+)
+
+
+def _empty_social_insights_metrics() -> Dict[str, Optional[int]]:
+    return {key: None for key in _SOCIAL_INSIGHTS_METRIC_KEYS}
+
+
+async def _fetch_facebook_page_insights(access_token: str, page_id: str, since_iso: str, until_iso: str) -> Dict[str, Any]:
+    since_unix = int(datetime.fromisoformat(since_iso).timestamp())
+    until_unix = int(datetime.fromisoformat(until_iso).timestamp())
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            f"https://graph.facebook.com/v19.0/{page_id}/insights",
+            params={
+                "metric": "page_impressions,page_engaged_users,page_post_engagements,page_fans",
+                "period": "day",
+                "since": since_unix,
+                "until": until_unix,
+                "access_token": access_token,
+            },
+        )
+    await _raise_for_status_or_502(response, "Facebook")
+
+    metrics = _empty_social_insights_metrics()
+    daily_by_date: Dict[str, Dict[str, Any]] = {}
+    total_impressions = 0
+    total_engagement = 0
+    last_fans_day = None
+    last_fans_value = None
+
+    for metric_entry in (response.json().get("data") or []):
+        name = metric_entry.get("name")
+        for value_entry in (metric_entry.get("values") or []):
+            end_time = value_entry.get("end_time") or ""
+            day = end_time[:10]
+            value = value_entry.get("value") or 0
+            if not day:
+                continue
+            if name == "page_fans":
+                # Running total, not a daily delta -- track the last day only.
+                if last_fans_day is None or day >= last_fans_day:
+                    last_fans_day = day
+                    last_fans_value = value
+                continue
+            bucket = daily_by_date.setdefault(day, {"date": day})
+            if name == "page_impressions":
+                bucket["impressions"] = bucket.get("impressions", 0) + int(value)
+                total_impressions += int(value)
+            elif name in ("page_engaged_users", "page_post_engagements"):
+                bucket["engagement"] = bucket.get("engagement", 0) + int(value)
+                total_engagement += int(value)
+
+    if last_fans_value is not None:
+        metrics["followers"] = int(last_fans_value)
+    metrics["impressions"] = total_impressions
+    metrics["engagement"] = total_engagement
+
+    daily = [daily_by_date[day] for day in sorted(daily_by_date)]
+    return {"metrics": metrics, "daily": daily}
+
+
+async def _fetch_instagram_insights(access_token: str, ig_user_id: str, since_iso: str, until_iso: str) -> Dict[str, Any]:
+    since_unix = int(datetime.fromisoformat(since_iso).timestamp())
+    until_unix = int(datetime.fromisoformat(until_iso).timestamp())
+
+    metrics = _empty_social_insights_metrics()
+    daily_by_date: Dict[str, Dict[str, Any]] = {}
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            insights_response = await client.get(
+                f"https://graph.facebook.com/v19.0/{ig_user_id}/insights",
+                params={
+                    "metric": "reach,profile_views,website_clicks",
+                    "period": "day",
+                    "since": since_unix,
+                    "until": until_unix,
+                    "access_token": access_token,
+                },
+            )
+        if insights_response.status_code in (401, 403):
+            # Invalid/expired token -- let the caller distinguish this from a
+            # partial data failure (see _get_social_insights_for_account).
+            await _raise_for_status_or_502(insights_response, "Instagram")
+        insights_response.raise_for_status()
+
+        total_reach = 0
+        total_engagement = 0
+        for metric_entry in (insights_response.json().get("data") or []):
+            name = metric_entry.get("name")
+            for value_entry in (metric_entry.get("values") or []):
+                end_time = value_entry.get("end_time") or ""
+                day = end_time[:10]
+                value = value_entry.get("value") or 0
+                if not day:
+                    continue
+                bucket = daily_by_date.setdefault(day, {"date": day})
+                if name == "reach":
+                    bucket["reach"] = bucket.get("reach", 0) + int(value)
+                    total_reach += int(value)
+                elif name == "profile_views":
+                    bucket["profile_views"] = bucket.get("profile_views", 0) + int(value)
+                elif name == "website_clicks":
+                    bucket["engagement"] = bucket.get("engagement", 0) + int(value)
+                    total_engagement += int(value)
+        metrics["reach"] = total_reach
+        metrics["engagement"] = total_engagement
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Failed to fetch Instagram insights for %s: %s", ig_user_id, exc)
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            profile_response = await client.get(
+                f"https://graph.facebook.com/v19.0/{ig_user_id}",
+                params={"fields": "followers_count,media_count", "access_token": access_token},
+            )
+        if profile_response.status_code in (401, 403):
+            await _raise_for_status_or_502(profile_response, "Instagram")
+        profile_response.raise_for_status()
+        followers_count = profile_response.json().get("followers_count")
+        if followers_count is not None:
+            metrics["followers"] = int(followers_count)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Failed to fetch Instagram profile for %s: %s", ig_user_id, exc)
+
+    daily = [daily_by_date[day] for day in sorted(daily_by_date)]
+    return {"metrics": metrics, "daily": daily}
+
+
+async def _fetch_youtube_analytics(access_token: str, since_date: str, until_date: str) -> Dict[str, Any]:
+    since_date = since_date[:10]
+    until_date = until_date[:10]
+
+    metrics = _empty_social_insights_metrics()
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            "https://youtubeanalytics.googleapis.com/v2/reports",
+            params={
+                "ids": "channel==MINE",
+                "startDate": since_date,
+                "endDate": until_date,
+                "metrics": "views,estimatedMinutesWatched,subscribersGained,subscribersLost,likes,comments",
+                "dimensions": "day",
+                "sort": "day",
+                "access_token": access_token,
+            },
+        )
+    await _raise_for_status_or_502(response, "YouTube")
+
+    body = response.json()
+    headers = [header.get("name") for header in (body.get("columnHeaders") or [])]
+    column_index = {name: idx for idx, name in enumerate(headers)}
+
+    daily: List[Dict[str, Any]] = []
+    totals = {
+        "views": 0, "watch_time_minutes": 0, "subscribers_gained": 0,
+        "subscribers_lost": 0, "likes": 0, "comments": 0,
+    }
+    column_to_metric_key = {
+        "views": "views",
+        "estimatedMinutesWatched": "watch_time_minutes",
+        "subscribersGained": "subscribers_gained",
+        "subscribersLost": "subscribers_lost",
+        "likes": "likes",
+        "comments": "comments",
+    }
+
+    for row in (body.get("rows") or []):
+        day_idx = column_index.get("day")
+        entry: Dict[str, Any] = {"date": row[day_idx] if day_idx is not None else None}
+        for column_name, metric_key in column_to_metric_key.items():
+            idx = column_index.get(column_name)
+            if idx is None:
+                continue
+            value = int(row[idx] or 0)
+            entry[metric_key] = value
+            totals[metric_key] += value
+        daily.append(entry)
+
+    metrics["views"] = totals["views"]
+    metrics["watch_time_minutes"] = totals["watch_time_minutes"]
+    metrics["subscribers_gained"] = totals["subscribers_gained"]
+    metrics["subscribers_lost"] = totals["subscribers_lost"]
+    metrics["likes"] = totals["likes"]
+    metrics["comments"] = totals["comments"]
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            channels_response = await client.get(
+                "https://www.googleapis.com/youtube/v3/channels",
+                params={"part": "statistics", "mine": "true", "access_token": access_token},
+            )
+        channels_response.raise_for_status()
+        items = channels_response.json().get("items") or []
+        if items:
+            subscriber_count = items[0].get("statistics", {}).get("subscriberCount")
+            if subscriber_count is not None:
+                metrics["followers"] = int(subscriber_count)
+    except Exception as exc:
+        logger.warning("Failed to fetch YouTube subscriber count: %s", exc)
+
+    return {"metrics": metrics, "daily": daily}
+
+
+async def _get_social_insights_for_account(account: Dict[str, Any], since_iso: str, until_iso: str) -> Dict[str, Any]:
+    platform = str(account.get("platform") or "")
+    if platform not in {"facebook", "instagram", "youtube"}:
+        return {
+            "supported": False,
+            "reason": f"{platform.capitalize()} analytics require special platform partner access not yet available.",
+            "metrics": None,
+            "daily": [],
+        }
+
+    try:
+        token = await get_valid_token(account)
+        if platform == "facebook":
+            target_id = str(account.get("platform_user_id") or "")
+            result = await _fetch_facebook_page_insights(token, target_id, since_iso, until_iso)
+        elif platform == "instagram":
+            target_id = str(account.get("platform_user_id") or "")
+            result = await _fetch_instagram_insights(token, target_id, since_iso, until_iso)
+        else:  # youtube
+            result = await _fetch_youtube_analytics(token, since_iso, until_iso)
+        return {"supported": True, "error": None, **result}
+    except Exception as exc:
+        logger.warning("Failed to fetch %s insights for account %s: %s", platform, account.get("id"), exc)
+        return {"supported": True, "error": str(exc), "metrics": None, "daily": []}
+
+
+@app.get("/api/social/insights", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def get_social_insights(
+    account_id: Annotated[str, Query()],
+    user_id: Annotated[str, Depends(get_user_id_header)],
+    range: Annotated[str, Query()] = "30d",
+):
+    await _assert_user_can_access_analytics(user_id)
+    if range not in {"7d", "30d", "90d"}:
+        raise HTTPException(status_code=400, detail="range must be one of: 7d, 30d, 90d")
+    account = await _get_social_account_by_id(user_id, account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Social account not found")
+
+    days = {"7d": 7, "30d": 30, "90d": 90}[range]
+    until = _utcnow()
+    since = until - timedelta(days=days)
+    result = await _get_social_insights_for_account(account, since.isoformat(), until.isoformat())
+
+    return {
+        "account_id": account_id,
+        "platform": account.get("platform"),
+        "platform_account_name": account.get("platform_account_name"),
+        "range": range,
+        **result,
+    }
 
 
 def _build_social_post_url(platform: str, platform_result: Dict[str, Any]) -> Optional[str]:

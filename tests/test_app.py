@@ -5935,3 +5935,308 @@ def test_update_publish_job_status_merges_extra_payload_with_post_url(monkeypatc
         "comments_results": [{"success": True, "id": "c1"}],
         "post_url": "https://example.com/post",
     }
+
+
+# ---------------------------------------------------------------------------
+# Dashboard stats (/api/dashboard/stats)
+# ---------------------------------------------------------------------------
+
+def test_dashboard_stats_rejects_invalid_range(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/dashboard/stats", params={"range": "bogus"}, headers=_auth_headers("u1"))
+
+    assert resp.status_code == 400
+
+
+def test_dashboard_stats_returns_zeroed_shape_when_supabase_not_configured(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/dashboard/stats", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["range"] == "30d"
+    assert data["totals"] == {
+        "reels": 0,
+        "captions": 0,
+        "anonymous_stories": 0,
+        "film_summaries": 0,
+        "publications_done": 0,
+        "publications_failed": 0,
+        "credits_consumed": 0.0,
+    }
+    assert data["daily"] == []
+    assert data["publications_by_platform"] == []
+
+
+def test_dashboard_stats_aggregates_counts_and_daily_series(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_utcnow", lambda: datetime(2026, 9, 5, tzinfo=timezone.utc))
+
+    monkeypatch.setattr(app, "supabase_list_reel_dates_since", AsyncMock(return_value=[
+        "2026-09-01T10:00:00+00:00", "2026-09-01T10:05:00+00:00", "2026-09-03T09:00:00+00:00",
+    ]))
+    monkeypatch.setattr(app, "supabase_list_caption_dates_since", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app, "supabase_list_anonymous_story_dates_since", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app, "supabase_list_film_summary_dates_since", AsyncMock(return_value=[]))
+
+    publish_rows = [
+        {"platform": "facebook", "created_at": "2026-09-01T11:00:00+00:00", "status": "done"},
+        {"platform": "instagram", "created_at": "2026-09-02T11:00:00+00:00", "status": "done"},
+        {"platform": "facebook", "created_at": "2026-09-03T11:00:00+00:00", "status": "failed"},
+    ]
+    history_rows = [
+        {"credit": 5.5, "created_at": "2026-09-01T12:00:00+00:00", "operation": "output"},
+        {"credit": 2.0, "created_at": "2026-09-03T12:00:00+00:00", "operation": "output"},
+    ]
+
+    class _FakeQuery:
+        def __init__(self, data):
+            self._data = data
+
+        def select(self, *_a, **_k):
+            return self
+
+        def eq(self, *_a, **_k):
+            return self
+
+        def gte(self, *_a, **_k):
+            return self
+
+        async def execute(self):
+            return types.SimpleNamespace(data=self._data)
+
+    class _FakeClient:
+        def table(self, name):
+            if name == app.SUPABASE_SOCIAL_PUBLISH_JOBS_TABLE:
+                return _FakeQuery(publish_rows)
+            if name == app.SUPABASE_USER_DATA_HISTORY_TABLE:
+                return _FakeQuery(history_rows)
+            return _FakeQuery([])
+
+    monkeypatch.setattr(app, "supabase_get_client", AsyncMock(return_value=_FakeClient()))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/dashboard/stats", params={"range": "all"}, headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["totals"] == {
+        "reels": 3,
+        "captions": 0,
+        "anonymous_stories": 0,
+        "film_summaries": 0,
+        "publications_done": 2,
+        "publications_failed": 1,
+        "credits_consumed": 7.5,
+    }
+    assert data["publications_by_platform"] == [
+        {"platform": "facebook", "count": 1},
+        {"platform": "instagram", "count": 1},
+    ]
+    sept_1_entry = next(d for d in data["daily"] if d["date"] == "2026-09-01")
+    assert sept_1_entry == {
+        "date": "2026-09-01",
+        "reels": 2,
+        "captions": 0,
+        "anonymous_stories": 0,
+        "film_summaries": 0,
+        "publications": 1,
+        "credits_consumed": 5.5,
+    }
+    assert data["daily"][0]["date"] == "2026-09-01"
+    assert data["daily"][-1]["date"] == "2026-09-05"
+
+
+# ---------------------------------------------------------------------------
+# Social analytics gate (_assert_user_can_access_analytics) and exposure via
+# /api/user/credits
+# ---------------------------------------------------------------------------
+
+def test_assert_user_can_access_analytics_blocks_silver_plan(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_get_active_plan_for_user", AsyncMock(return_value={"priorite": 1}))
+
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(app._assert_user_can_access_analytics("u1"))
+
+    assert exc_info.value.status_code == 403
+
+
+def test_assert_user_can_access_analytics_allows_gold_plan(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_get_active_plan_for_user", AsyncMock(return_value={"priorite": 2}))
+
+    asyncio.run(app._assert_user_can_access_analytics("u1"))
+
+
+def test_get_user_credits_reports_has_analytics_access(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value={"priorite": 3, "abonnement": "ultimate-plan"}))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 100, "stockage": 1}))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/user/credits", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json()["has_analytics_access"] is True
+
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value={"priorite": 1, "abonnement": "silver-plan"}))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/user/credits", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json()["has_analytics_access"] is False
+
+
+# ---------------------------------------------------------------------------
+# Social insights (/api/social/insights)
+# ---------------------------------------------------------------------------
+
+def test_get_social_insights_rejects_below_gold(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_get_active_plan_for_user", AsyncMock(return_value={"priorite": 1}))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/social/insights", params={"account_id": "acct-1"}, headers=_auth_headers("u1"))
+
+    assert resp.status_code == 403
+
+
+def test_get_social_insights_returns_unsupported_for_linkedin(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_can_access_analytics", AsyncMock())
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={
+        "id": "acct-1", "platform": "linkedin", "platform_account_name": "My LI Page",
+    }))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/social/insights", params={"account_id": "acct-1"}, headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["supported"] is False
+    assert data["platform"] == "linkedin"
+    assert data["metrics"] is None
+    assert data["daily"] == []
+
+
+def test_fetch_facebook_page_insights_parses_daily_series(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    body = {
+        "data": [
+            {
+                "name": "page_impressions",
+                "period": "day",
+                "values": [
+                    {"value": 100, "end_time": "2026-09-01T07:00:00+0000"},
+                    {"value": 150, "end_time": "2026-09-02T07:00:00+0000"},
+                ],
+            },
+            {
+                "name": "page_engaged_users",
+                "period": "day",
+                "values": [
+                    {"value": 10, "end_time": "2026-09-01T07:00:00+0000"},
+                    {"value": 20, "end_time": "2026-09-02T07:00:00+0000"},
+                ],
+            },
+            {
+                "name": "page_fans",
+                "period": "day",
+                "values": [
+                    {"value": 500, "end_time": "2026-09-01T07:00:00+0000"},
+                    {"value": 510, "end_time": "2026-09-02T07:00:00+0000"},
+                ],
+            },
+        ]
+    }
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, params=None):
+            request = app.httpx.Request("GET", url)
+            return app.httpx.Response(200, json=body, request=request)
+
+    monkeypatch.setattr(app.httpx, "AsyncClient", _FakeAsyncClient)
+
+    result = asyncio.run(app._fetch_facebook_page_insights(
+        "token-1", "page-1", "2026-09-01T00:00:00+00:00", "2026-09-02T23:59:59+00:00",
+    ))
+
+    assert result["metrics"]["impressions"] == 250
+    assert result["metrics"]["engagement"] == 30
+    assert result["metrics"]["followers"] == 510
+    assert result["daily"] == [
+        {"date": "2026-09-01", "impressions": 100, "engagement": 10},
+        {"date": "2026-09-02", "impressions": 150, "engagement": 20},
+    ]
+
+
+def test_fetch_youtube_analytics_parses_rows(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    reports_body = {
+        "columnHeaders": [
+            {"name": "day"}, {"name": "views"}, {"name": "estimatedMinutesWatched"},
+            {"name": "subscribersGained"}, {"name": "subscribersLost"}, {"name": "likes"}, {"name": "comments"},
+        ],
+        "rows": [
+            ["2026-08-01", 120, 45, 3, 1, 10, 2],
+            ["2026-08-02", 80, 30, 1, 0, 5, 1],
+        ],
+    }
+    channels_body = {"items": [{"statistics": {"subscriberCount": "4210"}}]}
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, params=None):
+            request = app.httpx.Request("GET", url)
+            body = channels_body if "channels" in url else reports_body
+            return app.httpx.Response(200, json=body, request=request)
+
+    monkeypatch.setattr(app.httpx, "AsyncClient", _FakeAsyncClient)
+
+    result = asyncio.run(app._fetch_youtube_analytics(
+        "token-1", "2026-08-01T00:00:00+00:00", "2026-08-02T23:59:59+00:00",
+    ))
+
+    assert result["metrics"]["views"] == 200
+    assert result["metrics"]["watch_time_minutes"] == 75
+    assert result["metrics"]["subscribers_gained"] == 4
+    assert result["metrics"]["subscribers_lost"] == 1
+    assert result["metrics"]["likes"] == 15
+    assert result["metrics"]["comments"] == 3
+    assert result["metrics"]["followers"] == 4210
+    assert result["daily"] == [
+        {"date": "2026-08-01", "views": 120, "watch_time_minutes": 45, "subscribers_gained": 3, "subscribers_lost": 1, "likes": 10, "comments": 2},
+        {"date": "2026-08-02", "views": 80, "watch_time_minutes": 30, "subscribers_gained": 1, "subscribers_lost": 0, "likes": 5, "comments": 1},
+    ]
