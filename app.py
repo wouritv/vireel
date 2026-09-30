@@ -15102,13 +15102,37 @@ _PLATFORM_HANDLERS = {
 # --------------------------------------------------------------------------
 
 _SOCIAL_INSIGHTS_METRIC_KEYS = (
-    "followers", "impressions", "reach", "engagement", "profile_views", "views", "follows",
+    "followers", "impressions", "reach", "engagement", "profile_views", "views",
+    "follows_gained", "follows_lost",
     "watch_time_minutes", "subscribers_gained", "subscribers_lost", "likes", "comments",
 )
 
 
 def _empty_social_insights_metrics() -> Dict[str, Optional[int]]:
     return dict.fromkeys(_SOCIAL_INSIGHTS_METRIC_KEYS)
+
+
+def _compute_metric_trend(current: int, previous: int) -> Dict[str, Any]:
+    if current > previous:
+        direction = "up"
+    elif current < previous:
+        direction = "down"
+    else:
+        direction = "flat"
+    change_pct = round((current - previous) / previous * 100, 1) if previous else None
+    return {"current": current, "previous": previous, "change_pct": change_pct, "direction": direction}
+
+
+def _build_metric_trends(current_totals: Dict[str, int], previous_totals: Dict[str, int], keys: Tuple[str, ...]) -> Dict[str, Dict[str, Any]]:
+    return {
+        key: _compute_metric_trend(current_totals.get(key, 0), previous_totals.get(key, 0))
+        for key in keys
+    }
+
+
+def _previous_period_bounds(since_unix: int, until_unix: int) -> Tuple[int, int]:
+    period_length = until_unix - since_unix
+    return since_unix - period_length, since_unix
 
 
 # Meta has repeatedly retired individual Page Insights metrics (page_fans,
@@ -15122,9 +15146,11 @@ _FACEBOOK_METRIC_TO_BUCKET = {
     "page_post_engagements": "engagement",
     "page_views_total": "profile_views",
     "page_video_views_unique": "views",
-    "page_follows": "follows",  # replaces the retired page_fans (net daily change, not a running total)
+    "page_daily_follows": "follows_gained",  # replaces the retired page_fans/page_fan_adds
+    "page_daily_unfollows": "follows_lost",  # replaces the retired page_fan_removes
 }
 _FACEBOOK_DAILY_METRICS = tuple(_FACEBOOK_METRIC_TO_BUCKET)
+_FACEBOOK_TREND_KEYS = ("impressions", "engagement", "follows_gained", "follows_lost", "comments")
 
 
 def _accumulate_facebook_daily_metric(daily_by_date: Dict[str, Dict[str, Any]], name: Optional[str], value_entry: Dict[str, Any]) -> None:
@@ -15155,7 +15181,7 @@ def _parse_facebook_insights_metrics(metric_entries: List[Dict[str, Any]]) -> Tu
     return daily_by_date, totals
 
 
-def _merge_facebook_daily(daily_by_date: Dict[str, Dict[str, Any]], other_daily: Dict[str, Dict[str, Any]]) -> None:
+def _merge_daily_buckets(daily_by_date: Dict[str, Dict[str, Any]], other_daily: Dict[str, Dict[str, Any]]) -> None:
     for day, other_bucket in other_daily.items():
         bucket = daily_by_date.setdefault(day, {"date": day})
         for key, value in other_bucket.items():
@@ -15204,7 +15230,7 @@ async def _fetch_facebook_metrics_individually(
     totals: Dict[str, int] = {}
     for metric in metrics:
         metric_daily, metric_totals = await _fetch_one_facebook_metric(access_token, page_id, metric, since_unix, until_unix)
-        _merge_facebook_daily(daily_by_date, metric_daily)
+        _merge_daily_buckets(daily_by_date, metric_daily)
         for key, value in metric_totals.items():
             totals[key] = totals.get(key, 0) + value
     return daily_by_date, totals
@@ -15254,76 +15280,242 @@ async def _fetch_facebook_follower_count(access_token: str, page_id: str) -> Opt
         return None
 
 
+_FACEBOOK_COMMENTS_MAX_PAGES = 5
+
+
+def _accumulate_facebook_post_comments(daily_by_date: Dict[str, Dict[str, Any]], post: Dict[str, Any]) -> int:
+    day = str(post.get("created_time") or "")[:10]
+    if not day:
+        return 0
+    count = int((post.get("comments") or {}).get("summary", {}).get("total_count") or 0)
+    bucket = daily_by_date.setdefault(day, {"date": day})
+    bucket["comments"] = bucket.get("comments", 0) + count
+    return count
+
+
+async def _fetch_facebook_comments_page(client: httpx.AsyncClient, url: str, params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    response = await client.get(url, params=params)
+    if response.status_code in (401, 403):
+        await _raise_for_status_or_502(response, "Facebook")
+    response.raise_for_status()
+    return response.json()
+
+
+async def _fetch_facebook_comments_daily(
+    access_token: str, page_id: str, since_unix: int, until_unix: int,
+) -> Tuple[Dict[str, Dict[str, Any]], int]:
+    """Page Insights has no per-day "comments" metric -- Meta counts
+    comments per post, not per Page -- so this sums each post's comment
+    count, bucketed by the post's own publish day, over a bounded number of
+    pages. Best-effort: returns ({}, 0) on any failure except an actual
+    token/permission error, which is re-raised (see
+    _get_social_insights_for_account)."""
+    daily_by_date: Dict[str, Dict[str, Any]] = {}
+    total_comments = 0
+    url = f"https://graph.facebook.com/v19.0/{page_id}/posts"
+    params: Optional[Dict[str, Any]] = {
+        "fields": "created_time,comments.summary(true).limit(0)",
+        "since": since_unix,
+        "until": until_unix,
+        "limit": 100,
+        "access_token": access_token,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for _ in range(_FACEBOOK_COMMENTS_MAX_PAGES):
+                body = await _fetch_facebook_comments_page(client, url, params)
+                for post in (body.get("data") or []):
+                    total_comments += _accumulate_facebook_post_comments(daily_by_date, post)
+                next_url = (body.get("paging") or {}).get("next")
+                if not next_url:
+                    break
+                url, params = next_url, None
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Failed to fetch Facebook comments for page %s: %s", page_id, exc)
+        return {}, 0
+    return daily_by_date, total_comments
+
+
+# Ad-breaks monetization insights are only populated for Pages actually
+# enrolled in Meta's in-stream-ads program -- these metric names are
+# unverified against a live account (see the module note above on Facebook
+# insights metric churn), so each is requested on its own and a
+# rejected/empty one just reads as "no monetization data", not an error.
+_FACEBOOK_MONETIZATION_METRICS = (
+    "page_daily_video_ad_break_ad_impressions",
+    "page_daily_video_ad_break_ad_earnings",
+    "page_daily_video_ad_break_ad_cpm",
+)
+
+
+async def _sum_facebook_metric_value(access_token: str, page_id: str, metric: str, since_unix: int, until_unix: int) -> Optional[int]:
+    try:
+        data = await _request_facebook_insights_metrics(access_token, page_id, (metric,), since_unix, until_unix)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Facebook monetization metric %r rejected for page %s: %s", metric, page_id, exc)
+        return None
+    return sum(int(value_entry.get("value") or 0) for entry in data for value_entry in (entry.get("values") or []))
+
+
+async def _fetch_facebook_monetization(access_token: str, page_id: str, since_unix: int, until_unix: int) -> Dict[str, Any]:
+    ad_impressions = await _sum_facebook_metric_value(access_token, page_id, "page_daily_video_ad_break_ad_impressions", since_unix, until_unix)
+    ad_earnings_cents = await _sum_facebook_metric_value(access_token, page_id, "page_daily_video_ad_break_ad_earnings", since_unix, until_unix)
+    ad_cpm_cents = await _sum_facebook_metric_value(access_token, page_id, "page_daily_video_ad_break_ad_cpm", since_unix, until_unix)
+
+    available = bool(ad_impressions or ad_earnings_cents)
+    return {
+        "supported": True,
+        "available": available,
+        "reason": None if available else (
+            "Aucune donnee de monetisation disponible (programme de monetisation video non actif "
+            "ou aucune donnee sur cette periode)."
+        ),
+        "ad_impressions": ad_impressions if available else None,
+        "ad_earnings_cents": ad_earnings_cents if available else None,
+        "ad_cpm_cents": ad_cpm_cents if available else None,
+    }
+
+
 async def _fetch_facebook_page_insights(access_token: str, page_id: str, since_iso: str, until_iso: str) -> Dict[str, Any]:
     since_unix = int(datetime.fromisoformat(since_iso).timestamp())
     until_unix = int(datetime.fromisoformat(until_iso).timestamp())
+    prev_since_unix, prev_until_unix = _previous_period_bounds(since_unix, until_unix)
 
-    daily_by_date, totals = await _fetch_facebook_engagement_insights(
-        access_token, page_id, since_unix, until_unix
-    )
+    daily_by_date, totals = await _fetch_facebook_engagement_insights(access_token, page_id, since_unix, until_unix)
+    _, previous_totals = await _fetch_facebook_engagement_insights(access_token, page_id, prev_since_unix, prev_until_unix)
+
+    comments_daily, comments_total = await _fetch_facebook_comments_daily(access_token, page_id, since_unix, until_unix)
+    _, previous_comments_total = await _fetch_facebook_comments_daily(access_token, page_id, prev_since_unix, prev_until_unix)
+    _merge_daily_buckets(daily_by_date, comments_daily)
+    totals["comments"] = comments_total
+    previous_totals["comments"] = previous_comments_total
+
     followers = await _fetch_facebook_follower_count(access_token, page_id)
+    monetization = await _fetch_facebook_monetization(access_token, page_id, since_unix, until_unix)
 
     metrics = _empty_social_insights_metrics()
     metrics["followers"] = followers
-    for bucket_key in set(_FACEBOOK_METRIC_TO_BUCKET.values()):
+    for bucket_key in set(_FACEBOOK_METRIC_TO_BUCKET.values()) | {"comments"}:
         metrics[bucket_key] = totals.get(bucket_key, 0)
 
+    trends = _build_metric_trends(totals, previous_totals, _FACEBOOK_TREND_KEYS)
+
     daily = [daily_by_date[day] for day in sorted(daily_by_date)]
-    return {"metrics": metrics, "daily": daily}
+    return {"metrics": metrics, "daily": daily, "trends": trends, "monetization": monetization}
 
 
-def _parse_instagram_insights_metrics(metric_entries: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
+# Instagram deprecated impressions/profile_views/website_clicks in Graph API
+# v22.0 in favor of views/reach/follower_count -- same per-metric resilience
+# pattern as Facebook's, since these replacement names are just as unverified
+# against a live account.
+_INSTAGRAM_METRIC_TO_BUCKET = {
+    "views": "impressions",  # replaces the retired impressions metric
+    "reach": "reach",
+    "total_interactions": "engagement",  # replaces the retired website_clicks-as-engagement proxy
+    "total_comments": "comments",
+}
+_INSTAGRAM_DAILY_METRICS = tuple(_INSTAGRAM_METRIC_TO_BUCKET)
+_INSTAGRAM_TREND_KEYS = ("impressions", "engagement", "comments")
+
+
+def _accumulate_instagram_daily_metric(daily_by_date: Dict[str, Dict[str, Any]], name: Optional[str], value_entry: Dict[str, Any]) -> None:
+    bucket_key = _INSTAGRAM_METRIC_TO_BUCKET.get(name)
+    if bucket_key is None:
+        return
+    day = (value_entry.get("end_time") or "")[:10]
+    if not day:
+        return
+    value = int(value_entry.get("value") or 0)
+    bucket = daily_by_date.setdefault(day, {"date": day})
+    bucket[bucket_key] = bucket.get(bucket_key, 0) + value
+
+
+def _parse_instagram_insights_metrics(metric_entries: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
     daily_by_date: Dict[str, Dict[str, Any]] = {}
-    total_reach = 0
-    total_engagement = 0
     for metric_entry in metric_entries:
         name = metric_entry.get("name")
         for value_entry in (metric_entry.get("values") or []):
-            end_time = value_entry.get("end_time") or ""
-            day = end_time[:10]
-            value = value_entry.get("value") or 0
-            if not day:
+            _accumulate_instagram_daily_metric(daily_by_date, name, value_entry)
+
+    totals: Dict[str, int] = {}
+    for bucket in daily_by_date.values():
+        for key, value in bucket.items():
+            if key == "date":
                 continue
-            bucket = daily_by_date.setdefault(day, {"date": day})
-            if name == "reach":
-                bucket["reach"] = bucket.get("reach", 0) + int(value)
-                total_reach += int(value)
-            elif name == "profile_views":
-                bucket["profile_views"] = bucket.get("profile_views", 0) + int(value)
-            elif name == "website_clicks":
-                bucket["engagement"] = bucket.get("engagement", 0) + int(value)
-                total_engagement += int(value)
-    return daily_by_date, total_reach, total_engagement
+            totals[key] = totals.get(key, 0) + value
+    return daily_by_date, totals
+
+
+async def _request_instagram_insights_metrics(
+    access_token: str, ig_user_id: str, metrics: Tuple[str, ...], since_unix: int, until_unix: int,
+) -> List[Dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            f"https://graph.facebook.com/v19.0/{ig_user_id}/insights",
+            params={
+                "metric": ",".join(metrics),
+                "period": "day",
+                "since": since_unix,
+                "until": until_unix,
+                "access_token": access_token,
+            },
+        )
+    if response.status_code in (401, 403):
+        await _raise_for_status_or_502(response, "Instagram")
+    response.raise_for_status()
+    return response.json().get("data") or []
+
+
+async def _fetch_one_instagram_metric(
+    access_token: str, ig_user_id: str, metric: str, since_unix: int, until_unix: int,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
+    try:
+        data = await _request_instagram_insights_metrics(access_token, ig_user_id, (metric,), since_unix, until_unix)
+        return _parse_instagram_insights_metrics(data)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Instagram insights metric %r rejected for %s: %s", metric, ig_user_id, exc)
+        return {}, {}
+
+
+async def _fetch_instagram_metrics_individually(
+    access_token: str, ig_user_id: str, metrics: Tuple[str, ...], since_unix: int, until_unix: int,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
+    daily_by_date: Dict[str, Dict[str, Any]] = {}
+    totals: Dict[str, int] = {}
+    for metric in metrics:
+        metric_daily, metric_totals = await _fetch_one_instagram_metric(access_token, ig_user_id, metric, since_unix, until_unix)
+        _merge_daily_buckets(daily_by_date, metric_daily)
+        for key, value in metric_totals.items():
+            totals[key] = totals.get(key, 0) + value
+    return daily_by_date, totals
 
 
 async def _fetch_instagram_reach_insights(
     access_token: str, ig_user_id: str, since_unix: int, until_unix: int,
-) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
-    """Best-effort: returns ({}, 0, 0) on any failure except an actual
-    token/permission error, which is re-raised so the caller can
-    distinguish it from a partial-data failure (see
-    _get_social_insights_for_account)."""
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
+    """Tries every known-useful metric in one batch call first; if Meta
+    rejects any one of them, falls back to requesting each metric on its
+    own and logs exactly which one(s) got rejected (see the equivalent
+    Facebook fetcher for why). An actual token/permission error (401/403)
+    is re-raised so the caller can distinguish it from a partial-data
+    failure (see _get_social_insights_for_account)."""
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                f"https://graph.facebook.com/v19.0/{ig_user_id}/insights",
-                params={
-                    "metric": "reach,profile_views,website_clicks",
-                    "period": "day",
-                    "since": since_unix,
-                    "until": until_unix,
-                    "access_token": access_token,
-                },
-            )
-        if response.status_code in (401, 403):
-            await _raise_for_status_or_502(response, "Instagram")
-        response.raise_for_status()
-        return _parse_instagram_insights_metrics(response.json().get("data") or [])
+        data = await _request_instagram_insights_metrics(access_token, ig_user_id, _INSTAGRAM_DAILY_METRICS, since_unix, until_unix)
+        return _parse_instagram_insights_metrics(data)
     except HTTPException:
         raise
     except Exception as exc:
-        logger.warning("Failed to fetch Instagram insights for %s: %s", ig_user_id, exc)
-        return {}, 0, 0
+        logger.warning(
+            "Instagram insights batch request rejected for %s (%s); retrying metrics individually to isolate the invalid one(s)",
+            ig_user_id, exc,
+        )
+        return await _fetch_instagram_metrics_individually(access_token, ig_user_id, _INSTAGRAM_DAILY_METRICS, since_unix, until_unix)
 
 
 async def _fetch_instagram_followers_count(access_token: str, ig_user_id: str) -> Optional[int]:
@@ -15345,20 +15537,37 @@ async def _fetch_instagram_followers_count(access_token: str, ig_user_id: str) -
         return None
 
 
+_INSTAGRAM_MONETIZATION_UNSUPPORTED = (
+    "Instagram ne propose pas d'API de monetisation publique pour les comptes "
+    "createurs/business (Reels Play Bonus, Badges, etc. ne sont pas exposes via l'API Graph)."
+)
+
+
 async def _fetch_instagram_insights(access_token: str, ig_user_id: str, since_iso: str, until_iso: str) -> Dict[str, Any]:
     since_unix = int(datetime.fromisoformat(since_iso).timestamp())
     until_unix = int(datetime.fromisoformat(until_iso).timestamp())
+    prev_since_unix, prev_until_unix = _previous_period_bounds(since_unix, until_unix)
+
+    daily_by_date, totals = await _fetch_instagram_reach_insights(access_token, ig_user_id, since_unix, until_unix)
+    _, previous_totals = await _fetch_instagram_reach_insights(access_token, ig_user_id, prev_since_unix, prev_until_unix)
 
     metrics = _empty_social_insights_metrics()
-    daily_by_date, total_reach, total_engagement = await _fetch_instagram_reach_insights(
-        access_token, ig_user_id, since_unix, until_unix,
-    )
-    metrics["reach"] = total_reach
-    metrics["engagement"] = total_engagement
+    for bucket_key in set(_INSTAGRAM_METRIC_TO_BUCKET.values()):
+        metrics[bucket_key] = totals.get(bucket_key, 0)
     metrics["followers"] = await _fetch_instagram_followers_count(access_token, ig_user_id)
 
+    trends = _build_metric_trends(totals, previous_totals, _INSTAGRAM_TREND_KEYS)
+    monetization = {
+        "supported": False,
+        "available": False,
+        "reason": _INSTAGRAM_MONETIZATION_UNSUPPORTED,
+        "ad_impressions": None,
+        "ad_earnings_cents": None,
+        "ad_cpm_cents": None,
+    }
+
     daily = [daily_by_date[day] for day in sorted(daily_by_date)]
-    return {"metrics": metrics, "daily": daily}
+    return {"metrics": metrics, "daily": daily, "trends": trends, "monetization": monetization}
 
 
 _YOUTUBE_COLUMN_TO_METRIC_KEY = {
