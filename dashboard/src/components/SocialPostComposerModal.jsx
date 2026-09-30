@@ -74,6 +74,7 @@ function emptyComment() {
 }
 
 const COMMENT_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+const POST_MEDIA_MAX_BYTES = 200 * 1024 * 1024;
 
 export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) {
     const { t } = useTranslation();
@@ -84,6 +85,15 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
     const [selectedAccountIds, setSelectedAccountIds] = useState({});
     const [backgrounds, setBackgrounds] = useState([]);
     const [backgroundId, setBackgroundId] = useState(NO_BACKGROUND_ID);
+    // A photo/video attached to the post itself (not a comment's image --
+    // see uploadCommentImage below). Mutually exclusive with the Facebook
+    // background: the backend drops the background the moment media is
+    // attached (see _build_social_post_publish_payload in app.py).
+    const [mediaUrl, setMediaUrl] = useState("");
+    const [mediaType, setMediaType] = useState("");
+    const [mediaUploading, setMediaUploading] = useState(false);
+    const [mediaError, setMediaError] = useState("");
+    const [isDraggingMedia, setIsDraggingMedia] = useState(false);
     const [comments, setComments] = useState([]);
     const [isScheduling, setIsScheduling] = useState(false);
     const [scheduleDate, setScheduleDate] = useState("");
@@ -95,6 +105,11 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
         setText("");
         setSelectedAccountIds({});
         setBackgroundId(NO_BACKGROUND_ID);
+        setMediaUrl("");
+        setMediaType("");
+        setMediaUploading(false);
+        setMediaError("");
+        setIsDraggingMedia(false);
         setComments([]);
         setIsScheduling(false);
         setScheduleDate("");
@@ -216,6 +231,63 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
         if (file) uploadCommentImage(localId, file);
     };
 
+    // Photo/video attached to the post itself, distinct from a comment's
+    // image above -- goes to /api/social/post-media/upload, which also
+    // detects and returns media_type ("image" or "video") so the backend
+    // knows whether to route it as PublishRequest.image_url or .video_url.
+    const uploadPostMedia = async (file) => {
+        if (!file) return;
+        const isImage = file.type.startsWith("image/");
+        const isVideo = file.type.startsWith("video/");
+        if (!isImage && !isVideo) {
+            setMediaError(t("social.postComposerMediaInvalidType", "Ce fichier doit etre une image ou une video."));
+            return;
+        }
+        if (file.size > POST_MEDIA_MAX_BYTES) {
+            setMediaError(t("social.postComposerMediaTooLarge", "Fichier trop volumineux (200 Mo max)."));
+            return;
+        }
+
+        setMediaUploading(true);
+        setMediaError("");
+        try {
+            const formData = new FormData();
+            formData.append("file", file);
+            const response = await fetch(getApiUrl("/api/social/post-media/upload"), {
+                method: "POST",
+                headers: { ...getAuthHeaders(user?.id) },
+                body: formData,
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok || !data?.media_url) {
+                throw new Error(data?.detail || t("social.postComposerMediaUploadFailed", "Echec de l'envoi du fichier."));
+            }
+            setMediaUrl(data.media_url);
+            setMediaType(data.media_type || (isVideo ? "video" : "image"));
+            // A background can't be combined with media -- see backend
+            // _build_social_post_publish_payload.
+            setBackgroundId(NO_BACKGROUND_ID);
+        } catch (err) {
+            setMediaError(err.message || t("social.postComposerMediaUploadFailed", "Echec de l'envoi du fichier."));
+        } finally {
+            setMediaUploading(false);
+        }
+    };
+
+    const handlePostMediaDrop = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsDraggingMedia(false);
+        const file = e.dataTransfer?.files?.[0];
+        if (file) uploadPostMedia(file);
+    };
+
+    const removePostMedia = () => {
+        setMediaUrl("");
+        setMediaType("");
+        setMediaError("");
+    };
+
     const handleSubmit = async () => {
         if (!user?.id) return;
 
@@ -241,6 +313,10 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
             setResult({ success: false, msg: t("anonymousStories.publishSelectDateTime", "Selectionnez une date et une heure.") });
             return;
         }
+        if (mediaUploading) {
+            setResult({ success: false, msg: t("social.postComposerMediaStillUploading", "Attendez la fin de l'envoi du fichier.") });
+            return;
+        }
 
         setIsSubmitting(true);
         setResult(null);
@@ -248,7 +324,9 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
             const payload = {
                 text: text.trim(),
                 account_ids: selectedAccountIdList,
-                background_id: backgroundId || undefined,
+                background_id: mediaUrl ? undefined : (backgroundId || undefined),
+                media_url: mediaUrl || undefined,
+                media_type: mediaUrl ? mediaType : undefined,
                 comments: comments
                     .filter((c) => c.text.trim() || c.imageUrl.trim())
                     .map((c) => ({
@@ -360,6 +438,75 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
 
                     <div>
                         <label className="block text-xs font-bold text-slate-500 dark:text-zinc-400 mb-2">
+                            {t("social.postComposerMediaLabel", "Photo ou video (optionnel)")}
+                        </label>
+                        {mediaUrl ? (
+                            <div className="relative inline-block">
+                                {mediaType === "video" ? (
+                                    <video src={mediaUrl} className="max-h-40 rounded-lg border border-slate-200 dark:border-white/10" controls muted />
+                                ) : (
+                                    <img src={mediaUrl} alt="" className="max-h-40 rounded-lg border border-slate-200 dark:border-white/10" />
+                                )}
+                                <button
+                                    type="button"
+                                    onClick={removePostMedia}
+                                    className="absolute -top-2 -right-2 bg-rose-500 text-white rounded-full p-0.5 shadow"
+                                    title={t("common.remove", "Remove")}
+                                >
+                                    <X size={12} />
+                                </button>
+                            </div>
+                        ) : (
+                            <div className="space-y-2">
+                                <label
+                                    htmlFor="post-media-file"
+                                    onDragOver={(e) => {
+                                        e.preventDefault();
+                                        setIsDraggingMedia(true);
+                                    }}
+                                    onDragLeave={() => setIsDraggingMedia(false)}
+                                    onDrop={handlePostMediaDrop}
+                                    className={`flex flex-col items-center justify-center gap-1 p-4 rounded-md border-2 border-dashed cursor-pointer transition-colors ${
+                                        isDraggingMedia
+                                            ? "border-primary bg-primary/10"
+                                            : "border-slate-300 dark:border-white/20 hover:border-primary/60"
+                                    }`}
+                                >
+                                    <input
+                                        id="post-media-file"
+                                        type="file"
+                                        accept="image/*,video/*"
+                                        className="hidden"
+                                        disabled={mediaUploading}
+                                        onChange={(e) => {
+                                            const file = e.target.files?.[0];
+                                            e.target.value = "";
+                                            if (file) uploadPostMedia(file);
+                                        }}
+                                    />
+                                    {mediaUploading ? (
+                                        <>
+                                            <Loader2 size={18} className="animate-spin text-primary" />
+                                            <span className="text-[11px] text-slate-500 dark:text-zinc-400">
+                                                {t("social.postComposerMediaUploading", "Envoi en cours...")}
+                                            </span>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <ImageIcon size={18} className="text-slate-400 dark:text-zinc-500" />
+                                            <span className="text-[11px] text-slate-500 dark:text-zinc-400 text-center">
+                                                {t("social.postComposerMediaDropzone", "Glissez une photo ou une video ici, ou cliquez pour parcourir")}
+                                            </span>
+                                        </>
+                                    )}
+                                </label>
+                                {mediaError ? <p className="text-[11px] text-rose-500">{mediaError}</p> : null}
+                            </div>
+                        )}
+                    </div>
+
+                    <div>
+                        <label className="block text-xs font-bold text-slate-500 dark:text-zinc-400 mb-2">
                             {t("anonymousStories.publishSelectPlatformLabel", "Choisir les comptes")}
                         </label>
                         {socialAccounts.length === 0 ? (
@@ -402,73 +549,88 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
                         )}
                     </div>
 
-                    <div>
-                        <label className="block text-xs font-bold text-slate-500 dark:text-zinc-400 mb-2">
-                            {t("anonymousStories.publishBackgroundLabel", "Arriere-plan de la publication")}
-                        </label>
-                        <p className="mb-2 text-[11px] text-slate-500 dark:text-zinc-400">
-                            {t(
-                                "anonymousStories.publishBackgroundFacebookOnly",
-                                "Facebook uniquement : LinkedIn ne prend pas en charge ces arriere-plans et publie toujours en texte seul."
-                            )}
-                        </p>
-                        <div className="flex flex-wrap gap-2 max-h-[180px] overflow-y-auto pr-1 custom-scrollbar">
-                            {backgrounds.map((preset) => {
-                                const isSelected = backgroundId === preset.id;
-                                const isNoBackground = preset.id === NO_BACKGROUND_ID;
+                    {!mediaUrl ? (
+                        <div>
+                            <label className="block text-xs font-bold text-slate-500 dark:text-zinc-400 mb-2">
+                                {t("anonymousStories.publishBackgroundLabel", "Arriere-plan de la publication")}
+                            </label>
+                            <p className="mb-2 text-[11px] text-slate-500 dark:text-zinc-400">
+                                {t(
+                                    "anonymousStories.publishBackgroundFacebookOnly",
+                                    "Facebook uniquement : LinkedIn ne prend pas en charge ces arriere-plans et publie toujours en texte seul."
+                                )}
+                            </p>
+                            <div className="flex flex-wrap gap-2 max-h-[180px] overflow-y-auto pr-1 custom-scrollbar">
+                                {backgrounds.map((preset) => {
+                                    const isSelected = backgroundId === preset.id;
+                                    const isNoBackground = preset.id === NO_BACKGROUND_ID;
 
-                                if (isNoBackground) {
+                                    if (isNoBackground) {
+                                        return (
+                                            <button
+                                                key={preset.id}
+                                                type="button"
+                                                onClick={() => setBackgroundId(preset.id)}
+                                                title={t("anonymousStories.publishBackgroundNone", "No background (text only)")}
+                                                className={`relative w-[50px] h-[50px] shrink-0 rounded-lg border-2 border-dashed flex flex-col items-center justify-center gap-0.5 text-[9px] font-medium transition ${isSelected ? "border-primary text-primary" : "border-slate-300 dark:border-white/20 text-slate-500 dark:text-zinc-400"}`}
+                                            >
+                                                <Ban size={12} />
+                                                {t("anonymousStories.publishBackgroundNoneShort", "None")}
+                                            </button>
+                                        );
+                                    }
+
                                     return (
                                         <button
                                             key={preset.id}
                                             type="button"
                                             onClick={() => setBackgroundId(preset.id)}
-                                            title={t("anonymousStories.publishBackgroundNone", "No background (text only)")}
-                                            className={`relative w-[50px] h-[50px] shrink-0 rounded-lg border-2 border-dashed flex flex-col items-center justify-center gap-0.5 text-[9px] font-medium transition ${isSelected ? "border-primary text-primary" : "border-slate-300 dark:border-white/20 text-slate-500 dark:text-zinc-400"}`}
+                                            title={preset.name}
+                                            className={`relative w-[50px] h-[50px] shrink-0 rounded-lg border-2 transition ${isSelected ? "border-primary" : "border-transparent"}`}
+                                            style={{ background: backgroundGradient(preset) }}
                                         >
-                                            <Ban size={12} />
-                                            {t("anonymousStories.publishBackgroundNoneShort", "None")}
+                                            {isSelected ? (
+                                                <span className="absolute inset-0 flex items-center justify-center">
+                                                    <Check size={14} className="text-white drop-shadow" />
+                                                </span>
+                                            ) : null}
                                         </button>
                                     );
-                                }
-
-                                return (
-                                    <button
-                                        key={preset.id}
-                                        type="button"
-                                        onClick={() => setBackgroundId(preset.id)}
-                                        title={preset.name}
-                                        className={`relative w-[50px] h-[50px] shrink-0 rounded-lg border-2 transition ${isSelected ? "border-primary" : "border-transparent"}`}
-                                        style={{ background: backgroundGradient(preset) }}
-                                    >
-                                        {isSelected ? (
-                                            <span className="absolute inset-0 flex items-center justify-center">
-                                                <Check size={14} className="text-white drop-shadow" />
-                                            </span>
-                                        ) : null}
-                                    </button>
-                                );
-                            })}
+                                })}
+                            </div>
                         </div>
-                    </div>
+                    ) : null}
 
                     <div>
                         <label className="block text-xs font-bold text-slate-500 dark:text-zinc-400 mb-2">
                             {t("anonymousStories.publishPreviewLabel", "Apercu de la publication")}
                         </label>
-                        <div
-                            className={`min-h-[120px] rounded-xl p-4 flex items-center justify-center text-center border border-slate-200 dark:border-white/5 ${hasBackground ? "" : "bg-slate-100 dark:bg-white/5"}`}
-                            style={
-                                hasBackground
-                                    ? { background: backgroundGradient(selectedPreset), color: selectedPreset.text_color || "#FFFFFF" }
-                                    : undefined
-                            }
-                        >
-                            <p className={`text-sm font-semibold whitespace-pre-wrap break-words ${hasBackground ? "" : "text-slate-800 dark:text-white"}`}>
-                                {(hasBackground ? buildPreviewSnippet(text, t("anonymousStories.publishPreviewSeeMore", "Voir plus")) : text) ||
-                                    t("anonymousStories.publishPreviewEmpty", "Le texte de la publication apparaitra ici.")}
-                            </p>
-                        </div>
+                        {mediaUrl ? (
+                            <div className="rounded-xl overflow-hidden border border-slate-200 dark:border-white/5 bg-slate-100 dark:bg-white/5">
+                                {mediaType === "video" ? (
+                                    <video src={mediaUrl} className="w-full max-h-52 object-cover" controls muted />
+                                ) : (
+                                    <img src={mediaUrl} alt="" className="w-full max-h-52 object-cover" />
+                                )}
+                                {text.trim() ? (
+                                    <p className="p-3 text-sm text-slate-800 dark:text-white whitespace-pre-wrap break-words">{text}</p>
+                                ) : null}
+                            </div>
+                        ) : (
+                            <div
+                                className={`min-h-[120px] rounded-xl p-4 flex items-center justify-center text-center border border-slate-200 dark:border-white/5 ${hasBackground ? "" : "bg-slate-100 dark:bg-white/5"}`}
+                                style={
+                                    hasBackground
+                                        ? { background: backgroundGradient(selectedPreset), color: selectedPreset.text_color || "#FFFFFF" }
+                                        : undefined
+                                }
+                            >
+                                <p className={`text-sm font-semibold whitespace-pre-wrap break-words ${hasBackground ? "" : "text-slate-800 dark:text-white"}`}>
+                                    {(hasBackground ? buildPreviewSnippet(text, t("anonymousStories.publishPreviewSeeMore", "Voir plus")) : text) ||
+                                        t("anonymousStories.publishPreviewEmpty", "Le texte de la publication apparaitra ici.")}
+                                </p>
+                            </div>
+                        )}
                     </div>
 
                     <div>

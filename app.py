@@ -10295,6 +10295,8 @@ class CreateSocialPostRequest(BaseModel):
     text: str
     account_ids: List[str] = []
     background_id: Optional[str] = None
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None  # "image" or "video" -- see upload_social_post_media
     comments: List[SocialPostCommentInput] = []
     scheduled_date: Optional[str] = None
     timezone: Optional[str] = "UTC"
@@ -10384,7 +10386,24 @@ async def _post_comments_sequence(
     return results
 
 
-def _build_social_post_publish_payload(text_value: str, background_id: Optional[str]) -> "PublishRequest":
+def _build_social_post_publish_payload(
+    text_value: str, background_id: Optional[str], media_url: Optional[str] = None, media_type: Optional[str] = None,
+) -> "PublishRequest":
+    # A background (Facebook's native colored-background text) can never be
+    # combined with a photo or video -- Facebook silently drops the
+    # background style the moment any media is attached (see
+    # publish_to_facebook_text_with_background) -- so an attached media
+    # takes priority and the background is simply not set in that case.
+    if media_url:
+        return PublishRequest(
+            user_id="",
+            title="Vireel",
+            description=text_value,
+            text=text_value,
+            caption=text_value,
+            video_url=media_url if media_type == "video" else None,
+            image_url=media_url if media_type != "video" else None,
+        )
     return PublishRequest(
         user_id="",
         title="Vireel",
@@ -10398,6 +10417,7 @@ def _build_social_post_publish_payload(text_value: str, background_id: Optional[
 async def _publish_social_post_now(
     user_id: str, account: Dict[str, Any], publish_priority: int, text_value: str,
     background_id: Optional[str], comments: List["SocialPostCommentInput"],
+    media_url: Optional[str] = None, media_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     platform_name = str(account.get("platform") or "")
     publish_job_id = await _insert_publish_job(
@@ -10411,13 +10431,15 @@ async def _publish_social_post_now(
             "account_id": account.get("id"),
             "text": text_value,
             "background_id": background_id,
+            "media_url": media_url,
+            "media_type": media_type,
             "comments": [c.model_dump() for c in comments],
         },
     )
     try:
         await _update_publish_job_status(publish_job_id, "processing")
 
-        publish_payload = _build_social_post_publish_payload(text_value, background_id)
+        publish_payload = _build_social_post_publish_payload(text_value, background_id, media_url, media_type)
         publish_payload.user_id = user_id
         platform_result = await publish_post(account, publish_payload)
         external_id = str(platform_result.get("publish_id") or platform_result.get("id") or "n/a")
@@ -10448,6 +10470,7 @@ async def _publish_social_post_now(
 async def _schedule_social_post_job(
     user_id: str, account: Dict[str, Any], publish_priority: int, scheduled_for, timezone: Optional[str],
     text_value: str, background_id: Optional[str], comments: List["SocialPostCommentInput"],
+    media_url: Optional[str] = None, media_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     publish_job_id = await _insert_publish_job(
         user_id=user_id,
@@ -10462,6 +10485,8 @@ async def _schedule_social_post_job(
             "account_id": account.get("id"),
             "text": text_value,
             "background_id": background_id,
+            "media_url": media_url,
+            "media_type": media_type,
             "comments": [c.model_dump() for c in comments],
         },
     )
@@ -10489,11 +10514,13 @@ async def _execute_scheduled_social_post_job(job_id: str, user_id: str, platform
 
         text_value = str(task_payload.get("text") or "")
         background_id = task_payload.get("background_id")
+        media_url = task_payload.get("media_url")
+        media_type = task_payload.get("media_type")
         comments = [
             SocialPostCommentInput(**c) for c in (task_payload.get("comments") or []) if isinstance(c, dict)
         ]
 
-        publish_payload = _build_social_post_publish_payload(text_value, background_id)
+        publish_payload = _build_social_post_publish_payload(text_value, background_id, media_url, media_type)
         publish_payload.user_id = user_id
         platform_result = await publish_post(account, publish_payload)
         external_id = str(platform_result.get("publish_id") or platform_result.get("id") or "n/a")
@@ -10523,7 +10550,12 @@ async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotate
     if payload.scheduled_date and not scheduled_for:
         raise HTTPException(status_code=400, detail=_INVALID_SCHEDULED_DATE)
     is_scheduled = bool(scheduled_for and scheduled_for > _utcnow())
-    background_id = payload.background_id or anonymous_stories.BACKGROUND_PRESETS[0]["id"]
+    media_url = (payload.media_url or "").strip() or None
+    media_type = payload.media_type if media_url else None
+    # A background can't be combined with a photo/video (Facebook drops the
+    # background style the moment media is attached), so only default to
+    # the first preset when there's no attached media at all.
+    background_id = (payload.background_id or anonymous_stories.BACKGROUND_PRESETS[0]["id"]) if not media_url else None
     comments = payload.comments or []
 
     # Keyed by account id (not platform) so publishing to several accounts
@@ -10535,11 +10567,11 @@ async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotate
         if is_scheduled:
             results[result_key] = await _schedule_social_post_job(
                 user_id, account, publish_priority, scheduled_for, payload.timezone,
-                text_value, background_id, comments,
+                text_value, background_id, comments, media_url, media_type,
             )
             continue
         results[result_key] = await _publish_social_post_now(
-            user_id, account, publish_priority, text_value, background_id, comments,
+            user_id, account, publish_priority, text_value, background_id, comments, media_url, media_type,
         )
 
     overall_success = all(result.get("success") for result in results.values())
@@ -10624,6 +10656,93 @@ async def upload_social_comment_image(
         raise HTTPException(status_code=503, detail="Failed to generate image URL")
 
     return {"image_url": image_url}
+
+
+_POST_MEDIA_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+_POST_MEDIA_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+_POST_MEDIA_VIDEO_MAX_BYTES = 200 * 1024 * 1024
+# Matches _COMMENT_IMAGE_URL_EXPIRATION_SECONDS: a scheduled post's
+# media_url is stored as-is in the publish job's payload (see
+# _schedule_social_post_job) and only resolved when the post actually goes
+# out, so it needs to survive as long as a post can be scheduled for.
+_POST_MEDIA_URL_EXPIRATION_SECONDS = 7 * 24 * 3600
+
+
+def _detect_post_media_type(file: Optional[UploadFile]) -> str:
+    """Returns "video" or "image", from the browser-supplied content_type
+    first and the filename extension as a fallback (some OSes/browsers send
+    application/octet-stream for common video containers)."""
+    if not file:
+        raise HTTPException(status_code=400, detail="Missing media file")
+    content_type = str(file.content_type or "").lower()
+    if content_type.startswith("video/"):
+        return "video"
+    if content_type.startswith("image/"):
+        return "image"
+    ext = os.path.splitext(_sanitize_input_filename(file.filename) or "")[1].lower()
+    if ext in _COMMON_VIDEO_EXTENSIONS:
+        return "video"
+    if ext in _POST_MEDIA_IMAGE_EXTENSIONS:
+        return "image"
+    raise HTTPException(status_code=400, detail="Unsupported media type (use an image or a video)")
+
+
+async def _save_post_media_upload(file: UploadFile, local_path: str, max_bytes: int) -> None:
+    async with aiofiles.open(local_path, "wb") as buffer:
+        total = 0
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise HTTPException(status_code=400, detail=f"File is too large (max {max_bytes // (1024 * 1024)} MB)")
+            await buffer.write(chunk)
+
+
+@app.post("/api/social/post-media/upload", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 503: {"description": "Service Unavailable"}})
+async def upload_social_post_media(
+    user_id: Annotated[str, Depends(get_user_id_header)],
+    file: Annotated[UploadFile, File()],
+):
+    """Uploads the photo or video attached to a "Faire une publication" post
+    (see SocialPostComposerModal) and returns a URL Facebook/LinkedIn can
+    fetch server-side, plus the detected media_type so the caller can route
+    it as PublishRequest.video_url or .image_url (see
+    _build_social_post_publish_payload)."""
+    media_type = _detect_post_media_type(file)
+
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket:
+        raise HTTPException(status_code=503, detail="AWS_S3_BUCKET is required for media uploads")
+
+    default_name = "video.mp4" if media_type == "video" else "image.jpg"
+    safe_name = _sanitize_input_filename(file.filename) or default_name
+    ext = os.path.splitext(safe_name)[1].lower()
+    allowed_extensions = _COMMON_VIDEO_EXTENSIONS if media_type == "video" else _POST_MEDIA_IMAGE_EXTENSIONS
+    if ext not in allowed_extensions:
+        ext = ".mp4" if media_type == "video" else ".jpg"
+    max_bytes = _POST_MEDIA_VIDEO_MAX_BYTES if media_type == "video" else _POST_MEDIA_IMAGE_MAX_BYTES
+
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    local_path = os.path.join(UPLOAD_DIR, f"post_media_{uuid.uuid4().hex}{ext}")
+    try:
+        await _save_post_media_upload(file, local_path, max_bytes)
+        s3_key = f"social_post_media/{user_id}/{uuid.uuid4().hex}{ext}"
+        if not upload_file_to_s3(local_path, bucket, s3_key):
+            raise HTTPException(status_code=503, detail="Failed to upload media")
+    finally:
+        try:
+            if os.path.exists(local_path):
+                os.remove(local_path)
+        except Exception:
+            pass
+
+    media_url = generate_presigned_url(bucket, s3_key, expiration=_POST_MEDIA_URL_EXPIRATION_SECONDS) or ""
+    if not media_url:
+        raise HTTPException(status_code=503, detail="Failed to generate media URL")
+
+    return {"media_url": media_url, "media_type": media_type}
 
 
 async def _publish_caption_now(user_id: str, account: Dict[str, Any], publish_priority: int, final_title: str, final_description: str, media_url: str) -> Dict[str, Any]:
@@ -14208,6 +14327,21 @@ async def publish_to_facebook_video(access_token: str, target_id: str, video_url
     return {"id": response.json().get("id")}
 
 
+async def publish_to_facebook_photo(access_token: str, target_id: str, image_url: str, message: str) -> Dict[str, Any]:
+    if not target_id:
+        raise HTTPException(status_code=400, detail="Connected Facebook target id is missing")
+    if not access_token:
+        raise HTTPException(status_code=401, detail=_FACEBOOK_TOKEN_EXPIRED_OR_MISSING)
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            f"https://graph.facebook.com/v19.0/{target_id}/photos",
+            data={"url": image_url, "caption": message, "access_token": access_token},
+        )
+    await _raise_for_status_or_502(response, "Facebook")
+    return {"id": response.json().get("id")}
+
+
 async def publish_to_facebook_text_with_background(
     access_token: str, page_id: str, message: str, meta_preset_id: str,
 ) -> Dict[str, Any]:
@@ -14482,37 +14616,95 @@ async def publish_to_linkedin_video(access_token: str, owner_urn: str, video_url
     finally:
         _cleanup_temp_file(temp_path)
 
+
+async def _li_initialize_image_upload(access_token: str, owner_urn: str):
+    """Renvoie (image_urn, upload_url) -- LinkedIn's Images API uses a
+    single direct PUT rather than the video API's multi-part upload, since
+    images don't need chunking."""
+    init_payload = {"initializeUploadRequest": {"owner": owner_urn}}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        init_response = await client.post(
+            "https://api.linkedin.com/rest/images?action=initializeUpload",
+            headers=_linkedin_headers(access_token),
+            json=init_payload,
+        )
+    await _raise_for_status_or_502(init_response, "LinkedIn")
+
+    init_data = (init_response.json() or {}).get("value") or {}
+    image_urn = init_data.get("image")
+    upload_url = init_data.get("uploadUrl")
+    if not image_urn or not upload_url:
+        raise HTTPException(status_code=502, detail="LinkedIn initializeUpload response missing image urn or upload url")
+    return image_urn, upload_url
+
+
+async def publish_to_linkedin_image(access_token: str, owner_urn: str, image_url: str, commentary: str) -> Dict[str, Any]:
+    """
+    Publie une image sur LinkedIn via la Images API :
+    1. Téléchargement local de l'image (image_url) avec validation anti-SSRF.
+    2. initializeUpload -> URN image + URL d'upload.
+    3. Upload direct du fichier (PUT, pas de decoupage en parts comme la video).
+    4. Création du post via /rest/posts référençant l'URN image.
+    """
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    temp_path = os.path.join(UPLOAD_DIR, f"li_publish_{uuid.uuid4().hex}.img")
+    await _download_to_file(image_url, temp_path)
+
+    try:
+        image_urn, upload_url = await _li_initialize_image_upload(access_token, owner_urn)
+        async with aiofiles.open(temp_path, "rb") as file_handle:
+            image_bytes = await file_handle.read()
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            upload_response = await client.put(
+                upload_url, headers={"Content-Type": "application/octet-stream"}, content=image_bytes,
+            )
+        upload_response.raise_for_status()
+
+        post_result = await _create_linkedin_post(
+            token=access_token, owner_urn=owner_urn, commentary=commentary, media={"id": image_urn},
+        )
+        post_result["image_urn"] = image_urn
+        return post_result
+    finally:
+        _cleanup_temp_file(temp_path)
+
 # --------------------------------------------------------------------------
 # Fonction principale
 # --------------------------------------------------------------------------
-async def _publish_video_then_text_fallback(has_video: bool, video_publisher, text_publisher) -> Dict[str, Any]:
+async def _publish_media_then_text_fallback(has_media: bool, media_publisher, text_publisher, media_label: str = "video") -> Dict[str, Any]:
     """
-    Tente video_publisher() si has_video est vrai ; en cas d'échec (ou si
-    pas de vidéo du tout), retombe sur text_publisher(). Les clés
-    video_failed/video_error ne sont ajoutées que si une vidéo a été
-    tentée et a échoué — comportement identique à la version précédente.
+    Tente media_publisher() si has_media est vrai ; en cas d'échec (ou s'il
+    n'y a pas de média du tout), retombe sur text_publisher(). Les clés
+    <media_label>_failed/<media_label>_error ne sont ajoutées que si un
+    média a été tenté et a échoué. Shared by the video and photo paths
+    (Facebook/LinkedIn) since both fall back to a plain-text post the same
+    way on failure.
     """
-    if not has_video:
+    if not has_media:
         return await text_publisher()
     try:
-        return await video_publisher()
+        return await media_publisher()
     except Exception as e:
-        logger.warning("Video publish failed, falling back to text: %s", e, exc_info=True)
+        logger.warning("%s publish failed, falling back to text: %s", media_label.capitalize(), e, exc_info=True)
         result = await text_publisher()
-        result["video_failed"] = True
-        result["video_error"] = str(e)
+        result[f"{media_label}_failed"] = True
+        result[f"{media_label}_error"] = str(e)
         return result
 
 
 async def _publish_linkedin(account: Dict[str, Any], token: str, content, text_value: str) -> Dict[str, Any]:
     # LinkedIn has no native colored-background text post and, per product
-    # decision, must never substitute a rendered image for one either (same
-    # "stays text, no exceptions" principle as Facebook's own background
-    # posts -- see _publish_facebook): an anonymous story always publishes
-    # here as plain text, regardless of which Facebook-only background the
-    # user picked.
+    # decision, must never substitute a rendered image for one for that
+    # purpose either (same "stays text, no exceptions" principle as
+    # Facebook's own background posts -- see _publish_facebook): an
+    # anonymous story always publishes here as plain text, regardless of
+    # which Facebook-only background the user picked, because it never
+    # sets content.image_url. A real user-attached photo (from the "Faire
+    # une publication" composer) does set it, and is genuinely posted as
+    # an image below.
     _require_platform_user_id(account, "LinkedIn")
     owner_urn = f"urn:li:person:{account.get('platform_user_id')}"
+    image_url = getattr(content, "image_url", None)
 
     async def video_publisher():
         return await publish_to_linkedin_video(
@@ -14520,22 +14712,37 @@ async def _publish_linkedin(account: Dict[str, Any], token: str, content, text_v
             title=content.title or "Vireel", description=text_value,
         )
 
+    async def image_publisher():
+        return await publish_to_linkedin_image(
+            access_token=token, owner_urn=owner_urn, image_url=image_url, commentary=text_value,
+        )
+
     async def text_publisher():
         return await _create_linkedin_post(token=token, owner_urn=owner_urn, commentary=text_value)
 
-    return await _publish_video_then_text_fallback(bool(content.video_url), video_publisher, text_publisher)
+    if content.video_url:
+        return await _publish_media_then_text_fallback(True, video_publisher, text_publisher, media_label="video")
+    if image_url:
+        return await _publish_media_then_text_fallback(True, image_publisher, text_publisher, media_label="image")
+    return await text_publisher()
 
 
 async def _publish_facebook(account: Dict[str, Any], token: str, content, text_value: str) -> Dict[str, Any]:
     _require_platform_user_id(account, "Facebook")
     meta_preset_id = getattr(content, "facebook_text_format_preset_id", None)
     target_id = str(account.get("platform_user_id") or "")
+    image_url = getattr(content, "image_url", None)
 
     async def video_publisher():
         return await publish_to_facebook_video(
             access_token=token, target_id=target_id,
             video_url=content.video_url, message=text_value,
             title=content.title or "Vireel", description=content.description or text_value,
+        )
+
+    async def image_publisher():
+        return await publish_to_facebook_photo(
+            access_token=token, target_id=target_id, image_url=image_url, message=text_value,
         )
 
     async def text_publisher():
@@ -14553,14 +14760,20 @@ async def _publish_facebook(account: Dict[str, Any], token: str, content, text_v
         # confirmed against Publer (which uses this same mechanism):
         # Facebook truncates the post to ~130 chars inline with a "See
         # more" expander and keeps the colored background behind it, for
-        # text of any length. Never falls back to an image: the
-        # publication must stay text, per spec -- if Meta rejects the
-        # call outright, that failure is surfaced to the user as-is.
+        # text of any length. Never falls back to an image: an anonymous
+        # story's publication must stay text, per spec -- if Meta rejects
+        # the call outright, that failure is surfaced to the user as-is.
+        # (An anonymous story never sets content.image_url, so this branch
+        # and the real photo-post one below never compete.)
         return await publish_to_facebook_text_with_background(
             access_token=token, page_id=target_id, message=text_value, meta_preset_id=meta_preset_id,
         )
 
-    return await _publish_video_then_text_fallback(bool(content.video_url), video_publisher, text_publisher)
+    if content.video_url:
+        return await _publish_media_then_text_fallback(True, video_publisher, text_publisher, media_label="video")
+    if image_url:
+        return await _publish_media_then_text_fallback(True, image_publisher, text_publisher, media_label="image")
+    return await text_publisher()
 
 
 async def _publish_instagram_platform(account: Dict[str, Any], token: str, content, text_value: str) -> Dict[str, Any]:

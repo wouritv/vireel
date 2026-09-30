@@ -2445,11 +2445,12 @@ def test_publish_request_supports_image_url(monkeypatch):
     assert default_payload.image_url is None
 
 
-def test_publish_facebook_ignores_image_url_and_posts_plain_text(monkeypatch):
-    # Spec correction: an anonymous-story publish must NEVER become an
-    # image post on Facebook, in any case. Without a mapped
-    # facebook_text_format_preset_id, Facebook publishes the story as an
-    # ordinary plain-text post.
+def test_publish_facebook_posts_photo_when_image_url_set(monkeypatch):
+    # A real user-attached photo (from the "Faire une publication" composer)
+    # publishes as an actual Facebook photo post. Anonymous stories never
+    # set content.image_url (they use facebook_text_format_preset_id
+    # instead -- see test_publish_facebook_uses_native_background_when_preset_mapped),
+    # so this never collides with the "a story must stay text" rule.
     app = _import_app_with_stubs(monkeypatch)
 
     captured = {}
@@ -2473,13 +2474,48 @@ def test_publish_facebook_ignores_image_url_and_posts_plain_text(monkeypatch):
     monkeypatch.setattr(app.httpx, "AsyncClient", _FakeAsyncClient)
 
     account = {"platform_user_id": "page-1"}
-    content = app.PublishRequest(user_id="u1", text="hello", image_url="https://example.com/bg.png")
+    content = app.PublishRequest(user_id="u1", text="hello", image_url="https://example.com/photo.png")
 
     result = asyncio.run(app._publish_facebook(account, "token-1", content, "hello"))
 
     assert result == {"id": "111_222"}
+    assert captured["url"] == "https://graph.facebook.com/v19.0/page-1/photos"
+    assert captured["data"] == {"url": "https://example.com/photo.png", "caption": "hello", "access_token": "token-1"}
+
+
+def test_publish_facebook_falls_back_to_text_when_photo_fails(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "publish_to_facebook_photo", AsyncMock(side_effect=RuntimeError("rate limited")))
+
+    captured = {}
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, data=None):
+            captured["url"] = url
+            captured["data"] = data
+            request = app.httpx.Request("POST", url)
+            return app.httpx.Response(200, json={"id": "111_222"}, request=request)
+
+    monkeypatch.setattr(app.httpx, "AsyncClient", _FakeAsyncClient)
+
+    account = {"platform_user_id": "page-1"}
+    content = app.PublishRequest(user_id="u1", text="hello", image_url="https://example.com/photo.png")
+
+    result = asyncio.run(app._publish_facebook(account, "token-1", content, "hello"))
+
+    assert result["id"] == "111_222"
+    assert result["image_failed"] is True
+    assert "rate limited" in result["image_error"]
     assert captured["url"] == "https://graph.facebook.com/page-1/feed"
-    assert captured["data"] == {"message": "hello", "access_token": "token-1"}
 
 
 def test_publish_facebook_uses_native_background_when_preset_mapped(monkeypatch):
@@ -2581,12 +2617,36 @@ def test_get_facebook_text_format_preset_id_maps_known_presets(monkeypatch):
     assert app.anonymous_stories.get_facebook_text_format_preset_id("does-not-exist") is None
 
 
-def test_publish_linkedin_ignores_image_url_and_posts_plain_text(monkeypatch):
-    # Same "stays text, no exceptions" principle as Facebook's own
-    # background posts: LinkedIn has no native colored-background feature
-    # and must never substitute a rendered image for one, regardless of
-    # what image_url (or background_id) was resolved upstream.
+def test_publish_linkedin_posts_photo_when_image_url_set(monkeypatch):
+    # A real user-attached photo (from the "Faire une publication" composer)
+    # publishes as an actual LinkedIn image post. Anonymous stories never
+    # set content.image_url, so this never collides with LinkedIn having no
+    # native colored-background substitute.
     app = _import_app_with_stubs(monkeypatch)
+
+    image_calls = []
+
+    async def fake_publish_to_linkedin_image(**kwargs):
+        image_calls.append(kwargs)
+        return {"id": "urn:li:share:999"}
+
+    monkeypatch.setattr(app, "publish_to_linkedin_image", fake_publish_to_linkedin_image)
+
+    account = {"platform_user_id": "person-1"}
+    content = app.PublishRequest(user_id="u1", text="hello", image_url="https://example.com/photo.png")
+
+    result = asyncio.run(app._publish_linkedin(account, "token-1", content, "hello"))
+
+    assert result == {"id": "urn:li:share:999"}
+    assert image_calls == [{
+        "access_token": "token-1", "owner_urn": "urn:li:person:person-1",
+        "image_url": "https://example.com/photo.png", "commentary": "hello",
+    }]
+
+
+def test_publish_linkedin_falls_back_to_text_when_photo_fails(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "publish_to_linkedin_image", AsyncMock(side_effect=RuntimeError("rate limited")))
 
     calls = []
 
@@ -2597,11 +2657,13 @@ def test_publish_linkedin_ignores_image_url_and_posts_plain_text(monkeypatch):
     monkeypatch.setattr(app, "_create_linkedin_post", fake_create_linkedin_post)
 
     account = {"platform_user_id": "person-1"}
-    content = app.PublishRequest(user_id="u1", text="hello", image_url="https://example.com/bg.png")
+    content = app.PublishRequest(user_id="u1", text="hello", image_url="https://example.com/photo.png")
 
     result = asyncio.run(app._publish_linkedin(account, "token-1", content, "hello"))
 
-    assert result == {"id": "urn:li:share:999"}
+    assert result["id"] == "urn:li:share:999"
+    assert result["image_failed"] is True
+    assert "rate limited" in result["image_error"]
     assert calls == [{"token": "token-1", "owner_urn": "urn:li:person:person-1", "commentary": "hello"}]
 
 
@@ -5417,6 +5479,63 @@ def test_upload_social_comment_image_requires_bucket_configured(monkeypatch, tmp
     assert exc.value.status_code == 503
 
 
+def test_upload_social_post_media_happy_path_image(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("AWS_S3_BUCKET", "bucket")
+
+    upload_calls = []
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda path, bucket, key: upload_calls.append((path, bucket, key)) or True)
+    monkeypatch.setattr(app, "generate_presigned_url", lambda bucket, key, expiration=3600: f"https://s3.example/{key}?exp={expiration}")
+
+    result = asyncio.run(app.upload_social_post_media(user_id="u1", file=_FakeCommentImageUpload(b"fake-image-bytes")))
+
+    assert result["media_type"] == "image"
+    assert result["media_url"].startswith("https://s3.example/social_post_media/u1/")
+    assert len(upload_calls) == 1
+    assert list((tmp_path / "uploads").glob("post_media_*")) == []
+
+
+def test_upload_social_post_media_happy_path_video(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("AWS_S3_BUCKET", "bucket")
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda path, bucket, key: True)
+    monkeypatch.setattr(app, "generate_presigned_url", lambda bucket, key, expiration=3600: f"https://s3.example/{key}")
+
+    result = asyncio.run(app.upload_social_post_media(
+        user_id="u1",
+        file=_FakeCommentImageUpload(b"fake-video-bytes", filename="clip.mp4", content_type="video/mp4"),
+    ))
+
+    assert result["media_type"] == "video"
+    assert result["media_url"].startswith("https://s3.example/social_post_media/u1/")
+
+
+def test_upload_social_post_media_rejects_unsupported_type(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    coro = app.upload_social_post_media(
+        user_id="u1", file=_FakeCommentImageUpload(b"x", filename="doc.pdf", content_type="application/pdf"),
+    )
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 400
+
+
+def test_upload_social_post_media_rejects_oversized_image(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("AWS_S3_BUCKET", "bucket")
+    monkeypatch.setattr(app, "_POST_MEDIA_IMAGE_MAX_BYTES", 4)
+
+    coro = app.upload_social_post_media(user_id="u1", file=_FakeCommentImageUpload(b"0123456789"))
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 400
+    assert "too large" in str(exc.value.detail).lower()
+
+
 def test_post_facebook_comment_requires_object_id(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
 
@@ -5579,6 +5698,53 @@ def test_create_social_post_publishes_now_and_posts_comments(monkeypatch):
     # final status update carries the post_url + comment results, not just post_url
     done_call = [c for c in update_status_mock.await_args_list if len(c.args) > 1 and c.args[1] == "done"][0]
     assert done_call.kwargs["extra_payload"]["comments_results"] == fb_result["comments_results"]
+
+
+def test_create_social_post_publishes_attached_photo(monkeypatch):
+    # The "Faire une publication" composer can attach a photo/video (see
+    # upload_social_post_media) -- it must route to PublishRequest.image_url
+    # (not video_url) and skip the background default entirely, since a
+    # background can't be combined with media.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value=_social_post_account()))
+    monkeypatch.setattr(app, "get_valid_token", AsyncMock(return_value="page-token"))
+    published_contents = []
+
+    async def fake_publish_post(account, content):
+        published_contents.append(content)
+        return {"id": "1234_5678"}
+
+    monkeypatch.setattr(app, "publish_post", fake_publish_post)
+    insert_job_mock = AsyncMock(return_value="job-1")
+    monkeypatch.setattr(app, "_insert_publish_job", insert_job_mock)
+    monkeypatch.setattr(app, "_update_publish_job_status", AsyncMock())
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/social/posts",
+            json={
+                "text": "Regardez cette photo !",
+                "account_ids": ["acct-1"],
+                "media_url": "https://example.com/photo.png",
+                "media_type": "image",
+            },
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["success"] is True
+    assert data["background_id"] is None
+    assert len(published_contents) == 1
+    assert published_contents[0].image_url == "https://example.com/photo.png"
+    assert published_contents[0].video_url is None
+    assert published_contents[0].facebook_text_format_preset_id is None
+    queued_payload = insert_job_mock.await_args_list[0].kwargs["payload"]
+    assert queued_payload["media_url"] == "https://example.com/photo.png"
+    assert queued_payload["media_type"] == "image"
 
 
 def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
