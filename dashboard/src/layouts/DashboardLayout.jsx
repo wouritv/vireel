@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Bell, CreditCard, FileText, LogOut, Menu, Settings as SettingsIcon } from "lucide-react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { fetchAppConfig, getDefaultHideSocialPlatforms } from "../config";
@@ -22,8 +23,12 @@ export default function DashboardLayout() {
     const [filmSummaryEnabled, setFilmSummaryEnabled] = useState(true);
     const [isNotificationsOpen, setIsNotificationsOpen] = useState(false);
     const [isUserMenuOpen, setIsUserMenuOpen] = useState(false);
+    const [notificationsMenuPos, setNotificationsMenuPos] = useState(null);
+    const [userMenuPos, setUserMenuPos] = useState(null);
     const notificationsRef = useRef(null);
     const userMenuRef = useRef(null);
+    const notificationsPanelRef = useRef(null);
+    const userMenuPanelRef = useRef(null);
     const displayName =
         user?.user_metadata?.full_name ||
         user?.user_metadata?.name ||
@@ -82,15 +87,44 @@ export default function DashboardLayout() {
     useEffect(() => {
         if (!isNotificationsOpen && !isUserMenuOpen) return undefined;
         const onClickOutside = (event) => {
-            if (isNotificationsOpen && notificationsRef.current && !notificationsRef.current.contains(event.target)) {
+            if (
+                isNotificationsOpen &&
+                !notificationsRef.current?.contains(event.target) &&
+                !notificationsPanelRef.current?.contains(event.target)
+            ) {
                 setIsNotificationsOpen(false);
             }
-            if (isUserMenuOpen && userMenuRef.current && !userMenuRef.current.contains(event.target)) {
+            if (
+                isUserMenuOpen &&
+                !userMenuRef.current?.contains(event.target) &&
+                !userMenuPanelRef.current?.contains(event.target)
+            ) {
                 setIsUserMenuOpen(false);
             }
         };
         document.addEventListener("mousedown", onClickOutside);
         return () => document.removeEventListener("mousedown", onClickOutside);
+    }, [isNotificationsOpen, isUserMenuOpen]);
+
+    useEffect(() => {
+        if (!isNotificationsOpen && !isUserMenuOpen) return undefined;
+        const updatePositions = () => {
+            if (isNotificationsOpen && notificationsRef.current) {
+                const rect = notificationsRef.current.getBoundingClientRect();
+                setNotificationsMenuPos({ top: rect.bottom + 8, right: window.innerWidth - rect.right });
+            }
+            if (isUserMenuOpen && userMenuRef.current) {
+                const rect = userMenuRef.current.getBoundingClientRect();
+                setUserMenuPos({ top: rect.bottom + 8, right: window.innerWidth - rect.right });
+            }
+        };
+        updatePositions();
+        window.addEventListener("resize", updatePositions);
+        window.addEventListener("scroll", updatePositions, true);
+        return () => {
+            window.removeEventListener("resize", updatePositions);
+            window.removeEventListener("scroll", updatePositions, true);
+        };
     }, [isNotificationsOpen, isUserMenuOpen]);
 
     useEffect(() => {
@@ -235,16 +269,23 @@ export default function DashboardLayout() {
                                 >
                                     <Bell size={18} />
                                 </button>
-                                {isNotificationsOpen ? (
-                                    <div className="absolute right-0 mt-2 w-72 rounded-xl border border-slate-200 dark:border-white/10 bg-surface shadow-2xl z-50">
-                                        <p className="px-4 pt-3 text-xs font-bold uppercase tracking-wider text-slate-400 dark:text-zinc-500">
-                                            {t("header.notifications", "Notifications")}
-                                        </p>
-                                        <p className="px-4 py-6 text-center text-sm text-slate-500 dark:text-zinc-400">
-                                            {t("header.noNotifications", "Aucune notification pour le moment.")}
-                                        </p>
-                                    </div>
-                                ) : null}
+                                {isNotificationsOpen && notificationsMenuPos
+                                    ? createPortal(
+                                          <div
+                                              ref={notificationsPanelRef}
+                                              style={{ top: notificationsMenuPos.top, right: notificationsMenuPos.right }}
+                                              className="fixed z-[1000] w-72 rounded-xl border border-slate-200 dark:border-white/10 bg-surface shadow-2xl"
+                                          >
+                                              <p className="px-4 pt-3 text-xs font-bold uppercase tracking-wider text-slate-400 dark:text-zinc-500">
+                                                  {t("header.notifications", "Notifications")}
+                                              </p>
+                                              <p className="px-4 py-6 text-center text-sm text-slate-500 dark:text-zinc-400">
+                                                  {t("header.noNotifications", "Aucune notification pour le moment.")}
+                                              </p>
+                                          </div>,
+                                          document.body
+                                      )
+                                    : null}
                             </div>
 
                             <div className="relative" ref={userMenuRef}>
@@ -259,57 +300,64 @@ export default function DashboardLayout() {
                                 >
                                     {avatarLetter}
                                 </button>
-                                {isUserMenuOpen ? (
-                                    <div className="absolute right-0 mt-2 w-64 rounded-xl border border-slate-200 dark:border-white/10 bg-surface shadow-2xl z-50 overflow-hidden">
-                                        <div className="p-4 flex items-center gap-3">
-                                            <div className="h-10 w-10 shrink-0 inline-flex items-center justify-center rounded-full bg-primary/15 text-primary font-bold text-sm border border-primary/20">
-                                                {avatarLetter}
-                                            </div>
-                                            <div className="min-w-0">
-                                                <p className="text-sm font-semibold text-white truncate">{displayName}</p>
-                                                <p className="text-xs text-slate-500 dark:text-zinc-400 truncate">{user?.email || ""}</p>
-                                            </div>
-                                        </div>
+                                {isUserMenuOpen && userMenuPos
+                                    ? createPortal(
+                                          <div
+                                              ref={userMenuPanelRef}
+                                              style={{ top: userMenuPos.top, right: userMenuPos.right }}
+                                              className="fixed z-[1000] w-64 rounded-xl border border-slate-200 dark:border-white/10 bg-surface shadow-2xl overflow-hidden"
+                                          >
+                                              <div className="p-4 flex items-center gap-3">
+                                                  <div className="h-10 w-10 shrink-0 inline-flex items-center justify-center rounded-full bg-primary/15 text-primary font-bold text-sm border border-primary/20">
+                                                      {avatarLetter}
+                                                  </div>
+                                                  <div className="min-w-0">
+                                                      <p className="text-sm font-semibold text-white truncate">{displayName}</p>
+                                                      <p className="text-xs text-slate-500 dark:text-zinc-400 truncate">{user?.email || ""}</p>
+                                                  </div>
+                                              </div>
 
-                                        <div className="border-t border-slate-200 dark:border-white/10" />
+                                              <div className="border-t border-slate-200 dark:border-white/10" />
 
-                                        <nav className="p-2">
-                                            <NavLink
-                                                to="/dashboard/settings"
-                                                onClick={() => setIsUserMenuOpen(false)}
-                                                className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-slate-700 dark:text-zinc-200 hover:bg-white/5"
-                                            >
-                                                <SettingsIcon size={16} /> {t("settings.title", "Paramètres")}
-                                            </NavLink>
-                                            <NavLink
-                                                to="/dashboard/abonnements"
-                                                onClick={() => setIsUserMenuOpen(false)}
-                                                className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-slate-700 dark:text-zinc-200 hover:bg-white/5"
-                                            >
-                                                <CreditCard size={16} /> {t("nav.abonnements", "Abonnement")}
-                                            </NavLink>
-                                            <a
-                                                href="https://docs.vireel.co/"
-                                                target="_blank"
-                                                rel="noopener noreferrer"
-                                                onClick={() => setIsUserMenuOpen(false)}
-                                                className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-slate-700 dark:text-zinc-200 hover:bg-white/5"
-                                            >
-                                                <FileText size={16} /> {t("nav.documents", "Documents")}
-                                            </a>
-                                            <button
-                                                type="button"
-                                                onClick={() => {
-                                                    setIsUserMenuOpen(false);
-                                                    logout();
-                                                }}
-                                                className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-red-500 hover:bg-red-500/10 transition-colors"
-                                            >
-                                                <LogOut size={16} /> {t("settings.logout", "Se déconnecter")}
-                                            </button>
-                                        </nav>
-                                    </div>
-                                ) : null}
+                                              <nav className="p-2">
+                                                  <NavLink
+                                                      to="/dashboard/settings"
+                                                      onClick={() => setIsUserMenuOpen(false)}
+                                                      className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-slate-700 dark:text-zinc-200 hover:bg-white/5"
+                                                  >
+                                                      <SettingsIcon size={16} /> {t("settings.title", "Paramètres")}
+                                                  </NavLink>
+                                                  <NavLink
+                                                      to="/dashboard/abonnements"
+                                                      onClick={() => setIsUserMenuOpen(false)}
+                                                      className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-slate-700 dark:text-zinc-200 hover:bg-white/5"
+                                                  >
+                                                      <CreditCard size={16} /> {t("nav.abonnements", "Abonnement")}
+                                                  </NavLink>
+                                                  <a
+                                                      href="https://docs.vireel.co/"
+                                                      target="_blank"
+                                                      rel="noopener noreferrer"
+                                                      onClick={() => setIsUserMenuOpen(false)}
+                                                      className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-slate-700 dark:text-zinc-200 hover:bg-white/5"
+                                                  >
+                                                      <FileText size={16} /> {t("nav.documents", "Documents")}
+                                                  </a>
+                                                  <button
+                                                      type="button"
+                                                      onClick={() => {
+                                                          setIsUserMenuOpen(false);
+                                                          logout();
+                                                      }}
+                                                      className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-red-500 hover:bg-red-500/10 transition-colors"
+                                                  >
+                                                      <LogOut size={16} /> {t("settings.logout", "Se déconnecter")}
+                                                  </button>
+                                              </nav>
+                                          </div>,
+                                          document.body
+                                      )
+                                    : null}
                             </div>
                         </div>
                     </header>
