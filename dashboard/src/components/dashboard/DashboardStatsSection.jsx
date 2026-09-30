@@ -31,10 +31,10 @@ const RANGE_OPTIONS = [
 // (violet/yellow/pink/teal) -- kept stable regardless of the selected
 // range so a series never repaints color when the filter changes.
 const CONTENT_TYPE_SERIES = [
-    { key: "reels", color: "#a78bfa", labelKey: "dashboard.reelgenerator", fallback: "Générer des reels" },
-    { key: "captions", color: "#facc15", labelKey: "dashboard.captionGenerator", fallback: "Générer des sous-titres" },
-    { key: "anonymous_stories", color: "#f472b6", labelKey: "dashboard.anonymousStoryGenerator", fallback: "Générer une histoire" },
-    { key: "film_summaries", color: "#2dd4bf", labelKey: "dashboard.filmSummaryGenerator", fallback: "Générer un résumé de film" },
+    { key: "reels", color: "#a78bfa", labelKey: "dashboard.chartLegendReels", fallback: "Réels" },
+    { key: "captions", color: "#facc15", labelKey: "dashboard.chartLegendCaptions", fallback: "Sous-titres" },
+    { key: "anonymous_stories", color: "#f472b6", labelKey: "dashboard.chartLegendAnonymousStories", fallback: "Histoires anonymes" },
+    { key: "film_summaries", color: "#2dd4bf", labelKey: "dashboard.chartLegendFilmSummaries", fallback: "Résumé de film" },
 ];
 
 const PLATFORM_COLORS = {
@@ -180,7 +180,7 @@ export default function DashboardStatsSection({ range, onRangeChange }) {
                                         <XAxis dataKey="date" tick={{ fontSize: 11 }} />
                                         <YAxis tick={{ fontSize: 11 }} allowDecimals={false} />
                                         <Tooltip />
-                                        <Legend />
+                                        <Legend wrapperStyle={{ fontSize: 11 }} />
                                         {CONTENT_TYPE_SERIES.map((series) => (
                                             <Line
                                                 key={series.key}
