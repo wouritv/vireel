@@ -1,18 +1,45 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { X, Loader2, Calendar, Clock, CheckCircle, AlertCircle, Video, Instagram, Youtube, ChevronLeft, ChevronRight, Globe, ExternalLink } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { DAYS, MONTHS, TIMEZONES, getDayLabel, formatDate, detectTimezone } from '../lib/formatting';
 import { getAuthHeaders } from '../lib/apiAuth';
 
+const SCHEDULE_WEEK_PLATFORMS = ['tiktok', 'instagram', 'youtube'];
+const SCHEDULE_WEEK_PLATFORM_ICONS = { tiktok: Video, instagram: Instagram, youtube: Youtube };
+
 export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, userId }) {
     const [time, setTime] = useState('12:00');
     const [timezone, setTimezone] = useState(detectTimezone);
-    const [platforms, setPlatforms] = useState({
-        tiktok: true,
-        instagram: true,
-        youtube: true
-    });
+    // Keyed by account id (not platform) -- a plan can have several accounts
+    // per platform (see max_social_account), so this fetches the user's
+    // actual connected accounts instead of toggling a fixed platform list.
+    const [accounts, setAccounts] = useState([]);
+    const [selectedAccountIds, setSelectedAccountIds] = useState({});
     const [startOffset, setStartOffset] = useState(1);
+
+    useEffect(() => {
+        if (!isOpen || !userId) return;
+        let cancelled = false;
+        (async () => {
+            try {
+                const response = await fetch(getApiUrl('/api/social/accounts'), {
+                    headers: { ...getAuthHeaders(userId) },
+                });
+                if (!response.ok) return;
+                const data = await response.json();
+                const rows = Array.isArray(data?.accounts) ? data.accounts : [];
+                const filtered = rows.filter((a) => SCHEDULE_WEEK_PLATFORMS.includes(a.platform));
+                if (cancelled) return;
+                setAccounts(filtered);
+                setSelectedAccountIds(Object.fromEntries(filtered.map((a) => [a.id, true])));
+            } catch {
+                // Best-effort: the modal simply shows no connected accounts.
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [isOpen, userId]);
 
     const schedule = useMemo(() => {
         if (!clips) return [];
@@ -41,11 +68,15 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, userI
 
     if (!isOpen) return null;
 
-    const selectedPlatforms = Object.keys(platforms).filter(k => platforms[k]);
+    const selectedAccountIdList = Object.keys(selectedAccountIds).filter(k => selectedAccountIds[k]);
+    const accountsByPlatform = {};
+    for (const account of accounts) {
+        (accountsByPlatform[account.platform] ||= []).push(account);
+    }
 
     const handleScheduleAll = async () => {
         if (!userId) return;
-        if (selectedPlatforms.length === 0) return;
+        if (selectedAccountIdList.length === 0) return;
 
         setScheduling(true);
         setDone(false);
@@ -65,7 +96,7 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, userI
                 job_id: jobId,
                 clip_index: index,
                 user_id: userId,
-                platforms: selectedPlatforms,
+                account_ids: selectedAccountIdList,
                 title: clip.video_title_for_youtube_short || 'Viral Short',
                 description: clip.video_description_for_instagram || clip.video_description_for_tiktok || '',
                 scheduled_date: scheduledDate,
@@ -229,32 +260,34 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, userI
                     ))}
                 </div>
 
-                {/* Platforms */}
+                {/* Accounts */}
                 <div className="mb-5">
-                    <label className="block text-xs font-bold text-slate-500 dark:text-zinc-400 mb-2">Plataformas</label>
-                    <div className="flex gap-2">
-                        <button
-                            onClick={() => setPlatforms(p => ({ ...p, tiktok: !p.tiktok }))}
-                            disabled={scheduling}
-                            className={`flex-1 flex items-center justify-center gap-2 p-2.5 rounded-lg text-xs font-bold border transition-all ${platforms.tiktok ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400' : 'bg-white/5 border-slate-200 dark:border-white/5 text-slate-400 dark:text-zinc-500'}`}
-                        >
-                            <Video size={14} /> TikTok
-                        </button>
-                        <button
-                            onClick={() => setPlatforms(p => ({ ...p, instagram: !p.instagram }))}
-                            disabled={scheduling}
-                            className={`flex-1 flex items-center justify-center gap-2 p-2.5 rounded-lg text-xs font-bold border transition-all ${platforms.instagram ? 'bg-pink-500/10 border-pink-500/30 text-pink-400' : 'bg-white/5 border-slate-200 dark:border-white/5 text-slate-400 dark:text-zinc-500'}`}
-                        >
-                            <Instagram size={14} /> Instagram
-                        </button>
-                        <button
-                            onClick={() => setPlatforms(p => ({ ...p, youtube: !p.youtube }))}
-                            disabled={scheduling}
-                            className={`flex-1 flex items-center justify-center gap-2 p-2.5 rounded-lg text-xs font-bold border transition-all ${platforms.youtube ? 'bg-red-500/10 border-red-500/30 text-red-400' : 'bg-white/5 border-slate-200 dark:border-white/5 text-slate-400 dark:text-zinc-500'}`}
-                        >
-                            <Youtube size={14} /> YouTube
-                        </button>
-                    </div>
+                    <label className="block text-xs font-bold text-slate-500 dark:text-zinc-400 mb-2">Comptes</label>
+                    {accounts.length === 0 ? (
+                        <p className="text-xs text-slate-400 dark:text-zinc-500">Aucun compte TikTok/Instagram/YouTube connecte.</p>
+                    ) : (
+                        <div className="space-y-2">
+                            {SCHEDULE_WEEK_PLATFORMS.map((platform) => {
+                                const platformAccounts = accountsByPlatform[platform] || [];
+                                if (platformAccounts.length === 0) return null;
+                                const Icon = SCHEDULE_WEEK_PLATFORM_ICONS[platform];
+                                return (
+                                    <div key={platform} className="flex flex-wrap gap-2">
+                                        {platformAccounts.map((account) => (
+                                            <button
+                                                key={account.id}
+                                                onClick={() => setSelectedAccountIds(p => ({ ...p, [account.id]: !p[account.id] }))}
+                                                disabled={scheduling}
+                                                className={`flex-1 min-w-[8rem] flex items-center justify-center gap-2 p-2.5 rounded-lg text-xs font-bold border transition-all ${selectedAccountIds[account.id] ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400' : 'bg-white/5 border-slate-200 dark:border-white/5 text-slate-400 dark:text-zinc-500'}`}
+                                            >
+                                                <Icon size={14} /> {account.platform_account_name || platform}
+                                            </button>
+                                        ))}
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
                 </div>
 
                 {/* Progress bar */}
@@ -294,7 +327,7 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, userI
                     {!done ? (
                         <button
                             onClick={handleScheduleAll}
-                            disabled={scheduling || !userId || selectedPlatforms.length === 0}
+                            disabled={scheduling || !userId || selectedAccountIdList.length === 0}
                             className="flex-1 py-3 bg-gradient-to-r from-purple-500 to-indigo-600 hover:from-purple-400 hover:to-indigo-500 text-white rounded-xl font-bold transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                         >
                             {scheduling ? (

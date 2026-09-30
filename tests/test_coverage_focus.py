@@ -116,10 +116,13 @@ def _import_app_with_stubs(monkeypatch):
         "get_job_record", "insert_film_summary", "list_film_summaries",
         "get_film_summary", "update_film_summary", "soft_delete_film_summary",
         "get_film_summaries_by_project", "list_caption_style_themes",
-        "upsert_caption_style_theme", "delete_caption_style_theme"]:
+        "upsert_caption_style_theme", "delete_caption_style_theme",
+        "list_reel_dates_since", "list_caption_dates_since",
+        "list_anonymous_story_dates_since", "list_film_summary_dates_since"]:
         setattr(supabase_request_mod, func_name, MagicMock(return_value=None) if "get" not in func_name else AsyncMock(return_value=None))
 
     supabase_request_mod.is_supabase_configured = MagicMock(return_value=False)
+    supabase_request_mod.SUPABASE_USER_DATA_HISTORY_TABLE = "user_data_history"
     monkeypatch.setitem(sys.modules, "supabase_request", supabase_request_mod)
 
     billing_mod = types.ModuleType("billing")

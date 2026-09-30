@@ -77,6 +77,38 @@ const formatDate = (date) => {
     }
 };
 
+const IMAGE_URL_PATTERN = /\.(jpe?g|png|gif|webp)(\?|$)/i;
+
+// Media (video/photo) publications carry media_url/title/description in
+// payload (see app.py's _publish_reel_now/_publish_caption_now/
+// _publish_film_summary_now/_publish_reel_social_post_now); plain-text
+// posts (social_post/anonymous_story) carry payload.text instead. Either
+// way this is the only place the actual published content is shown --
+// without it every card looked identical regardless of what was posted.
+const SocialPublicationContent = ({ payload }) => {
+    const mediaUrl = payload?.media_url;
+    const comment = payload?.description || payload?.title || payload?.text || "";
+
+    if (!mediaUrl && !comment) return null;
+
+    return (
+        <div className="space-y-2">
+            {mediaUrl ? (
+                <div className="rounded-lg overflow-hidden bg-slate-100 dark:bg-black/40 border border-slate-200 dark:border-white/10">
+                    {IMAGE_URL_PATTERN.test(mediaUrl) ? (
+                        <img src={mediaUrl} alt="" className="w-full max-h-40 object-cover" />
+                    ) : (
+                        <video src={mediaUrl} className="w-full max-h-40 object-cover" muted controls preload="metadata" />
+                    )}
+                </div>
+            ) : null}
+            {comment ? (
+                <p className="text-xs text-slate-700 dark:text-zinc-300 line-clamp-3 whitespace-pre-wrap">{comment}</p>
+            ) : null}
+        </div>
+    );
+};
+
 const SocialPublicationCard = ({ pub, badge, t, deletingId, onDeletePublication }) => {
     return (
         <div
@@ -97,6 +129,8 @@ const SocialPublicationCard = ({ pub, badge, t, deletingId, onDeletePublication 
             </div>
 
             <div className="p-4 space-y-3">
+                <SocialPublicationContent payload={pub.payload} />
+
                 <SocialPublicationExternalId externalId={pub.external_id} t={t} />
 
                 <div className="space-y-2">

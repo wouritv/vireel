@@ -36,7 +36,10 @@ export default function AnonymousStoryProjectDetailPage() {
 
     const [backgrounds, setBackgrounds] = useState([]);
     const [publishModalOpen, setPublishModalOpen] = useState(false);
-    const [publishPlatforms, setPublishPlatforms] = useState({ facebook: false, linkedin: false });
+    // Keyed by account id (not platform) -- AnonymousStoryPublishModal
+    // fetches the user's real connected accounts and lets them pick
+    // specific ones.
+    const [publishPlatforms, setPublishPlatforms] = useState({});
     const [publishBackgroundId, setPublishBackgroundId] = useState("");
     const [publishScheduling, setPublishScheduling] = useState(false);
     const [publishScheduleDate, setPublishScheduleDate] = useState("");
@@ -188,7 +191,7 @@ export default function AnonymousStoryProjectDetailPage() {
     };
 
     const handleOpenPublish = () => {
-        setPublishPlatforms({ facebook: false, linkedin: false });
+        setPublishPlatforms({});
         setPublishScheduling(false);
         setPublishScheduleDate("");
         setPublishResult(null);
@@ -198,8 +201,8 @@ export default function AnonymousStoryProjectDetailPage() {
     const submitPublish = async () => {
         if (!user?.id || !storyId) return;
 
-        const selectedPlatforms = Object.keys(publishPlatforms).filter((key) => publishPlatforms[key]);
-        if (selectedPlatforms.length === 0) {
+        const selectedAccountIds = Object.keys(publishPlatforms).filter((key) => publishPlatforms[key]);
+        if (selectedAccountIds.length === 0) {
             setPublishResult({ success: false, msg: t("anonymousStories.publishSelectPlatform", "Selectionnez au moins une plateforme.") });
             return;
         }
@@ -212,7 +215,7 @@ export default function AnonymousStoryProjectDetailPage() {
         setPublishResult(null);
         try {
             const payload = {
-                platforms: selectedPlatforms,
+                account_ids: selectedAccountIds,
                 background_id: publishBackgroundId || undefined,
             };
             if (publishScheduling && publishScheduleDate) {
@@ -436,8 +439,8 @@ export default function AnonymousStoryProjectDetailPage() {
                 onSchedulingChange={setPublishScheduling}
                 scheduleDate={publishScheduleDate}
                 onScheduleDateChange={setPublishScheduleDate}
-                platforms={publishPlatforms}
-                onPlatformChange={(platform, checked) => setPublishPlatforms((prev) => ({ ...prev, [platform]: checked }))}
+                selectedAccountIds={publishPlatforms}
+                onAccountToggle={(accountId, checked) => setPublishPlatforms((prev) => ({ ...prev, [accountId]: checked }))}
                 isSubmitting={publishing}
                 result={publishResult}
                 onSubmit={submitPublish}

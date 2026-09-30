@@ -165,18 +165,16 @@ export default function ReelsProjectsPage() {
         <div className="flex-1 overflow-y-auto p-8 space-y-6">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
                 <div>
-                    <h1 className="text-3xl font-black tracking-tight">{t("projects.reelsTitle", "Mes projets Reels")}</h1>
-                    <p className="mt-2 text-sm text-slate-500 dark:text-zinc-400">{t("projects.subtitle", "Organisez vos operations sans changer vos actions habituelles.")}</p>
+                    <h1 className="text-3xl font-black tracking-tight">{t("common.reels", "Mes Réels")}</h1>
+                    <p className="mt-2 text-sm text-slate-500 dark:text-zinc-400">{t("common.page-des", "Organisez vos opérations sans changer vos actions habituelles.")}</p>
                 </div>
                 <button
                     type="button"
                     onClick={() => navigate("/dashboard/reel-generator?new=1")}
-                    className="w-full md:w-auto flex items-center justify-center gap-2 p-3 bg-white/5 hover:bg-white/10 rounded-xl transition-colors"
+                    className="w-full md:w-auto flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-sm font-bold shadow-lg shadow-blue-500/20 hover:from-blue-500 hover:to-indigo-500 transition-all"
                 >
-                    <div className="w-8 h-8 rounded-full bg-primary/20 text-primary flex items-center justify-center shrink-0">
-                        <Plus size={16} />
-                    </div>
-                    <span className="text-sm font-bold text-white">{t("app.newOperation", "New operation")}</span>
+                    <Plus size={16} />
+                    {t("app.newOperation", "Nouveau projet")}
                 </button>
             </div>
 

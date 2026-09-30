@@ -17,7 +17,7 @@ import re
 import ipaddress
 import socket
 import sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from typing import Dict, Optional, List, Any, Annotated, Tuple
@@ -118,6 +118,11 @@ from supabase_request import (
 	list_caption_style_themes as supabase_list_caption_style_themes,
 	upsert_caption_style_theme as supabase_upsert_caption_style_theme,
 	delete_caption_style_theme as supabase_delete_caption_style_theme,
+	list_reel_dates_since as supabase_list_reel_dates_since,
+	list_caption_dates_since as supabase_list_caption_dates_since,
+	list_anonymous_story_dates_since as supabase_list_anonymous_story_dates_since,
+	list_film_summary_dates_since as supabase_list_film_summary_dates_since,
+	SUPABASE_USER_DATA_HISTORY_TABLE,
 )
 import anonymous_stories
 import email_templates
@@ -129,12 +134,10 @@ from billing import (
     calculate_credits_for_operation,
     estimate_reel_cost_usd,
     estimate_caption_cost_usd,
-    estimate_publication_cost_usd,
     estimate_film_summary_analysis_cost_usd,
     estimate_film_summary_render_cost_usd,
     DEFAULT_REEL_CREDITS,
     DEFAULT_CAPTION_CREDITS,
-    DEFAULT_PUBLICATION_CREDITS,
     CREDIT_UNIT_PRICE_BY_DOLLAR,
     estimate_llm_usage_cost_usd,
 )
@@ -163,6 +166,7 @@ _JOB_NOT_FOUND = "Job not found"
 _INVALID_INPUT_FILENAME = "Invalid input filename"
 _CLIP_NOT_FOUND = "Clip not found"
 _FACEBOOK_TOKEN_EXPIRED_OR_MISSING = "Facebook page access token expired or missing"
+_FACEBOOK_TARGET_ID_MISSING = "Connected Facebook target id is missing"
 _METADATA_NOT_FOUND = "Metadata not found"
 _HTTPS_SCHEME_PREFIX = "https://"
 _INVALID_SCHEDULED_DATE = "Invalid scheduled_date (expected ISO-8601)"
@@ -321,6 +325,13 @@ PLATFORM_CONFIG = {
         "token_url": "https://www.linkedin.com/oauth/v2/accessToken",
         "client_id": os.getenv("LINKEDIN_CLIENT_ID"),
         "client_secret": os.getenv("LINKEDIN_CLIENT_SECRET"),
+        # No analytics scope is requested here: real LinkedIn analytics
+        # (page/post insights) require the LinkedIn Marketing Developer
+        # Platform, a separate partner/developer approval process that
+        # cannot be obtained by writing code -- see
+        # _get_social_insights_for_account, which reports this platform as
+        # unsupported for the analytics feature rather than silently
+        # returning nothing.
         "scopes": ["w_member_social", "openid", "profile","email"],
     },
     "facebook": {
@@ -335,9 +346,13 @@ PLATFORM_CONFIG = {
         # be requested alongside pages_manage_engagement (its App Review
         # docs state the submission must include pages_show_list and
         # pages_read_user_content to use pages_manage_engagement).
+        # read_insights is required for the Page Insights /insights edge
+        # used by the social analytics dashboard block (see
+        # _fetch_facebook_page_insights) -- pages_read_engagement alone does
+        # not cover it.
         "scopes": [
             "pages_show_list", "pages_manage_posts", "pages_read_engagement",
-            "pages_manage_engagement", "pages_read_user_content",
+            "pages_manage_engagement", "pages_read_user_content", "read_insights",
         ],
     },
     "instagram": {
@@ -353,6 +368,12 @@ PLATFORM_CONFIG = {
         # Review isn't asked to approve permissions with no real use case
         # to demonstrate. manage_insights is kept deliberately (planned
         # analytics use) despite the same gap.
+        # instagram_business_manage_insights is required by the social
+        # analytics dashboard block added alongside
+        # _fetch_instagram_insights (the /insights edge on an Instagram
+        # Business/Creator account) -- keep it even if it looks unused by
+        # publishing itself, a future cleanup pass should not remove it
+        # again.
         "scopes": [
             "instagram_business_basic",
             "instagram_business_content_publish",
@@ -364,13 +385,26 @@ PLATFORM_CONFIG = {
         "token_url": "https://oauth2.googleapis.com/token",
         "client_id": os.getenv("YOUTUBE_CLIENT_ID"),
         "client_secret": os.getenv("YOUTUBE_CLIENT_SECRET"),
-        "scopes": ["https://www.googleapis.com/auth/youtube.upload","https://www.googleapis.com/auth/youtube.readonly"],
+        # yt-analytics.readonly is required for the separate YouTube
+        # Analytics API (_fetch_youtube_analytics) -- youtube.readonly only
+        # covers the Data API and does not grant access to Analytics reports.
+        "scopes": [
+            "https://www.googleapis.com/auth/youtube.upload",
+            "https://www.googleapis.com/auth/youtube.readonly",
+            "https://www.googleapis.com/auth/yt-analytics.readonly",
+        ],
     },
     "tiktok": {
         "auth_url": "https://www.tiktok.com/v2/auth/authorize",
         "token_url": "https://open.tiktokapis.com/v2/oauth/token/",
         "client_id": os.getenv("TIKTOK_CLIENT_KEY"),
         "client_secret": os.getenv("TIKTOK_CLIENT_SECRET"),
+        # No analytics scope is requested here: real TikTok analytics
+        # require the TikTok Business API, a separate partner/developer
+        # approval process that cannot be obtained by writing code -- see
+        # _get_social_insights_for_account, which reports this platform as
+        # unsupported for the analytics feature rather than silently
+        # returning nothing.
         "scopes": ["video.upload", "user.info.basic"],
     },
 }
@@ -3950,6 +3984,36 @@ async def _assert_user_has_required_credits(user_id: str, required_credits: floa
             ),
         )
     return required
+
+
+async def _assert_user_has_active_subscription_for_publish(user_id: str) -> None:
+    """Publishing to social networks is free of credit cost, but still
+    requires an active paid subscription: an account at 0 credits can still
+    publish as long as its subscription is active, while one with no active
+    subscription is blocked regardless of its credit balance."""
+    if not is_supabase_configured():
+        return
+    subscription = await get_user_abonnement(user_id)
+    if not subscription:
+        raise HTTPException(
+            status_code=402,
+            detail="Un abonnement actif est requis pour publier sur les reseaux sociaux.",
+        )
+
+
+async def _assert_user_can_access_analytics(user_id: str) -> None:
+    """Social insights and the analytics dashboard block are restricted to
+    the gold and ultimate subscription tiers (priorite 2 and 3) -- silver
+    (priorite 1) and no active subscription are both blocked."""
+    if not is_supabase_configured():
+        return
+    plan = await _get_active_plan_for_user(user_id)
+    priorite = int((plan or {}).get("priorite") or 1)
+    if priorite < 2:
+        raise HTTPException(
+            status_code=403,
+            detail="Les analyses sont reservees aux abonnements Gold et Ultimate.",
+        )
 
 
 async def _assert_user_has_storage_headroom(user_id: str) -> None:
@@ -7815,7 +7879,7 @@ class SocialPostRequest(BaseModel):
     job_id: str
     clip_index: int
     user_id: Optional[str] = None
-    platforms: Optional[List[str]] = None # ["tiktok", "instagram", "youtube"]
+    account_ids: List[str] = []
     # Optional overrides if frontend wants to edit them
     title: Optional[str] = None
     description: Optional[str] = None
@@ -7841,20 +7905,38 @@ def _resolve_request_user_id(explicit_user_id: Optional[str], user_id: str) -> s
     return resolved
 
 
-def _resolve_social_platforms(platforms: Optional[List[str]]) -> List[str]:
-    allowed = {"tiktok", "instagram", "youtube", "facebook", "linkedin"}
-    candidate = [p.strip().lower() for p in (platforms or []) if isinstance(p, str) and p.strip()]
-    if not candidate:
-        env_value = os.getenv("SOCIAL_DEFAULT_PLATFORMS", "tiktok,instagram,youtube")
-        candidate = [p.strip().lower() for p in env_value.split(",") if p.strip()]
+_SHARE_PLATFORMS = {"tiktok", "instagram", "youtube", "facebook", "linkedin"}
+_SOCIAL_POST_PLATFORMS = {"facebook", "linkedin"}
 
-    deduped = []
-    for p in candidate:
-        if p in allowed and p not in deduped:
-            deduped.append(p)
-    if not deduped:
-        raise HTTPException(status_code=400, detail="No valid social platforms selected")
-    return deduped
+
+async def _resolve_accounts_for_publish(
+    user_id: str, account_ids: Optional[List[str]], allowed_platforms: set,
+) -> List[Dict[str, Any]]:
+    """Resolves each requested account id to its connected-account row,
+    ownership-checked -- lets a single publish/share/schedule request target
+    several specific connected accounts at once (e.g. two Facebook Pages),
+    each billed and tracked as its own publish_jobs row. Shared by every
+    publish surface (composer, reel/caption/film-summary share, anonymous
+    stories); only the allowed platform set differs per surface."""
+    ids: List[str] = []
+    seen = set()
+    for raw in account_ids or []:
+        account_id = str(raw or "").strip()
+        if account_id and account_id not in seen:
+            seen.add(account_id)
+            ids.append(account_id)
+    if not ids:
+        raise HTTPException(status_code=400, detail="account_ids must include at least one connected account")
+
+    accounts: List[Dict[str, Any]] = []
+    for account_id in ids:
+        account = await _get_social_account_by_id(user_id, account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail=f"Connected account not found: {account_id}")
+        if account.get("platform") not in allowed_platforms:
+            raise HTTPException(status_code=400, detail=f"Unsupported platform for account {account_id}")
+        accounts.append(account)
+    return accounts
 
 
 def _resolve_local_video_path(job_id: str, video_ref: str, clip_index: int) -> Optional[str]:
@@ -7904,12 +7986,12 @@ def _resolve_public_video_url(video_ref: str, request: Request, job_id: str) -> 
     return f"{base_url}/videos/{job_id}/{ref}"
 
 async def _schedule_reel_social_post_job(
-    user_id: str, platform_name: str, req: "SocialPostRequest", publish_priority: int,
+    user_id: str, account: Dict[str, Any], req: "SocialPostRequest", publish_priority: int,
     scheduled_for, final_title: str, final_description: str, public_video_url: str,
 ) -> Dict[str, Any]:
     publish_job_id = await _insert_publish_job(
         user_id=user_id,
-        platform=platform_name,
+        platform=str(account.get("platform") or ""),
         external_id="scheduled",
         status="queued",
         priority=publish_priority,
@@ -7917,6 +7999,7 @@ async def _schedule_reel_social_post_job(
         timezone=req.timezone or "UTC",
         payload={
             "source_type": "job_clip",
+            "account_id": account.get("id"),
             "source_id": req.job_id,
             "clip_index": req.clip_index,
             "title": final_title,
@@ -7933,14 +8016,18 @@ async def _schedule_reel_social_post_job(
 
 
 async def _publish_reel_social_post_now(
-    user_id: str, platform_name: str, publish_priority: int,
+    user_id: str, account: Dict[str, Any], publish_priority: int,
     final_title: str, final_description: str, public_video_url: str, local_video_path: str,
 ) -> Dict[str, Any]:
+    platform_name = str(account.get("platform") or "")
+    base_payload = {
+        "source_type": "job_clip",
+        "account_id": account.get("id"),
+        "title": final_title,
+        "description": final_description,
+        "media_url": public_video_url,
+    }
     try:
-        account = await _get_social_account(user_id, platform_name)
-        if not account:
-            raise HTTPException(status_code=404, detail=f"No connected {platform_name} account found")
-
         # Sonar false positive (S5332): validates the URL is absolute (any
         # scheme) before submitting it to the platform API -- not a
         # hardcoded http:// request of our own.
@@ -7962,7 +8049,7 @@ async def _publish_reel_social_post_now(
         post_url = _build_social_post_url(platform_name, platform_result)
         await _insert_publish_job(
             user_id=user_id, platform=platform_name, external_id=external_id, status="done", priority=publish_priority,
-            payload={"post_url": post_url} if post_url else None,
+            payload={**base_payload, "post_url": post_url} if post_url else base_payload,
         )
         return {
             "success": True,
@@ -7970,17 +8057,21 @@ async def _publish_reel_social_post_now(
         }
     except Exception as exc:
         err_msg = str(exc)
-        await _insert_publish_job(user_id=user_id, platform=platform_name, external_id="n/a", status="failed", error_message=err_msg, priority=publish_priority)
+        await _insert_publish_job(
+            user_id=user_id, platform=platform_name, external_id="n/a", status="failed", error_message=err_msg,
+            priority=publish_priority, payload=base_payload,
+        )
         return {
             "success": False,
             "error": err_msg,
         }
 
 
-@app.post("/api/social/post", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+@app.post("/api/social/post", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def post_to_socials(req: SocialPostRequest, request: Request, user_id_header: Annotated[str, Depends(get_user_id_header)]):
-    selected_platforms = _resolve_social_platforms(req.platforms)
     user_id = _resolve_request_user_id(req.user_id, user_id_header)
+    await _assert_user_has_active_subscription_for_publish(user_id)
+    accounts = await _resolve_accounts_for_publish(user_id, req.account_ids, _SHARE_PLATFORMS)
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(req.scheduled_date, req.timezone)
     if req.scheduled_date and not scheduled_for:
@@ -8002,17 +8093,18 @@ async def post_to_socials(req: SocialPostRequest, request: Request, user_id_head
     results: Dict[str, Any] = {}
     overall_success = True
 
-    for platform_name in selected_platforms:
+    for account in accounts:
+        result_key = str(account.get("id") or account.get("platform"))
         if is_scheduled:
-            results[platform_name] = await _schedule_reel_social_post_job(
-                user_id, platform_name, req, publish_priority, scheduled_for, final_title, final_description, public_video_url,
+            results[result_key] = await _schedule_reel_social_post_job(
+                user_id, account, req, publish_priority, scheduled_for, final_title, final_description, public_video_url,
             )
             continue
 
         result = await _publish_reel_social_post_now(
-            user_id, platform_name, publish_priority, final_title, final_description, public_video_url, local_video_path,
+            user_id, account, publish_priority, final_title, final_description, public_video_url, local_video_path,
         )
-        results[platform_name] = result
+        results[result_key] = result
         if not result["success"]:
             overall_success = False
 
@@ -8457,7 +8549,7 @@ def thumbnail_publish_status(publish_id: str, user_id: Annotated[str, Depends(ge
 
 
 class ReelShareRequest(BaseModel):
-    platforms: Optional[List[str]] = None
+    account_ids: List[str] = []
     title: Optional[str] = None
     description: Optional[str] = None
     scheduled_date: Optional[str] = None
@@ -9079,7 +9171,45 @@ async def resume_souscription(user_id: Annotated[str, Depends(get_user_id_header
     )
 
 
-@app.post("/api/souscription/change-plan", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def _assert_plan_change_within_limits(user_id: str, new_plan: Dict[str, Any]) -> None:
+    """Blocks a plan change that would leave the account over the new
+    plan's allowances. The new plan's resources aren't allocated until
+    this passes (see _allocate_plan_resources) -- without this check a
+    downgrade would silently leave, say, 5 connected Facebook accounts
+    against a plan that only allows 1, or more storage in use than the
+    new plan grants, with no way for the user to know until something
+    mysteriously stops working."""
+    new_max_social = max(1, int(new_plan.get("max_social_account") or 1))
+    counts = await _count_social_accounts_by_platform(user_id)
+    over_limit_platforms = {platform: count for platform, count in counts.items() if count > new_max_social}
+    if over_limit_platforms:
+        details = ", ".join(f"{platform} ({count}/{new_max_social})" for platform, count in over_limit_platforms.items())
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cette offre autorise au maximum {new_max_social} compte(s) par reseau social. "
+                f"Supprimez les comptes en surplus avant de changer d'offre : {details}."
+            ),
+        )
+
+    user_data = await supabase_get_user_data(user_id)
+    if not user_data:
+        return
+    storage_max = float(user_data.get("stockage_max") or 0.0)
+    storage_left = float(user_data.get("stockage") or 0.0)
+    storage_used = max(0.0, storage_max - storage_left)
+    new_storage_allowance = float(new_plan.get("stockage") or 0.0)
+    if storage_used > new_storage_allowance:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cette offre inclut {new_storage_allowance:.1f} Go de stockage, mais vous utilisez "
+                f"actuellement {storage_used:.1f} Go. Supprimez du contenu avant de changer d'offre."
+            ),
+        )
+
+
+@app.post("/api/souscription/change-plan", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def change_souscription_plan(
     payload: ChangeSubscriptionPlanRequest, user_id: Annotated[str, Depends(get_user_id_header)],
 ):
@@ -9097,6 +9227,8 @@ async def change_souscription_plan(
     new_plan = await supabase_get_abonnement(payload.plan_id)
     if not new_plan:
         raise HTTPException(status_code=404, detail="Subscription plan not found")
+
+    await _assert_plan_change_within_limits(user_id, new_plan)
 
     try:
         unit_amount = int(round(float(new_plan.get("price") or 0) * 100))
@@ -9171,6 +9303,9 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
 
     await _enforce_subscription_retention_policy(user_id)
 
+    abonnement = await get_user_abonnement(user_id)
+    has_active_subscription = bool(abonnement)
+
     data = await supabase_get_user_data(user_id)
     if not data:
         return {
@@ -9180,6 +9315,8 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
             "stockage_max": 0.0,
             "storage_overage_tolerance_percent": STORAGE_OVERAGE_TOLERANCE_PERCENT,
             "has_credits": False,
+            "has_active_subscription": has_active_subscription,
+            "has_analytics_access": bool(abonnement) and int(abonnement.get("priorite") or 1) >= 2,
             "abo_costs": {
                 "credit":  0.0,
                 "storage": 0.0,
@@ -9187,7 +9324,7 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
             "default_costs": {
                 "reel":        DEFAULT_REEL_CREDITS,
                 "caption":     DEFAULT_CAPTION_CREDITS,
-                "publication": DEFAULT_PUBLICATION_CREDITS,
+                "publication": 0.0,
             },
         }
 
@@ -9196,7 +9333,6 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
     credit_max = float(data.get("credit_max", credit) or 0.0)
     storage_max = float(data.get("stockage_max", max(storage, 0.0)) or 0.0)
 
-    abonnement = await get_user_abonnement(user_id)
     if not abonnement:
         abo_costs = {
             "credit":  0.0,
@@ -9215,11 +9351,13 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
         "stockage_max": storage_max,
         "storage_overage_tolerance_percent": STORAGE_OVERAGE_TOLERANCE_PERCENT,
         "has_credits": credit > 0,
+        "has_active_subscription": has_active_subscription,
+        "has_analytics_access": bool(abonnement) and int(abonnement.get("priorite") or 1) >= 2,
         "abo_costs": abo_costs,
         "default_costs": {
             "reel":        DEFAULT_REEL_CREDITS,
             "caption":     DEFAULT_CAPTION_CREDITS,
-            "publication": DEFAULT_PUBLICATION_CREDITS,
+            "publication": 0.0,
         },
     }
 
@@ -9241,6 +9379,207 @@ async def get_user_history(
         "total":     total,
         "page":      page,
         "page_size": page_size,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dashboard stats (internal KPI block) -- computed entirely from this app's
+# own DB, no external calls.
+# ---------------------------------------------------------------------------
+
+_DASHBOARD_STATS_RANGE_TO_DAYS = {"7d": 7, "30d": 30, "90d": 90}
+_DASHBOARD_STATS_MAX_DAILY_ENTRIES = 180
+
+
+def _bucket_timestamps_by_day(timestamps: List[str]) -> Dict[str, int]:
+    """Bucket a list of ISO-8601 timestamp strings into {"YYYY-MM-DD": count}.
+    Postgres timestamptz ISO output always starts with the date, so a plain
+    prefix slice is enough -- no timezone-aware parsing needed here."""
+    buckets: Dict[str, int] = {}
+    for ts in timestamps:
+        if not ts or len(ts) < 10:
+            continue
+        day = ts[:10]
+        buckets[day] = buckets.get(day, 0) + 1
+    return buckets
+
+
+def _bucket_credit_history_by_day(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+    buckets: Dict[str, float] = {}
+    for row in rows:
+        ts = row.get("created_at")
+        if not ts or len(ts) < 10:
+            continue
+        day = ts[:10]
+        buckets[day] = buckets.get(day, 0.0) + float(row.get("credit") or 0)
+    return buckets
+
+
+async def _fetch_dashboard_publish_rows(client, user_id: str, since_iso: Optional[str]) -> List[Dict[str, Any]]:
+    query = client.table(SUPABASE_SOCIAL_PUBLISH_JOBS_TABLE).select("platform, created_at, status").eq("user_id", user_id)
+    if since_iso:
+        query = query.gte("created_at", since_iso)
+    response = await query.execute()
+    return response.data or []
+
+
+async def _fetch_dashboard_credit_rows(client, user_id: str, since_iso: Optional[str]) -> List[Dict[str, Any]]:
+    query = (
+        client.table(SUPABASE_USER_DATA_HISTORY_TABLE)
+        .select("credit, created_at, operation")
+        .eq("user_id", user_id)
+        .eq("operation", "output")
+    )
+    if since_iso:
+        query = query.gte("created_at", since_iso)
+    response = await query.execute()
+    return response.data or []
+
+
+def _aggregate_publication_rows(publish_rows: List[Dict[str, Any]]) -> Tuple[Dict[str, int], int, int, List[Dict[str, Any]]]:
+    publications_daily: Dict[str, int] = {}
+    publications_done = 0
+    publications_failed = 0
+    platform_counts: Dict[str, int] = {}
+    for row in publish_rows:
+        status = row.get("status")
+        platform = str(row.get("platform") or "")
+        if status == "done":
+            publications_done += 1
+            if platform:
+                platform_counts[platform] = platform_counts.get(platform, 0) + 1
+        elif status == "failed":
+            publications_failed += 1
+        ts = row.get("created_at")
+        if ts and len(ts) >= 10:
+            day = ts[:10]
+            publications_daily[day] = publications_daily.get(day, 0) + 1
+
+    publications_by_platform = sorted(
+        ({"platform": platform, "count": count} for platform, count in platform_counts.items()),
+        key=lambda entry: entry["count"],
+        reverse=True,
+    )
+    return publications_daily, publications_done, publications_failed, publications_by_platform
+
+
+def _resolve_dashboard_stats_start_date(since_dt: Optional[datetime], *daily_maps: Dict[str, Any]) -> Optional[date]:
+    if since_dt is not None:
+        return since_dt.date()
+    all_days: set = set()
+    for daily_map in daily_maps:
+        all_days |= set(daily_map)
+    if not all_days:
+        return None
+    return min(datetime.fromisoformat(day).date() for day in all_days)
+
+
+def _build_dashboard_daily_series(
+    start_date: date, today: date, reel_daily: Dict[str, int], caption_daily: Dict[str, int],
+    story_daily: Dict[str, int], film_daily: Dict[str, int], publications_daily: Dict[str, int],
+    credits_daily: Dict[str, float],
+) -> List[Dict[str, Any]]:
+    daily: List[Dict[str, Any]] = []
+    day_cursor = start_date
+    while day_cursor <= today:
+        date_str = day_cursor.isoformat()
+        daily.append({
+            "date": date_str,
+            "reels": reel_daily.get(date_str, 0),
+            "captions": caption_daily.get(date_str, 0),
+            "anonymous_stories": story_daily.get(date_str, 0),
+            "film_summaries": film_daily.get(date_str, 0),
+            "publications": publications_daily.get(date_str, 0),
+            "credits_consumed": credits_daily.get(date_str, 0.0),
+        })
+        day_cursor += timedelta(days=1)
+    if len(daily) > _DASHBOARD_STATS_MAX_DAILY_ENTRIES:
+        daily = daily[-_DASHBOARD_STATS_MAX_DAILY_ENTRIES:]
+    return daily
+
+
+@app.get("/api/dashboard/stats", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
+async def get_dashboard_stats(
+    user_id: Annotated[str, Depends(get_user_id_header)],
+    range: Annotated[str, Query()] = "30d",
+):
+    """Internal KPI/stats block for the dashboard home page: reels/captions/
+    anonymous stories/film summaries created, publications by platform and
+    credit consumption, bucketed per day. Computed entirely from this app's
+    own DB -- no external (social platform) calls."""
+    if range not in {"7d", "30d", "90d", "all"}:
+        raise HTTPException(status_code=400, detail="range must be one of: 7d, 30d, 90d, all")
+
+    empty_totals = {
+        "reels": 0,
+        "captions": 0,
+        "anonymous_stories": 0,
+        "film_summaries": 0,
+        "publications_done": 0,
+        "publications_failed": 0,
+        "credits_consumed": 0.0,
+    }
+
+    if not is_supabase_configured():
+        return {
+            "range": range,
+            "totals": empty_totals,
+            "daily": [],
+            "publications_by_platform": [],
+        }
+
+    since_dt: Optional[datetime] = None if range == "all" else _utcnow() - timedelta(days=_DASHBOARD_STATS_RANGE_TO_DAYS[range])
+    since_iso = since_dt.isoformat() if since_dt else None
+
+    reel_dates, caption_dates, story_dates, film_dates = await asyncio.gather(
+        supabase_list_reel_dates_since(user_id, since_iso),
+        supabase_list_caption_dates_since(user_id, since_iso),
+        supabase_list_anonymous_story_dates_since(user_id, since_iso),
+        supabase_list_film_summary_dates_since(user_id, since_iso),
+    )
+
+    client = await supabase_get_client()
+    publish_rows = await _fetch_dashboard_publish_rows(client, user_id, since_iso)
+    credit_rows = await _fetch_dashboard_credit_rows(client, user_id, since_iso)
+
+    reel_daily = _bucket_timestamps_by_day(reel_dates)
+    caption_daily = _bucket_timestamps_by_day(caption_dates)
+    story_daily = _bucket_timestamps_by_day(story_dates)
+    film_daily = _bucket_timestamps_by_day(film_dates)
+    publications_daily, publications_done, publications_failed, publications_by_platform = _aggregate_publication_rows(publish_rows)
+    credits_daily = _bucket_credit_history_by_day(credit_rows)
+
+    totals = {
+        "reels": len(reel_dates),
+        "captions": len(caption_dates),
+        "anonymous_stories": len(story_dates),
+        "film_summaries": len(film_dates),
+        "publications_done": publications_done,
+        "publications_failed": publications_failed,
+        "credits_consumed": sum(credits_daily.values()),
+    }
+
+    start_date = _resolve_dashboard_stats_start_date(
+        since_dt, reel_daily, caption_daily, story_daily, film_daily, publications_daily, credits_daily,
+    )
+    if start_date is None:
+        return {
+            "range": range,
+            "totals": totals,
+            "daily": [],
+            "publications_by_platform": publications_by_platform,
+        }
+
+    daily = _build_dashboard_daily_series(
+        start_date, _utcnow().date(), reel_daily, caption_daily, story_daily, film_daily,
+        publications_daily, credits_daily,
+    )
+
+    return {
+        "range": range,
+        "totals": totals,
+        "daily": daily,
+        "publications_by_platform": publications_by_platform,
     }
 
 
@@ -9377,7 +9716,7 @@ class AnonymousStoryUpdateRequest(BaseModel):
 
 
 class AnonymousStoryPublishRequest(BaseModel):
-    platforms: List[str]
+    account_ids: List[str] = []
     background_id: Optional[str] = None
     scheduled_date: Optional[str] = None
     timezone: Optional[str] = "UTC"
@@ -10037,36 +10376,29 @@ async def regenerate_anonymous_story_endpoint(story_id: str, user_id: Annotated[
 # explicitly asked for ("la publication dois se faire entre facebook et
 # Linkedin") -- unlike reels/captions, which fan out to whatever the
 # account has connected among tiktok/instagram/youtube/facebook/linkedin.
-_ANONYMOUS_STORY_PUBLISH_PLATFORMS = {"facebook", "linkedin"}
-
-
-def _resolve_anonymous_story_platforms(platforms: Optional[List[str]]) -> List[str]:
-    candidate = [p.strip().lower() for p in (platforms or []) if isinstance(p, str) and p.strip()]
-    result: List[str] = []
-    for p in candidate:
-        if p in _ANONYMOUS_STORY_PUBLISH_PLATFORMS and p not in result:
-            result.append(p)
-    if not result:
-        raise HTTPException(status_code=400, detail="platforms must include at least one of: facebook, linkedin")
-    return result
+# Reuses _SOCIAL_POST_PLATFORMS (the composer's own set is identical).
 
 
 async def _publish_anonymous_story_now(
-    user_id: str, platform_name: str, publish_priority: int, text_value: str,
+    user_id: str, account: Dict[str, Any], publish_priority: int, text_value: str,
     background_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    platform_name = str(account.get("platform") or "")
     publish_job_id = await _insert_publish_job(
         user_id=user_id,
         platform=platform_name,
         external_id="n/a",
         status="queued",
         priority=publish_priority,
+        payload={
+            "source_type": "anonymous_story",
+            "account_id": account.get("id"),
+            "text": text_value,
+            "background_id": background_id,
+        },
     )
     try:
         await _update_publish_job_status(publish_job_id, "processing")
-        account = await _get_social_account(user_id, platform_name)
-        if not account:
-            raise HTTPException(status_code=404, detail=f"No connected {platform_name} account found")
 
         publish_payload = PublishRequest(
             user_id=user_id,
@@ -10109,24 +10441,25 @@ def _resolve_anonymous_story_schedule(payload: "AnonymousStoryPublishRequest"):
 
 async def _dispatch_anonymous_story_publish(
     user_id: str, story_id: str, story_title: str, text_value: str, background_id: str,
-    selected_platforms: List[str], publish_priority: int, scheduled_for, timezone: Optional[str],
+    accounts: List[Dict[str, Any]], publish_priority: int, scheduled_for, timezone: Optional[str],
     is_scheduled: bool,
 ) -> Dict[str, Any]:
-    """Publish (or schedule) the story across every selected platform.
+    """Publish (or schedule) the story across every selected account.
     Pulled out of publish_anonymous_story_endpoint to keep its cognitive
     complexity down."""
     results: Dict[str, Any] = {}
-    for platform_name in selected_platforms:
+    for account in accounts:
+        result_key = str(account.get("id") or account.get("platform"))
         if is_scheduled:
-            results[platform_name] = await _schedule_share_publish_job(
-                user_id, platform_name, "anonymous_story", story_id, publish_priority,
+            results[result_key] = await _schedule_share_publish_job(
+                user_id, account, "anonymous_story", story_id, publish_priority,
                 scheduled_for, timezone, story_title, text_value, "",
                 background_id=background_id,
             )
             continue
 
-        results[platform_name] = await _publish_anonymous_story_now(
-            user_id, platform_name, publish_priority, text_value, background_id,
+        results[result_key] = await _publish_anonymous_story_now(
+            user_id, account, publish_priority, text_value, background_id,
         )
     return results
 
@@ -10138,7 +10471,7 @@ async def publish_anonymous_story_endpoint(
     if not ANONYMOUS_STORIES_ENABLED:
         raise HTTPException(status_code=404, detail=_ANONYMOUS_STORIES_DISABLED)
 
-    await _assert_user_has_required_credits(user_id, 0.0)
+    await _assert_user_has_active_subscription_for_publish(user_id)
 
     row = await supabase_get_anonymous_story(story_id, user_id)
     if not row:
@@ -10148,19 +10481,16 @@ async def publish_anonymous_story_endpoint(
     if not text_value:
         raise HTTPException(status_code=400, detail="Story has no generated text to publish yet")
 
-    selected_platforms = _resolve_anonymous_story_platforms(payload.platforms)
+    accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SOCIAL_POST_PLATFORMS)
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for, is_scheduled = _resolve_anonymous_story_schedule(payload)
     background_id = payload.background_id or anonymous_stories.BACKGROUND_PRESETS[0]["id"]
 
     results = await _dispatch_anonymous_story_publish(
         user_id, story_id, str(row.get("title") or "Vireel"), text_value, background_id,
-        selected_platforms, publish_priority, scheduled_for, payload.timezone, is_scheduled,
+        accounts, publish_priority, scheduled_for, payload.timezone, is_scheduled,
     )
     overall_success = all(result.get("success") for result in results.values())
-
-    if not is_scheduled:
-        await _debit_publish_credits_after_share(user_id, story_id, results)
 
     return {
         "success": overall_success,
@@ -10171,13 +10501,13 @@ async def publish_anonymous_story_endpoint(
 
 
 async def _schedule_share_publish_job(
-    user_id: str, platform_name: str, source_type: str, source_id: str, publish_priority: int,
+    user_id: str, account: Dict[str, Any], source_type: str, source_id: str, publish_priority: int,
     scheduled_for, timezone: Optional[str], final_title: str, final_description: str, media_url: str,
     background_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     publish_job_id = await _insert_publish_job(
         user_id=user_id,
-        platform=platform_name,
+        platform=str(account.get("platform") or ""),
         external_id="scheduled",
         status="queued",
         priority=publish_priority,
@@ -10185,6 +10515,7 @@ async def _schedule_share_publish_job(
         timezone=timezone or "UTC",
         payload={
             "source_type": source_type,
+            "account_id": account.get("id"),
             "source_id": source_id,
             "title": final_title,
             "description": final_description,
@@ -10200,39 +10531,14 @@ async def _schedule_share_publish_job(
     }
 
 
-async def _debit_publish_credits_after_share(user_id: str, operation_id: str, results: Dict[str, Any]) -> None:
-    if not is_supabase_configured():
-        return
-    platform_count_done = sum(1 for v in results.values() if v.get("success"))
-    if platform_count_done <= 0:
-        return
-    pub_done_cost = calculate_credits_for_operation(
-        estimate_publication_cost_usd(platform_count=platform_count_done, video_size_gb=0.5)
-    )
-    pub_done_credits = pub_done_cost["final_credits"]
-    await supabase_deduct_user_credits(user_id, pub_done_credits)
-    await supabase_insert_user_data_history(
-        user_id=user_id,
-        credit=pub_done_credits,
-        storage=0.0,
-        operation="output",
-        operation_type="publication",
-        operation_id=operation_id,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Social posts: a user-authored post (with an optional Facebook background
 # theme, reusing anonymous_stories.BACKGROUND_PRESETS) published together
 # with zero or more follow-up comments, posted by the connected Page/account
-# itself right after the post goes live. Billed the same as any other
-# publication (_debit_publish_credits_after_share / _debit_scheduled_publish_
-# credits) -- comments ride along on the same charge, they don't add their
-# own cost.
+# itself right after the post goes live. Publishing is free (no credit
+# debit, no user_data_history entry) but still requires an active
+# subscription -- see _assert_user_has_active_subscription_for_publish.
 # ---------------------------------------------------------------------------
-
-_SOCIAL_POST_PLATFORMS = {"facebook", "linkedin"}
-
 
 class SocialPostCommentInput(BaseModel):
     text: str = ""
@@ -10242,22 +10548,13 @@ class SocialPostCommentInput(BaseModel):
 
 class CreateSocialPostRequest(BaseModel):
     text: str
-    platforms: List[str]
+    account_ids: List[str] = []
     background_id: Optional[str] = None
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None  # "image" or "video" -- see upload_social_post_media
     comments: List[SocialPostCommentInput] = []
     scheduled_date: Optional[str] = None
     timezone: Optional[str] = "UTC"
-
-
-def _resolve_social_post_platforms(platforms: Optional[List[str]]) -> List[str]:
-    candidate = [p.strip().lower() for p in (platforms or []) if isinstance(p, str) and p.strip()]
-    result: List[str] = []
-    for p in candidate:
-        if p in _SOCIAL_POST_PLATFORMS and p not in result:
-            result.append(p)
-    if not result:
-        raise HTTPException(status_code=400, detail="platforms must include at least one of: facebook, linkedin")
-    return result
 
 
 def _build_comment_message(comment: "SocialPostCommentInput") -> str:
@@ -10344,7 +10641,24 @@ async def _post_comments_sequence(
     return results
 
 
-def _build_social_post_publish_payload(text_value: str, background_id: Optional[str]) -> "PublishRequest":
+def _build_social_post_publish_payload(
+    text_value: str, background_id: Optional[str], media_url: Optional[str] = None, media_type: Optional[str] = None,
+) -> "PublishRequest":
+    # A background (Facebook's native colored-background text) can never be
+    # combined with a photo or video -- Facebook silently drops the
+    # background style the moment any media is attached (see
+    # publish_to_facebook_text_with_background) -- so an attached media
+    # takes priority and the background is simply not set in that case.
+    if media_url:
+        return PublishRequest(
+            user_id="",
+            title="Vireel",
+            description=text_value,
+            text=text_value,
+            caption=text_value,
+            video_url=media_url if media_type == "video" else None,
+            image_url=media_url if media_type != "video" else None,
+        )
     return PublishRequest(
         user_id="",
         title="Vireel",
@@ -10356,24 +10670,31 @@ def _build_social_post_publish_payload(text_value: str, background_id: Optional[
 
 
 async def _publish_social_post_now(
-    user_id: str, platform_name: str, publish_priority: int, text_value: str,
+    user_id: str, account: Dict[str, Any], publish_priority: int, text_value: str,
     background_id: Optional[str], comments: List["SocialPostCommentInput"],
+    media_url: Optional[str] = None, media_type: Optional[str] = None,
 ) -> Dict[str, Any]:
+    platform_name = str(account.get("platform") or "")
     publish_job_id = await _insert_publish_job(
         user_id=user_id,
         platform=platform_name,
         external_id="n/a",
         status="queued",
         priority=publish_priority,
-        payload={"source_type": "social_post", "comments": [c.model_dump() for c in comments]},
+        payload={
+            "source_type": "social_post",
+            "account_id": account.get("id"),
+            "text": text_value,
+            "background_id": background_id,
+            "media_url": media_url,
+            "media_type": media_type,
+            "comments": [c.model_dump() for c in comments],
+        },
     )
     try:
         await _update_publish_job_status(publish_job_id, "processing")
-        account = await _get_social_account(user_id, platform_name)
-        if not account:
-            raise HTTPException(status_code=404, detail=f"No connected {platform_name} account found")
 
-        publish_payload = _build_social_post_publish_payload(text_value, background_id)
+        publish_payload = _build_social_post_publish_payload(text_value, background_id, media_url, media_type)
         publish_payload.user_id = user_id
         platform_result = await publish_post(account, publish_payload)
         external_id = str(platform_result.get("publish_id") or platform_result.get("id") or "n/a")
@@ -10402,12 +10723,13 @@ async def _publish_social_post_now(
 
 
 async def _schedule_social_post_job(
-    user_id: str, platform_name: str, publish_priority: int, scheduled_for, timezone: Optional[str],
+    user_id: str, account: Dict[str, Any], publish_priority: int, scheduled_for, timezone: Optional[str],
     text_value: str, background_id: Optional[str], comments: List["SocialPostCommentInput"],
+    media_url: Optional[str] = None, media_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     publish_job_id = await _insert_publish_job(
         user_id=user_id,
-        platform=platform_name,
+        platform=str(account.get("platform") or ""),
         external_id="scheduled",
         status="queued",
         priority=publish_priority,
@@ -10415,8 +10737,11 @@ async def _schedule_social_post_job(
         timezone=timezone or "UTC",
         payload={
             "source_type": "social_post",
+            "account_id": account.get("id"),
             "text": text_value,
             "background_id": background_id,
+            "media_url": media_url,
+            "media_type": media_type,
             "comments": [c.model_dump() for c in comments],
         },
     )
@@ -10432,17 +10757,25 @@ async def _execute_scheduled_social_post_job(job_id: str, user_id: str, platform
     try:
         await _update_publish_job_status(job_id, "processing", error_message=None)
 
-        account = await _get_social_account(user_id, platform)
+        # account_id is only present on jobs scheduled after multi-account
+        # support was added -- fall back to "any account of this platform"
+        # for older in-flight jobs that don't have it.
+        account_id = task_payload.get("account_id")
+        account = await _get_social_account_by_id(user_id, account_id) if account_id else None
+        if not account:
+            account = await _get_social_account(user_id, platform)
         if not account:
             raise HTTPException(status_code=404, detail=f"No connected {platform} account found")
 
         text_value = str(task_payload.get("text") or "")
         background_id = task_payload.get("background_id")
+        media_url = task_payload.get("media_url")
+        media_type = task_payload.get("media_type")
         comments = [
             SocialPostCommentInput(**c) for c in (task_payload.get("comments") or []) if isinstance(c, dict)
         ]
 
-        publish_payload = _build_social_post_publish_payload(text_value, background_id)
+        publish_payload = _build_social_post_publish_payload(text_value, background_id, media_url, media_type)
         publish_payload.user_id = user_id
         platform_result = await publish_post(account, publish_payload)
         external_id = str(platform_result.get("publish_id") or platform_result.get("id") or "n/a")
@@ -10454,44 +10787,49 @@ async def _execute_scheduled_social_post_job(job_id: str, user_id: str, platform
             job_id, "done", external_id=external_id, post_url=post_url,
             extra_payload={"comments_results": comments_results},
         )
-        await _debit_scheduled_publish_credits(user_id, task_payload, job_id)
     except Exception as exc:
         await _update_publish_job_status(job_id, "failed", error_message=str(exc))
 
 
 @app.post("/api/social/posts", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
-    await _assert_user_has_required_credits(user_id, 0.0)
+    await _assert_user_has_active_subscription_for_publish(user_id)
 
     text_value = (payload.text or "").strip()
     if not text_value:
         raise HTTPException(status_code=400, detail="text is required")
 
-    selected_platforms = _resolve_social_post_platforms(payload.platforms)
+    accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SOCIAL_POST_PLATFORMS)
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
     if payload.scheduled_date and not scheduled_for:
         raise HTTPException(status_code=400, detail=_INVALID_SCHEDULED_DATE)
     is_scheduled = bool(scheduled_for and scheduled_for > _utcnow())
-    background_id = payload.background_id or anonymous_stories.BACKGROUND_PRESETS[0]["id"]
+    media_url = (payload.media_url or "").strip() or None
+    media_type = payload.media_type if media_url else None
+    # A background can't be combined with a photo/video (Facebook drops the
+    # background style the moment media is attached), so only default to
+    # the first preset when there's no attached media at all.
+    background_id = (payload.background_id or anonymous_stories.BACKGROUND_PRESETS[0]["id"]) if not media_url else None
     comments = payload.comments or []
 
+    # Keyed by account id (not platform) so publishing to several accounts
+    # of the same platform (e.g. two Facebook Pages) reports each one
+    # separately instead of the second silently overwriting the first.
     results: Dict[str, Any] = {}
-    for platform_name in selected_platforms:
+    for account in accounts:
+        result_key = str(account.get("id") or account.get("platform"))
         if is_scheduled:
-            results[platform_name] = await _schedule_social_post_job(
-                user_id, platform_name, publish_priority, scheduled_for, payload.timezone,
-                text_value, background_id, comments,
+            results[result_key] = await _schedule_social_post_job(
+                user_id, account, publish_priority, scheduled_for, payload.timezone,
+                text_value, background_id, comments, media_url, media_type,
             )
             continue
-        results[platform_name] = await _publish_social_post_now(
-            user_id, platform_name, publish_priority, text_value, background_id, comments,
+        results[result_key] = await _publish_social_post_now(
+            user_id, account, publish_priority, text_value, background_id, comments, media_url, media_type,
         )
 
     overall_success = all(result.get("success") for result in results.values())
-
-    if not is_scheduled:
-        await _debit_publish_credits_after_share(user_id, f"social_post:{uuid.uuid4().hex[:12]}", results)
 
     return {
         "success": overall_success,
@@ -10575,19 +10913,111 @@ async def upload_social_comment_image(
     return {"image_url": image_url}
 
 
-async def _publish_caption_now(user_id: str, platform_name: str, publish_priority: int, final_title: str, final_description: str, media_url: str) -> Dict[str, Any]:
+_POST_MEDIA_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+_POST_MEDIA_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+_POST_MEDIA_VIDEO_MAX_BYTES = 200 * 1024 * 1024
+# Matches _COMMENT_IMAGE_URL_EXPIRATION_SECONDS: a scheduled post's
+# media_url is stored as-is in the publish job's payload (see
+# _schedule_social_post_job) and only resolved when the post actually goes
+# out, so it needs to survive as long as a post can be scheduled for.
+_POST_MEDIA_URL_EXPIRATION_SECONDS = 7 * 24 * 3600
+
+
+def _detect_post_media_type(file: Optional[UploadFile]) -> str:
+    """Returns "video" or "image", from the browser-supplied content_type
+    first and the filename extension as a fallback (some OSes/browsers send
+    application/octet-stream for common video containers)."""
+    if not file:
+        raise HTTPException(status_code=400, detail="Missing media file")
+    content_type = str(file.content_type or "").lower()
+    if content_type.startswith("video/"):
+        return "video"
+    if content_type.startswith("image/"):
+        return "image"
+    ext = os.path.splitext(_sanitize_input_filename(file.filename) or "")[1].lower()
+    if ext in _COMMON_VIDEO_EXTENSIONS:
+        return "video"
+    if ext in _POST_MEDIA_IMAGE_EXTENSIONS:
+        return "image"
+    raise HTTPException(status_code=400, detail="Unsupported media type (use an image or a video)")
+
+
+async def _save_post_media_upload(file: UploadFile, local_path: str, max_bytes: int) -> None:
+    async with aiofiles.open(local_path, "wb") as buffer:
+        total = 0
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise HTTPException(status_code=400, detail=f"File is too large (max {max_bytes // (1024 * 1024)} MB)")
+            await buffer.write(chunk)
+
+
+@app.post("/api/social/post-media/upload", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 503: {"description": "Service Unavailable"}})
+async def upload_social_post_media(
+    user_id: Annotated[str, Depends(get_user_id_header)],
+    file: Annotated[UploadFile, File()],
+):
+    """Uploads the photo or video attached to a "Faire une publication" post
+    (see SocialPostComposerModal) and returns a URL Facebook/LinkedIn can
+    fetch server-side, plus the detected media_type so the caller can route
+    it as PublishRequest.video_url or .image_url (see
+    _build_social_post_publish_payload)."""
+    media_type = _detect_post_media_type(file)
+
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket:
+        raise HTTPException(status_code=503, detail="AWS_S3_BUCKET is required for media uploads")
+
+    default_name = "video.mp4" if media_type == "video" else "image.jpg"
+    safe_name = _sanitize_input_filename(file.filename) or default_name
+    ext = os.path.splitext(safe_name)[1].lower()
+    allowed_extensions = _COMMON_VIDEO_EXTENSIONS if media_type == "video" else _POST_MEDIA_IMAGE_EXTENSIONS
+    if ext not in allowed_extensions:
+        ext = ".mp4" if media_type == "video" else ".jpg"
+    max_bytes = _POST_MEDIA_VIDEO_MAX_BYTES if media_type == "video" else _POST_MEDIA_IMAGE_MAX_BYTES
+
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    local_path = os.path.join(UPLOAD_DIR, f"post_media_{uuid.uuid4().hex}{ext}")
+    try:
+        await _save_post_media_upload(file, local_path, max_bytes)
+        s3_key = f"social_post_media/{user_id}/{uuid.uuid4().hex}{ext}"
+        if not upload_file_to_s3(local_path, bucket, s3_key):
+            raise HTTPException(status_code=503, detail="Failed to upload media")
+    finally:
+        try:
+            if os.path.exists(local_path):
+                os.remove(local_path)
+        except Exception:
+            pass
+
+    media_url = generate_presigned_url(bucket, s3_key, expiration=_POST_MEDIA_URL_EXPIRATION_SECONDS) or ""
+    if not media_url:
+        raise HTTPException(status_code=503, detail="Failed to generate media URL")
+
+    return {"media_url": media_url, "media_type": media_type}
+
+
+async def _publish_caption_now(user_id: str, account: Dict[str, Any], publish_priority: int, final_title: str, final_description: str, media_url: str) -> Dict[str, Any]:
+    platform_name = str(account.get("platform") or "")
     publish_job_id = await _insert_publish_job(
         user_id=user_id,
         platform=platform_name,
         external_id="n/a",
         status="queued",
         priority=publish_priority,
+        payload={
+            "source_type": "caption",
+            "account_id": account.get("id"),
+            "title": final_title,
+            "description": final_description,
+            "media_url": media_url,
+        },
     )
     try:
         await _update_publish_job_status(publish_job_id, "processing")
-        account = await _get_social_account(user_id, platform_name)
-        if not account:
-            raise HTTPException(status_code=404, detail=f"No connected {platform_name} account found")
 
         publish_payload = PublishRequest(
             user_id=user_id,
@@ -10618,7 +11048,7 @@ async def _publish_caption_now(user_id: str, platform_name: str, publish_priorit
 
 @app.post("/api/captions/{caption_id}/share", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def share_caption(caption_id: str, payload: ReelShareRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
-    await _assert_user_has_required_credits(user_id, 0.0)
+    await _assert_user_has_active_subscription_for_publish(user_id)
 
     row = await supabase_get_caption(caption_id, user_id)
     if not row:
@@ -10631,7 +11061,7 @@ async def share_caption(caption_id: str, payload: ReelShareRequest, user_id: Ann
 
     final_title = payload.title or row.get("caption_title") or "Sous-titres"
     final_description = payload.description or row.get("caption_description") or ""
-    selected_platforms = _resolve_social_platforms(payload.platforms)
+    accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SHARE_PLATFORMS)
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
     if payload.scheduled_date and not scheduled_for:
@@ -10640,20 +11070,18 @@ async def share_caption(caption_id: str, payload: ReelShareRequest, user_id: Ann
 
     results: Dict[str, Any] = {}
     overall_success = True
-    for platform_name in selected_platforms:
+    for account in accounts:
+        result_key = str(account.get("id") or account.get("platform"))
         if is_scheduled:
-            results[platform_name] = await _schedule_share_publish_job(
-                user_id, platform_name, "caption", caption_id, publish_priority, scheduled_for, payload.timezone, final_title, final_description, media_url,
+            results[result_key] = await _schedule_share_publish_job(
+                user_id, account, "caption", caption_id, publish_priority, scheduled_for, payload.timezone, final_title, final_description, media_url,
             )
             continue
 
-        result = await _publish_caption_now(user_id, platform_name, publish_priority, final_title, final_description, media_url)
-        results[platform_name] = result
+        result = await _publish_caption_now(user_id, account, publish_priority, final_title, final_description, media_url)
+        results[result_key] = result
         if not result["success"]:
             overall_success = False
-
-    if not is_scheduled:
-        await _debit_publish_credits_after_share(user_id, caption_id, results)
 
     return {
         "success": overall_success,
@@ -11959,20 +12387,25 @@ async def delete_film_summary_endpoint(film_summary_id: str, user_id: Annotated[
 
 
 async def _publish_film_summary_now(
-    user_id: str, platform_name: str, publish_priority: int, final_title: str, final_description: str, media_url: str,
+    user_id: str, account: Dict[str, Any], publish_priority: int, final_title: str, final_description: str, media_url: str,
 ) -> Dict[str, Any]:
     """Same immediate-publish flow as _publish_caption_now/_publish_reel_now
     (share_caption/share_reel) -- the only thing that differs per feature is
     where media_url/title/description come from, so this mirrors them
     exactly rather than introducing a fourth, subtly different variant."""
+    platform_name = str(account.get("platform") or "")
     publish_job_id = await _insert_publish_job(
         user_id=user_id, platform=platform_name, external_id="n/a", status="queued", priority=publish_priority,
+        payload={
+            "source_type": "film_summary",
+            "account_id": account.get("id"),
+            "title": final_title,
+            "description": final_description,
+            "media_url": media_url,
+        },
     )
     try:
         await _update_publish_job_status(publish_job_id, "processing")
-        account = await _get_social_account(user_id, platform_name)
-        if not account:
-            raise HTTPException(status_code=404, detail=f"No connected {platform_name} account found")
 
         publish_payload = PublishRequest(
             user_id=user_id, title=final_title, description=final_description,
@@ -11991,7 +12424,7 @@ async def _publish_film_summary_now(
 
 @app.post("/api/film-summaries/{film_summary_id}/share", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def share_film_summary(film_summary_id: str, payload: ReelShareRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
-    await _assert_user_has_required_credits(user_id, 0.0)
+    await _assert_user_has_active_subscription_for_publish(user_id)
 
     row = await supabase_get_film_summary(film_summary_id, user_id)
     if not row:
@@ -12009,7 +12442,7 @@ async def share_film_summary(film_summary_id: str, payload: ReelShareRequest, us
 
     final_title = payload.title or row.get("title") or "Resume de film"
     final_description = payload.description or ""
-    selected_platforms = _resolve_social_platforms(payload.platforms)
+    accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SHARE_PLATFORMS)
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
     if payload.scheduled_date and not scheduled_for:
@@ -12018,21 +12451,19 @@ async def share_film_summary(film_summary_id: str, payload: ReelShareRequest, us
 
     results: Dict[str, Any] = {}
     overall_success = True
-    for platform_name in selected_platforms:
+    for account in accounts:
+        result_key = str(account.get("id") or account.get("platform"))
         if is_scheduled:
-            results[platform_name] = await _schedule_share_publish_job(
-                user_id, platform_name, "film_summary", film_summary_id, publish_priority,
+            results[result_key] = await _schedule_share_publish_job(
+                user_id, account, "film_summary", film_summary_id, publish_priority,
                 scheduled_for, payload.timezone, final_title, final_description, media_url,
             )
             continue
 
-        result = await _publish_film_summary_now(user_id, platform_name, publish_priority, final_title, final_description, media_url)
-        results[platform_name] = result
+        result = await _publish_film_summary_now(user_id, account, publish_priority, final_title, final_description, media_url)
+        results[result_key] = result
         if not result["success"]:
             overall_success = False
-
-    if not is_scheduled:
-        await _debit_publish_credits_after_share(user_id, film_summary_id, results)
 
     return {
         "success": overall_success,
@@ -12408,12 +12839,16 @@ async def delete_reel(reel_id: str, user_id: Annotated[str, Depends(get_user_id_
     return {"deleted": True}
 
 
-async def _publish_reel_now(user_id: str, platform_name: str, publish_priority: int, final_title: str, final_description: str, media_url: str) -> Dict[str, Any]:
+async def _publish_reel_now(user_id: str, account: Dict[str, Any], publish_priority: int, final_title: str, final_description: str, media_url: str) -> Dict[str, Any]:
+    platform_name = str(account.get("platform") or "")
+    base_payload = {
+        "source_type": "reel",
+        "account_id": account.get("id"),
+        "title": final_title,
+        "description": final_description,
+        "media_url": media_url,
+    }
     try:
-        account = await _get_social_account(user_id, platform_name)
-        if not account:
-            raise HTTPException(status_code=404, detail=f"No connected {platform_name} account found")
-
         publish_payload = PublishRequest(
             user_id=user_id,
             title=final_title,
@@ -12427,7 +12862,7 @@ async def _publish_reel_now(user_id: str, platform_name: str, publish_priority: 
         post_url = _build_social_post_url(platform_name, platform_result)
         await _insert_publish_job(
             user_id=user_id, platform=platform_name, external_id=external_id, status="done", priority=publish_priority,
-            payload={"post_url": post_url} if post_url else None,
+            payload={**base_payload, "post_url": post_url} if post_url else base_payload,
         )
         return {
             "success": True,
@@ -12435,7 +12870,10 @@ async def _publish_reel_now(user_id: str, platform_name: str, publish_priority: 
         }
     except Exception as exc:
         err_msg = str(exc)
-        await _insert_publish_job(user_id=user_id, platform=platform_name, external_id="n/a", status="failed", error_message=err_msg, priority=publish_priority)
+        await _insert_publish_job(
+            user_id=user_id, platform=platform_name, external_id="n/a", status="failed", error_message=err_msg,
+            priority=publish_priority, payload=base_payload,
+        )
         return {
             "success": False,
             "error": err_msg,
@@ -12444,7 +12882,7 @@ async def _publish_reel_now(user_id: str, platform_name: str, publish_priority: 
 
 @app.post("/api/reels/{reel_id}/share", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def share_reel(reel_id: str, payload: ReelShareRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
-    await _assert_user_has_required_credits(user_id, 0.0)
+    await _assert_user_has_active_subscription_for_publish(user_id)
 
     row = await supabase_get_reel(reel_id, user_id)
     if not row:
@@ -12457,7 +12895,7 @@ async def share_reel(reel_id: str, payload: ReelShareRequest, user_id: Annotated
 
     final_title = payload.title or row.get("reel_title") or "Vireel"
     final_description = payload.description or row.get("reel_description") or ""
-    selected_platforms = _resolve_social_platforms(payload.platforms)
+    accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SHARE_PLATFORMS)
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
     if payload.scheduled_date and not scheduled_for:
@@ -12466,21 +12904,18 @@ async def share_reel(reel_id: str, payload: ReelShareRequest, user_id: Annotated
 
     results: Dict[str, Any] = {}
     overall_success = True
-    for platform_name in selected_platforms:
+    for account in accounts:
+        result_key = str(account.get("id") or account.get("platform"))
         if is_scheduled:
-            results[platform_name] = await _schedule_share_publish_job(
-                user_id, platform_name, "reel", reel_id, publish_priority, scheduled_for, payload.timezone, final_title, final_description, media_url,
+            results[result_key] = await _schedule_share_publish_job(
+                user_id, account, "reel", reel_id, publish_priority, scheduled_for, payload.timezone, final_title, final_description, media_url,
             )
             continue
 
-        result = await _publish_reel_now(user_id, platform_name, publish_priority, final_title, final_description, media_url)
-        results[platform_name] = result
+        result = await _publish_reel_now(user_id, account, publish_priority, final_title, final_description, media_url)
+        results[result_key] = result
         if not result["success"]:
             overall_success = False
-
-    # Debit credits after publications (best-effort)
-    if not is_scheduled:
-        await _debit_publish_credits_after_share(user_id, reel_id, results)
 
     return {
         "success": overall_success,
@@ -12733,16 +13168,85 @@ async def _extract_token_data(platform: str, token_data: Dict[str, Any]) -> Dict
     }
 
 async def _get_social_account(user_id: str, platform: str) -> Optional[Dict[str, Any]]:
+    """Returns one representative account for this platform (the most
+    recently touched one) -- used by call sites that haven't yet been
+    updated to let the user pick a specific one of several connected
+    accounts of the same platform. Prefer _get_social_account_by_id or
+    _list_social_accounts in any new code."""
+    accounts = await _list_social_accounts(user_id, platform)
+    return accounts[0] if accounts else None
+
+
+async def _list_social_accounts(user_id: str, platform: Optional[str] = None) -> List[Dict[str, Any]]:
+    client = await supabase_get_client()
+    query = client.table(SUPABASE_SOCIAL_ACCOUNTS_TABLE).select("*").eq("user_id", user_id)
+    if platform:
+        query = query.eq("platform", platform)
+    response = await query.order("updated_at", desc=True).execute()
+    return response.data or []
+
+
+async def _get_social_account_by_id(user_id: str, account_id: str) -> Optional[Dict[str, Any]]:
+    """Scoped to user_id so one user can never target another's connected
+    account by guessing/reusing an id."""
+    if not account_id:
+        return None
     client = await supabase_get_client()
     response = (
         await client.table(SUPABASE_SOCIAL_ACCOUNTS_TABLE)
         .select("*")
+        .eq("id", account_id)
         .eq("user_id", user_id)
-        .eq("platform", platform)
-        .order("created_at", desc=True)
         .limit(1)
         .execute()
     )
+    rows = response.data or []
+    return rows[0] if rows else None
+
+
+async def _count_social_accounts_by_platform(user_id: str) -> Dict[str, int]:
+    client = await supabase_get_client()
+    response = (
+        await client.table(SUPABASE_SOCIAL_ACCOUNTS_TABLE)
+        .select("platform")
+        .eq("user_id", user_id)
+        .execute()
+    )
+    counts: Dict[str, int] = {}
+    for row in response.data or []:
+        platform = str(row.get("platform") or "")
+        if platform:
+            counts[platform] = counts.get(platform, 0) + 1
+    return counts
+
+
+async def _get_active_plan_for_user(user_id: str) -> Optional[Dict[str, Any]]:
+    subscription = await get_user_abonnement(user_id)
+    abonnement_id = str((subscription or {}).get("abonnement") or "").strip()
+    if not abonnement_id:
+        return None
+    return await supabase_get_abonnement(abonnement_id)
+
+
+async def _get_user_max_social_accounts(user_id: str) -> int:
+    """How many accounts of EACH platform the user's active plan allows --
+    defaults to 1 (the lowest tier) with no active paid subscription,
+    matching get_user_abonnement's own priorite fallback."""
+    plan = await _get_active_plan_for_user(user_id)
+    try:
+        return max(1, int((plan or {}).get("max_social_account") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+async def _find_social_account_by_platform_user(
+    user_id: str, platform: str, platform_user_id: str
+) -> Optional[Dict[str, Any]]:
+    client = await supabase_get_client()
+    query = client.table(SUPABASE_SOCIAL_ACCOUNTS_TABLE).select("*").eq("user_id", user_id).eq("platform", platform)
+    if platform_user_id:
+        query = query.eq("platform_user_id", platform_user_id)
+    response = await query.order("updated_at", desc=True).limit(1).execute()
     rows = response.data or []
     return rows[0] if rows else None
 
@@ -12757,6 +13261,13 @@ async def _upsert_social_account(
     platform_account_name: str,
     scopes: str,
 ) -> None:
+    """Reconnecting/reauthorizing the same external account (matched on
+    platform_user_id) always just refreshes its row. Connecting a genuinely
+    new one for this platform is gated behind the user's plan allowance
+    (see _get_user_max_social_accounts) -- e.g. Silver allows 1 Facebook
+    Page, Gold 3, Ultimate 10 -- so the only way to connect more is to
+    upgrade, and downgrading below what's already connected is blocked in
+    change_souscription_plan instead of silently dropping accounts here."""
     client = await supabase_get_client()
     expires_at = datetime.fromtimestamp(time.time() + max(expires_in, 60), tz=timezone.utc).isoformat()
     payload = {
@@ -12771,7 +13282,7 @@ async def _upsert_social_account(
         "updated_at": _utcnow_iso(),
     }
 
-    existing = await _get_social_account(user_id, platform)
+    existing = await _find_social_account_by_platform_user(user_id, platform, platform_user_id)
     if existing and existing.get("id"):
         await (
             client.table(SUPABASE_SOCIAL_ACCOUNTS_TABLE)
@@ -12779,8 +13290,20 @@ async def _upsert_social_account(
             .eq("id", existing["id"])
             .execute()
         )
-    else:
-        await client.table(SUPABASE_SOCIAL_ACCOUNTS_TABLE).insert(payload).execute()
+        return
+
+    counts = await _count_social_accounts_by_platform(user_id)
+    max_allowed = await _get_user_max_social_accounts(user_id)
+    if counts.get(platform, 0) >= max_allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Votre offre autorise au maximum {max_allowed} compte(s) {platform} connecte(s). "
+                "Supprimez-en un dans Parametres avant d'en ajouter un nouveau, ou passez a une offre superieure."
+            ),
+        )
+
+    await client.table(SUPABASE_SOCIAL_ACCOUNTS_TABLE).insert(payload).execute()
 
 
 async def _insert_publish_job(
@@ -12815,24 +13338,6 @@ async def _insert_publish_job(
     response = await client.table(SUPABASE_SOCIAL_PUBLISH_JOBS_TABLE).insert(insert_payload).execute()
     rows = response.data or []
     return str(rows[0].get("id")) if rows and rows[0].get("id") is not None else None
-
-
-async def _debit_scheduled_publish_credits(user_id: str, task_payload: Dict[str, Any], job_id: str) -> None:
-    if not is_supabase_configured():
-        return
-    done_cost = calculate_credits_for_operation(
-        estimate_publication_cost_usd(platform_count=1, video_size_gb=0.5)
-    )
-    done_credits = done_cost["final_credits"]
-    await supabase_deduct_user_credits(user_id, done_credits)
-    await supabase_insert_user_data_history(
-        user_id=user_id,
-        credit=done_credits,
-        storage=0.0,
-        operation="output",
-        operation_type="publication",
-        operation_id=str(task_payload.get("source_id") or job_id),
-    )
 
 
 def _build_scheduled_publish_payload(user_id: str, task_payload: Dict[str, Any]) -> "PublishRequest":
@@ -12879,7 +13384,13 @@ async def _execute_scheduled_publish_job(job_row: Dict[str, Any]) -> None:
     try:
         await _update_publish_job_status(job_id, "processing", error_message=None)
 
-        account = await _get_social_account(user_id, platform)
+        # account_id is only present on jobs scheduled after multi-account
+        # support was added -- fall back to "any account of this platform"
+        # for older in-flight jobs that don't have it.
+        account_id = task_payload.get("account_id")
+        account = await _get_social_account_by_id(user_id, account_id) if account_id else None
+        if not account:
+            account = await _get_social_account(user_id, platform)
         if not account:
             raise HTTPException(status_code=404, detail=f"No connected {platform} account found")
 
@@ -12889,8 +13400,6 @@ async def _execute_scheduled_publish_job(job_row: Dict[str, Any]) -> None:
         external_id = str(platform_result.get("publish_id") or platform_result.get("id") or platform_result.get("video_id") or "n/a")
         post_url = _build_social_post_url(platform, platform_result)
         await _update_publish_job_status(job_id, "done", external_id=external_id, post_url=post_url, error_message=None)
-
-        await _debit_scheduled_publish_credits(user_id, task_payload, job_id)
     except Exception as exc:
         await _update_publish_job_status(job_id, "failed", error_message=str(exc))
 
@@ -12940,12 +13449,22 @@ async def _update_publish_job_status(
         payload["error_message"] = error_message
     if external_id is not None:
         payload["external_id"] = external_id
-    # Note: this replaces the row's whole `payload` jsonb column rather than
-    # merging into it -- fine for every current caller since nothing reads
-    # back the pre-completion payload (source_type/comments/background_id)
-    # after a job finishes.
+    # Merges into the row's existing `payload` jsonb column rather than
+    # replacing it, so the source_type/media_url/title/description recorded
+    # at insert/schedule time survives past completion -- the publications
+    # page needs it to show what was actually posted (see
+    # SocialPublicationsPage.jsx).
     if post_url or extra_payload:
-        merged_payload: Dict[str, Any] = dict(extra_payload or {})
+        existing = (
+            await client.table(SUPABASE_SOCIAL_PUBLISH_JOBS_TABLE)
+            .select("payload")
+            .eq("id", publish_job_id)
+            .limit(1)
+            .execute()
+        )
+        existing_rows = existing.data or []
+        existing_payload = (existing_rows[0].get("payload") or {}) if existing_rows else {}
+        merged_payload: Dict[str, Any] = {**existing_payload, **(extra_payload or {})}
         if post_url:
             merged_payload["post_url"] = post_url
         payload["payload"] = merged_payload
@@ -12972,20 +13491,27 @@ async def list_social_accounts(user_id: Annotated[str, Depends(get_user_id_heade
         }
         for row in rows
     ]
-    return {"accounts": accounts}
+    # Included here (rather than a separate call) so the Settings page can
+    # disable/annotate each network's "+ Connecter" button with how many
+    # more accounts of that platform the current plan still allows.
+    max_social_account = await _get_user_max_social_accounts(user_id)
+    return {"accounts": accounts, "max_social_account": max_social_account}
 
 
-@app.delete("/api/social/accounts/{platform}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
-async def disconnect_social_account(platform: str, user_id: Annotated[str, Depends(get_user_id_header)]):
-    key = (platform or "").strip().lower()
-    if key not in PLATFORM_CONFIG:
-        raise HTTPException(status_code=404, detail=_UNSUPPORTED_PLATFORM)
+@app.delete("/api/social/accounts/{account_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
+async def disconnect_social_account(account_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Disconnects one specific connected account (e.g. one Facebook Page
+    among several) -- scoped by id rather than platform now that a user can
+    have more than one account per platform (see _upsert_social_account)."""
+    account = await _get_social_account_by_id(user_id, account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Social account not found")
     client = await supabase_get_client()
     response = (
         await client.table(SUPABASE_SOCIAL_ACCOUNTS_TABLE)
         .delete()
+        .eq("id", account_id)
         .eq("user_id", user_id)
-        .eq("platform", key)
         .execute()
     )
     return {"deleted": bool(response.data)}
@@ -13141,7 +13667,7 @@ class SelectFacebookPageRequest(BaseModel):
     page_id: str
 
 
-@app.post("/api/auth/facebook/select-page", responses={400: {"description": "Bad Request"}, 404: {"description": "Not Found"}})
+@app.post("/api/auth/facebook/select-page", responses={400: {"description": "Bad Request"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def select_facebook_page(payload: SelectFacebookPageRequest):
     try:
         data = _page_selection_serializer.loads(payload.selection_token, max_age=_PAGE_SELECTION_TTL_SECONDS)
@@ -13301,7 +13827,7 @@ async def _finalize_oauth_callback_identity(key: str, state_data: dict, token_da
     return _oauth_popup_response(True, key)
 
 
-@app.get("/api/auth/{platform}/callback", responses={404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/auth/{platform}/callback", responses={403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def callback(platform: str, code: Optional[str] = None, state: str = "", error: Optional[str] = None):
     key = (platform or "").strip().lower()
 
@@ -14043,7 +14569,7 @@ async def poll_tiktok_status(
 
 async def publish_to_facebook_video(access_token: str, target_id: str, video_url: str, message: str, title: str, description: str):
     if not target_id:
-        raise HTTPException(status_code=400, detail="Connected Facebook target id is missing")
+        raise HTTPException(status_code=400, detail=_FACEBOOK_TARGET_ID_MISSING)
     if not access_token:
         raise HTTPException(status_code=401, detail=_FACEBOOK_TOKEN_EXPIRED_OR_MISSING)
 
@@ -14051,6 +14577,21 @@ async def publish_to_facebook_video(access_token: str, target_id: str, video_url
         response = await client.post(
             f"https://graph.facebook.com/v19.0/{target_id}/videos",
             data={"file_url": video_url, "description": message or description, "title": title, "access_token": access_token},
+        )
+    await _raise_for_status_or_502(response, "Facebook")
+    return {"id": response.json().get("id")}
+
+
+async def publish_to_facebook_photo(access_token: str, target_id: str, image_url: str, message: str) -> Dict[str, Any]:
+    if not target_id:
+        raise HTTPException(status_code=400, detail=_FACEBOOK_TARGET_ID_MISSING)
+    if not access_token:
+        raise HTTPException(status_code=401, detail=_FACEBOOK_TOKEN_EXPIRED_OR_MISSING)
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            f"https://graph.facebook.com/v19.0/{target_id}/photos",
+            data={"url": image_url, "caption": message, "access_token": access_token},
         )
     await _raise_for_status_or_502(response, "Facebook")
     return {"id": response.json().get("id")}
@@ -14066,7 +14607,7 @@ async def publish_to_facebook_text_with_background(
     moment any media is attached, so this only ever sends message +
     text_format_preset_id."""
     if not page_id:
-        raise HTTPException(status_code=400, detail="Connected Facebook target id is missing")
+        raise HTTPException(status_code=400, detail=_FACEBOOK_TARGET_ID_MISSING)
     if not access_token:
         raise HTTPException(status_code=401, detail=_FACEBOOK_TOKEN_EXPIRED_OR_MISSING)
 
@@ -14330,37 +14871,95 @@ async def publish_to_linkedin_video(access_token: str, owner_urn: str, video_url
     finally:
         _cleanup_temp_file(temp_path)
 
+
+async def _li_initialize_image_upload(access_token: str, owner_urn: str):
+    """Renvoie (image_urn, upload_url) -- LinkedIn's Images API uses a
+    single direct PUT rather than the video API's multi-part upload, since
+    images don't need chunking."""
+    init_payload = {"initializeUploadRequest": {"owner": owner_urn}}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        init_response = await client.post(
+            "https://api.linkedin.com/rest/images?action=initializeUpload",
+            headers=_linkedin_headers(access_token),
+            json=init_payload,
+        )
+    await _raise_for_status_or_502(init_response, "LinkedIn")
+
+    init_data = (init_response.json() or {}).get("value") or {}
+    image_urn = init_data.get("image")
+    upload_url = init_data.get("uploadUrl")
+    if not image_urn or not upload_url:
+        raise HTTPException(status_code=502, detail="LinkedIn initializeUpload response missing image urn or upload url")
+    return image_urn, upload_url
+
+
+async def publish_to_linkedin_image(access_token: str, owner_urn: str, image_url: str, commentary: str) -> Dict[str, Any]:
+    """
+    Publie une image sur LinkedIn via la Images API :
+    1. Téléchargement local de l'image (image_url) avec validation anti-SSRF.
+    2. initializeUpload -> URN image + URL d'upload.
+    3. Upload direct du fichier (PUT, pas de decoupage en parts comme la video).
+    4. Création du post via /rest/posts référençant l'URN image.
+    """
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    temp_path = os.path.join(UPLOAD_DIR, f"li_publish_{uuid.uuid4().hex}.img")
+    await _download_to_file(image_url, temp_path)
+
+    try:
+        image_urn, upload_url = await _li_initialize_image_upload(access_token, owner_urn)
+        async with aiofiles.open(temp_path, "rb") as file_handle:
+            image_bytes = await file_handle.read()
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            upload_response = await client.put(
+                upload_url, headers={"Content-Type": "application/octet-stream"}, content=image_bytes,
+            )
+        upload_response.raise_for_status()
+
+        post_result = await _create_linkedin_post(
+            token=access_token, owner_urn=owner_urn, commentary=commentary, media={"id": image_urn},
+        )
+        post_result["image_urn"] = image_urn
+        return post_result
+    finally:
+        _cleanup_temp_file(temp_path)
+
 # --------------------------------------------------------------------------
 # Fonction principale
 # --------------------------------------------------------------------------
-async def _publish_video_then_text_fallback(has_video: bool, video_publisher, text_publisher) -> Dict[str, Any]:
+async def _publish_media_then_text_fallback(has_media: bool, media_publisher, text_publisher, media_label: str = "video") -> Dict[str, Any]:
     """
-    Tente video_publisher() si has_video est vrai ; en cas d'échec (ou si
-    pas de vidéo du tout), retombe sur text_publisher(). Les clés
-    video_failed/video_error ne sont ajoutées que si une vidéo a été
-    tentée et a échoué — comportement identique à la version précédente.
+    Tente media_publisher() si has_media est vrai ; en cas d'échec (ou s'il
+    n'y a pas de média du tout), retombe sur text_publisher(). Les clés
+    <media_label>_failed/<media_label>_error ne sont ajoutées que si un
+    média a été tenté et a échoué. Shared by the video and photo paths
+    (Facebook/LinkedIn) since both fall back to a plain-text post the same
+    way on failure.
     """
-    if not has_video:
+    if not has_media:
         return await text_publisher()
     try:
-        return await video_publisher()
+        return await media_publisher()
     except Exception as e:
-        logger.warning("Video publish failed, falling back to text: %s", e, exc_info=True)
+        logger.warning("%s publish failed, falling back to text: %s", media_label.capitalize(), e, exc_info=True)
         result = await text_publisher()
-        result["video_failed"] = True
-        result["video_error"] = str(e)
+        result[f"{media_label}_failed"] = True
+        result[f"{media_label}_error"] = str(e)
         return result
 
 
 async def _publish_linkedin(account: Dict[str, Any], token: str, content, text_value: str) -> Dict[str, Any]:
     # LinkedIn has no native colored-background text post and, per product
-    # decision, must never substitute a rendered image for one either (same
-    # "stays text, no exceptions" principle as Facebook's own background
-    # posts -- see _publish_facebook): an anonymous story always publishes
-    # here as plain text, regardless of which Facebook-only background the
-    # user picked.
+    # decision, must never substitute a rendered image for one for that
+    # purpose either (same "stays text, no exceptions" principle as
+    # Facebook's own background posts -- see _publish_facebook): an
+    # anonymous story always publishes here as plain text, regardless of
+    # which Facebook-only background the user picked, because it never
+    # sets content.image_url. A real user-attached photo (from the "Faire
+    # une publication" composer) does set it, and is genuinely posted as
+    # an image below.
     _require_platform_user_id(account, "LinkedIn")
     owner_urn = f"urn:li:person:{account.get('platform_user_id')}"
+    image_url = getattr(content, "image_url", None)
 
     async def video_publisher():
         return await publish_to_linkedin_video(
@@ -14368,22 +14967,37 @@ async def _publish_linkedin(account: Dict[str, Any], token: str, content, text_v
             title=content.title or "Vireel", description=text_value,
         )
 
+    async def image_publisher():
+        return await publish_to_linkedin_image(
+            access_token=token, owner_urn=owner_urn, image_url=image_url, commentary=text_value,
+        )
+
     async def text_publisher():
         return await _create_linkedin_post(token=token, owner_urn=owner_urn, commentary=text_value)
 
-    return await _publish_video_then_text_fallback(bool(content.video_url), video_publisher, text_publisher)
+    if content.video_url:
+        return await _publish_media_then_text_fallback(True, video_publisher, text_publisher, media_label="video")
+    if image_url:
+        return await _publish_media_then_text_fallback(True, image_publisher, text_publisher, media_label="image")
+    return await text_publisher()
 
 
 async def _publish_facebook(account: Dict[str, Any], token: str, content, text_value: str) -> Dict[str, Any]:
     _require_platform_user_id(account, "Facebook")
     meta_preset_id = getattr(content, "facebook_text_format_preset_id", None)
     target_id = str(account.get("platform_user_id") or "")
+    image_url = getattr(content, "image_url", None)
 
     async def video_publisher():
         return await publish_to_facebook_video(
             access_token=token, target_id=target_id,
             video_url=content.video_url, message=text_value,
             title=content.title or "Vireel", description=content.description or text_value,
+        )
+
+    async def image_publisher():
+        return await publish_to_facebook_photo(
+            access_token=token, target_id=target_id, image_url=image_url, message=text_value,
         )
 
     async def text_publisher():
@@ -14401,14 +15015,20 @@ async def _publish_facebook(account: Dict[str, Any], token: str, content, text_v
         # confirmed against Publer (which uses this same mechanism):
         # Facebook truncates the post to ~130 chars inline with a "See
         # more" expander and keeps the colored background behind it, for
-        # text of any length. Never falls back to an image: the
-        # publication must stay text, per spec -- if Meta rejects the
-        # call outright, that failure is surfaced to the user as-is.
+        # text of any length. Never falls back to an image: an anonymous
+        # story's publication must stay text, per spec -- if Meta rejects
+        # the call outright, that failure is surfaced to the user as-is.
+        # (An anonymous story never sets content.image_url, so this branch
+        # and the real photo-post one below never compete.)
         return await publish_to_facebook_text_with_background(
             access_token=token, page_id=target_id, message=text_value, meta_preset_id=meta_preset_id,
         )
 
-    return await _publish_video_then_text_fallback(bool(content.video_url), video_publisher, text_publisher)
+    if content.video_url:
+        return await _publish_media_then_text_fallback(True, video_publisher, text_publisher, media_label="video")
+    if image_url:
+        return await _publish_media_then_text_fallback(True, image_publisher, text_publisher, media_label="image")
+    return await text_publisher()
 
 
 async def _publish_instagram_platform(account: Dict[str, Any], token: str, content, text_value: str) -> Dict[str, Any]:
@@ -14470,6 +15090,324 @@ _PLATFORM_HANDLERS = {
     "youtube": _publish_youtube_platform,
     "tiktok": _publish_tiktok_platform,
 }
+
+
+# --------------------------------------------------------------------------
+# Social insights (analytics) -- Facebook / Instagram / YouTube only.
+#
+# LinkedIn and TikTok have no analytics scope requested (see PLATFORM_CONFIG)
+# since their real analytics APIs require a separate platform partner
+# approval process -- _get_social_insights_for_account reports them as
+# unsupported rather than silently returning empty data.
+# --------------------------------------------------------------------------
+
+_SOCIAL_INSIGHTS_METRIC_KEYS = (
+    "followers", "impressions", "reach", "engagement", "profile_views", "views",
+    "watch_time_minutes", "subscribers_gained", "subscribers_lost", "likes", "comments",
+)
+
+
+def _empty_social_insights_metrics() -> Dict[str, Optional[int]]:
+    return dict.fromkeys(_SOCIAL_INSIGHTS_METRIC_KEYS)
+
+
+def _latest_facebook_fans_value(value_entries: List[Dict[str, Any]], last_day: Optional[str], last_value: Any) -> Tuple[Optional[str], Any]:
+    # page_fans is a running total, not a daily delta -- track the last day only.
+    for value_entry in value_entries:
+        day = (value_entry.get("end_time") or "")[:10]
+        if not day:
+            continue
+        if last_day is None or day >= last_day:
+            last_day = day
+            last_value = value_entry.get("value") or 0
+    return last_day, last_value
+
+
+def _accumulate_facebook_daily_metric(daily_by_date: Dict[str, Dict[str, Any]], name: Optional[str], value_entry: Dict[str, Any]) -> Tuple[int, int]:
+    day = (value_entry.get("end_time") or "")[:10]
+    value = int(value_entry.get("value") or 0)
+    if not day:
+        return 0, 0
+    bucket = daily_by_date.setdefault(day, {"date": day})
+    if name == "page_impressions":
+        bucket["impressions"] = bucket.get("impressions", 0) + value
+        return value, 0
+    if name in ("page_engaged_users", "page_post_engagements"):
+        bucket["engagement"] = bucket.get("engagement", 0) + value
+        return 0, value
+    return 0, 0
+
+
+def _parse_facebook_insights_metrics(metric_entries: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], int, int, Optional[int]]:
+    daily_by_date: Dict[str, Dict[str, Any]] = {}
+    total_impressions = 0
+    total_engagement = 0
+    last_fans_day = None
+    last_fans_value = None
+
+    for metric_entry in metric_entries:
+        name = metric_entry.get("name")
+        value_entries = metric_entry.get("values") or []
+        if name == "page_fans":
+            last_fans_day, last_fans_value = _latest_facebook_fans_value(value_entries, last_fans_day, last_fans_value)
+            continue
+        for value_entry in value_entries:
+            impressions_delta, engagement_delta = _accumulate_facebook_daily_metric(daily_by_date, name, value_entry)
+            total_impressions += impressions_delta
+            total_engagement += engagement_delta
+
+    followers = int(last_fans_value) if last_fans_value is not None else None
+    return daily_by_date, total_impressions, total_engagement, followers
+
+
+async def _fetch_facebook_page_insights(access_token: str, page_id: str, since_iso: str, until_iso: str) -> Dict[str, Any]:
+    since_unix = int(datetime.fromisoformat(since_iso).timestamp())
+    until_unix = int(datetime.fromisoformat(until_iso).timestamp())
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            f"https://graph.facebook.com/v19.0/{page_id}/insights",
+            params={
+                "metric": "page_impressions,page_engaged_users,page_post_engagements,page_fans",
+                "period": "day",
+                "since": since_unix,
+                "until": until_unix,
+                "access_token": access_token,
+            },
+        )
+    await _raise_for_status_or_502(response, "Facebook")
+
+    daily_by_date, total_impressions, total_engagement, followers = _parse_facebook_insights_metrics(
+        response.json().get("data") or []
+    )
+
+    metrics = _empty_social_insights_metrics()
+    metrics["followers"] = followers
+    metrics["impressions"] = total_impressions
+    metrics["engagement"] = total_engagement
+
+    daily = [daily_by_date[day] for day in sorted(daily_by_date)]
+    return {"metrics": metrics, "daily": daily}
+
+
+def _parse_instagram_insights_metrics(metric_entries: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
+    daily_by_date: Dict[str, Dict[str, Any]] = {}
+    total_reach = 0
+    total_engagement = 0
+    for metric_entry in metric_entries:
+        name = metric_entry.get("name")
+        for value_entry in (metric_entry.get("values") or []):
+            end_time = value_entry.get("end_time") or ""
+            day = end_time[:10]
+            value = value_entry.get("value") or 0
+            if not day:
+                continue
+            bucket = daily_by_date.setdefault(day, {"date": day})
+            if name == "reach":
+                bucket["reach"] = bucket.get("reach", 0) + int(value)
+                total_reach += int(value)
+            elif name == "profile_views":
+                bucket["profile_views"] = bucket.get("profile_views", 0) + int(value)
+            elif name == "website_clicks":
+                bucket["engagement"] = bucket.get("engagement", 0) + int(value)
+                total_engagement += int(value)
+    return daily_by_date, total_reach, total_engagement
+
+
+async def _fetch_instagram_reach_insights(
+    access_token: str, ig_user_id: str, since_unix: int, until_unix: int,
+) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
+    """Best-effort: returns ({}, 0, 0) on any failure except an actual
+    token/permission error, which is re-raised so the caller can
+    distinguish it from a partial-data failure (see
+    _get_social_insights_for_account)."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"https://graph.facebook.com/v19.0/{ig_user_id}/insights",
+                params={
+                    "metric": "reach,profile_views,website_clicks",
+                    "period": "day",
+                    "since": since_unix,
+                    "until": until_unix,
+                    "access_token": access_token,
+                },
+            )
+        if response.status_code in (401, 403):
+            await _raise_for_status_or_502(response, "Instagram")
+        response.raise_for_status()
+        return _parse_instagram_insights_metrics(response.json().get("data") or [])
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Failed to fetch Instagram insights for %s: %s", ig_user_id, exc)
+        return {}, 0, 0
+
+
+async def _fetch_instagram_followers_count(access_token: str, ig_user_id: str) -> Optional[int]:
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"https://graph.facebook.com/v19.0/{ig_user_id}",
+                params={"fields": "followers_count,media_count", "access_token": access_token},
+            )
+        if response.status_code in (401, 403):
+            await _raise_for_status_or_502(response, "Instagram")
+        response.raise_for_status()
+        followers_count = response.json().get("followers_count")
+        return int(followers_count) if followers_count is not None else None
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Failed to fetch Instagram profile for %s: %s", ig_user_id, exc)
+        return None
+
+
+async def _fetch_instagram_insights(access_token: str, ig_user_id: str, since_iso: str, until_iso: str) -> Dict[str, Any]:
+    since_unix = int(datetime.fromisoformat(since_iso).timestamp())
+    until_unix = int(datetime.fromisoformat(until_iso).timestamp())
+
+    metrics = _empty_social_insights_metrics()
+    daily_by_date, total_reach, total_engagement = await _fetch_instagram_reach_insights(
+        access_token, ig_user_id, since_unix, until_unix,
+    )
+    metrics["reach"] = total_reach
+    metrics["engagement"] = total_engagement
+    metrics["followers"] = await _fetch_instagram_followers_count(access_token, ig_user_id)
+
+    daily = [daily_by_date[day] for day in sorted(daily_by_date)]
+    return {"metrics": metrics, "daily": daily}
+
+
+_YOUTUBE_COLUMN_TO_METRIC_KEY = {
+    "views": "views",
+    "estimatedMinutesWatched": "watch_time_minutes",
+    "subscribersGained": "subscribers_gained",
+    "subscribersLost": "subscribers_lost",
+    "likes": "likes",
+    "comments": "comments",
+}
+
+
+def _parse_youtube_analytics_report(body: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    headers = [header.get("name") for header in (body.get("columnHeaders") or [])]
+    column_index = {name: idx for idx, name in enumerate(headers)}
+
+    daily: List[Dict[str, Any]] = []
+    totals = dict.fromkeys(_YOUTUBE_COLUMN_TO_METRIC_KEY.values(), 0)
+
+    for row in (body.get("rows") or []):
+        day_idx = column_index.get("day")
+        entry: Dict[str, Any] = {"date": row[day_idx] if day_idx is not None else None}
+        for column_name, metric_key in _YOUTUBE_COLUMN_TO_METRIC_KEY.items():
+            idx = column_index.get(column_name)
+            if idx is None:
+                continue
+            value = int(row[idx] or 0)
+            entry[metric_key] = value
+            totals[metric_key] += value
+        daily.append(entry)
+
+    return daily, totals
+
+
+async def _fetch_youtube_subscriber_count(access_token: str) -> Optional[int]:
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                "https://www.googleapis.com/youtube/v3/channels",
+                params={"part": "statistics", "mine": "true", "access_token": access_token},
+            )
+        response.raise_for_status()
+        items = response.json().get("items") or []
+        if not items:
+            return None
+        subscriber_count = items[0].get("statistics", {}).get("subscriberCount")
+        return int(subscriber_count) if subscriber_count is not None else None
+    except Exception as exc:
+        logger.warning("Failed to fetch YouTube subscriber count: %s", exc)
+        return None
+
+
+async def _fetch_youtube_analytics(access_token: str, since_date: str, until_date: str) -> Dict[str, Any]:
+    since_date = since_date[:10]
+    until_date = until_date[:10]
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            "https://youtubeanalytics.googleapis.com/v2/reports",
+            params={
+                "ids": "channel==MINE",
+                "startDate": since_date,
+                "endDate": until_date,
+                "metrics": "views,estimatedMinutesWatched,subscribersGained,subscribersLost,likes,comments",
+                "dimensions": "day",
+                "sort": "day",
+                "access_token": access_token,
+            },
+        )
+    await _raise_for_status_or_502(response, "YouTube")
+
+    daily, totals = _parse_youtube_analytics_report(response.json())
+
+    metrics = _empty_social_insights_metrics()
+    metrics.update(totals)
+    metrics["followers"] = await _fetch_youtube_subscriber_count(access_token)
+
+    return {"metrics": metrics, "daily": daily}
+
+
+async def _get_social_insights_for_account(account: Dict[str, Any], since_iso: str, until_iso: str) -> Dict[str, Any]:
+    platform = str(account.get("platform") or "")
+    if platform not in {"facebook", "instagram", "youtube"}:
+        return {
+            "supported": False,
+            "reason": f"{platform.capitalize()} analytics require special platform partner access not yet available.",
+            "metrics": None,
+            "daily": [],
+        }
+
+    try:
+        token = await get_valid_token(account)
+        if platform == "facebook":
+            target_id = str(account.get("platform_user_id") or "")
+            result = await _fetch_facebook_page_insights(token, target_id, since_iso, until_iso)
+        elif platform == "instagram":
+            target_id = str(account.get("platform_user_id") or "")
+            result = await _fetch_instagram_insights(token, target_id, since_iso, until_iso)
+        else:  # youtube
+            result = await _fetch_youtube_analytics(token, since_iso, until_iso)
+        return {"supported": True, "error": None, **result}
+    except Exception as exc:
+        logger.warning("Failed to fetch %s insights for account %s: %s", platform, account.get("id"), exc)
+        return {"supported": True, "error": str(exc), "metrics": None, "daily": []}
+
+
+@app.get("/api/social/insights", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def get_social_insights(
+    account_id: Annotated[str, Query()],
+    user_id: Annotated[str, Depends(get_user_id_header)],
+    range: Annotated[str, Query()] = "30d",
+):
+    await _assert_user_can_access_analytics(user_id)
+    if range not in {"7d", "30d", "90d"}:
+        raise HTTPException(status_code=400, detail="range must be one of: 7d, 30d, 90d")
+    account = await _get_social_account_by_id(user_id, account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Social account not found")
+
+    days = {"7d": 7, "30d": 30, "90d": 90}[range]
+    until = _utcnow()
+    since = until - timedelta(days=days)
+    result = await _get_social_insights_for_account(account, since.isoformat(), until.isoformat())
+
+    return {
+        "account_id": account_id,
+        "platform": account.get("platform"),
+        "platform_account_name": account.get("platform_account_name"),
+        "range": range,
+        **result,
+    }
 
 
 def _build_social_post_url(platform: str, platform_result: Dict[str, Any]) -> Optional[str]:

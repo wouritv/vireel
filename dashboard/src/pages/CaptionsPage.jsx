@@ -7,7 +7,6 @@ import { useNavigate } from "react-router-dom";
 import ResultCard from "../components/ResultCard";
 import SharePostModal from "../components/SharePostModal";
 import MobileFilterDropdown from "../components/MobileFilterDropdown";
-import { getConnectedPlatforms } from "../lib/platforms";
 import { useTranslation } from "../state/LanguageContext";
 import { statusClass, statusLabel } from "../lib/status";
 import { getAuthHeaders } from "../lib/apiAuth";
@@ -31,10 +30,9 @@ function toResultCardClipFromCaption(item, mediaUrl) {
 
 export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) {
     const { user } = useAuth();
-    const { credits, defaultCosts } = useUserCredits();
+    const { credits, hasActiveSubscription } = useUserCredits();
     const { t } = useTranslation();
     const navigate = useNavigate();
-    const connectedPlatforms = getConnectedPlatforms();
 
     const [items, setItems] = useState([]);
     const [loading, setLoading] = useState(true);
@@ -58,21 +56,16 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
     const [shareModalItem, setShareModalItem] = useState(null);
     const [shareTitle, setShareTitle] = useState("");
     const [shareDescription, setShareDescription] = useState("");
-    const [sharePlatforms, setSharePlatforms] = useState({
-        tiktok: true,
-        instagram: true,
-        youtube: true,
-        facebook: false,
-        linkedin: false,
-    });
+    // Keyed by account id (not platform) -- SharePostModal fetches the
+    // user's real connected accounts and lets them pick specific ones.
+    const [sharePlatforms, setSharePlatforms] = useState({});
     const [shareScheduling, setShareScheduling] = useState(false);
     const [shareScheduleDate, setShareScheduleDate] = useState("");
     const [hideSocialPlatforms, setHideSocialPlatforms] = useState(getDefaultHideSocialPlatforms());
     const [projectMeta, setProjectMeta] = useState(null);
     const [didAutoOpen, setDidAutoOpen] = useState(false);
 
-    const publicationCostEstimate = Number(defaultCosts?.publication || 1);
-    const canShareCaption = credits >= publicationCostEstimate;
+    const canShareCaption = hasActiveSubscription === true;
     const canCreateCaption = Number(credits || 0) > 0;
     const statusOptions = [
         { value: "", label: t("reels.allStatuses", "All statuses") },
@@ -280,18 +273,10 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
 
     const handleShare = (item) => {
         if (!canShareCaption) {
-            setShareResult({ success: false, msg: t("reels.shareDisabledInsufficient", "Insufficient credits. Sharing is disabled.") });
+            setShareResult({ success: false, msg: t("reels.shareDisabledNoSubscription", "Un abonnement actif est requis pour publier.") });
             return;
         }
-        const fallbackPlatforms = ["tiktok", "instagram", "youtube"];
-        const nextDefaultPlatforms = connectedPlatforms.length > 0 ? connectedPlatforms : fallbackPlatforms;
-        setSharePlatforms({
-            tiktok: nextDefaultPlatforms.includes("tiktok"),
-            instagram: nextDefaultPlatforms.includes("instagram"),
-            youtube: nextDefaultPlatforms.includes("youtube"),
-            facebook: nextDefaultPlatforms.includes("facebook"),
-            linkedin: nextDefaultPlatforms.includes("linkedin"),
-        });
+        setSharePlatforms({});
         setShareTitle(item?.caption_title || t("reels.defaultShareTitle", "Viral Short"));
         setShareDescription(item?.caption_description || "");
         setShareScheduling(false);
@@ -303,12 +288,12 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
     const submitShare = async () => {
         if (!user?.id || !shareModalItem?.id) return;
         if (!canShareCaption) {
-            setShareResult({ success: false, msg: t("reels.shareDisabledInsufficient", "Insufficient credits. Sharing is disabled.") });
+            setShareResult({ success: false, msg: t("reels.shareDisabledNoSubscription", "Un abonnement actif est requis pour publier.") });
             return;
         }
 
-        const selectedPlatforms = Object.keys(sharePlatforms).filter((key) => Boolean(sharePlatforms[key]));
-        if (selectedPlatforms.length === 0) {
+        const selectedAccountIds = Object.keys(sharePlatforms).filter((key) => Boolean(sharePlatforms[key]));
+        if (selectedAccountIds.length === 0) {
             setShareResult({ success: false, msg: t("reels.selectAtLeastOnePlatform", "Select at least one platform.") });
             return;
         }
@@ -321,7 +306,7 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
         setShareResult(null);
         try {
             const payload = {
-                platforms: selectedPlatforms,
+                account_ids: selectedAccountIds,
                 title: shareTitle || undefined,
                 description: shareDescription || undefined,
             };
@@ -397,14 +382,10 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
                             navigate("/dashboard/captions/new");
                         }}
                         disabled={!canCreateCaption}
-                        className="flex items-center gap-2 p-3 bg-white/5 hover:bg-white/10 rounded-xl transition-colors group disabled:opacity-40 disabled:cursor-not-allowed"
+                        className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-sm font-bold shadow-lg shadow-blue-500/20 hover:from-blue-500 hover:to-indigo-500 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                     >
-                        <div className="w-8 h-8 rounded-full bg-primary/20 text-primary flex items-center justify-center shrink-0">
-                            <Plus size={16} />
-                        </div>
-                        <div className="hidden lg:block overflow-hidden">
-                            <p className="text-sm font-bold text-white leading-none mb-0.5">{t("app.newOperation", "New operation")}</p>
-                        </div>
+                        <Plus size={16} />
+                        {t("app.newOperation", "Nouveau projet")}
                     </button>
                 )}
             </div>
@@ -678,9 +659,8 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
                     onSchedulingChange={setShareScheduling}
                     scheduleDate={shareScheduleDate}
                     onScheduleDateChange={setShareScheduleDate}
-                    platforms={sharePlatforms}
-                    onPlatformChange={(platform, checked) => setSharePlatforms((prev) => ({ ...prev, [platform]: checked }))}
-                    connectedPlatforms={connectedPlatforms}
+                    selectedAccountIds={sharePlatforms}
+                    onAccountToggle={(accountId, checked) => setSharePlatforms((prev) => ({ ...prev, [accountId]: checked }))}
                     isSubmitting={Boolean(shareModalItem && sharingId === shareModalItem.id)}
                     result={shareResult}
                     onSubmit={submitShare}

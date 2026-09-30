@@ -126,6 +126,20 @@ async def list_reels(
 	return response.data, response.count or 0
 
 
+async def list_reel_dates_since(user_id: str, since_iso: Optional[str]) -> List[str]:
+	client = await get_client()
+	q = (
+		client.table(SUPABASE_REELS_TABLE)
+		.select("reel_created_at")
+		.eq("reel_user_id", user_id)
+		.is_("deleted_at", "null")
+	)
+	if since_iso:
+		q = q.gte("reel_created_at", since_iso)
+	response = await q.execute()
+	return [row["reel_created_at"] for row in (response.data or []) if row.get("reel_created_at")]
+
+
 async def get_reel(reel_id: str, user_id: str) -> Optional[Dict[str, Any]]:
 	client = await get_client()
 	response = (
@@ -586,6 +600,20 @@ async def list_captions(
 
 	response = await q.execute()
 	return response.data or [], response.count or 0
+
+
+async def list_caption_dates_since(user_id: str, since_iso: Optional[str]) -> List[str]:
+	client = await get_client()
+	q = (
+		client.table(SUPABASE_CAPTIONS_TABLE)
+		.select("caption_created_at")
+		.eq("caption_user_id", user_id)
+		.is_("deleted_at", "null")
+	)
+	if since_iso:
+		q = q.gte("caption_created_at", since_iso)
+	response = await q.execute()
+	return [row["caption_created_at"] for row in (response.data or []) if row.get("caption_created_at")]
 
 
 async def get_caption(caption_id: str, user_id: str) -> Optional[Dict[str, Any]]:
@@ -1824,6 +1852,20 @@ async def list_anonymous_stories(
 	return response.data or [], response.count or 0
 
 
+async def list_anonymous_story_dates_since(user_id: str, since_iso: Optional[str]) -> List[str]:
+	client = await get_client()
+	q = (
+		client.table(SUPABASE_ANONYMOUS_STORIES_TABLE)
+		.select("created_at")
+		.eq("user_id", user_id)
+		.is_("deleted_at", "null")
+	)
+	if since_iso:
+		q = q.gte("created_at", since_iso)
+	response = await q.execute()
+	return [row["created_at"] for row in (response.data or []) if row.get("created_at")]
+
+
 async def get_anonymous_story(story_id: str, user_id: str) -> Optional[Dict[str, Any]]:
 	if not story_id or not user_id:
 		return None
@@ -1933,6 +1975,20 @@ async def list_film_summaries(
 
 	response = await q.execute()
 	return response.data or [], response.count or 0
+
+
+async def list_film_summary_dates_since(user_id: str, since_iso: Optional[str]) -> List[str]:
+	client = await get_client()
+	q = (
+		client.table(SUPABASE_FILM_SUMMARIES_TABLE)
+		.select("created_at")
+		.eq("user_id", user_id)
+		.is_("deleted_at", "null")
+	)
+	if since_iso:
+		q = q.gte("created_at", since_iso)
+	response = await q.execute()
+	return [row["created_at"] for row in (response.data or []) if row.get("created_at")]
 
 
 async def get_film_summary(film_summary_id: str, user_id: str) -> Optional[Dict[str, Any]]:

@@ -2376,26 +2376,15 @@ def test_reset_caption_style_history_falls_back_without_default_version(monkeypa
     insert_mock.assert_not_awaited()
 
 
-def test_resolve_anonymous_story_platforms_filters_to_facebook_and_linkedin(monkeypatch):
-    # Anonymous stories may only be published to Facebook/LinkedIn (the
-    # user's explicit ask), unlike reels/captions' full platform list --
-    # this pins that tiktok/instagram/youtube are silently dropped rather
-    # than rejected outright, and that duplicates are deduped.
+def test_resolve_accounts_for_publish_rejects_instagram_for_anonymous_story_set(monkeypatch):
+    # Anonymous stories may only be published to Facebook/LinkedIn accounts
+    # (the user's explicit ask), unlike reels/captions' full platform list.
     app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "acct-1", "platform": "instagram"}))
 
-    assert app._resolve_anonymous_story_platforms(["facebook", "linkedin"]) == ["facebook", "linkedin"]
-    assert app._resolve_anonymous_story_platforms(["LinkedIn", "tiktok", "linkedin"]) == ["linkedin"]
-
-    with pytest.raises(app.HTTPException):
-        app._resolve_anonymous_story_platforms(["instagram", "youtube"])
-
-
-def test_resolve_anonymous_story_platforms_rejects_when_none_selected(monkeypatch):
-    app = _import_app_with_stubs(monkeypatch)
-
+    coro = app._resolve_accounts_for_publish("u1", ["acct-1"], app._SOCIAL_POST_PLATFORMS)
     with pytest.raises(app.HTTPException) as exc:
-        app._resolve_anonymous_story_platforms([])
-
+        asyncio.run(coro)
     assert exc.value.status_code == 400
 
 
@@ -2456,11 +2445,12 @@ def test_publish_request_supports_image_url(monkeypatch):
     assert default_payload.image_url is None
 
 
-def test_publish_facebook_ignores_image_url_and_posts_plain_text(monkeypatch):
-    # Spec correction: an anonymous-story publish must NEVER become an
-    # image post on Facebook, in any case. Without a mapped
-    # facebook_text_format_preset_id, Facebook publishes the story as an
-    # ordinary plain-text post.
+def test_publish_facebook_posts_photo_when_image_url_set(monkeypatch):
+    # A real user-attached photo (from the "Faire une publication" composer)
+    # publishes as an actual Facebook photo post. Anonymous stories never
+    # set content.image_url (they use facebook_text_format_preset_id
+    # instead -- see test_publish_facebook_uses_native_background_when_preset_mapped),
+    # so this never collides with the "a story must stay text" rule.
     app = _import_app_with_stubs(monkeypatch)
 
     captured = {}
@@ -2484,13 +2474,48 @@ def test_publish_facebook_ignores_image_url_and_posts_plain_text(monkeypatch):
     monkeypatch.setattr(app.httpx, "AsyncClient", _FakeAsyncClient)
 
     account = {"platform_user_id": "page-1"}
-    content = app.PublishRequest(user_id="u1", text="hello", image_url="https://example.com/bg.png")
+    content = app.PublishRequest(user_id="u1", text="hello", image_url="https://example.com/photo.png")
 
     result = asyncio.run(app._publish_facebook(account, "token-1", content, "hello"))
 
     assert result == {"id": "111_222"}
+    assert captured["url"] == "https://graph.facebook.com/v19.0/page-1/photos"
+    assert captured["data"] == {"url": "https://example.com/photo.png", "caption": "hello", "access_token": "token-1"}
+
+
+def test_publish_facebook_falls_back_to_text_when_photo_fails(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "publish_to_facebook_photo", AsyncMock(side_effect=RuntimeError("rate limited")))
+
+    captured = {}
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, data=None):
+            captured["url"] = url
+            captured["data"] = data
+            request = app.httpx.Request("POST", url)
+            return app.httpx.Response(200, json={"id": "111_222"}, request=request)
+
+    monkeypatch.setattr(app.httpx, "AsyncClient", _FakeAsyncClient)
+
+    account = {"platform_user_id": "page-1"}
+    content = app.PublishRequest(user_id="u1", text="hello", image_url="https://example.com/photo.png")
+
+    result = asyncio.run(app._publish_facebook(account, "token-1", content, "hello"))
+
+    assert result["id"] == "111_222"
+    assert result["image_failed"] is True
+    assert "rate limited" in result["image_error"]
     assert captured["url"] == "https://graph.facebook.com/page-1/feed"
-    assert captured["data"] == {"message": "hello", "access_token": "token-1"}
 
 
 def test_publish_facebook_uses_native_background_when_preset_mapped(monkeypatch):
@@ -2592,12 +2617,36 @@ def test_get_facebook_text_format_preset_id_maps_known_presets(monkeypatch):
     assert app.anonymous_stories.get_facebook_text_format_preset_id("does-not-exist") is None
 
 
-def test_publish_linkedin_ignores_image_url_and_posts_plain_text(monkeypatch):
-    # Same "stays text, no exceptions" principle as Facebook's own
-    # background posts: LinkedIn has no native colored-background feature
-    # and must never substitute a rendered image for one, regardless of
-    # what image_url (or background_id) was resolved upstream.
+def test_publish_linkedin_posts_photo_when_image_url_set(monkeypatch):
+    # A real user-attached photo (from the "Faire une publication" composer)
+    # publishes as an actual LinkedIn image post. Anonymous stories never
+    # set content.image_url, so this never collides with LinkedIn having no
+    # native colored-background substitute.
     app = _import_app_with_stubs(monkeypatch)
+
+    image_calls = []
+
+    async def fake_publish_to_linkedin_image(**kwargs):
+        image_calls.append(kwargs)
+        return {"id": "urn:li:share:999"}
+
+    monkeypatch.setattr(app, "publish_to_linkedin_image", fake_publish_to_linkedin_image)
+
+    account = {"platform_user_id": "person-1"}
+    content = app.PublishRequest(user_id="u1", text="hello", image_url="https://example.com/photo.png")
+
+    result = asyncio.run(app._publish_linkedin(account, "token-1", content, "hello"))
+
+    assert result == {"id": "urn:li:share:999"}
+    assert image_calls == [{
+        "access_token": "token-1", "owner_urn": "urn:li:person:person-1",
+        "image_url": "https://example.com/photo.png", "commentary": "hello",
+    }]
+
+
+def test_publish_linkedin_falls_back_to_text_when_photo_fails(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "publish_to_linkedin_image", AsyncMock(side_effect=RuntimeError("rate limited")))
 
     calls = []
 
@@ -2608,11 +2657,13 @@ def test_publish_linkedin_ignores_image_url_and_posts_plain_text(monkeypatch):
     monkeypatch.setattr(app, "_create_linkedin_post", fake_create_linkedin_post)
 
     account = {"platform_user_id": "person-1"}
-    content = app.PublishRequest(user_id="u1", text="hello", image_url="https://example.com/bg.png")
+    content = app.PublishRequest(user_id="u1", text="hello", image_url="https://example.com/photo.png")
 
     result = asyncio.run(app._publish_linkedin(account, "token-1", content, "hello"))
 
-    assert result == {"id": "urn:li:share:999"}
+    assert result["id"] == "urn:li:share:999"
+    assert result["image_failed"] is True
+    assert "rate limited" in result["image_error"]
     assert calls == [{"token": "token-1", "owner_urn": "urn:li:person:person-1", "commentary": "hello"}]
 
 
@@ -2686,13 +2737,9 @@ def test_execute_scheduled_publish_job_anonymous_story_skips_media_url_requireme
         published_payloads.append(content)
         return {"id": "111_222"}
 
-    async def fake_debit_scheduled_publish_credits(user_id, task_payload, job_id):
-        return None
-
     monkeypatch.setattr(app, "_update_publish_job_status", fake_update_publish_job_status)
     monkeypatch.setattr(app, "_get_social_account", fake_get_social_account)
     monkeypatch.setattr(app, "publish_post", fake_publish_post)
-    monkeypatch.setattr(app, "_debit_scheduled_publish_credits", fake_debit_scheduled_publish_credits)
 
     asyncio.run(app._execute_scheduled_publish_job(job_row))
 
@@ -2775,51 +2822,56 @@ def test_resolve_anonymous_story_schedule_no_date_is_immediate(monkeypatch):
     assert is_scheduled is False
 
 
-def test_dispatch_anonymous_story_publish_immediate_calls_publish_now_per_platform(monkeypatch):
+def test_dispatch_anonymous_story_publish_immediate_calls_publish_now_per_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
 
     calls = []
 
-    async def fake_publish_anonymous_story_now(user_id, platform_name, publish_priority, text_value, background_id=None):
-        calls.append((platform_name, background_id))
-        return {"success": platform_name == "facebook"}
+    async def fake_publish_anonymous_story_now(user_id, account, publish_priority, text_value, background_id=None):
+        calls.append((account["platform"], background_id))
+        return {"success": account["platform"] == "facebook"}
 
     monkeypatch.setattr(app, "_publish_anonymous_story_now", fake_publish_anonymous_story_now)
 
+    accounts = [
+        {"id": "fb-acct", "platform": "facebook"},
+        {"id": "li-acct", "platform": "linkedin"},
+    ]
     results = asyncio.run(app._dispatch_anonymous_story_publish(
         "user-1", "story-1", "Une histoire", "texte", "sunset",
-        ["facebook", "linkedin"], 5, None, "UTC", False,
+        accounts, 5, None, "UTC", False,
     ))
 
     assert calls == [
         ("facebook", "sunset"),
         ("linkedin", "sunset"),
     ]
-    assert results == {"facebook": {"success": True}, "linkedin": {"success": False}}
+    assert results == {"fb-acct": {"success": True}, "li-acct": {"success": False}}
 
 
-def test_dispatch_anonymous_story_publish_scheduled_schedules_each_platform(monkeypatch):
+def test_dispatch_anonymous_story_publish_scheduled_schedules_each_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
 
     calls = []
 
     async def fake_schedule_share_publish_job(
-        user_id, platform_name, source_type, source_id, publish_priority,
+        user_id, account, source_type, source_id, publish_priority,
         scheduled_for, timezone, final_title, final_description, media_url, background_id=None,
     ):
-        calls.append((platform_name, source_type, source_id, final_title, background_id))
+        calls.append((account["platform"], source_type, source_id, final_title, background_id))
         return {"success": True, "scheduled": True}
 
     monkeypatch.setattr(app, "_schedule_share_publish_job", fake_schedule_share_publish_job)
 
     scheduled_for = app._utcnow() + app.timedelta(days=1)
+    accounts = [{"id": "fb-acct", "platform": "facebook"}]
     results = asyncio.run(app._dispatch_anonymous_story_publish(
         "user-1", "story-1", "Une histoire", "texte", "sunset",
-        ["facebook"], 5, scheduled_for, "UTC", True,
+        accounts, 5, scheduled_for, "UTC", True,
     ))
 
     assert calls == [("facebook", "anonymous_story", "story-1", "Une histoire", "sunset")]
-    assert results == {"facebook": {"success": True, "scheduled": True}}
+    assert results == {"fb-acct": {"success": True, "scheduled": True}}
 
 
 def test_publish_linkedin_posts_full_text_even_when_long(monkeypatch):
@@ -3532,13 +3584,13 @@ def test_render_pipeline_reports_incremental_progress_per_segment(monkeypatch, t
 
 def test_share_film_summary_rejects_when_not_completed(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
     app.supabase_get_film_summary = AsyncMock(return_value={"id": "fs-1", "status": "awaiting_review"})
 
     with TestClient(app.app) as client:
         resp = client.post(
             "/api/film-summaries/fs-1/share",
-            json={"platforms": ["facebook"]},
+            json={"account_ids": ["acct-1"]},
             headers=_auth_headers("u1"),
         )
     assert resp.status_code == 400
@@ -3546,12 +3598,12 @@ def test_share_film_summary_rejects_when_not_completed(monkeypatch):
 
 def test_share_film_summary_publishes_immediately(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
     app.supabase_get_film_summary = AsyncMock(return_value={
         "id": "fs-1", "status": "completed", "title": "Mon film", "final_s3_key": "final/fs-1.mp4",
     })
     monkeypatch.setattr(app, "generate_presigned_url", lambda bucket, key, expiration=3600: "https://s3.example/final/fs-1.mp4")
-    app._get_social_account = AsyncMock(return_value={"id": "acct-1", "platform_user_id": "page-1"})
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "acct-1", "platform": "facebook", "platform_user_id": "page-1"}))
     app._insert_publish_job = AsyncMock(return_value="pub-1")
     app._update_publish_job_status = AsyncMock()
     published_payloads = []
@@ -3561,19 +3613,18 @@ def test_share_film_summary_publishes_immediately(monkeypatch):
         return {"id": "post-123"}
 
     monkeypatch.setattr(app, "publish_post", fake_publish_post)
-    app._debit_publish_credits_after_share = AsyncMock()
 
     with TestClient(app.app) as client:
         resp = client.post(
             "/api/film-summaries/fs-1/share",
-            json={"platforms": ["facebook"], "description": "Regardez ce resume !"},
+            json={"account_ids": ["acct-1"], "description": "Regardez ce resume !"},
             headers=_auth_headers("u1"),
         )
 
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["success"] is True
-    assert payload["results"]["facebook"]["success"] is True
+    assert payload["results"]["acct-1"]["success"] is True
     assert len(published_payloads) == 1
     assert published_payloads[0].video_url == "https://s3.example/final/fs-1.mp4"
     assert published_payloads[0].description == "Regardez ce resume !"
@@ -3581,11 +3632,12 @@ def test_share_film_summary_publishes_immediately(monkeypatch):
 
 def test_share_film_summary_schedules_future_post(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
     app.supabase_get_film_summary = AsyncMock(return_value={
         "id": "fs-1", "status": "completed", "title": "Mon film", "final_s3_key": "final/fs-1.mp4",
     })
     monkeypatch.setattr(app, "generate_presigned_url", lambda bucket, key, expiration=3600: "https://s3.example/final/fs-1.mp4")
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "yt-acct", "platform": "youtube"}))
     schedule_mock = AsyncMock(return_value={"success": True, "scheduled": True, "publish_job_id": "pub-1"})
     app._schedule_share_publish_job = schedule_mock
 
@@ -3593,15 +3645,104 @@ def test_share_film_summary_schedules_future_post(monkeypatch):
     with TestClient(app.app) as client:
         resp = client.post(
             "/api/film-summaries/fs-1/share",
-            json={"platforms": ["youtube"], "scheduled_date": future_date, "timezone": "UTC"},
+            json={"account_ids": ["yt-acct"], "scheduled_date": future_date, "timezone": "UTC"},
             headers=_auth_headers("u1"),
         )
 
     assert resp.status_code == 200
-    assert resp.json()["results"]["youtube"]["scheduled"] is True
+    assert resp.json()["results"]["yt-acct"]["scheduled"] is True
     schedule_mock.assert_awaited_once()
     assert schedule_mock.await_args.args[2] == "film_summary"
     assert schedule_mock.await_args.args[3] == "fs-1"
+
+
+def test_share_reel_publishes_to_each_selected_account(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    app.supabase_get_reel = AsyncMock(return_value={"reel_title": "Mon reel"})
+    monkeypatch.setattr(app, "_normalize_reel_row", lambda row: {**row, "media_url": "https://s3.example/reel.mp4"})
+    accounts_by_id = {
+        "fb-acct": {"id": "fb-acct", "platform": "facebook"},
+        "yt-acct": {"id": "yt-acct", "platform": "youtube"},
+    }
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(side_effect=lambda _uid, aid: accounts_by_id.get(aid)))
+    monkeypatch.setattr(app, "_insert_publish_job", AsyncMock(return_value="pub-1"))
+    monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "post-1"}))
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/reels/reel-1/share",
+            json={"account_ids": ["fb-acct", "yt-acct"]},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["success"] is True
+    assert set(data["results"].keys()) == {"fb-acct", "yt-acct"}
+
+
+def test_share_reel_rejects_when_no_media_url(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    app.supabase_get_reel = AsyncMock(return_value={"reel_title": "Mon reel"})
+    monkeypatch.setattr(app, "_normalize_reel_row", lambda row: {**row, "media_url": ""})
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/reels/reel-1/share",
+            json={"account_ids": ["fb-acct"]},
+            headers=_auth_headers("u1"),
+        )
+    assert resp.status_code == 400
+
+
+def test_share_caption_publishes_to_each_selected_account(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    app.supabase_get_caption = AsyncMock(return_value={"caption_title": "Mes sous-titres"})
+    monkeypatch.setattr(app, "_normalize_caption_row", lambda row: {**row, "media_url": "https://s3.example/caption.mp4"})
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "fb-acct", "platform": "facebook"}))
+    monkeypatch.setattr(app, "_insert_publish_job", AsyncMock(return_value="pub-1"))
+    monkeypatch.setattr(app, "_update_publish_job_status", AsyncMock())
+    monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "post-1"}))
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/captions/caption-1/share",
+            json={"account_ids": ["fb-acct"]},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["success"] is True
+    assert data["results"]["fb-acct"]["success"] is True
+
+
+def test_post_to_socials_publishes_reel_clip_to_selected_account(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "fb-acct", "platform": "facebook"}))
+    monkeypatch.setattr(
+        app, "_resolve_clip_for_social_post",
+        AsyncMock(return_value={"video_url": "https://s3.example/clip.mp4", "title": "Clip"}),
+    )
+    monkeypatch.setattr(app, "_insert_publish_job", AsyncMock(return_value="pub-1"))
+    monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "post-1"}))
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/social/post",
+            json={"job_id": "job-1", "clip_index": 0, "account_ids": ["fb-acct"]},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["success"] is True
+    assert data["results"]["fb-acct"]["success"] is True
 
 
 def test_film_summary_voice_preview_rejects_unknown_voice(monkeypatch):
@@ -4862,7 +5003,9 @@ def test_change_souscription_plan_swaps_price_and_resets_resources(monkeypatch):
     )
     fake_stripe.Subscription.modify.return_value = {"current_period_end": 1700000000}
 
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "new-plan", "name": "Premium", "price": 49.99}))
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "new-plan", "name": "Premium", "price": 49.99, "max_social_account": 3}))
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
     insert_mock = AsyncMock(return_value={"id": "sous-2"})
     monkeypatch.setattr(app, "supabase_insert_souscription", insert_mock)
     allocate_mock = AsyncMock()
@@ -4912,6 +5055,61 @@ def test_change_souscription_plan_404_for_unknown_plan(monkeypatch):
     assert exc_info.value.status_code == 404
 
 
+def test_change_souscription_plan_blocks_when_over_social_account_limit(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "silver", "name": "Silver", "max_social_account": 1}))
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={"facebook": 5, "instagram": 1}))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
+
+    coro = app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+    assert "facebook" in exc_info.value.detail
+    assert "instagram" not in exc_info.value.detail
+
+
+def test_change_souscription_plan_blocks_when_over_storage_limit(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "silver", "name": "Silver", "max_social_account": 1, "stockage": 5.0}))
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
+    # stockage is the remaining balance, stockage_max the plan allowance --
+    # 20 Go used (30 max - 10 left) against a 5 Go new plan must block.
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"stockage": 10.0, "stockage_max": 30.0}))
+
+    coro = app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+    assert "stockage" in exc_info.value.detail.lower() or "Go" in exc_info.value.detail
+
+
+def test_change_souscription_plan_allows_when_within_limits(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe, _ = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    fake_stripe.Subscription.retrieve.return_value = _FakeStripeSubscriptionObject(
+        {"items": {"data": [{"id": "si_123"}]}},
+        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
+    )
+    fake_stripe.Subscription.modify.return_value = {"current_period_end": 1700000000}
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "gold", "name": "Gold", "price": 49.99, "max_social_account": 3, "stockage": 100.0}))
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={"facebook": 2}))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"stockage": 50.0, "stockage_max": 100.0}))
+    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-2"}))
+    monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
+
+    result = asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="gold"), user_id="u1",
+    ))
+    assert result == {"id": "sous-2"}
+
+
 # ---------------------------------------------------------------------------
 # Social posts: a user-authored post + follow-up comments, published (or
 # scheduled) by the connected Facebook/LinkedIn account itself.
@@ -4954,6 +5152,220 @@ def _install_fake_httpx_post(monkeypatch, app, response):
     _FakeHttpxAsyncClient.next_response = response
     monkeypatch.setattr(app.httpx, "AsyncClient", _FakeHttpxAsyncClient)
     return _FakeHttpxAsyncClient
+
+
+class _FakeSocialAccountsTable:
+    """Minimal chainable stand-in for the postgrest query builder, just
+    enough for _upsert_social_account's insert/update calls, plus select
+    (returns select_rows) and delete (records into deleted)."""
+
+    def __init__(self, select_rows=None):
+        self.inserted = []
+        self.updated = []
+        self.deleted = []
+        self._select_rows = select_rows if select_rows is not None else []
+        self._pending_update = None
+        self._pending_delete = False
+
+    def insert(self, payload):
+        self.inserted.append(payload)
+        return self
+
+    def update(self, payload):
+        self._pending_update = payload
+        return self
+
+    def select(self, *_args, **_kwargs):
+        return self
+
+    def delete(self):
+        self._pending_delete = True
+        return self
+
+    def order(self, *_args, **_kwargs):
+        return self
+
+    def eq(self, field, value):
+        self.deleted.append((field, value)) if self._pending_delete else None
+        return self
+
+    async def execute(self):
+        if self._pending_update is not None:
+            self.updated.append(self._pending_update)
+            self._pending_update = None
+            return types.SimpleNamespace(data=[])
+        if self._pending_delete:
+            self._pending_delete = False
+            return types.SimpleNamespace(data=[{"id": "deleted"}])
+        return types.SimpleNamespace(data=self._select_rows)
+
+
+class _FakeSupabaseClient:
+    def __init__(self, table):
+        self._table = table
+
+    def table(self, _name):
+        return self._table
+
+
+def test_upsert_social_account_inserts_new_account_within_limit(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    table = _FakeSocialAccountsTable()
+    monkeypatch.setattr(app, "supabase_get_client", AsyncMock(return_value=_FakeSupabaseClient(table)))
+    monkeypatch.setattr(app, "_find_social_account_by_platform_user", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={"facebook": 1}))
+    monkeypatch.setattr(app, "_get_user_max_social_accounts", AsyncMock(return_value=3))
+
+    asyncio.run(app._upsert_social_account(
+        user_id="u1", platform="facebook", access_token="tok", refresh_token=None,
+        expires_in=3600, platform_user_id="page-2", platform_account_name="Page 2", scopes="pages_show_list",
+    ))
+
+    assert len(table.inserted) == 1
+    assert table.inserted[0]["platform_user_id"] == "page-2"
+    assert table.updated == []
+
+
+def test_upsert_social_account_updates_existing_match_without_limit_check(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    table = _FakeSocialAccountsTable()
+    monkeypatch.setattr(app, "supabase_get_client", AsyncMock(return_value=_FakeSupabaseClient(table)))
+    monkeypatch.setattr(app, "_find_social_account_by_platform_user", AsyncMock(return_value={"id": "acct-1"}))
+    count_mock = AsyncMock()
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", count_mock)
+
+    asyncio.run(app._upsert_social_account(
+        user_id="u1", platform="facebook", access_token="tok", refresh_token=None,
+        expires_in=3600, platform_user_id="page-1", platform_account_name="Page 1", scopes="pages_show_list",
+    ))
+
+    assert len(table.updated) == 1
+    assert table.inserted == []
+    count_mock.assert_not_called()
+
+
+def test_upsert_social_account_rejects_new_account_over_plan_limit(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    table = _FakeSocialAccountsTable()
+    monkeypatch.setattr(app, "supabase_get_client", AsyncMock(return_value=_FakeSupabaseClient(table)))
+    monkeypatch.setattr(app, "_find_social_account_by_platform_user", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={"facebook": 1}))
+    monkeypatch.setattr(app, "_get_user_max_social_accounts", AsyncMock(return_value=1))
+
+    coro = app._upsert_social_account(
+        user_id="u1", platform="facebook", access_token="tok", refresh_token=None,
+        expires_in=3600, platform_user_id="page-2", platform_account_name="Page 2", scopes="pages_show_list",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 403
+    assert table.inserted == []
+
+
+def test_assert_user_has_active_subscription_for_publish_blocks_without_subscription(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+
+    coro = app._assert_user_has_active_subscription_for_publish("u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+
+    assert exc_info.value.status_code == 402
+
+
+def test_assert_user_has_active_subscription_for_publish_allows_with_zero_credits(monkeypatch):
+    # Publishing is free (no credit debit) -- an active subscription is
+    # enough to publish even when the account has 0 credits.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value={"id": "sub-1", "abonnement": "silver-plan"}))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 0}))
+
+    asyncio.run(app._assert_user_has_active_subscription_for_publish("u1"))
+
+
+def test_get_user_max_social_accounts_defaults_to_one_without_active_plan(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+
+    result = asyncio.run(app._get_user_max_social_accounts("u1"))
+
+    assert result == 1
+
+
+def test_get_user_max_social_accounts_reads_active_plan(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value={"abonnement": "gold-plan"}))
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"max_social_account": 3}))
+
+    result = asyncio.run(app._get_user_max_social_accounts("u1"))
+
+    assert result == 3
+
+
+def test_count_social_accounts_by_platform_groups_rows(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    class _CountTable:
+        def table(self, _name):
+            return self
+
+        def select(self, _cols):
+            return self
+
+        def eq(self, *_a, **_k):
+            return self
+
+        async def execute(self):
+            return types.SimpleNamespace(data=[
+                {"platform": "facebook"}, {"platform": "facebook"}, {"platform": "instagram"},
+            ])
+
+    monkeypatch.setattr(app, "supabase_get_client", AsyncMock(return_value=_CountTable()))
+
+    result = asyncio.run(app._count_social_accounts_by_platform("u1"))
+
+    assert result == {"facebook": 2, "instagram": 1}
+
+
+def test_list_social_accounts_returns_accounts_and_plan_limit(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    table = _FakeSocialAccountsTable(select_rows=[
+        {"id": "acct-1", "platform": "facebook", "platform_account_name": "Page A"},
+        {"id": "acct-2", "platform": "facebook", "platform_account_name": "Page B"},
+    ])
+    monkeypatch.setattr(app, "supabase_get_client", AsyncMock(return_value=_FakeSupabaseClient(table)))
+    monkeypatch.setattr(app, "_get_user_max_social_accounts", AsyncMock(return_value=3))
+
+    result = asyncio.run(app.list_social_accounts(user_id="u1"))
+
+    assert result["max_social_account"] == 3
+    assert len(result["accounts"]) == 2
+    assert all(a["connected"] is True for a in result["accounts"])
+
+
+def test_disconnect_social_account_deletes_owned_account(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    table = _FakeSocialAccountsTable()
+    monkeypatch.setattr(app, "supabase_get_client", AsyncMock(return_value=_FakeSupabaseClient(table)))
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "acct-1", "user_id": "u1"}))
+
+    result = asyncio.run(app.disconnect_social_account(account_id="acct-1", user_id="u1"))
+
+    assert result == {"deleted": True}
+    assert ("id", "acct-1") in table.deleted
+    assert ("user_id", "u1") in table.deleted
+
+
+def test_disconnect_social_account_404_when_not_owned(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value=None))
+
+    coro = app.disconnect_social_account(account_id="acct-1", user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 404
 
 
 def test_post_facebook_comment_sends_message_and_attachment(monkeypatch):
@@ -5069,6 +5481,63 @@ def test_upload_social_comment_image_requires_bucket_configured(monkeypatch, tmp
     assert exc.value.status_code == 503
 
 
+def test_upload_social_post_media_happy_path_image(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("AWS_S3_BUCKET", "bucket")
+
+    upload_calls = []
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda path, bucket, key: upload_calls.append((path, bucket, key)) or True)
+    monkeypatch.setattr(app, "generate_presigned_url", lambda bucket, key, expiration=3600: f"https://s3.example/{key}?exp={expiration}")
+
+    result = asyncio.run(app.upload_social_post_media(user_id="u1", file=_FakeCommentImageUpload(b"fake-image-bytes")))
+
+    assert result["media_type"] == "image"
+    assert result["media_url"].startswith("https://s3.example/social_post_media/u1/")
+    assert len(upload_calls) == 1
+    assert list((tmp_path / "uploads").glob("post_media_*")) == []
+
+
+def test_upload_social_post_media_happy_path_video(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("AWS_S3_BUCKET", "bucket")
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda path, bucket, key: True)
+    monkeypatch.setattr(app, "generate_presigned_url", lambda bucket, key, expiration=3600: f"https://s3.example/{key}")
+
+    result = asyncio.run(app.upload_social_post_media(
+        user_id="u1",
+        file=_FakeCommentImageUpload(b"fake-video-bytes", filename="clip.mp4", content_type="video/mp4"),
+    ))
+
+    assert result["media_type"] == "video"
+    assert result["media_url"].startswith("https://s3.example/social_post_media/u1/")
+
+
+def test_upload_social_post_media_rejects_unsupported_type(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    coro = app.upload_social_post_media(
+        user_id="u1", file=_FakeCommentImageUpload(b"x", filename="doc.pdf", content_type="application/pdf"),
+    )
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 400
+
+
+def test_upload_social_post_media_rejects_oversized_image(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("AWS_S3_BUCKET", "bucket")
+    monkeypatch.setattr(app, "_POST_MEDIA_IMAGE_MAX_BYTES", 4)
+
+    coro = app.upload_social_post_media(user_id="u1", file=_FakeCommentImageUpload(b"0123456789"))
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 400
+    assert "too large" in str(exc.value.detail).lower()
+
+
 def test_post_facebook_comment_requires_object_id(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
 
@@ -5095,17 +5564,54 @@ def test_post_linkedin_comment_sends_actor_and_encoded_urn(monkeypatch):
     assert call["json"]["message"]["text"] == "Nice post"
 
 
-def test_resolve_social_post_platforms_rejects_when_none_recognized(monkeypatch):
+def test_resolve_accounts_for_publish_rejects_empty_list(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
+    coro = app._resolve_accounts_for_publish("u1", [], app._SOCIAL_POST_PLATFORMS)
     with pytest.raises(app.HTTPException) as exc_info:
-        app._resolve_social_post_platforms(["tiktok", "youtube"])
+        asyncio.run(coro)
     assert exc_info.value.status_code == 400
 
 
-def test_resolve_social_post_platforms_dedupes_and_filters(monkeypatch):
+def test_resolve_accounts_for_publish_rejects_unowned_or_missing_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    result = app._resolve_social_post_platforms(["facebook", "FACEBOOK", "linkedin", "tiktok"])
-    assert result == ["facebook", "linkedin"]
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value=None))
+
+    coro = app._resolve_accounts_for_publish("u1", ["acct-1"], app._SOCIAL_POST_PLATFORMS)
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 404
+
+
+def test_resolve_accounts_for_publish_rejects_unsupported_platform(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "acct-1", "platform": "tiktok"}))
+
+    coro = app._resolve_accounts_for_publish("u1", ["acct-1"], app._SOCIAL_POST_PLATFORMS)
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 400
+
+
+def test_resolve_accounts_for_publish_dedupes_and_resolves_each(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    accounts_by_id = {
+        "acct-1": {"id": "acct-1", "platform": "facebook"},
+        "acct-2": {"id": "acct-2", "platform": "linkedin"},
+    }
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(side_effect=lambda _uid, aid: accounts_by_id.get(aid)))
+
+    result = asyncio.run(app._resolve_accounts_for_publish("u1", ["acct-1", "acct-1", "acct-2"], app._SOCIAL_POST_PLATFORMS))
+
+    assert [a["id"] for a in result] == ["acct-1", "acct-2"]
+
+
+def test_resolve_accounts_for_publish_allows_wider_share_platforms(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "acct-1", "platform": "youtube"}))
+
+    result = asyncio.run(app._resolve_accounts_for_publish("u1", ["acct-1"], app._SHARE_PLATFORMS))
+
+    assert result == [{"id": "acct-1", "platform": "youtube"}]
 
 
 def test_build_comment_message_appends_link_when_missing(monkeypatch):
@@ -5126,25 +5632,26 @@ def _social_post_account(platform="facebook"):
 
 def test_create_social_post_rejects_empty_text(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
 
     with TestClient(app.app) as client:
         resp = client.post(
             "/api/social/posts",
-            json={"text": "   ", "platforms": ["facebook"]},
+            json={"text": "   ", "account_ids": ["acct-1"]},
             headers=_auth_headers("u1"),
         )
     assert resp.status_code == 400
 
 
-def test_create_social_post_rejects_unsupported_platforms(monkeypatch):
+def test_create_social_post_rejects_unsupported_platform_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "acct-1", "platform": "tiktok"}))
 
     with TestClient(app.app) as client:
         resp = client.post(
             "/api/social/posts",
-            json={"text": "Hello", "platforms": ["tiktok"]},
+            json={"text": "Hello", "account_ids": ["acct-1"]},
             headers=_auth_headers("u1"),
         )
     assert resp.status_code == 400
@@ -5152,10 +5659,10 @@ def test_create_social_post_rejects_unsupported_platforms(monkeypatch):
 
 def test_create_social_post_publishes_now_and_posts_comments(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
-    monkeypatch.setattr(app, "_get_social_account", AsyncMock(return_value=_social_post_account()))
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value=_social_post_account()))
     monkeypatch.setattr(app, "get_valid_token", AsyncMock(return_value="page-token"))
     monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "1234_5678"}))
     insert_job_mock = AsyncMock(return_value="job-1")
@@ -5164,15 +5671,13 @@ def test_create_social_post_publishes_now_and_posts_comments(monkeypatch):
     monkeypatch.setattr(app, "_update_publish_job_status", update_status_mock)
     post_comment_mock = AsyncMock(side_effect=[{"id": "c1"}, {"id": "c2"}])
     monkeypatch.setattr(app, "_post_platform_comment", post_comment_mock)
-    monkeypatch.setattr(app, "supabase_deduct_user_credits", AsyncMock(return_value=True))
-    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
 
     with TestClient(app.app) as client:
         resp = client.post(
             "/api/social/posts",
             json={
                 "text": "Big announcement!",
-                "platforms": ["facebook"],
+                "account_ids": ["acct-1"],
                 "comments": [
                     {"text": "First comment", "link": "https://example.com"},
                     {"text": "Second comment", "image_url": "https://example.com/img.png"},
@@ -5185,7 +5690,7 @@ def test_create_social_post_publishes_now_and_posts_comments(monkeypatch):
     data = resp.json()
     assert data["success"] is True
     assert data["scheduled"] is False
-    fb_result = data["results"]["facebook"]
+    fb_result = data["results"]["acct-1"]
     assert fb_result["success"] is True
     assert fb_result["comments_results"] == [
         {"success": True, "id": "c1", "text": "First comment"},
@@ -5197,12 +5702,59 @@ def test_create_social_post_publishes_now_and_posts_comments(monkeypatch):
     assert done_call.kwargs["extra_payload"]["comments_results"] == fb_result["comments_results"]
 
 
-def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
+def test_create_social_post_publishes_attached_photo(monkeypatch):
+    # The "Faire une publication" composer can attach a photo/video (see
+    # upload_social_post_media) -- it must route to PublishRequest.image_url
+    # (not video_url) and skip the background default entirely, since a
+    # background can't be combined with media.
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
-    monkeypatch.setattr(app, "_get_social_account", AsyncMock(return_value=_social_post_account()))
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value=_social_post_account()))
+    monkeypatch.setattr(app, "get_valid_token", AsyncMock(return_value="page-token"))
+    published_contents = []
+
+    async def fake_publish_post(account, content):
+        published_contents.append(content)
+        return {"id": "1234_5678"}
+
+    monkeypatch.setattr(app, "publish_post", fake_publish_post)
+    insert_job_mock = AsyncMock(return_value="job-1")
+    monkeypatch.setattr(app, "_insert_publish_job", insert_job_mock)
+    monkeypatch.setattr(app, "_update_publish_job_status", AsyncMock())
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/social/posts",
+            json={
+                "text": "Regardez cette photo !",
+                "account_ids": ["acct-1"],
+                "media_url": "https://example.com/photo.png",
+                "media_type": "image",
+            },
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["success"] is True
+    assert data["background_id"] is None
+    assert len(published_contents) == 1
+    assert published_contents[0].image_url == "https://example.com/photo.png"
+    assert published_contents[0].video_url is None
+    assert published_contents[0].facebook_text_format_preset_id is None
+    queued_payload = insert_job_mock.await_args_list[0].kwargs["payload"]
+    assert queued_payload["media_url"] == "https://example.com/photo.png"
+    assert queued_payload["media_type"] == "image"
+
+
+def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value=_social_post_account()))
     monkeypatch.setattr(app, "get_valid_token", AsyncMock(return_value="page-token"))
     monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "1234_5678"}))
     monkeypatch.setattr(app, "_insert_publish_job", AsyncMock(return_value="job-1"))
@@ -5211,15 +5763,13 @@ def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
         app, "_post_platform_comment",
         AsyncMock(side_effect=[RuntimeError("rate limited"), {"id": "c2"}]),
     )
-    monkeypatch.setattr(app, "supabase_deduct_user_credits", AsyncMock(return_value=True))
-    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
 
     with TestClient(app.app) as client:
         resp = client.post(
             "/api/social/posts",
             json={
                 "text": "Big announcement!",
-                "platforms": ["facebook"],
+                "account_ids": ["acct-1"],
                 "comments": [{"text": "First"}, {"text": "Second"}],
             },
             headers=_auth_headers("u1"),
@@ -5228,7 +5778,7 @@ def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
     assert resp.status_code == 200
     data = resp.json()
     assert data["success"] is True  # the post itself succeeded even though one comment failed
-    comments_results = data["results"]["facebook"]["comments_results"]
+    comments_results = data["results"]["acct-1"]["comments_results"]
     assert comments_results[0]["success"] is False
     assert "rate limited" in comments_results[0]["error"]
     assert comments_results[1] == {"success": True, "id": "c2", "text": "Second"}
@@ -5236,14 +5786,17 @@ def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
 
 def test_create_social_post_schedules_job_without_publishing(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
+    accounts_by_id = {
+        "fb-acct": {"id": "fb-acct", "platform": "facebook"},
+        "li-acct": {"id": "li-acct", "platform": "linkedin"},
+    }
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(side_effect=lambda _uid, aid: accounts_by_id.get(aid)))
     insert_job_mock = AsyncMock(return_value="job-scheduled-1")
     monkeypatch.setattr(app, "_insert_publish_job", insert_job_mock)
     publish_post_mock = AsyncMock()
     monkeypatch.setattr(app, "publish_post", publish_post_mock)
-    debit_mock = AsyncMock()
-    monkeypatch.setattr(app, "_debit_publish_credits_after_share", debit_mock)
 
     future_iso = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
 
@@ -5252,7 +5805,7 @@ def test_create_social_post_schedules_job_without_publishing(monkeypatch):
             "/api/social/posts",
             json={
                 "text": "Scheduled announcement",
-                "platforms": ["facebook", "linkedin"],
+                "account_ids": ["fb-acct", "li-acct"],
                 "background_id": "some-preset",
                 "comments": [{"text": "Follow-up"}],
                 "scheduled_date": future_iso,
@@ -5266,12 +5819,13 @@ def test_create_social_post_schedules_job_without_publishing(monkeypatch):
     assert data["scheduled"] is True
     assert data["success"] is True
     publish_post_mock.assert_not_awaited()
-    debit_mock.assert_not_awaited()
-    assert insert_job_mock.await_count == 2  # one job per platform
+    assert insert_job_mock.await_count == 2  # one job per account
+    assert set(data["results"].keys()) == {"fb-acct", "li-acct"}
 
     inserted_payloads = [call.kwargs["payload"] for call in insert_job_mock.await_args_list]
     for payload in inserted_payloads:
         assert payload["source_type"] == "social_post"
+        assert payload["account_id"] in {"fb-acct", "li-acct"}
         assert payload["text"] == "Scheduled announcement"
         assert payload["background_id"] == "some-preset"
         assert payload["comments"] == [{"text": "Follow-up", "link": None, "image_url": None}]
@@ -5286,8 +5840,6 @@ def test_execute_scheduled_social_post_job_publishes_and_comments(monkeypatch):
     monkeypatch.setattr(app, "_update_publish_job_status", update_status_mock)
     post_comment_mock = AsyncMock(return_value={"id": "comment-urn"})
     monkeypatch.setattr(app, "_post_platform_comment", post_comment_mock)
-    debit_mock = AsyncMock()
-    monkeypatch.setattr(app, "_debit_scheduled_publish_credits", debit_mock)
 
     task_payload = {
         "source_type": "social_post",
@@ -5299,7 +5851,6 @@ def test_execute_scheduled_social_post_job_publishes_and_comments(monkeypatch):
     asyncio.run(app._execute_scheduled_social_post_job("job-9", "u1", "linkedin", task_payload))
 
     post_comment_mock.assert_awaited_once()
-    debit_mock.assert_awaited_once()
     done_call = [c for c in update_status_mock.await_args_list if len(c.args) > 1 and c.args[1] == "done"][0]
     assert done_call.kwargs["external_id"] == "urn:li:share:999"
     assert done_call.kwargs["extra_payload"]["comments_results"] == [
@@ -5342,7 +5893,20 @@ def test_update_publish_job_status_merges_extra_payload_with_post_url(monkeypatc
 
     captured = {}
 
+    class _FakeSelectQuery:
+        def eq(self, *_a, **_k):
+            return self
+
+        def limit(self, *_a, **_k):
+            return self
+
+        async def execute(self):
+            return types.SimpleNamespace(data=[{"payload": {"source_type": "reel", "title": "T"}}])
+
     class _FakeTable:
+        def select(self, *_a, **_k):
+            return _FakeSelectQuery()
+
         def update(self, payload):
             captured["payload"] = payload
             return self
@@ -5364,7 +5928,318 @@ def test_update_publish_job_status_merges_extra_payload_with_post_url(monkeypatc
         extra_payload={"comments_results": [{"success": True, "id": "c1"}]},
     ))
 
+    # The pre-existing payload (source_type/title, set at insert/schedule
+    # time) survives alongside the new post_url/comments_results -- it's
+    # what lets the publications page show what was actually posted.
     assert captured["payload"]["payload"] == {
+        "source_type": "reel",
+        "title": "T",
         "comments_results": [{"success": True, "id": "c1"}],
         "post_url": "https://example.com/post",
     }
+
+
+# ---------------------------------------------------------------------------
+# Dashboard stats (/api/dashboard/stats)
+# ---------------------------------------------------------------------------
+
+def test_dashboard_stats_rejects_invalid_range(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/dashboard/stats", params={"range": "bogus"}, headers=_auth_headers("u1"))
+
+    assert resp.status_code == 400
+
+
+def test_dashboard_stats_returns_zeroed_shape_when_supabase_not_configured(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/dashboard/stats", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["range"] == "30d"
+    assert data["totals"] == {
+        "reels": 0,
+        "captions": 0,
+        "anonymous_stories": 0,
+        "film_summaries": 0,
+        "publications_done": 0,
+        "publications_failed": 0,
+        "credits_consumed": 0.0,
+    }
+    assert data["daily"] == []
+    assert data["publications_by_platform"] == []
+
+
+def test_dashboard_stats_aggregates_counts_and_daily_series(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_utcnow", lambda: datetime(2026, 9, 5, tzinfo=timezone.utc))
+
+    monkeypatch.setattr(app, "supabase_list_reel_dates_since", AsyncMock(return_value=[
+        "2026-09-01T10:00:00+00:00", "2026-09-01T10:05:00+00:00", "2026-09-03T09:00:00+00:00",
+    ]))
+    monkeypatch.setattr(app, "supabase_list_caption_dates_since", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app, "supabase_list_anonymous_story_dates_since", AsyncMock(return_value=[]))
+    monkeypatch.setattr(app, "supabase_list_film_summary_dates_since", AsyncMock(return_value=[]))
+
+    publish_rows = [
+        {"platform": "facebook", "created_at": "2026-09-01T11:00:00+00:00", "status": "done"},
+        {"platform": "instagram", "created_at": "2026-09-02T11:00:00+00:00", "status": "done"},
+        {"platform": "facebook", "created_at": "2026-09-03T11:00:00+00:00", "status": "failed"},
+    ]
+    history_rows = [
+        {"credit": 5.5, "created_at": "2026-09-01T12:00:00+00:00", "operation": "output"},
+        {"credit": 2.0, "created_at": "2026-09-03T12:00:00+00:00", "operation": "output"},
+    ]
+
+    class _FakeQuery:
+        def __init__(self, data):
+            self._data = data
+
+        def select(self, *_a, **_k):
+            return self
+
+        def eq(self, *_a, **_k):
+            return self
+
+        def gte(self, *_a, **_k):
+            return self
+
+        async def execute(self):
+            return types.SimpleNamespace(data=self._data)
+
+    class _FakeClient:
+        def table(self, name):
+            if name == app.SUPABASE_SOCIAL_PUBLISH_JOBS_TABLE:
+                return _FakeQuery(publish_rows)
+            if name == app.SUPABASE_USER_DATA_HISTORY_TABLE:
+                return _FakeQuery(history_rows)
+            return _FakeQuery([])
+
+    monkeypatch.setattr(app, "supabase_get_client", AsyncMock(return_value=_FakeClient()))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/dashboard/stats", params={"range": "all"}, headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["totals"] == {
+        "reels": 3,
+        "captions": 0,
+        "anonymous_stories": 0,
+        "film_summaries": 0,
+        "publications_done": 2,
+        "publications_failed": 1,
+        "credits_consumed": 7.5,
+    }
+    assert data["publications_by_platform"] == [
+        {"platform": "facebook", "count": 1},
+        {"platform": "instagram", "count": 1},
+    ]
+    sept_1_entry = next(d for d in data["daily"] if d["date"] == "2026-09-01")
+    assert sept_1_entry == {
+        "date": "2026-09-01",
+        "reels": 2,
+        "captions": 0,
+        "anonymous_stories": 0,
+        "film_summaries": 0,
+        "publications": 1,
+        "credits_consumed": 5.5,
+    }
+    assert data["daily"][0]["date"] == "2026-09-01"
+    assert data["daily"][-1]["date"] == "2026-09-05"
+
+
+# ---------------------------------------------------------------------------
+# Social analytics gate (_assert_user_can_access_analytics) and exposure via
+# /api/user/credits
+# ---------------------------------------------------------------------------
+
+def test_assert_user_can_access_analytics_blocks_silver_plan(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_get_active_plan_for_user", AsyncMock(return_value={"priorite": 1}))
+
+    coro = app._assert_user_can_access_analytics("u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+
+    assert exc_info.value.status_code == 403
+
+
+def test_assert_user_can_access_analytics_allows_gold_plan(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_get_active_plan_for_user", AsyncMock(return_value={"priorite": 2}))
+
+    asyncio.run(app._assert_user_can_access_analytics("u1"))
+
+
+def test_get_user_credits_reports_has_analytics_access(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value={"priorite": 3, "abonnement": "ultimate-plan"}))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 100, "stockage": 1}))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/user/credits", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json()["has_analytics_access"] is True
+
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value={"priorite": 1, "abonnement": "silver-plan"}))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/user/credits", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json()["has_analytics_access"] is False
+
+
+# ---------------------------------------------------------------------------
+# Social insights (/api/social/insights)
+# ---------------------------------------------------------------------------
+
+def test_get_social_insights_rejects_below_gold(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_get_active_plan_for_user", AsyncMock(return_value={"priorite": 1}))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/social/insights", params={"account_id": "acct-1"}, headers=_auth_headers("u1"))
+
+    assert resp.status_code == 403
+
+
+def test_get_social_insights_returns_unsupported_for_linkedin(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_can_access_analytics", AsyncMock())
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={
+        "id": "acct-1", "platform": "linkedin", "platform_account_name": "My LI Page",
+    }))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/social/insights", params={"account_id": "acct-1"}, headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["supported"] is False
+    assert data["platform"] == "linkedin"
+    assert data["metrics"] is None
+    assert data["daily"] == []
+
+
+def test_fetch_facebook_page_insights_parses_daily_series(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    body = {
+        "data": [
+            {
+                "name": "page_impressions",
+                "period": "day",
+                "values": [
+                    {"value": 100, "end_time": "2026-09-01T07:00:00+0000"},
+                    {"value": 150, "end_time": "2026-09-02T07:00:00+0000"},
+                ],
+            },
+            {
+                "name": "page_engaged_users",
+                "period": "day",
+                "values": [
+                    {"value": 10, "end_time": "2026-09-01T07:00:00+0000"},
+                    {"value": 20, "end_time": "2026-09-02T07:00:00+0000"},
+                ],
+            },
+            {
+                "name": "page_fans",
+                "period": "day",
+                "values": [
+                    {"value": 500, "end_time": "2026-09-01T07:00:00+0000"},
+                    {"value": 510, "end_time": "2026-09-02T07:00:00+0000"},
+                ],
+            },
+        ]
+    }
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, params=None):
+            request = app.httpx.Request("GET", url)
+            return app.httpx.Response(200, json=body, request=request)
+
+    monkeypatch.setattr(app.httpx, "AsyncClient", _FakeAsyncClient)
+
+    result = asyncio.run(app._fetch_facebook_page_insights(
+        "token-1", "page-1", "2026-09-01T00:00:00+00:00", "2026-09-02T23:59:59+00:00",
+    ))
+
+    assert result["metrics"]["impressions"] == 250
+    assert result["metrics"]["engagement"] == 30
+    assert result["metrics"]["followers"] == 510
+    assert result["daily"] == [
+        {"date": "2026-09-01", "impressions": 100, "engagement": 10},
+        {"date": "2026-09-02", "impressions": 150, "engagement": 20},
+    ]
+
+
+def test_fetch_youtube_analytics_parses_rows(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    reports_body = {
+        "columnHeaders": [
+            {"name": "day"}, {"name": "views"}, {"name": "estimatedMinutesWatched"},
+            {"name": "subscribersGained"}, {"name": "subscribersLost"}, {"name": "likes"}, {"name": "comments"},
+        ],
+        "rows": [
+            ["2026-08-01", 120, 45, 3, 1, 10, 2],
+            ["2026-08-02", 80, 30, 1, 0, 5, 1],
+        ],
+    }
+    channels_body = {"items": [{"statistics": {"subscriberCount": "4210"}}]}
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, params=None):
+            request = app.httpx.Request("GET", url)
+            body = channels_body if "channels" in url else reports_body
+            return app.httpx.Response(200, json=body, request=request)
+
+    monkeypatch.setattr(app.httpx, "AsyncClient", _FakeAsyncClient)
+
+    result = asyncio.run(app._fetch_youtube_analytics(
+        "token-1", "2026-08-01T00:00:00+00:00", "2026-08-02T23:59:59+00:00",
+    ))
+
+    assert result["metrics"]["views"] == 200
+    assert result["metrics"]["watch_time_minutes"] == 75
+    assert result["metrics"]["subscribers_gained"] == 4
+    assert result["metrics"]["subscribers_lost"] == 1
+    assert result["metrics"]["likes"] == 15
+    assert result["metrics"]["comments"] == 3
+    assert result["metrics"]["followers"] == 4210
+    assert result["daily"] == [
+        {"date": "2026-08-01", "views": 120, "watch_time_minutes": 45, "subscribers_gained": 3, "subscribers_lost": 1, "likes": 10, "comments": 2},
+        {"date": "2026-08-02", "views": 80, "watch_time_minutes": 30, "subscribers_gained": 1, "subscribers_lost": 0, "likes": 5, "comments": 1},
+    ]

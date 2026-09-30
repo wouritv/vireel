@@ -7,7 +7,6 @@ import { useNavigate } from "react-router-dom";
 import ResultCard from "../components/ResultCard";
 import SharePostModal from "../components/SharePostModal";
 import MobileFilterDropdown from "../components/MobileFilterDropdown";
-import { getConnectedPlatforms } from "../lib/platforms";
 import { toResultCardClip } from "../lib/clips";
 import { statusLabel, statusClass } from "../lib/status";
 import { getAuthHeaders } from "../lib/apiAuth";
@@ -15,9 +14,8 @@ import { useTranslation } from "../state/LanguageContext";
 
 export default function ReelsPage({ projectId = "" }) {
     const { user } = useAuth();
-    const { credits, defaultCosts } = useUserCredits();
+    const { credits, hasActiveSubscription } = useUserCredits();
     const {t} = useTranslation();
-    const connectedPlatforms = getConnectedPlatforms();
     const [items, setItems] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState("");
@@ -32,13 +30,9 @@ export default function ReelsPage({ projectId = "" }) {
     const [shareModalItem, setShareModalItem] = useState(null);
     const [shareTitle, setShareTitle] = useState("");
     const [shareDescription, setShareDescription] = useState("");
-    const [sharePlatforms, setSharePlatforms] = useState({
-        tiktok: true,
-        instagram: true,
-        youtube: true,
-        facebook: false,
-        linkedin: false,
-    });
+    // Keyed by account id (not platform) -- SharePostModal fetches the
+    // user's real connected accounts and lets them pick specific ones.
+    const [sharePlatforms, setSharePlatforms] = useState({});
     const [shareScheduling, setShareScheduling] = useState(false);
     const [shareScheduleDate, setShareScheduleDate] = useState("");
     const [deletingId, setDeletingId] = useState("");
@@ -49,9 +43,8 @@ export default function ReelsPage({ projectId = "" }) {
     const navigate = useNavigate();
 
     const totalPages = useMemo(() => Math.max(1, Math.ceil(total / pageSize)), [total, pageSize]);
-    const publicationCostEstimate = Number(defaultCosts?.publication || 1);
     const hasAnyReelCredit = Number(credits || 0) > 0;
-    const canShareReel = credits >= publicationCostEstimate;
+    const canShareReel = hasActiveSubscription === true;
     const statusOptions = [
         { value: "", label: t('reels.allStatuses', 'All statuses') },
         { value: "en_cours", label: t("reels.statusInProgress", "In progress") },
@@ -267,18 +260,10 @@ export default function ReelsPage({ projectId = "" }) {
 
     const handleShare = (item) => {
         if (!canShareReel) {
-            setShareResult({ success: false, msg: t("reels.shareDisabledInsufficient", "Insufficient credits. Sharing is disabled.") });
+            setShareResult({ success: false, msg: t("reels.shareDisabledNoSubscription", "Un abonnement actif est requis pour publier.") });
             return;
         }
-        const fallbackPlatforms = ['tiktok', 'instagram', 'youtube'];
-        const nextDefaultPlatforms = connectedPlatforms.length > 0 ? connectedPlatforms : fallbackPlatforms;
-        setSharePlatforms({
-            tiktok: nextDefaultPlatforms.includes('tiktok'),
-            instagram: nextDefaultPlatforms.includes('instagram'),
-            youtube: nextDefaultPlatforms.includes('youtube'),
-            facebook: nextDefaultPlatforms.includes('facebook'),
-            linkedin: nextDefaultPlatforms.includes('linkedin'),
-        });
+        setSharePlatforms({});
         setShareTitle(item?.reel_title || t("reels.defaultShareTitle", "Viral Short"));
         setShareDescription(item?.reel_description || "");
         setShareScheduling(false);
@@ -291,12 +276,12 @@ export default function ReelsPage({ projectId = "" }) {
         if (!user?.id) return;
         if (!shareModalItem?.id) return;
         if (!canShareReel) {
-            setShareResult({ success: false, msg: t("reels.shareDisabledInsufficient", "Insufficient credits. Sharing is disabled.") });
+            setShareResult({ success: false, msg: t("reels.shareDisabledNoSubscription", "Un abonnement actif est requis pour publier.") });
             return;
         }
 
-        const selectedPlatforms = Object.keys(sharePlatforms).filter((k) => Boolean(sharePlatforms[k]));
-        if (selectedPlatforms.length === 0) {
+        const selectedAccountIds = Object.keys(sharePlatforms).filter((k) => Boolean(sharePlatforms[k]));
+        if (selectedAccountIds.length === 0) {
             setShareResult({ success: false, msg: t("reels.selectAtLeastOnePlatform", "Select at least one platform.") });
             return;
         }
@@ -309,7 +294,7 @@ export default function ReelsPage({ projectId = "" }) {
         setShareResult(null);
         try {
             const payload = {
-                platforms: selectedPlatforms,
+                account_ids: selectedAccountIds,
                 title: shareTitle || undefined,
                 description: shareDescription || undefined,
             };
@@ -404,14 +389,10 @@ export default function ReelsPage({ projectId = "" }) {
                         onClick={() => {
                             navigate("/dashboard/reel-generator?new=1");
                         }}
-                        className="flex items-center gap-2 p-3 bg-white/5 hover:bg-white/10 rounded-xl transition-colors group disabled:opacity-40 disabled:cursor-not-allowed"
+                        className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-sm font-bold shadow-lg shadow-blue-500/20 hover:from-blue-500 hover:to-indigo-500 transition-all"
                     >
-                        <div className="w-8 h-8 rounded-full bg-primary/20 text-primary flex items-center justify-center shrink-0">
-                            <Plus size={16} />
-                        </div>
-                        <div className="hidden lg:block overflow-hidden">
-                            <p className="text-sm font-bold text-white leading-none mb-0.5">{t('app.newOperation', 'New operation')}</p>
-                        </div>
+                        <Plus size={16} />
+                        {t('app.newOperation', 'Nouveau projet')}
                     </button>
                 )}
             </div>
@@ -698,9 +679,8 @@ export default function ReelsPage({ projectId = "" }) {
                     onSchedulingChange={setShareScheduling}
                     scheduleDate={shareScheduleDate}
                     onScheduleDateChange={setShareScheduleDate}
-                    platforms={sharePlatforms}
-                    onPlatformChange={(platform, checked) => setSharePlatforms((prev) => ({ ...prev, [platform]: checked }))}
-                    connectedPlatforms={connectedPlatforms}
+                    selectedAccountIds={sharePlatforms}
+                    onAccountToggle={(accountId, checked) => setSharePlatforms((prev) => ({ ...prev, [accountId]: checked }))}
                     isSubmitting={Boolean(shareModalItem && sharingId === shareModalItem.id)}
                     result={shareResult}
                     onSubmit={submitShare}

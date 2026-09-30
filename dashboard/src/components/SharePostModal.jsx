@@ -1,7 +1,18 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { X, Loader2, Share2, Calendar, Clock, Instagram, Youtube, Video, Facebook, Linkedin, CheckCircle, AlertCircle } from 'lucide-react';
 import { SUPPORTED_SOCIAL_PLATFORMS, PLATFORM_LABELS } from '../lib/platforms';
+import { getApiUrl } from '../config';
+import { getAuthHeaders } from '../lib/apiAuth';
+import { useAuth } from '../state/AuthContext';
 import { useTranslation } from "../state/LanguageContext";
+
+const PLATFORM_ICONS = {
+    instagram: Instagram,
+    youtube: Youtube,
+    facebook: Facebook,
+    linkedin: Linkedin,
+    tiktok: Video,
+};
 
 export default function SharePostModal({
     isOpen,
@@ -14,17 +25,49 @@ export default function SharePostModal({
     onSchedulingChange,
     scheduleDate,
     onScheduleDateChange,
-    platforms,
-    onPlatformChange,
-    connectedPlatforms,
+    selectedAccountIds,
+    onAccountToggle,
     isSubmitting,
     result,
     onSubmit,
 }) {
 
     const { t } = useTranslation();
+    const { user } = useAuth();
+    const [accounts, setAccounts] = useState([]);
+
+    // Fetched fresh every time the modal opens rather than relying on a
+    // parent-owned "connected platforms" cache -- a plan can have several
+    // accounts per platform (see max_social_account), so the real list of
+    // specific pages/profiles has to come from the API, not a boolean per
+    // platform.
+    useEffect(() => {
+        if (!isOpen) return;
+        let cancelled = false;
+        (async () => {
+            try {
+                const response = await fetch(getApiUrl("/api/social/accounts"), {
+                    headers: { ...getAuthHeaders(user?.id) },
+                });
+                if (!response.ok) return;
+                const data = await response.json();
+                const rows = Array.isArray(data?.accounts) ? data.accounts : [];
+                if (!cancelled) setAccounts(rows.filter((a) => SUPPORTED_SOCIAL_PLATFORMS.includes(a.platform)));
+            } catch {
+                // Best-effort: the modal simply shows no connected accounts.
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [isOpen, user?.id]);
 
     if (!isOpen) return null;
+
+    const accountsByPlatform = {};
+    for (const account of accounts) {
+        (accountsByPlatform[account.platform] ||= []).push(account);
+    }
 
     return (
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-[fadeIn_0.2s_ease-out]">
@@ -90,34 +133,42 @@ export default function SharePostModal({
                     </div>
 
                     <div>
-                        <label className="block text-xs font-bold text-slate-500 dark:text-zinc-400 mb-2">{t("social.postSelectPlatform", "Select Platforms")}</label>
-                        <div className="grid grid-cols-1 gap-2">
-                            {SUPPORTED_SOCIAL_PLATFORMS
-                                .filter((platform) => connectedPlatforms.length === 0 || connectedPlatforms.includes(platform))
-                                .map((platform) => {
-                                    const Icon = platform === 'instagram' ? Instagram
-                                        : platform === 'youtube' ? Youtube
-                                            : platform === 'facebook' ? Facebook
-                                                : platform === 'linkedin' ? Linkedin
-                                                    : Video;
+                        <label className="block text-xs font-bold text-slate-500 dark:text-zinc-400 mb-2">{t("social.postSelectPlatform", "Select Accounts")}</label>
+                        {accounts.length === 0 ? (
+                            <p className="text-xs text-slate-400 dark:text-zinc-500">
+                                {t("social.noPlatformConnected", "Aucun compte connecte. Connectez-en un dans Parametres.")}
+                            </p>
+                        ) : (
+                            <div className="space-y-3">
+                                {SUPPORTED_SOCIAL_PLATFORMS.map((platform) => {
+                                    const platformAccounts = accountsByPlatform[platform] || [];
+                                    if (platformAccounts.length === 0) return null;
+                                    const Icon = PLATFORM_ICONS[platform] || Video;
                                     return (
-                                        <label key={platform} className="flex items-center gap-3 p-3 bg-slate-100 dark:bg-white/5 rounded-lg cursor-pointer hover:bg-slate-200 dark:hover:bg-white/10 transition-colors border border-slate-200 dark:border-white/5">
-                                            <input
-                                                type="checkbox"
-                                                checked={Boolean(platforms[platform])}
-                                                onChange={(e) => onPlatformChange(platform, e.target.checked)}
-                                                className="w-4 h-4 rounded border-zinc-600 bg-black/50 text-primary focus:ring-primary"
-                                            />
-                                            <div className="flex items-center gap-2 text-sm text-slate-800 dark:text-white">
-                                                <Icon size={16} className="text-slate-700 dark:text-zinc-300" /> {t(`social.${platform}`, PLATFORM_LABELS[platform])}
+                                        <div key={platform}>
+                                            <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-slate-400 dark:text-zinc-500 mb-1">
+                                                <Icon size={13} /> {t(`social.${platform}`, PLATFORM_LABELS[platform])}
                                             </div>
-                                        </label>
+                                            <div className="grid grid-cols-1 gap-2">
+                                                {platformAccounts.map((account) => (
+                                                    <label key={account.id} className="flex items-center gap-3 p-3 bg-slate-100 dark:bg-white/5 rounded-lg cursor-pointer hover:bg-slate-200 dark:hover:bg-white/10 transition-colors border border-slate-200 dark:border-white/5">
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={Boolean(selectedAccountIds[account.id])}
+                                                            onChange={(e) => onAccountToggle(account.id, e.target.checked)}
+                                                            className="w-4 h-4 rounded border-zinc-600 bg-black/50 text-primary focus:ring-primary"
+                                                        />
+                                                        <span className="text-sm text-slate-800 dark:text-white truncate">
+                                                            {account.platform_account_name || account.platform}
+                                                        </span>
+                                                    </label>
+                                                ))}
+                                            </div>
+                                        </div>
                                     );
                                 })}
-                        </div>
-                        {connectedPlatforms.length === 0 ? (
-                            <p className="mt-2 text-xs text-slate-400 dark:text-zinc-500">{t("social.noPlatformConnected", "No platform is marked as connected in Settings, so defaults are shown.")}</p>
-                        ) : null}
+                            </div>
+                        )}
                     </div>
                 </div>
 
@@ -149,4 +200,3 @@ export default function SharePostModal({
         </div>
     );
 }
-
