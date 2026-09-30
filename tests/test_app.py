@@ -6190,6 +6190,237 @@ def test_fetch_facebook_page_insights_parses_daily_series(monkeypatch):
     ]
 
 
+def test_fetch_facebook_page_insights_falls_back_to_per_metric_on_rejected_batch(monkeypatch):
+    # Simulates Meta rejecting one metric in the combined request (error
+    # #100 "must be a valid insights metric") -- the whole batch call
+    # fails, so the fetch must retry metric-by-metric and still return the
+    # metrics Meta does accept instead of zeroing everything out.
+    app = _import_app_with_stubs(monkeypatch)
+    profile_body = {"followers_count": 42}
+
+    def _per_metric_body(url, params):
+        metric = (params or {}).get("metric", "")
+        if metric == "page_engaged_users":
+            return {
+                "data": [
+                    {
+                        "name": "page_engaged_users",
+                        "period": "day",
+                        "values": [{"value": 5, "end_time": "2026-09-01T07:00:00+0000"}],
+                    },
+                ]
+            }
+        # Every other individual metric (including the removed/invalid one)
+        # comes back empty, as Meta does for a metric with no data -- only
+        # the one batch call with ALL metrics together is rejected outright.
+        return {"data": []}
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, params=None):
+            request = app.httpx.Request("GET", url)
+            if not url.endswith("/insights"):
+                return app.httpx.Response(200, json=profile_body, request=request)
+            metric = (params or {}).get("metric", "")
+            if "," in metric:
+                return app.httpx.Response(
+                    400,
+                    json={"error": {"message": "(#100) The value must be a valid insights metric", "code": 100}},
+                    request=request,
+                )
+            return app.httpx.Response(200, json=_per_metric_body(url, params), request=request)
+
+    monkeypatch.setattr(app.httpx, "AsyncClient", _FakeAsyncClient)
+
+    result = asyncio.run(app._fetch_facebook_page_insights(
+        "token-1", "page-1", "2026-09-01T00:00:00+00:00", "2026-09-01T23:59:59+00:00",
+    ))
+
+    assert result["metrics"]["engagement"] == 5
+    assert result["metrics"]["followers"] == 42
+    assert result["daily"] == [{"date": "2026-09-01", "engagement": 5}]
+
+
+def test_fetch_facebook_page_insights_includes_trends_comments_and_monetization(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    since_iso = "2026-09-08T00:00:00+00:00"
+    until_iso = "2026-09-10T00:00:00+00:00"
+    since_unix = int(app.datetime.fromisoformat(since_iso).timestamp())
+
+    current_engagement_body = {
+        "data": [
+            {"name": "page_media_view", "values": [{"value": 200, "end_time": "2026-09-08T07:00:00+0000"}]},
+            {"name": "page_engaged_users", "values": [{"value": 50, "end_time": "2026-09-08T07:00:00+0000"}]},
+        ]
+    }
+    previous_engagement_body = {
+        "data": [
+            {"name": "page_media_view", "values": [{"value": 100, "end_time": "2026-09-06T07:00:00+0000"}]},
+            {"name": "page_engaged_users", "values": [{"value": 80, "end_time": "2026-09-06T07:00:00+0000"}]},
+        ]
+    }
+    posts_body_current = {"data": [{"created_time": "2026-09-08T10:00:00+0000", "comments": {"summary": {"total_count": 4}}}]}
+    posts_body_previous = {"data": [{"created_time": "2026-09-06T10:00:00+0000", "comments": {"summary": {"total_count": 10}}}]}
+    monetization_bodies = {
+        "page_daily_video_ad_break_ad_impressions": {
+            "data": [{"name": "page_daily_video_ad_break_ad_impressions", "values": [{"value": 1000, "end_time": "2026-09-08T07:00:00+0000"}]}]
+        },
+        "page_daily_video_ad_break_ad_earnings": {
+            "data": [{"name": "page_daily_video_ad_break_ad_earnings", "values": [{"value": 250, "end_time": "2026-09-08T07:00:00+0000"}]}]
+        },
+        "page_daily_video_ad_break_ad_cpm": {
+            "data": [{"name": "page_daily_video_ad_break_ad_cpm", "values": [{"value": 30, "end_time": "2026-09-08T07:00:00+0000"}]}]
+        },
+    }
+    profile_body = {"followers_count": 77}
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, params=None):
+            request = app.httpx.Request("GET", url)
+            params = params or {}
+            if url.endswith("/posts"):
+                body = posts_body_current if params.get("since") == since_unix else posts_body_previous
+                return app.httpx.Response(200, json=body, request=request)
+            if url.endswith("/insights"):
+                metric = params.get("metric", "")
+                if metric in monetization_bodies:
+                    return app.httpx.Response(200, json=monetization_bodies[metric], request=request)
+                if "," in metric:
+                    body = current_engagement_body if params.get("since") == since_unix else previous_engagement_body
+                    return app.httpx.Response(200, json=body, request=request)
+                return app.httpx.Response(200, json={"data": []}, request=request)
+            return app.httpx.Response(200, json=profile_body, request=request)
+
+    monkeypatch.setattr(app.httpx, "AsyncClient", _FakeAsyncClient)
+
+    result = asyncio.run(app._fetch_facebook_page_insights("token-1", "page-1", since_iso, until_iso))
+
+    assert result["metrics"]["impressions"] == 200
+    assert result["metrics"]["engagement"] == 50
+    assert result["metrics"]["comments"] == 4
+    assert result["metrics"]["followers"] == 77
+
+    assert result["trends"]["impressions"] == {"current": 200, "previous": 100, "change_pct": 100.0, "direction": "up"}
+    assert result["trends"]["engagement"] == {"current": 50, "previous": 80, "change_pct": -37.5, "direction": "down"}
+    assert result["trends"]["comments"] == {"current": 4, "previous": 10, "change_pct": -60.0, "direction": "down"}
+
+    assert result["monetization"]["supported"] is True
+    assert result["monetization"]["available"] is True
+    assert result["monetization"]["ad_impressions"] == 1000
+    assert result["monetization"]["ad_earnings_cents"] == 250
+    assert result["monetization"]["ad_cpm_cents"] == 30
+
+
+def test_fetch_facebook_monetization_reports_unavailable_without_ad_break_data(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, params=None):
+            request = app.httpx.Request("GET", url)
+            return app.httpx.Response(200, json={"data": []}, request=request)
+
+    monkeypatch.setattr(app.httpx, "AsyncClient", _FakeAsyncClient)
+
+    result = asyncio.run(app._fetch_facebook_monetization("token-1", "page-1", 1000, 2000))
+
+    assert result == {
+        "supported": True,
+        "available": False,
+        "reason": (
+            "Aucune donnee de monetisation disponible (programme de monetisation video non actif "
+            "ou aucune donnee sur cette periode)."
+        ),
+        "ad_impressions": None,
+        "ad_earnings_cents": None,
+        "ad_cpm_cents": None,
+    }
+
+
+def test_fetch_instagram_insights_includes_trends_and_unsupported_monetization(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    since_iso = "2026-09-08T00:00:00+00:00"
+    until_iso = "2026-09-10T00:00:00+00:00"
+    since_unix = int(app.datetime.fromisoformat(since_iso).timestamp())
+
+    current_body = {
+        "data": [
+            {"name": "views", "values": [{"value": 300, "end_time": "2026-09-08T07:00:00+0000"}]},
+            {"name": "total_interactions", "values": [{"value": 60, "end_time": "2026-09-08T07:00:00+0000"}]},
+            {"name": "total_comments", "values": [{"value": 15, "end_time": "2026-09-08T07:00:00+0000"}]},
+        ]
+    }
+    previous_body = {
+        "data": [
+            {"name": "views", "values": [{"value": 250, "end_time": "2026-09-06T07:00:00+0000"}]},
+            {"name": "total_interactions", "values": [{"value": 90, "end_time": "2026-09-06T07:00:00+0000"}]},
+            {"name": "total_comments", "values": [{"value": 20, "end_time": "2026-09-06T07:00:00+0000"}]},
+        ]
+    }
+    profile_body = {"followers_count": 555}
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, params=None):
+            request = app.httpx.Request("GET", url)
+            params = params or {}
+            if url.endswith("/insights"):
+                body = current_body if params.get("since") == since_unix else previous_body
+                return app.httpx.Response(200, json=body, request=request)
+            return app.httpx.Response(200, json=profile_body, request=request)
+
+    monkeypatch.setattr(app.httpx, "AsyncClient", _FakeAsyncClient)
+
+    result = asyncio.run(app._fetch_instagram_insights("token-1", "ig-1", since_iso, until_iso))
+
+    assert result["metrics"]["impressions"] == 300
+    assert result["metrics"]["engagement"] == 60
+    assert result["metrics"]["comments"] == 15
+    assert result["metrics"]["followers"] == 555
+
+    assert result["trends"]["impressions"] == {"current": 300, "previous": 250, "change_pct": 20.0, "direction": "up"}
+    assert result["trends"]["engagement"] == {"current": 60, "previous": 90, "change_pct": -33.3, "direction": "down"}
+    assert result["trends"]["comments"] == {"current": 15, "previous": 20, "change_pct": -25.0, "direction": "down"}
+
+    assert result["monetization"]["supported"] is False
+    assert result["monetization"]["available"] is False
+
+
 def test_fetch_youtube_analytics_parses_rows(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
 

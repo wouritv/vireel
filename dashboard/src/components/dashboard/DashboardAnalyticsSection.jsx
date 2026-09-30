@@ -1,6 +1,19 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { AlertTriangle, Facebook, Instagram, Linkedin, Loader2, Lock, Twitch, Youtube } from "lucide-react";
+import {
+    AlertTriangle,
+    Coins,
+    Facebook,
+    Instagram,
+    Linkedin,
+    Loader2,
+    Lock,
+    Minus,
+    Twitch,
+    TrendingDown,
+    TrendingUp,
+    Youtube,
+} from "lucide-react";
 import {
     ResponsiveContainer,
     LineChart,
@@ -30,6 +43,8 @@ const METRIC_DEFS = [
     { key: "engagement", labelKey: "dashboard.metricEngagement", fallback: "Engagement" },
     { key: "profile_views", labelKey: "dashboard.metricProfileViews", fallback: "Vues du profil" },
     { key: "views", labelKey: "dashboard.metricViews", fallback: "Vues" },
+    { key: "follows_gained", labelKey: "dashboard.metricFollowsGained", fallback: "Nouveaux abonnés" },
+    { key: "follows_lost", labelKey: "dashboard.metricFollowsLost", fallback: "Abonnés perdus" },
     { key: "watch_time_minutes", labelKey: "dashboard.metricWatchTime", fallback: "Minutes visionnées" },
     { key: "subscribers_gained", labelKey: "dashboard.metricSubscribersGained", fallback: "Abonnés gagnés" },
     { key: "subscribers_lost", labelKey: "dashboard.metricSubscribersLost", fallback: "Abonnés perdus" },
@@ -53,6 +68,83 @@ const CHART_LINE_COLORS = [
     "#ec4899", // pink
     "#84cc16", // lime
 ];
+
+function formatChangePct(pct) {
+    if (pct === null || pct === undefined || Number.isNaN(pct)) return null;
+    const sign = pct > 0 ? "+" : "";
+    return `${sign}${pct.toFixed(1)}%`;
+}
+
+function formatCentsToCurrency(cents) {
+    if (cents === null || cents === undefined || Number.isNaN(cents)) return null;
+    return `$${(cents / 100).toFixed(2)}`;
+}
+
+function TrendBadge({ trend }) {
+    if (!trend) return null;
+    const { direction, change_pct } = trend;
+    const Icon = direction === "up" ? TrendingUp : direction === "down" ? TrendingDown : Minus;
+    const colorClass =
+        direction === "up"
+            ? "text-emerald-500"
+            : direction === "down"
+            ? "text-red-500"
+            : "text-slate-400 dark:text-zinc-500";
+    const pctLabel = formatChangePct(change_pct);
+    return (
+        <span className={`inline-flex items-center gap-0.5 text-[11px] font-semibold shrink-0 ${colorClass}`}>
+            <Icon size={12} />
+            {pctLabel ? <span>{pctLabel}</span> : null}
+        </span>
+    );
+}
+
+function MonetizationCard({ monetization, t }) {
+    if (!monetization) return null;
+
+    if (monetization.supported === false || monetization.available === false) {
+        return (
+            <div className={`${CARD_CLASS} p-4 flex items-center gap-3 bg-slate-50 dark:bg-white/[0.02]`}>
+                <span className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-slate-100 dark:bg-white/5 text-slate-500 dark:text-zinc-400 shrink-0">
+                    <Coins size={16} />
+                </span>
+                <p className="text-xs text-slate-500 dark:text-zinc-400">
+                    {monetization.reason ||
+                        t("dashboard.monetizationUnavailable", "Donnees de monetisation non disponibles pour ce compte.")}
+                </p>
+            </div>
+        );
+    }
+
+    return (
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+            <div className={`${CARD_CLASS} p-4`}>
+                <p className="text-2xl font-black tracking-tight text-slate-900 dark:text-white">
+                    {monetization.ad_impressions ?? 0}
+                </p>
+                <p className="text-xs text-slate-500 dark:text-zinc-400">
+                    {t("dashboard.monetizationAdImpressions", "Impressions publicitaires")}
+                </p>
+            </div>
+            <div className={`${CARD_CLASS} p-4`}>
+                <p className="text-2xl font-black tracking-tight text-slate-900 dark:text-white">
+                    {formatCentsToCurrency(monetization.ad_earnings_cents) ?? "—"}
+                </p>
+                <p className="text-xs text-slate-500 dark:text-zinc-400">
+                    {t("dashboard.monetizationAdEarnings", "Revenus publicitaires estimes")}
+                </p>
+            </div>
+            <div className={`${CARD_CLASS} p-4`}>
+                <p className="text-2xl font-black tracking-tight text-slate-900 dark:text-white">
+                    {formatCentsToCurrency(monetization.ad_cpm_cents) ?? "—"}
+                </p>
+                <p className="text-xs text-slate-500 dark:text-zinc-400">
+                    {t("dashboard.monetizationAdCpm", "CPM publicitaire moyen")}
+                </p>
+            </div>
+        </div>
+    );
+}
 
 async function fetchSocialAccounts(userId) {
     const response = await fetch(getApiUrl("/api/social/accounts"), {
@@ -177,15 +269,25 @@ function AccountInsightsCard({ insights, loading, t }) {
         <div className="space-y-4">
             {availableMetrics.length > 0 && (
                 <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-                    {availableMetrics.map((def) => (
-                        <div key={def.key} className={`${CARD_CLASS} p-4`}>
-                            <p className="text-2xl font-black tracking-tight text-slate-900 dark:text-white">
-                                {insights.metrics[def.key]}
-                            </p>
-                            <p className="text-xs text-slate-500 dark:text-zinc-400">{t(def.labelKey, def.fallback)}</p>
-                        </div>
-                    ))}
+                    {availableMetrics.map((def) => {
+                        const trend = insights?.trends?.[def.key];
+                        return (
+                            <div key={def.key} className={`${CARD_CLASS} p-4`}>
+                                <div className="flex items-baseline justify-between gap-2">
+                                    <p className="text-2xl font-black tracking-tight text-slate-900 dark:text-white">
+                                        {insights.metrics[def.key]}
+                                    </p>
+                                    <TrendBadge trend={trend} />
+                                </div>
+                                <p className="text-xs text-slate-500 dark:text-zinc-400">{t(def.labelKey, def.fallback)}</p>
+                            </div>
+                        );
+                    })}
                 </div>
+            )}
+
+            {insights?.monetization !== undefined && (
+                <MonetizationCard monetization={insights.monetization} t={t} />
             )}
 
             {dailySeriesKeys.length > 0 && (
