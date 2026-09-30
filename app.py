@@ -129,12 +129,10 @@ from billing import (
     calculate_credits_for_operation,
     estimate_reel_cost_usd,
     estimate_caption_cost_usd,
-    estimate_publication_cost_usd,
     estimate_film_summary_analysis_cost_usd,
     estimate_film_summary_render_cost_usd,
     DEFAULT_REEL_CREDITS,
     DEFAULT_CAPTION_CREDITS,
-    DEFAULT_PUBLICATION_CREDITS,
     CREDIT_UNIT_PRICE_BY_DOLLAR,
     estimate_llm_usage_cost_usd,
 )
@@ -3950,6 +3948,21 @@ async def _assert_user_has_required_credits(user_id: str, required_credits: floa
             ),
         )
     return required
+
+
+async def _assert_user_has_active_subscription_for_publish(user_id: str) -> None:
+    """Publishing to social networks is free of credit cost, but still
+    requires an active paid subscription: an account at 0 credits can still
+    publish as long as its subscription is active, while one with no active
+    subscription is blocked regardless of its credit balance."""
+    if not is_supabase_configured():
+        return
+    subscription = await get_user_abonnement(user_id)
+    if not subscription:
+        raise HTTPException(
+            status_code=402,
+            detail="Un abonnement actif est requis pour publier sur les reseaux sociaux.",
+        )
 
 
 async def _assert_user_has_storage_headroom(user_id: str) -> None:
@@ -7956,6 +7969,13 @@ async def _publish_reel_social_post_now(
     final_title: str, final_description: str, public_video_url: str, local_video_path: str,
 ) -> Dict[str, Any]:
     platform_name = str(account.get("platform") or "")
+    base_payload = {
+        "source_type": "job_clip",
+        "account_id": account.get("id"),
+        "title": final_title,
+        "description": final_description,
+        "media_url": public_video_url,
+    }
     try:
         # Sonar false positive (S5332): validates the URL is absolute (any
         # scheme) before submitting it to the platform API -- not a
@@ -7978,7 +7998,7 @@ async def _publish_reel_social_post_now(
         post_url = _build_social_post_url(platform_name, platform_result)
         await _insert_publish_job(
             user_id=user_id, platform=platform_name, external_id=external_id, status="done", priority=publish_priority,
-            payload={"post_url": post_url} if post_url else None,
+            payload={**base_payload, "post_url": post_url} if post_url else base_payload,
         )
         return {
             "success": True,
@@ -7986,16 +8006,20 @@ async def _publish_reel_social_post_now(
         }
     except Exception as exc:
         err_msg = str(exc)
-        await _insert_publish_job(user_id=user_id, platform=platform_name, external_id="n/a", status="failed", error_message=err_msg, priority=publish_priority)
+        await _insert_publish_job(
+            user_id=user_id, platform=platform_name, external_id="n/a", status="failed", error_message=err_msg,
+            priority=publish_priority, payload=base_payload,
+        )
         return {
             "success": False,
             "error": err_msg,
         }
 
 
-@app.post("/api/social/post", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+@app.post("/api/social/post", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def post_to_socials(req: SocialPostRequest, request: Request, user_id_header: Annotated[str, Depends(get_user_id_header)]):
     user_id = _resolve_request_user_id(req.user_id, user_id_header)
+    await _assert_user_has_active_subscription_for_publish(user_id)
     accounts = await _resolve_accounts_for_publish(user_id, req.account_ids, _SHARE_PLATFORMS)
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(req.scheduled_date, req.timezone)
@@ -9228,6 +9252,9 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
 
     await _enforce_subscription_retention_policy(user_id)
 
+    abonnement = await get_user_abonnement(user_id)
+    has_active_subscription = bool(abonnement)
+
     data = await supabase_get_user_data(user_id)
     if not data:
         return {
@@ -9237,6 +9264,7 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
             "stockage_max": 0.0,
             "storage_overage_tolerance_percent": STORAGE_OVERAGE_TOLERANCE_PERCENT,
             "has_credits": False,
+            "has_active_subscription": has_active_subscription,
             "abo_costs": {
                 "credit":  0.0,
                 "storage": 0.0,
@@ -9244,7 +9272,7 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
             "default_costs": {
                 "reel":        DEFAULT_REEL_CREDITS,
                 "caption":     DEFAULT_CAPTION_CREDITS,
-                "publication": DEFAULT_PUBLICATION_CREDITS,
+                "publication": 0.0,
             },
         }
 
@@ -9253,7 +9281,6 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
     credit_max = float(data.get("credit_max", credit) or 0.0)
     storage_max = float(data.get("stockage_max", max(storage, 0.0)) or 0.0)
 
-    abonnement = await get_user_abonnement(user_id)
     if not abonnement:
         abo_costs = {
             "credit":  0.0,
@@ -9272,11 +9299,12 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
         "stockage_max": storage_max,
         "storage_overage_tolerance_percent": STORAGE_OVERAGE_TOLERANCE_PERCENT,
         "has_credits": credit > 0,
+        "has_active_subscription": has_active_subscription,
         "abo_costs": abo_costs,
         "default_costs": {
             "reel":        DEFAULT_REEL_CREDITS,
             "caption":     DEFAULT_CAPTION_CREDITS,
-            "publication": DEFAULT_PUBLICATION_CREDITS,
+            "publication": 0.0,
         },
     }
 
@@ -10108,6 +10136,12 @@ async def _publish_anonymous_story_now(
         external_id="n/a",
         status="queued",
         priority=publish_priority,
+        payload={
+            "source_type": "anonymous_story",
+            "account_id": account.get("id"),
+            "text": text_value,
+            "background_id": background_id,
+        },
     )
     try:
         await _update_publish_job_status(publish_job_id, "processing")
@@ -10183,7 +10217,7 @@ async def publish_anonymous_story_endpoint(
     if not ANONYMOUS_STORIES_ENABLED:
         raise HTTPException(status_code=404, detail=_ANONYMOUS_STORIES_DISABLED)
 
-    await _assert_user_has_required_credits(user_id, 0.0)
+    await _assert_user_has_active_subscription_for_publish(user_id)
 
     row = await supabase_get_anonymous_story(story_id, user_id)
     if not row:
@@ -10203,9 +10237,6 @@ async def publish_anonymous_story_endpoint(
         accounts, publish_priority, scheduled_for, payload.timezone, is_scheduled,
     )
     overall_success = all(result.get("success") for result in results.values())
-
-    if not is_scheduled:
-        await _debit_publish_credits_after_share(user_id, story_id, results)
 
     return {
         "success": overall_success,
@@ -10246,35 +10277,13 @@ async def _schedule_share_publish_job(
     }
 
 
-async def _debit_publish_credits_after_share(user_id: str, operation_id: str, results: Dict[str, Any]) -> None:
-    if not is_supabase_configured():
-        return
-    platform_count_done = sum(1 for v in results.values() if v.get("success"))
-    if platform_count_done <= 0:
-        return
-    pub_done_cost = calculate_credits_for_operation(
-        estimate_publication_cost_usd(platform_count=platform_count_done, video_size_gb=0.5)
-    )
-    pub_done_credits = pub_done_cost["final_credits"]
-    await supabase_deduct_user_credits(user_id, pub_done_credits)
-    await supabase_insert_user_data_history(
-        user_id=user_id,
-        credit=pub_done_credits,
-        storage=0.0,
-        operation="output",
-        operation_type="publication",
-        operation_id=operation_id,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Social posts: a user-authored post (with an optional Facebook background
 # theme, reusing anonymous_stories.BACKGROUND_PRESETS) published together
 # with zero or more follow-up comments, posted by the connected Page/account
-# itself right after the post goes live. Billed the same as any other
-# publication (_debit_publish_credits_after_share / _debit_scheduled_publish_
-# credits) -- comments ride along on the same charge, they don't add their
-# own cost.
+# itself right after the post goes live. Publishing is free (no credit
+# debit, no user_data_history entry) but still requires an active
+# subscription -- see _assert_user_has_active_subscription_for_publish.
 # ---------------------------------------------------------------------------
 
 class SocialPostCommentInput(BaseModel):
@@ -10398,7 +10407,13 @@ async def _publish_social_post_now(
         external_id="n/a",
         status="queued",
         priority=publish_priority,
-        payload={"source_type": "social_post", "account_id": account.get("id"), "comments": [c.model_dump() for c in comments]},
+        payload={
+            "source_type": "social_post",
+            "account_id": account.get("id"),
+            "text": text_value,
+            "background_id": background_id,
+            "comments": [c.model_dump() for c in comments],
+        },
     )
     try:
         await _update_publish_job_status(publish_job_id, "processing")
@@ -10491,14 +10506,13 @@ async def _execute_scheduled_social_post_job(job_id: str, user_id: str, platform
             job_id, "done", external_id=external_id, post_url=post_url,
             extra_payload={"comments_results": comments_results},
         )
-        await _debit_scheduled_publish_credits(user_id, task_payload, job_id)
     except Exception as exc:
         await _update_publish_job_status(job_id, "failed", error_message=str(exc))
 
 
 @app.post("/api/social/posts", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
-    await _assert_user_has_required_credits(user_id, 0.0)
+    await _assert_user_has_active_subscription_for_publish(user_id)
 
     text_value = (payload.text or "").strip()
     if not text_value:
@@ -10530,9 +10544,6 @@ async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotate
         )
 
     overall_success = all(result.get("success") for result in results.values())
-
-    if not is_scheduled:
-        await _debit_publish_credits_after_share(user_id, f"social_post:{uuid.uuid4().hex[:12]}", results)
 
     return {
         "success": overall_success,
@@ -10624,6 +10635,13 @@ async def _publish_caption_now(user_id: str, account: Dict[str, Any], publish_pr
         external_id="n/a",
         status="queued",
         priority=publish_priority,
+        payload={
+            "source_type": "caption",
+            "account_id": account.get("id"),
+            "title": final_title,
+            "description": final_description,
+            "media_url": media_url,
+        },
     )
     try:
         await _update_publish_job_status(publish_job_id, "processing")
@@ -10657,7 +10675,7 @@ async def _publish_caption_now(user_id: str, account: Dict[str, Any], publish_pr
 
 @app.post("/api/captions/{caption_id}/share", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def share_caption(caption_id: str, payload: ReelShareRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
-    await _assert_user_has_required_credits(user_id, 0.0)
+    await _assert_user_has_active_subscription_for_publish(user_id)
 
     row = await supabase_get_caption(caption_id, user_id)
     if not row:
@@ -10691,9 +10709,6 @@ async def share_caption(caption_id: str, payload: ReelShareRequest, user_id: Ann
         results[result_key] = result
         if not result["success"]:
             overall_success = False
-
-    if not is_scheduled:
-        await _debit_publish_credits_after_share(user_id, caption_id, results)
 
     return {
         "success": overall_success,
@@ -12008,6 +12023,13 @@ async def _publish_film_summary_now(
     platform_name = str(account.get("platform") or "")
     publish_job_id = await _insert_publish_job(
         user_id=user_id, platform=platform_name, external_id="n/a", status="queued", priority=publish_priority,
+        payload={
+            "source_type": "film_summary",
+            "account_id": account.get("id"),
+            "title": final_title,
+            "description": final_description,
+            "media_url": media_url,
+        },
     )
     try:
         await _update_publish_job_status(publish_job_id, "processing")
@@ -12029,7 +12051,7 @@ async def _publish_film_summary_now(
 
 @app.post("/api/film-summaries/{film_summary_id}/share", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def share_film_summary(film_summary_id: str, payload: ReelShareRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
-    await _assert_user_has_required_credits(user_id, 0.0)
+    await _assert_user_has_active_subscription_for_publish(user_id)
 
     row = await supabase_get_film_summary(film_summary_id, user_id)
     if not row:
@@ -12069,9 +12091,6 @@ async def share_film_summary(film_summary_id: str, payload: ReelShareRequest, us
         results[result_key] = result
         if not result["success"]:
             overall_success = False
-
-    if not is_scheduled:
-        await _debit_publish_credits_after_share(user_id, film_summary_id, results)
 
     return {
         "success": overall_success,
@@ -12449,6 +12468,13 @@ async def delete_reel(reel_id: str, user_id: Annotated[str, Depends(get_user_id_
 
 async def _publish_reel_now(user_id: str, account: Dict[str, Any], publish_priority: int, final_title: str, final_description: str, media_url: str) -> Dict[str, Any]:
     platform_name = str(account.get("platform") or "")
+    base_payload = {
+        "source_type": "reel",
+        "account_id": account.get("id"),
+        "title": final_title,
+        "description": final_description,
+        "media_url": media_url,
+    }
     try:
         publish_payload = PublishRequest(
             user_id=user_id,
@@ -12463,7 +12489,7 @@ async def _publish_reel_now(user_id: str, account: Dict[str, Any], publish_prior
         post_url = _build_social_post_url(platform_name, platform_result)
         await _insert_publish_job(
             user_id=user_id, platform=platform_name, external_id=external_id, status="done", priority=publish_priority,
-            payload={"post_url": post_url} if post_url else None,
+            payload={**base_payload, "post_url": post_url} if post_url else base_payload,
         )
         return {
             "success": True,
@@ -12471,7 +12497,10 @@ async def _publish_reel_now(user_id: str, account: Dict[str, Any], publish_prior
         }
     except Exception as exc:
         err_msg = str(exc)
-        await _insert_publish_job(user_id=user_id, platform=platform_name, external_id="n/a", status="failed", error_message=err_msg, priority=publish_priority)
+        await _insert_publish_job(
+            user_id=user_id, platform=platform_name, external_id="n/a", status="failed", error_message=err_msg,
+            priority=publish_priority, payload=base_payload,
+        )
         return {
             "success": False,
             "error": err_msg,
@@ -12480,7 +12509,7 @@ async def _publish_reel_now(user_id: str, account: Dict[str, Any], publish_prior
 
 @app.post("/api/reels/{reel_id}/share", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def share_reel(reel_id: str, payload: ReelShareRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
-    await _assert_user_has_required_credits(user_id, 0.0)
+    await _assert_user_has_active_subscription_for_publish(user_id)
 
     row = await supabase_get_reel(reel_id, user_id)
     if not row:
@@ -12514,10 +12543,6 @@ async def share_reel(reel_id: str, payload: ReelShareRequest, user_id: Annotated
         results[result_key] = result
         if not result["success"]:
             overall_success = False
-
-    # Debit credits after publications (best-effort)
-    if not is_scheduled:
-        await _debit_publish_credits_after_share(user_id, reel_id, results)
 
     return {
         "success": overall_success,
@@ -12942,24 +12967,6 @@ async def _insert_publish_job(
     return str(rows[0].get("id")) if rows and rows[0].get("id") is not None else None
 
 
-async def _debit_scheduled_publish_credits(user_id: str, task_payload: Dict[str, Any], job_id: str) -> None:
-    if not is_supabase_configured():
-        return
-    done_cost = calculate_credits_for_operation(
-        estimate_publication_cost_usd(platform_count=1, video_size_gb=0.5)
-    )
-    done_credits = done_cost["final_credits"]
-    await supabase_deduct_user_credits(user_id, done_credits)
-    await supabase_insert_user_data_history(
-        user_id=user_id,
-        credit=done_credits,
-        storage=0.0,
-        operation="output",
-        operation_type="publication",
-        operation_id=str(task_payload.get("source_id") or job_id),
-    )
-
-
 def _build_scheduled_publish_payload(user_id: str, task_payload: Dict[str, Any]) -> "PublishRequest":
     """Build the PublishRequest for a due scheduled publish job. Pulled out
     of _execute_scheduled_publish_job to keep its cognitive complexity down:
@@ -13020,8 +13027,6 @@ async def _execute_scheduled_publish_job(job_row: Dict[str, Any]) -> None:
         external_id = str(platform_result.get("publish_id") or platform_result.get("id") or platform_result.get("video_id") or "n/a")
         post_url = _build_social_post_url(platform, platform_result)
         await _update_publish_job_status(job_id, "done", external_id=external_id, post_url=post_url, error_message=None)
-
-        await _debit_scheduled_publish_credits(user_id, task_payload, job_id)
     except Exception as exc:
         await _update_publish_job_status(job_id, "failed", error_message=str(exc))
 
@@ -13071,12 +13076,22 @@ async def _update_publish_job_status(
         payload["error_message"] = error_message
     if external_id is not None:
         payload["external_id"] = external_id
-    # Note: this replaces the row's whole `payload` jsonb column rather than
-    # merging into it -- fine for every current caller since nothing reads
-    # back the pre-completion payload (source_type/comments/background_id)
-    # after a job finishes.
+    # Merges into the row's existing `payload` jsonb column rather than
+    # replacing it, so the source_type/media_url/title/description recorded
+    # at insert/schedule time survives past completion -- the publications
+    # page needs it to show what was actually posted (see
+    # SocialPublicationsPage.jsx).
     if post_url or extra_payload:
-        merged_payload: Dict[str, Any] = dict(extra_payload or {})
+        existing = (
+            await client.table(SUPABASE_SOCIAL_PUBLISH_JOBS_TABLE)
+            .select("payload")
+            .eq("id", publish_job_id)
+            .limit(1)
+            .execute()
+        )
+        existing_rows = existing.data or []
+        existing_payload = (existing_rows[0].get("payload") or {}) if existing_rows else {}
+        merged_payload: Dict[str, Any] = {**existing_payload, **(extra_payload or {})}
         if post_url:
             merged_payload["post_url"] = post_url
         payload["payload"] = merged_payload

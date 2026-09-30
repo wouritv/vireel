@@ -30,7 +30,7 @@ function toResultCardClipFromCaption(item, mediaUrl) {
 
 export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) {
     const { user } = useAuth();
-    const { credits, defaultCosts } = useUserCredits();
+    const { credits, hasActiveSubscription } = useUserCredits();
     const { t } = useTranslation();
     const navigate = useNavigate();
 
@@ -65,8 +65,7 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
     const [projectMeta, setProjectMeta] = useState(null);
     const [didAutoOpen, setDidAutoOpen] = useState(false);
 
-    const publicationCostEstimate = Number(defaultCosts?.publication || 1);
-    const canShareCaption = credits >= publicationCostEstimate;
+    const canShareCaption = hasActiveSubscription === true;
     const canCreateCaption = Number(credits || 0) > 0;
     const statusOptions = [
         { value: "", label: t("reels.allStatuses", "All statuses") },
@@ -274,7 +273,7 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
 
     const handleShare = (item) => {
         if (!canShareCaption) {
-            setShareResult({ success: false, msg: t("reels.shareDisabledInsufficient", "Insufficient credits. Sharing is disabled.") });
+            setShareResult({ success: false, msg: t("reels.shareDisabledNoSubscription", "Un abonnement actif est requis pour publier.") });
             return;
         }
         setSharePlatforms({});
@@ -289,7 +288,7 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
     const submitShare = async () => {
         if (!user?.id || !shareModalItem?.id) return;
         if (!canShareCaption) {
-            setShareResult({ success: false, msg: t("reels.shareDisabledInsufficient", "Insufficient credits. Sharing is disabled.") });
+            setShareResult({ success: false, msg: t("reels.shareDisabledNoSubscription", "Un abonnement actif est requis pour publier.") });
             return;
         }
 

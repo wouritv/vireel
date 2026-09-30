@@ -14,7 +14,7 @@ import { useTranslation } from "../state/LanguageContext";
 
 export default function ReelsPage({ projectId = "" }) {
     const { user } = useAuth();
-    const { credits, defaultCosts } = useUserCredits();
+    const { credits, hasActiveSubscription } = useUserCredits();
     const {t} = useTranslation();
     const [items, setItems] = useState([]);
     const [loading, setLoading] = useState(true);
@@ -43,9 +43,8 @@ export default function ReelsPage({ projectId = "" }) {
     const navigate = useNavigate();
 
     const totalPages = useMemo(() => Math.max(1, Math.ceil(total / pageSize)), [total, pageSize]);
-    const publicationCostEstimate = Number(defaultCosts?.publication || 1);
     const hasAnyReelCredit = Number(credits || 0) > 0;
-    const canShareReel = credits >= publicationCostEstimate;
+    const canShareReel = hasActiveSubscription === true;
     const statusOptions = [
         { value: "", label: t('reels.allStatuses', 'All statuses') },
         { value: "en_cours", label: t("reels.statusInProgress", "In progress") },
@@ -261,7 +260,7 @@ export default function ReelsPage({ projectId = "" }) {
 
     const handleShare = (item) => {
         if (!canShareReel) {
-            setShareResult({ success: false, msg: t("reels.shareDisabledInsufficient", "Insufficient credits. Sharing is disabled.") });
+            setShareResult({ success: false, msg: t("reels.shareDisabledNoSubscription", "Un abonnement actif est requis pour publier.") });
             return;
         }
         setSharePlatforms({});
@@ -277,7 +276,7 @@ export default function ReelsPage({ projectId = "" }) {
         if (!user?.id) return;
         if (!shareModalItem?.id) return;
         if (!canShareReel) {
-            setShareResult({ success: false, msg: t("reels.shareDisabledInsufficient", "Insufficient credits. Sharing is disabled.") });
+            setShareResult({ success: false, msg: t("reels.shareDisabledNoSubscription", "Un abonnement actif est requis pour publier.") });
             return;
         }
 

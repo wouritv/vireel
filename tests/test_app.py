@@ -2675,13 +2675,9 @@ def test_execute_scheduled_publish_job_anonymous_story_skips_media_url_requireme
         published_payloads.append(content)
         return {"id": "111_222"}
 
-    async def fake_debit_scheduled_publish_credits(user_id, task_payload, job_id):
-        return None
-
     monkeypatch.setattr(app, "_update_publish_job_status", fake_update_publish_job_status)
     monkeypatch.setattr(app, "_get_social_account", fake_get_social_account)
     monkeypatch.setattr(app, "publish_post", fake_publish_post)
-    monkeypatch.setattr(app, "_debit_scheduled_publish_credits", fake_debit_scheduled_publish_credits)
 
     asyncio.run(app._execute_scheduled_publish_job(job_row))
 
@@ -3526,7 +3522,7 @@ def test_render_pipeline_reports_incremental_progress_per_segment(monkeypatch, t
 
 def test_share_film_summary_rejects_when_not_completed(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
     app.supabase_get_film_summary = AsyncMock(return_value={"id": "fs-1", "status": "awaiting_review"})
 
     with TestClient(app.app) as client:
@@ -3540,7 +3536,7 @@ def test_share_film_summary_rejects_when_not_completed(monkeypatch):
 
 def test_share_film_summary_publishes_immediately(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
     app.supabase_get_film_summary = AsyncMock(return_value={
         "id": "fs-1", "status": "completed", "title": "Mon film", "final_s3_key": "final/fs-1.mp4",
     })
@@ -3555,7 +3551,6 @@ def test_share_film_summary_publishes_immediately(monkeypatch):
         return {"id": "post-123"}
 
     monkeypatch.setattr(app, "publish_post", fake_publish_post)
-    app._debit_publish_credits_after_share = AsyncMock()
 
     with TestClient(app.app) as client:
         resp = client.post(
@@ -3575,7 +3570,7 @@ def test_share_film_summary_publishes_immediately(monkeypatch):
 
 def test_share_film_summary_schedules_future_post(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
     app.supabase_get_film_summary = AsyncMock(return_value={
         "id": "fs-1", "status": "completed", "title": "Mon film", "final_s3_key": "final/fs-1.mp4",
     })
@@ -3601,7 +3596,7 @@ def test_share_film_summary_schedules_future_post(monkeypatch):
 
 def test_share_reel_publishes_to_each_selected_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
     app.supabase_get_reel = AsyncMock(return_value={"reel_title": "Mon reel"})
     monkeypatch.setattr(app, "_normalize_reel_row", lambda row: {**row, "media_url": "https://s3.example/reel.mp4"})
     accounts_by_id = {
@@ -3611,7 +3606,6 @@ def test_share_reel_publishes_to_each_selected_account(monkeypatch):
     monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(side_effect=lambda _uid, aid: accounts_by_id.get(aid)))
     monkeypatch.setattr(app, "_insert_publish_job", AsyncMock(return_value="pub-1"))
     monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "post-1"}))
-    monkeypatch.setattr(app, "_debit_publish_credits_after_share", AsyncMock())
 
     with TestClient(app.app) as client:
         resp = client.post(
@@ -3628,7 +3622,7 @@ def test_share_reel_publishes_to_each_selected_account(monkeypatch):
 
 def test_share_reel_rejects_when_no_media_url(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
     app.supabase_get_reel = AsyncMock(return_value={"reel_title": "Mon reel"})
     monkeypatch.setattr(app, "_normalize_reel_row", lambda row: {**row, "media_url": ""})
 
@@ -3643,14 +3637,13 @@ def test_share_reel_rejects_when_no_media_url(monkeypatch):
 
 def test_share_caption_publishes_to_each_selected_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
     app.supabase_get_caption = AsyncMock(return_value={"caption_title": "Mes sous-titres"})
     monkeypatch.setattr(app, "_normalize_caption_row", lambda row: {**row, "media_url": "https://s3.example/caption.mp4"})
     monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "fb-acct", "platform": "facebook"}))
     monkeypatch.setattr(app, "_insert_publish_job", AsyncMock(return_value="pub-1"))
     monkeypatch.setattr(app, "_update_publish_job_status", AsyncMock())
     monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "post-1"}))
-    monkeypatch.setattr(app, "_debit_publish_credits_after_share", AsyncMock())
 
     with TestClient(app.app) as client:
         resp = client.post(
@@ -3667,6 +3660,7 @@ def test_share_caption_publishes_to_each_selected_account(monkeypatch):
 
 def test_post_to_socials_publishes_reel_clip_to_selected_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "fb-acct", "platform": "facebook"}))
     monkeypatch.setattr(
@@ -5205,6 +5199,28 @@ def test_upsert_social_account_rejects_new_account_over_plan_limit(monkeypatch):
     assert table.inserted == []
 
 
+def test_assert_user_has_active_subscription_for_publish_blocks_without_subscription(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(app._assert_user_has_active_subscription_for_publish("u1"))
+
+    assert exc_info.value.status_code == 402
+
+
+def test_assert_user_has_active_subscription_for_publish_allows_with_zero_credits(monkeypatch):
+    # Publishing is free (no credit debit) -- an active subscription is
+    # enough to publish even when the account has 0 credits.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value={"id": "sub-1", "abonnement": "silver-plan"}))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 0}))
+
+    asyncio.run(app._assert_user_has_active_subscription_for_publish("u1"))
+
+
 def test_get_user_max_social_accounts_defaults_to_one_without_active_plan(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
@@ -5495,7 +5511,7 @@ def _social_post_account(platform="facebook"):
 
 def test_create_social_post_rejects_empty_text(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
 
     with TestClient(app.app) as client:
         resp = client.post(
@@ -5508,7 +5524,7 @@ def test_create_social_post_rejects_empty_text(monkeypatch):
 
 def test_create_social_post_rejects_unsupported_platform_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "acct-1", "platform": "tiktok"}))
 
     with TestClient(app.app) as client:
@@ -5522,7 +5538,7 @@ def test_create_social_post_rejects_unsupported_platform_account(monkeypatch):
 
 def test_create_social_post_publishes_now_and_posts_comments(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value=_social_post_account()))
@@ -5534,8 +5550,6 @@ def test_create_social_post_publishes_now_and_posts_comments(monkeypatch):
     monkeypatch.setattr(app, "_update_publish_job_status", update_status_mock)
     post_comment_mock = AsyncMock(side_effect=[{"id": "c1"}, {"id": "c2"}])
     monkeypatch.setattr(app, "_post_platform_comment", post_comment_mock)
-    monkeypatch.setattr(app, "supabase_deduct_user_credits", AsyncMock(return_value=True))
-    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
 
     with TestClient(app.app) as client:
         resp = client.post(
@@ -5569,7 +5583,7 @@ def test_create_social_post_publishes_now_and_posts_comments(monkeypatch):
 
 def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value=_social_post_account()))
@@ -5581,8 +5595,6 @@ def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
         app, "_post_platform_comment",
         AsyncMock(side_effect=[RuntimeError("rate limited"), {"id": "c2"}]),
     )
-    monkeypatch.setattr(app, "supabase_deduct_user_credits", AsyncMock(return_value=True))
-    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
 
     with TestClient(app.app) as client:
         resp = client.post(
@@ -5606,7 +5618,7 @@ def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
 
 def test_create_social_post_schedules_job_without_publishing(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     accounts_by_id = {
         "fb-acct": {"id": "fb-acct", "platform": "facebook"},
@@ -5617,8 +5629,6 @@ def test_create_social_post_schedules_job_without_publishing(monkeypatch):
     monkeypatch.setattr(app, "_insert_publish_job", insert_job_mock)
     publish_post_mock = AsyncMock()
     monkeypatch.setattr(app, "publish_post", publish_post_mock)
-    debit_mock = AsyncMock()
-    monkeypatch.setattr(app, "_debit_publish_credits_after_share", debit_mock)
 
     future_iso = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
 
@@ -5641,7 +5651,6 @@ def test_create_social_post_schedules_job_without_publishing(monkeypatch):
     assert data["scheduled"] is True
     assert data["success"] is True
     publish_post_mock.assert_not_awaited()
-    debit_mock.assert_not_awaited()
     assert insert_job_mock.await_count == 2  # one job per account
     assert set(data["results"].keys()) == {"fb-acct", "li-acct"}
 
@@ -5663,8 +5672,6 @@ def test_execute_scheduled_social_post_job_publishes_and_comments(monkeypatch):
     monkeypatch.setattr(app, "_update_publish_job_status", update_status_mock)
     post_comment_mock = AsyncMock(return_value={"id": "comment-urn"})
     monkeypatch.setattr(app, "_post_platform_comment", post_comment_mock)
-    debit_mock = AsyncMock()
-    monkeypatch.setattr(app, "_debit_scheduled_publish_credits", debit_mock)
 
     task_payload = {
         "source_type": "social_post",
@@ -5676,7 +5683,6 @@ def test_execute_scheduled_social_post_job_publishes_and_comments(monkeypatch):
     asyncio.run(app._execute_scheduled_social_post_job("job-9", "u1", "linkedin", task_payload))
 
     post_comment_mock.assert_awaited_once()
-    debit_mock.assert_awaited_once()
     done_call = [c for c in update_status_mock.await_args_list if len(c.args) > 1 and c.args[1] == "done"][0]
     assert done_call.kwargs["external_id"] == "urn:li:share:999"
     assert done_call.kwargs["extra_payload"]["comments_results"] == [
@@ -5719,7 +5725,20 @@ def test_update_publish_job_status_merges_extra_payload_with_post_url(monkeypatc
 
     captured = {}
 
+    class _FakeSelectQuery:
+        def eq(self, *_a, **_k):
+            return self
+
+        def limit(self, *_a, **_k):
+            return self
+
+        async def execute(self):
+            return types.SimpleNamespace(data=[{"payload": {"source_type": "reel", "title": "T"}}])
+
     class _FakeTable:
+        def select(self, *_a, **_k):
+            return _FakeSelectQuery()
+
         def update(self, payload):
             captured["payload"] = payload
             return self
@@ -5741,7 +5760,12 @@ def test_update_publish_job_status_merges_extra_payload_with_post_url(monkeypatc
         extra_payload={"comments_results": [{"success": True, "id": "c1"}]},
     ))
 
+    # The pre-existing payload (source_type/title, set at insert/schedule
+    # time) survives alongside the new post_url/comments_results -- it's
+    # what lets the publications page show what was actually posted.
     assert captured["payload"]["payload"] == {
+        "source_type": "reel",
+        "title": "T",
         "comments_results": [{"success": True, "id": "c1"}],
         "post_url": "https://example.com/post",
     }

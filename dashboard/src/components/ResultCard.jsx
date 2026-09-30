@@ -30,7 +30,7 @@ const isLikelyVideoAsset = (value) => {
 export default function ResultCard({ clip, index, jobId, onPlay, onPause, compactActions = false, hideVideoPreview = false }) {
     const { t } = useTranslation();
     const { user } = useAuth();
-    const { credits, defaultCosts } = useUserCredits();
+    const { credits, hasActiveSubscription } = useUserCredits();
     const safeClip = clip && typeof clip === 'object' ? clip : {};
     const clipIndexForApi = Number.isFinite(Number(safeClip.reel_clip_index))
         ? Number(safeClip.reel_clip_index)
@@ -44,8 +44,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
         : '';
     const hasClipContext = Boolean(jobId) && Number.isFinite(Number(clipIndexForApi));
     const hasAnyEditingCredit = Number(credits || 0) > 0;
-    const publicationCostEstimate = Number(defaultCosts?.publication || 1);
-    const canShare = credits >= publicationCostEstimate;
+    const canShare = hasActiveSubscription === true;
 
     const [showModal, setShowModal] = useState(false);
     const [showCaptionsModal, setShowCaptionsModal] = useState(false);
@@ -619,7 +618,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
 
     const handlePost = async () => {
         if (!canShare) {
-            setPostResult({ success: false, msg: insufficientCreditsMessage() });
+            setPostResult({ success: false, msg: t("reels.shareDisabledNoSubscription", "Un abonnement actif est requis pour publier.") });
             return;
         }
         if (!hasClipContext) {
