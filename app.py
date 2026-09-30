@@ -355,8 +355,7 @@ PLATFORM_CONFIG = {
         # analytics use) despite the same gap.
         "scopes": [
             "instagram_business_basic",
-            "instagram_business_content_publish",
-            "instagram_business_manage_insights",
+            "instagram_business_content_publish"
         ],
     },
     "youtube": {
