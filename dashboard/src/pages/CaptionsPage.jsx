@@ -7,7 +7,6 @@ import { useNavigate } from "react-router-dom";
 import ResultCard from "../components/ResultCard";
 import SharePostModal from "../components/SharePostModal";
 import MobileFilterDropdown from "../components/MobileFilterDropdown";
-import { getConnectedPlatforms } from "../lib/platforms";
 import { useTranslation } from "../state/LanguageContext";
 import { statusClass, statusLabel } from "../lib/status";
 import { getAuthHeaders } from "../lib/apiAuth";
@@ -34,7 +33,6 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
     const { credits, defaultCosts } = useUserCredits();
     const { t } = useTranslation();
     const navigate = useNavigate();
-    const connectedPlatforms = getConnectedPlatforms();
 
     const [items, setItems] = useState([]);
     const [loading, setLoading] = useState(true);
@@ -58,13 +56,9 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
     const [shareModalItem, setShareModalItem] = useState(null);
     const [shareTitle, setShareTitle] = useState("");
     const [shareDescription, setShareDescription] = useState("");
-    const [sharePlatforms, setSharePlatforms] = useState({
-        tiktok: true,
-        instagram: true,
-        youtube: true,
-        facebook: false,
-        linkedin: false,
-    });
+    // Keyed by account id (not platform) -- SharePostModal fetches the
+    // user's real connected accounts and lets them pick specific ones.
+    const [sharePlatforms, setSharePlatforms] = useState({});
     const [shareScheduling, setShareScheduling] = useState(false);
     const [shareScheduleDate, setShareScheduleDate] = useState("");
     const [hideSocialPlatforms, setHideSocialPlatforms] = useState(getDefaultHideSocialPlatforms());
@@ -283,15 +277,7 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
             setShareResult({ success: false, msg: t("reels.shareDisabledInsufficient", "Insufficient credits. Sharing is disabled.") });
             return;
         }
-        const fallbackPlatforms = ["tiktok", "instagram", "youtube"];
-        const nextDefaultPlatforms = connectedPlatforms.length > 0 ? connectedPlatforms : fallbackPlatforms;
-        setSharePlatforms({
-            tiktok: nextDefaultPlatforms.includes("tiktok"),
-            instagram: nextDefaultPlatforms.includes("instagram"),
-            youtube: nextDefaultPlatforms.includes("youtube"),
-            facebook: nextDefaultPlatforms.includes("facebook"),
-            linkedin: nextDefaultPlatforms.includes("linkedin"),
-        });
+        setSharePlatforms({});
         setShareTitle(item?.caption_title || t("reels.defaultShareTitle", "Viral Short"));
         setShareDescription(item?.caption_description || "");
         setShareScheduling(false);
@@ -307,8 +293,8 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
             return;
         }
 
-        const selectedPlatforms = Object.keys(sharePlatforms).filter((key) => Boolean(sharePlatforms[key]));
-        if (selectedPlatforms.length === 0) {
+        const selectedAccountIds = Object.keys(sharePlatforms).filter((key) => Boolean(sharePlatforms[key]));
+        if (selectedAccountIds.length === 0) {
             setShareResult({ success: false, msg: t("reels.selectAtLeastOnePlatform", "Select at least one platform.") });
             return;
         }
@@ -321,7 +307,7 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
         setShareResult(null);
         try {
             const payload = {
-                platforms: selectedPlatforms,
+                account_ids: selectedAccountIds,
                 title: shareTitle || undefined,
                 description: shareDescription || undefined,
             };
@@ -678,9 +664,8 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
                     onSchedulingChange={setShareScheduling}
                     scheduleDate={shareScheduleDate}
                     onScheduleDateChange={setShareScheduleDate}
-                    platforms={sharePlatforms}
-                    onPlatformChange={(platform, checked) => setSharePlatforms((prev) => ({ ...prev, [platform]: checked }))}
-                    connectedPlatforms={connectedPlatforms}
+                    selectedAccountIds={sharePlatforms}
+                    onAccountToggle={(accountId, checked) => setSharePlatforms((prev) => ({ ...prev, [accountId]: checked }))}
                     isSubmitting={Boolean(shareModalItem && sharingId === shareModalItem.id)}
                     result={shareResult}
                     onSubmit={submitShare}

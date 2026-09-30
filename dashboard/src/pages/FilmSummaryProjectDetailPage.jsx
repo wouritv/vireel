@@ -6,7 +6,6 @@ import { getAuthHeaders } from "../lib/apiAuth";
 import { useAuth } from "../state/AuthContext";
 import { useTranslation } from "../state/LanguageContext";
 import { errorMessageForCode } from "../lib/filmSummary";
-import { getConnectedPlatforms } from "../lib/platforms";
 import FilmSummaryProcessingPanel from "../components/FilmSummaryProcessingPanel";
 import FilmSummaryReviewPanel from "../components/FilmSummaryReviewPanel";
 import SharePostModal from "../components/SharePostModal";
@@ -223,22 +222,21 @@ export default function FilmSummaryProjectDetailPage() {
     const handleOpenShare = () => {
         setShareTitle(filmSummary?.title || "");
         setShareDescription("");
-        const connected = getConnectedPlatforms();
-        setSharePlatforms(Object.fromEntries(connected.map((platform) => [platform, true])));
+        setSharePlatforms({});
         setIsScheduling(false);
         setScheduleDate("");
         setShareResult(null);
         setShowShareModal(true);
     };
 
-    const handlePlatformChange = (platform, checked) => {
-        setSharePlatforms((prev) => ({ ...prev, [platform]: checked }));
+    const handlePlatformChange = (accountId, checked) => {
+        setSharePlatforms((prev) => ({ ...prev, [accountId]: checked }));
     };
 
     const handleShare = async () => {
         if (!filmSummary?.id || !user?.id) return;
-        const selectedPlatforms = Object.keys(sharePlatforms).filter((key) => sharePlatforms[key]);
-        if (selectedPlatforms.length === 0) {
+        const selectedAccountIds = Object.keys(sharePlatforms).filter((key) => sharePlatforms[key]);
+        if (selectedAccountIds.length === 0) {
             setShareResult({ success: false, msg: t("reels.selectAtLeastOnePlatform", "Select at least one platform.") });
             return;
         }
@@ -251,7 +249,7 @@ export default function FilmSummaryProjectDetailPage() {
         setShareResult(null);
         try {
             const payload = {
-                platforms: selectedPlatforms,
+                account_ids: selectedAccountIds,
                 title: shareTitle,
                 description: shareDescription,
             };
@@ -468,9 +466,8 @@ export default function FilmSummaryProjectDetailPage() {
                 onSchedulingChange={setIsScheduling}
                 scheduleDate={scheduleDate}
                 onScheduleDateChange={setScheduleDate}
-                platforms={sharePlatforms}
-                onPlatformChange={handlePlatformChange}
-                connectedPlatforms={getConnectedPlatforms()}
+                selectedAccountIds={sharePlatforms}
+                onAccountToggle={handlePlatformChange}
                 isSubmitting={sharing}
                 result={shareResult}
                 onSubmit={handleShare}

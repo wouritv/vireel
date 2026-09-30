@@ -5,15 +5,11 @@ import CaptionsModal from './CaptionsModal';
 import HookModal from './HookModal';
 import SharePostModal from './SharePostModal';
 import { renderInBrowser } from '../lib/renderInBrowser';
-import { getConnectedPlatforms } from '../lib/platforms';
 import { inputFilenameFromVideoUrl } from '../lib/clips';
 import { useAuth } from '../state/AuthContext';
 import { getAuthHeaders } from '../lib/apiAuth';
 import { useUserCredits } from '../state/UserCreditsContext';
 import { useTranslation } from "../state/LanguageContext";
-function readConnectedPlatformsFromSettings() {
-    return getConnectedPlatforms();
-}
 
 const parseApiErrorText = (rawText) => {
     try {
@@ -46,8 +42,6 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
     const rawVideoUrl = typeof (safeClip.reel_playback_url || safeClip.caption_playback_url || safeClip.media_url || safeClip.video_url) === 'string'
         ? (safeClip.reel_playback_url || safeClip.caption_playback_url || safeClip.media_url || safeClip.video_url)
         : '';
-    const connectedPlatforms = readConnectedPlatformsFromSettings();
-    const defaultPlatforms = connectedPlatforms.length > 0 ? connectedPlatforms : ['tiktok', 'instagram', 'youtube'];
     const hasClipContext = Boolean(jobId) && Number.isFinite(Number(clipIndexForApi));
     const hasAnyEditingCredit = Number(credits || 0) > 0;
     const publicationCostEstimate = Number(defaultCosts?.publication || 1);
@@ -59,13 +53,10 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
     const originalVideoUrl = rawVideoUrl ? getApiUrl(rawVideoUrl) : '';
     const [currentVideoUrl, setCurrentVideoUrl] = useState(originalVideoUrl);
 
-    const [platforms, setPlatforms] = useState({
-        tiktok: defaultPlatforms.includes('tiktok'),
-        instagram: defaultPlatforms.includes('instagram'),
-        youtube: defaultPlatforms.includes('youtube'),
-        facebook: defaultPlatforms.includes('facebook'),
-        linkedin: defaultPlatforms.includes('linkedin'),
-    });
+    // Keyed by account id (not platform) -- SharePostModal fetches the
+    // user's real connected accounts itself and lets them pick specific
+    // ones, since a plan can have several accounts per platform.
+    const [selectedAccountIds, setSelectedAccountIds] = useState({});
     const [postTitle, setPostTitle] = useState("");
     const [postDescription, setPostDescription] = useState("");
     const [isScheduling, setIsScheduling] = useState(false);
@@ -223,19 +214,6 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
         }
     }, [currentVideoUrl]);
 
-    useEffect(() => {
-        const nextPlatforms = {
-            tiktok: defaultPlatforms.includes('tiktok'),
-            instagram: defaultPlatforms.includes('instagram'),
-            youtube: defaultPlatforms.includes('youtube'),
-            facebook: defaultPlatforms.includes('facebook'),
-            linkedin: defaultPlatforms.includes('linkedin'),
-        };
-        setPlatforms((prev) => {
-            const changed = Object.keys(nextPlatforms).some((k) => prev[k] !== nextPlatforms[k]);
-            return changed ? nextPlatforms : prev;
-        });
-    }, [defaultPlatforms.join('|')]);
 
     // Initialize/Reset form when modal opens
     useEffect(() => {
@@ -648,8 +626,8 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
             setPostResult({ success: false, msg: t("reels.noActionAvailable", "Publication indisponible: reel detache de son job original.") });
             return;
         }
-        const selectedPlatforms = Object.keys(platforms).filter(k => platforms[k]);
-        if (selectedPlatforms.length === 0) {
+        const selectedAccountIdList = Object.keys(selectedAccountIds).filter(k => selectedAccountIds[k]);
+        if (selectedAccountIdList.length === 0) {
             setPostResult({ success: false, msg: t("reels.selectAtLeastOnePlatform", "Select at least one platform.") });
             return;
         }
@@ -667,7 +645,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
                 job_id: jobId,
                     clip_index: clipIndexForApi,
                 user_id: user?.id,
-                platforms: selectedPlatforms,
+                account_ids: selectedAccountIdList,
                 title: postTitle,
                 description: postDescription
             };
@@ -919,9 +897,8 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
                     onSchedulingChange={setIsScheduling}
                     scheduleDate={scheduleDate}
                     onScheduleDateChange={setScheduleDate}
-                    platforms={platforms}
-                    onPlatformChange={(platform, checked) => setPlatforms((prev) => ({ ...prev, [platform]: checked }))}
-                    connectedPlatforms={connectedPlatforms}
+                    selectedAccountIds={selectedAccountIds}
+                    onAccountToggle={(accountId, checked) => setSelectedAccountIds((prev) => ({ ...prev, [accountId]: checked }))}
                     isSubmitting={posting}
                     result={postResult}
                     onSubmit={handlePost}
