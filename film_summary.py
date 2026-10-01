@@ -618,6 +618,42 @@ def validate_edit_plan_content(
     }
 
 
+def _clamp_legacy_duration_truncation_overage(
+    segments: List[Dict[str, Any]], source_duration_ms: int, max_overage_ms: int = 999,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Repairs a pre-existing precision-loss bug: source_duration_seconds
+    used to be stored truncated to a whole second (losing up to 999ms of
+    precision), so a segment/clip whose end_ms was valid against the
+    full-precision duration used when the plan was first generated can
+    overshoot the now-reconstituted (truncated) source_duration_ms by
+    exactly that much. Clamping only an overage within that known bound --
+    never a bigger one, which would be a real out-of-bounds plan -- lets
+    an already-affected film summary render instead of staying
+    permanently stuck on "timecode hors limites", without weakening the
+    bounds check for anything else."""
+    changed = False
+    fixed_segments = []
+    for seg in segments:
+        seg = dict(seg)
+        if seg.get("type") == SEGMENT_TYPE_VOICE_OVER:
+            fixed_clips = []
+            for clip in seg.get("clips") or []:
+                clip = dict(clip)
+                end_ms = clip.get("end_ms")
+                if isinstance(end_ms, int) and source_duration_ms < end_ms <= source_duration_ms + max_overage_ms:
+                    clip["end_ms"] = source_duration_ms
+                    changed = True
+                fixed_clips.append(clip)
+            seg["clips"] = fixed_clips
+        else:
+            end_ms = seg.get("end_ms")
+            if isinstance(end_ms, int) and source_duration_ms < end_ms <= source_duration_ms + max_overage_ms:
+                seg["end_ms"] = source_duration_ms
+                changed = True
+        fixed_segments.append(seg)
+    return fixed_segments, changed
+
+
 def realign_plan_target_duration(
     plan: Dict[str, Any], *, source_duration_ms: int, valid_scene_ids: Optional[List[str]] = None,
     duration_tolerance_ratio: float = 0.15,
@@ -632,7 +668,15 @@ def realign_plan_target_duration(
     if the actual total still lands outside the tolerance band, the target
     is snapped to that total instead of leaving the plan permanently stuck
     on a duration mismatch. Returns (plan, validation_report); the plan is
-    the same object, unchanged, when already within tolerance."""
+    the same object, unchanged, when already within tolerance.
+
+    Also repairs the legacy duration-truncation bug described in
+    _clamp_legacy_duration_truncation_overage before validating."""
+    clamped_segments, clamped = _clamp_legacy_duration_truncation_overage(plan.get("segments") or [], source_duration_ms)
+    if clamped:
+        plan = dict(plan)
+        plan["segments"] = clamped_segments
+
     total_ms = compute_total_estimated_duration_ms(plan.get("segments") or [])
     target_ms = int(plan.get("target_duration_ms") or 0)
     if target_ms > 0 and abs(total_ms - target_ms) > target_ms * duration_tolerance_ratio:
@@ -937,6 +981,7 @@ def _build_planning_correction_message(
     validation_report: Dict[str, Any], plan: Dict[str, Any], target_duration_ms: int, duration_tolerance_ratio: float,
 ) -> Dict[str, str]:
     errors = "; ".join(validation_report.get("errors") or [])
+    warnings = "; ".join(validation_report.get("warnings") or [])
     # Recomputed directly instead of sniffing the (now user-facing, French)
     # error text for the word "duration" -- that substring match broke the
     # moment _validate_duration_tolerance's message got translated.
@@ -945,12 +990,22 @@ def _build_planning_correction_message(
         target_duration_ms > 0 and abs(total_ms - target_duration_ms) > target_duration_ms * duration_tolerance_ratio
     )
     duration_hint = _describe_duration_gap(plan, target_duration_ms) if duration_out_of_tolerance else ""
+
+    sentences = []
+    if errors:
+        sentences.append(f"Your previous plan failed automated validation with these blocking errors: {errors}.")
+    if warnings:
+        # Repeated-clip reuse (and similar) never blocks validation -- see
+        # _validate_repeated_clips -- but is still worth one corrective shot
+        # here, the same mechanism already used for blocking errors, instead
+        # of relying only on the planning prompt's best-effort instruction.
+        sentences.append(f"It also has these quality issues you should fix even though they did not block validation: {warnings}.")
+
     return {
         "role": "user",
         "content": (
-            "Your previous plan failed automated validation with these blocking errors: "
-            f"{errors}.{duration_hint} Return a corrected full plan (same OUTPUT SCHEMA, JSON only) that "
-            "fixes every one of these issues while preserving everything else that was already correct."
+            f"{' '.join(sentences)}{duration_hint} Return a corrected full plan (same OUTPUT SCHEMA, JSON only) "
+            "that fixes every one of these issues while preserving everything else that was already correct."
         ),
     }
 
@@ -965,15 +1020,20 @@ async def generate_edit_plan(
     malformed/insufficient-evidence response.
 
     Self-corrects once on a blocking validation failure (duration outside
-    tolerance, non-contiguous sequence numbers, overlapping dialogue, ...):
-    LLM-produced plans occasionally violate a numeric/structural constraint
-    even when the prompt states it clearly, since keeping a running total
-    consistent across many segments is a self-consistency task models don't
-    reliably get right in one pass. Feeding the exact validation errors back
-    as a corrective follow-up turn (keeping the model's own prior answer in
-    context, rather than starting over) converges far more often than a
-    fresh independent attempt would, at the cost of a second call only when
-    the first one actually failed."""
+    tolerance, non-contiguous sequence numbers, overlapping dialogue, ...)
+    or a non-blocking warning (a clip reused across segments, an unknown
+    character reference, ...): LLM-produced plans occasionally violate a
+    numeric/structural constraint, or ignore a softer instruction like
+    "never reuse a clip", even when the prompt states it clearly, since
+    keeping a running total (or a set of already-used clips) consistent
+    across many segments is a self-consistency task models don't reliably
+    get right in one pass. Feeding the exact validation errors/warnings
+    back as a corrective follow-up turn (keeping the model's own prior
+    answer in context, rather than starting over) converges far more often
+    than a fresh independent attempt would, at the cost of a second call
+    only when the first one actually had something to fix. A warning that
+    still isn't resolved after the retry is never blocking -- the user
+    must always be able to render, see _validate_repeated_clips."""
     client = _get_openai_client()
     model_name = os.environ.get("FILM_SUMMARY_PLANNING_MODEL", os.environ.get("OPENAI_MODEL", "gpt-4o"))
     max_attempts = int(os.environ.get("FILM_SUMMARY_PLANNING_MAX_ATTEMPTS", "2"))
@@ -1017,7 +1077,8 @@ async def generate_edit_plan(
             plan, source_duration_ms=source_duration_ms, valid_scene_ids=valid_scene_ids,
             duration_tolerance_ratio=duration_tolerance_ratio,
         )
-        if validation_report["valid"] or attempt == max_attempts - 1:
+        has_fixable_issue = not validation_report["valid"] or bool(validation_report["warnings"])
+        if not has_fixable_issue or attempt == max_attempts - 1:
             break
         messages.append({"role": "assistant", "content": raw_text})
         messages.append(_build_planning_correction_message(validation_report, plan, target_duration_ms, duration_tolerance_ratio))

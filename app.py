@@ -11619,7 +11619,13 @@ async def _persist_film_summary_row(
         "source_type": source_type,
         "source_url": source_url_value,
         "source_s3_key": source_s3_key,
-        "source_duration_seconds": int(local_duration or 0),
+        # Truncating to an int here used to lose up to ~1s of precision --
+        # a segment whose end_ms was valid against the full-precision
+        # duration used for the original plan (_run_planning_and_validation_
+        # stages' duration_ms) could then fail render_film_summary_
+        # endpoint's "timecode hors limites" check, which recomputes
+        # source_duration_ms from this same stored value.
+        "source_duration_seconds": float(local_duration or 0.0),
         "target_duration_seconds": resolved_target_duration,
         "source_language": (source_language or "").strip()[:50] or None,
         "narration_language": resolved_narration_language or None,

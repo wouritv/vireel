@@ -3001,6 +3001,28 @@ def test_resolve_film_summary_narration_settings_defaults_style_to_cinematic(mon
     assert style == "cinematic"
 
 
+def test_persist_film_summary_row_stores_full_precision_duration(monkeypatch):
+    # Used to store int(local_duration), truncating up to ~1s of precision
+    # -- a segment valid against the full-precision duration used to
+    # generate the plan (_run_planning_and_validation_stages) could then
+    # fail render_film_summary_endpoint's bounds check, which recomputes
+    # source_duration_ms from this exact stored value.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    insert_mock = AsyncMock(return_value={"id": "fs-1"})
+    monkeypatch.setattr(app, "supabase_insert_film_summary", insert_mock)
+
+    asyncio.run(app._persist_film_summary_row(
+        user_id="u1", project_id=None, film_title="Film", source_type="upload", source_url_value=None,
+        source_s3_key="key", local_duration=125.834, resolved_target_duration=60,
+        source_language="en", resolved_narration_language="en", resolved_narration_style="cinematic",
+        resolved_voice_id="voice-1", film_job_id="job-1",
+    ))
+
+    insert_mock.assert_awaited_once()
+    assert insert_mock.await_args.args[0]["source_duration_seconds"] == 125.834
+
+
 def test_resolve_film_summary_narration_settings_preserves_explicit_values(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     language, style = app._resolve_film_summary_narration_settings(" fr ", " dramatic ")
