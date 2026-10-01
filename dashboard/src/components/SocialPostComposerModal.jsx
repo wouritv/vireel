@@ -301,8 +301,8 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
             return `${PLATFORM_LABELS[account.platform] || account.platform} - ${account.platform_account_name || accountId}`;
         };
 
-        if (!text.trim()) {
-            setResult({ success: false, msg: t("social.postComposerTextRequired", "Ecrivez le texte de votre publication.") });
+        if (!text.trim() && !mediaUrl) {
+            setResult({ success: false, msg: t("social.postComposerTextRequired", "Ecrivez le texte de votre publication, ou ajoutez une photo/video.") });
             return;
         }
         if (selectedAccountIdList.length === 0) {

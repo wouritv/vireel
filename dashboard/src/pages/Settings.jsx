@@ -744,7 +744,7 @@ export default function SettingsPage() {
                   className="w-full rounded-md bg-primary px-2 py-1.5 text-xs font-semibold text-white hover:bg-blue-500 disabled:opacity-40 inline-flex items-center justify-center gap-1"
                 >
                   <Plus size={13} />
-                  {isConnectBusy ? '...' : t('settings.connectAnother', '+ Connecter')}
+                  {isConnectBusy ? '...' : t('settings.connectAnother', 'Connecter')}
                 </button>
               </div>
             );
@@ -832,7 +832,7 @@ export default function SettingsPage() {
               </button>
               <button
                 onClick={() => runSubAction('reactivate')}
-                disabled={subActionLoading === 'reactivate'}
+                disabled={!subscription || subActionLoading === 'reactivate'}
                 className="rounded-lg border border-emerald-300 dark:border-green-500/30 bg-emerald-100 dark:bg-green-500/10 px-3 py-2 text-xs text-emerald-800 dark:text-green-300 hover:bg-emerald-200 dark:hover:bg-green-500/20 disabled:opacity-40"
               >
                 {subActionLoading === 'reactivate' ? '...' : t('settings.reactivate', 'Reactivate')}
