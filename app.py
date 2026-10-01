@@ -8894,6 +8894,29 @@ def _handle_payment_method_setup(session: "stripe.checkout.Session") -> dict:
     return {"received": True}
 
 
+def _sync_customer_default_payment_method(stripe_subscription_id: Optional[str], stripe_customer_id: Optional[str]) -> None:
+    """A subscription-mode Checkout sets the Subscription's own
+    default_payment_method to the card used, but -- unlike the dedicated
+    card-replace flow above (_handle_payment_method_setup) -- never
+    mirrors that onto the Customer's invoice_settings.default_payment_method.
+    Without this, get_souscription_payment_method's "card on file" (read
+    off the Customer, not the Subscription -- see
+    _get_stripe_default_payment_method) stays empty for anyone who has
+    only ever subscribed and never explicitly replaced their card.
+    Best-effort: a failure here must never fail the purchase itself."""
+    if not stripe_subscription_id or not stripe_customer_id:
+        return
+    try:
+        subscription = stripe.Subscription.retrieve(stripe_subscription_id, expand=["default_payment_method"])
+        payment_method = subscription.get("default_payment_method")
+        payment_method_id = payment_method["id"] if isinstance(payment_method, dict) else payment_method
+        if not payment_method_id:
+            return
+        stripe.Customer.modify(stripe_customer_id, invoice_settings={"default_payment_method": payment_method_id})
+    except Exception:
+        logger.warning("Failed to sync default payment method for customer %s", stripe_customer_id)
+
+
 async def _handle_subscription_purchase(ctx: dict) -> dict:
     """Handle a standard plan subscription checkout."""
     abonnement = ctx["metadata"].get("abonnement")
@@ -8902,6 +8925,8 @@ async def _handle_subscription_purchase(ctx: dict) -> dict:
 
     if await supabase_get_souscription_by_reference(ctx["payment_reference"]):
         return {"received": True, "duplicate": True}
+
+    _sync_customer_default_payment_method(ctx.get("stripe_subscription_id"), ctx.get("stripe_customer_id"))
 
     new_souscription = await supabase_insert_souscription(
         user_id=ctx["user_id"],
@@ -9426,6 +9451,13 @@ async def replace_souscription_payment_method(
             success_url=f"{default_base_url}/dashboard/settings?payment_method=success",
             cancel_url=f"{default_base_url}/dashboard/settings?payment_method=cancel",
             metadata={"userid": user_id},
+            # Managed Payments (on by default for newer Stripe accounts)
+            # only allows mode="subscription"/"payment" and rejects
+            # mode="setup" outright ("Invalid mode: setup") -- it has
+            # nothing to manage for a card-only setup session anyway, so
+            # it's turned off for this specific request rather than for
+            # the account.
+            managed_payments={"enabled": False},
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")

@@ -4904,6 +4904,7 @@ def test_handle_subscription_purchase_closes_out_previous_souscription(monkeypat
     monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-new"}))
     monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
     monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+    monkeypatch.setattr(app, "_sync_customer_default_payment_method", MagicMock())
     update_mock = AsyncMock()
     monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
 
@@ -4925,12 +4926,80 @@ def test_handle_subscription_purchase_without_previous_souscription_touches_noth
     monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-new"}))
     monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
     monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+    monkeypatch.setattr(app, "_sync_customer_default_payment_method", MagicMock())
     update_mock = AsyncMock()
     monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
 
     asyncio.run(app._handle_subscription_purchase(_fake_subscription_purchase_ctx()))
 
     update_mock.assert_not_awaited()
+
+
+def test_handle_subscription_purchase_syncs_default_payment_method(monkeypatch):
+    # The card used to pay during the Checkout must become visible as
+    # "card on file" in Settings (get_souscription_payment_method), which
+    # reads the Customer's invoice_settings.default_payment_method, not
+    # the Subscription's -- without this sync call, a user who only ever
+    # subscribed (never replaced their card) would never see the card
+    # they actually paid with.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-new"}))
+    monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+    monkeypatch.setattr(app, "supabase_update_souscription_row", AsyncMock())
+    sync_mock = MagicMock()
+    monkeypatch.setattr(app, "_sync_customer_default_payment_method", sync_mock)
+
+    asyncio.run(app._handle_subscription_purchase(_fake_subscription_purchase_ctx(
+        stripe_subscription_id="sub_new", stripe_customer_id="cus_new",
+    )))
+
+    sync_mock.assert_called_once_with("sub_new", "cus_new")
+
+
+def test_sync_customer_default_payment_method_sets_default_from_expanded_subscription(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    fake_stripe.Subscription.retrieve.return_value = {"default_payment_method": {"id": "pm_abc"}}
+
+    app._sync_customer_default_payment_method("sub_1", "cus_1")
+
+    fake_stripe.Subscription.retrieve.assert_called_once_with("sub_1", expand=["default_payment_method"])
+    fake_stripe.Customer.modify.assert_called_once_with("cus_1", invoice_settings={"default_payment_method": "pm_abc"})
+
+
+def test_sync_customer_default_payment_method_accepts_unexpanded_string_id(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    fake_stripe.Subscription.retrieve.return_value = {"default_payment_method": "pm_xyz"}
+
+    app._sync_customer_default_payment_method("sub_1", "cus_1")
+
+    fake_stripe.Customer.modify.assert_called_once_with("cus_1", invoice_settings={"default_payment_method": "pm_xyz"})
+
+
+def test_sync_customer_default_payment_method_noop_without_ids(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+
+    app._sync_customer_default_payment_method(None, "cus_1")
+    app._sync_customer_default_payment_method("sub_1", None)
+
+    fake_stripe.Subscription.retrieve.assert_not_called()
+    fake_stripe.Customer.modify.assert_not_called()
+
+
+def test_sync_customer_default_payment_method_swallows_stripe_errors(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    fake_stripe.Subscription.retrieve.side_effect = RuntimeError("boom")
+
+    app._sync_customer_default_payment_method("sub_1", "cus_1")  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -5026,6 +5095,10 @@ def test_replace_souscription_payment_method_returns_setup_checkout_url(monkeypa
     _, create_kwargs = fake_stripe.checkout.Session.create.call_args
     assert create_kwargs["mode"] == "setup"
     assert create_kwargs["customer"] == "cus_456"
+    # Managed Payments (on by default on newer Stripe accounts) rejects
+    # mode="setup" outright ("Invalid mode: setup") unless explicitly
+    # disabled for the request.
+    assert create_kwargs["managed_payments"] == {"enabled": False}
 
 
 # ---------------------------------------------------------------------------
