@@ -5002,6 +5002,7 @@ def test_change_souscription_plan_swaps_price_and_resets_resources(monkeypatch):
         metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
     )
     fake_stripe.Subscription.modify.return_value = {"current_period_end": 1700000000}
+    fake_stripe.Price.create.return_value = types.SimpleNamespace(id="price_new_1")
 
     monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "new-plan", "name": "Premium", "price": 49.99, "max_social_account": 3}))
     monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
@@ -5017,14 +5018,13 @@ def test_change_souscription_plan_swaps_price_and_resets_resources(monkeypatch):
 
     assert result == {"id": "sous-2"}
     fake_stripe.Subscription.retrieve.assert_called_once_with("sub_123")
+    _, price_create_kwargs = fake_stripe.Price.create.call_args
+    assert price_create_kwargs == {
+        "currency": app.STRIPE_CURRENCY, "unit_amount": 4999, "recurring": {"interval": "month"},
+        "product_data": {"name": "Premium"},
+    }
     _, modify_kwargs = fake_stripe.Subscription.modify.call_args
-    assert modify_kwargs["items"] == [{
-        "id": "si_123",
-        "price_data": {
-            "currency": app.STRIPE_CURRENCY, "unit_amount": 4999, "recurring": {"interval": "month"},
-            "product_data": {"name": "Premium"},
-        },
-    }]
+    assert modify_kwargs["items"] == [{"id": "si_123", "price": "price_new_1"}]
     assert modify_kwargs["proration_behavior"] == "create_prorations"
     assert modify_kwargs["metadata"]["abonnement"] == "new-plan"
     assert modify_kwargs["metadata"]["userid"] == "u1"  # preserved from the existing subscription metadata
