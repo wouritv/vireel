@@ -4994,6 +4994,45 @@ class _FakeStripeSubscriptionObject(dict):
         self.metadata = metadata
 
 
+class _FakeStripeObjectNoGet:
+    """Mimics the real stripe.StripeObject's actual failure mode: supports
+    bracket access via __getitem__, but .get(...) raises exactly the
+    AttributeError the real SDK raises ("is a dict method, but a
+    Subscription is not a dict") -- a plain dict/ _FakeStripeSubscriptionObject
+    mock would silently accept .get() and hide this regression."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __getattr__(self, name):
+        if name == "get":
+            raise AttributeError(f"'get' is a dict method, but a Subscription is not a dict. Use .to_dict() to convert it.")
+        raise AttributeError(name)
+
+
+def test_extract_subscription_period_end_reads_subscription_level_field(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _FakeStripeObjectNoGet({"current_period_end": 1700000000})
+    assert app._extract_subscription_period_end(subscription) == 1700000000
+
+
+def test_extract_subscription_period_end_falls_back_to_item_level_field(monkeypatch):
+    # Stripe moved current_period_end from the Subscription to its items in
+    # a 2025 API version -- the top-level key is simply absent then.
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _FakeStripeObjectNoGet({"items": {"data": [{"current_period_end": 1700000001}]}})
+    assert app._extract_subscription_period_end(subscription) == 1700000001
+
+
+def test_extract_subscription_period_end_returns_none_when_absent_everywhere(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _FakeStripeObjectNoGet({"items": {"data": []}})
+    assert app._extract_subscription_period_end(subscription) is None
+
+
 def test_change_souscription_plan_swaps_price_and_resets_resources(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     fake_stripe, _ = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
@@ -5001,7 +5040,7 @@ def test_change_souscription_plan_swaps_price_and_resets_resources(monkeypatch):
         {"items": {"data": [{"id": "si_123"}]}},
         metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
     )
-    fake_stripe.Subscription.modify.return_value = {"current_period_end": 1700000000}
+    fake_stripe.Subscription.modify.return_value = _FakeStripeObjectNoGet({"current_period_end": 1700000000})
     fake_stripe.Price.create.return_value = types.SimpleNamespace(id="price_new_1")
 
     monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "new-plan", "name": "Premium", "price": 49.99, "max_social_account": 3}))
@@ -5097,7 +5136,7 @@ def test_change_souscription_plan_allows_when_within_limits(monkeypatch):
         {"items": {"data": [{"id": "si_123"}]}},
         metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
     )
-    fake_stripe.Subscription.modify.return_value = {"current_period_end": 1700000000}
+    fake_stripe.Subscription.modify.return_value = _FakeStripeObjectNoGet({"current_period_end": 1700000000})
     monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "gold", "name": "Gold", "price": 49.99, "max_social_account": 3, "stockage": 100.0}))
     monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={"facebook": 2}))
     monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"stockage": 50.0, "stockage_max": 100.0}))

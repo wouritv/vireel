@@ -9216,6 +9216,23 @@ async def _assert_plan_change_within_limits(user_id: str, new_plan: Dict[str, An
         )
 
 
+def _extract_subscription_period_end(stripe_subscription: "stripe.Subscription") -> Optional[int]:
+    """current_period_end moved from the Subscription object to its items
+    in a 2025 Stripe API version -- try both locations. A real
+    stripe.StripeObject only reliably supports bracket access here:
+    .get() raises a guided AttributeError ("is a dict method, but a
+    Subscription is not a dict") since StripeObject isn't a dict, so this
+    must never call it."""
+    try:
+        return stripe_subscription["current_period_end"]
+    except (KeyError, TypeError):
+        pass
+    try:
+        return stripe_subscription["items"]["data"][0]["current_period_end"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
 @app.post("/api/souscription/change-plan", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def change_souscription_plan(
     payload: ChangeSubscriptionPlanRequest, user_id: Annotated[str, Depends(get_user_id_header)],
@@ -9288,7 +9305,7 @@ async def change_souscription_plan(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
 
-    current_period_end = updated_stripe_subscription.get("current_period_end")
+    current_period_end = _extract_subscription_period_end(updated_stripe_subscription)
     period_end = datetime.fromtimestamp(current_period_end, tz=timezone.utc) if current_period_end else None
 
     new_souscription = await supabase_insert_souscription(
