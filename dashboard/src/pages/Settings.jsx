@@ -744,7 +744,7 @@ export default function SettingsPage() {
                   className="w-full rounded-md bg-primary px-2 py-1.5 text-xs font-semibold text-white hover:bg-blue-500 disabled:opacity-40 inline-flex items-center justify-center gap-1"
                 >
                   <Plus size={13} />
-                  {isConnectBusy ? '...' : t('settings.connectAnother', '+ Connecter')}
+                  {isConnectBusy ? '...' : t('settings.connectAnother', 'Connecter')}
                 </button>
               </div>
             );
