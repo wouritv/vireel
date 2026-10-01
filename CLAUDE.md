@@ -10,3 +10,4 @@
 - L’agent principal assure l’intégration et la validation finale.
 - Commencer avec 2 à 3 agents ; augmenter seulement si cela
   apporte un bénéfice concret.
+- Éviter les fonctions complexes dans le code, privilégier plusieurs fonctions simples et claires.
