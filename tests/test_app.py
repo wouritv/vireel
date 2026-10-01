@@ -4913,6 +4913,11 @@ def _stub_subscription_lifecycle_prereqs(monkeypatch, app, subscription=_DEFAULT
     monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=subscription))
     update_mock = AsyncMock(return_value={"id": "sous-1"})
     monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
+    # cancel/reactivate/pause/resume/change-plan all look up the plan name
+    # for the notification email they now send -- individual tests may
+    # override this with a more specific plan when it matters to them.
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"name": "Silver"}))
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
     return fake_stripe, update_mock
 
 
@@ -4928,6 +4933,24 @@ def test_cancel_souscription_sets_cancel_at_period_end(monkeypatch):
     assert args[0] == "sous-1"
     assert args[1]["auto_renew"] is False
     assert kwargs["user_id"] == "u1"
+
+
+def test_cancel_souscription_sends_notification_email(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    _stub_subscription_lifecycle_prereqs(monkeypatch, app, subscription={
+        "id": "sous-1", "stripe_subscription_id": "sub_123", "abonnement": "silver",
+        "payment_end_date": "2026-11-15T00:00:00+00:00",
+    })
+    email_mock = MagicMock()
+    monkeypatch.setattr(app, "_send_transactional_email", email_mock)
+
+    asyncio.run(app.cancel_souscription(
+        user_id="u1", request=_FakeCheckoutRequest(headers={"X-User-Email": "user@example.com"}),
+    ))
+
+    email_mock.assert_called_once_with(
+        "user@example.com", "subscription_canceled", plan_name="Silver", period_end_date="15/11/2026",
+    )
 
 
 def test_cancel_souscription_404_without_active_subscription(monkeypatch):
@@ -4962,6 +4985,19 @@ def test_reactivate_souscription_clears_cancel_at_period_end(monkeypatch):
     assert args[1]["canceled_at"] is None
 
 
+def test_reactivate_souscription_sends_notification_email(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    email_mock = MagicMock()
+    monkeypatch.setattr(app, "_send_transactional_email", email_mock)
+
+    asyncio.run(app.reactivate_souscription(
+        user_id="u1", request=_FakeCheckoutRequest(headers={"X-User-Email": "user@example.com"}),
+    ))
+
+    email_mock.assert_called_once_with("user@example.com", "subscription_reactivated", plan_name="Silver")
+
+
 def test_pause_souscription_voids_pause_collection(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     fake_stripe, update_mock = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
@@ -4973,6 +5009,19 @@ def test_pause_souscription_voids_pause_collection(monkeypatch):
     assert "paused_at" in args[1]
 
 
+def test_pause_souscription_sends_notification_email(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    email_mock = MagicMock()
+    monkeypatch.setattr(app, "_send_transactional_email", email_mock)
+
+    asyncio.run(app.pause_souscription(
+        user_id="u1", request=_FakeCheckoutRequest(headers={"X-User-Email": "user@example.com"}),
+    ))
+
+    email_mock.assert_called_once_with("user@example.com", "subscription_paused", plan_name="Silver")
+
+
 def test_resume_souscription_clears_pause_collection(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     fake_stripe, update_mock = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
@@ -4982,6 +5031,32 @@ def test_resume_souscription_clears_pause_collection(monkeypatch):
     fake_stripe.Subscription.modify.assert_called_once_with("sub_123", pause_collection="")
     args, _ = update_mock.await_args
     assert "resumed_at" in args[1]
+
+
+def test_resume_souscription_sends_notification_email(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    email_mock = MagicMock()
+    monkeypatch.setattr(app, "_send_transactional_email", email_mock)
+
+    asyncio.run(app.resume_souscription(
+        user_id="u1", request=_FakeCheckoutRequest(headers={"X-User-Email": "user@example.com"}),
+    ))
+
+    email_mock.assert_called_once_with("user@example.com", "subscription_resumed", plan_name="Silver")
+
+
+def test_subscription_lifecycle_action_skips_email_without_request(monkeypatch):
+    # request defaults to None for direct/internal callers (e.g. no X-User-Email
+    # header available) -- must degrade to "no email sent", never crash.
+    app = _import_app_with_stubs(monkeypatch)
+    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    email_mock = MagicMock()
+    monkeypatch.setattr(app, "_send_transactional_email", email_mock)
+
+    asyncio.run(app.pause_souscription(user_id="u1"))
+
+    email_mock.assert_called_once_with(None, "subscription_paused", plan_name="Silver")
 
 
 class _FakeStripeSubscriptionObject(dict):
@@ -5091,6 +5166,33 @@ def test_change_souscription_plan_swaps_price_and_resets_resources(monkeypatch):
     assert update_args[0] == "sous-1"
     assert "payment_end_date" in update_args[1]
     assert update_kwargs["user_id"] == "u1"
+
+
+def test_change_souscription_plan_sends_notification_email(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe, _ = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    fake_stripe.Subscription.retrieve.return_value = _FakeStripeSubscriptionObject(
+        {"items": {"data": [{"id": "si_123"}]}},
+        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
+    )
+    fake_stripe.Subscription.modify.return_value = _FakeStripeObjectNoGet({"current_period_end": 1700000000})
+    fake_stripe.Price.create.return_value = types.SimpleNamespace(id="price_new_1")
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "new-plan", "name": "Premium", "price": 49.99, "max_social_account": 3}))
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-2"}))
+    monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
+    email_mock = MagicMock()
+    monkeypatch.setattr(app, "_send_transactional_email", email_mock)
+
+    asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="new-plan"), user_id="u1",
+        request=_FakeCheckoutRequest(headers={"X-User-Email": "user@example.com"}),
+    ))
+
+    email_mock.assert_called_once_with(
+        "user@example.com", "subscription_plan_changed", plan_name="Premium", amount=49.99,
+    )
 
 
 def test_change_souscription_plan_404_for_unknown_plan(monkeypatch):

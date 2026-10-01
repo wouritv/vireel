@@ -1,8 +1,9 @@
 """
 email_templates.py -- Single editable source of truth for every transactional
 email this backend sends via Brevo (credit purchase, subscription purchase,
-subscription renewal, failed monthly payment). Edit the subject/html strings
-below directly; no other file needs to change to update copy or styling.
+subscription renewal, failed monthly payment, plan change, cancel/reactivate/
+pause/resume). Edit the subject/html strings below directly; no other file
+needs to change to update copy or styling.
 
 Account creation and password reset are NOT here: those are sent by
 Supabase Auth itself (the frontend calls supabase.auth.signUp()/
@@ -69,6 +70,59 @@ EMAIL_TEMPLATES: Dict[str, EmailTemplate] = {
             "<p><a href=\"{update_payment_url}\">Mettre à jour mon moyen de paiement</a></p>"
             "<p>Si le prélèvement continue d'échouer, l'accès aux fonctionnalités de votre abonnement "
             "sera suspendu jusqu'à régularisation.</p>"
+            "<p>-- L'équipe Vireel</p>"
+        ),
+    ),
+    "subscription_plan_changed": EmailTemplate(
+        subject="Votre abonnement Vireel est passé à {plan_name}",
+        html=(
+            "<p>Bonjour,</p>"
+            "<p>Votre abonnement est désormais <strong>{plan_name}</strong>, pour un montant de "
+            "<strong>{amount:.2f} €</strong> par mois.</p>"
+            "<p>Vos crédits et votre espace de stockage ont été mis à jour selon les allocations de "
+            "votre nouvelle offre.</p>"
+            "<p>-- L'équipe Vireel</p>"
+        ),
+    ),
+    "subscription_canceled": EmailTemplate(
+        subject="Confirmation d'annulation de votre abonnement Vireel {plan_name}",
+        html=(
+            "<p>Bonjour,</p>"
+            "<p>Nous confirmons l'annulation du renouvellement automatique de votre abonnement "
+            "<strong>{plan_name}</strong>.</p>"
+            "<p>Vous conservez l'accès à toutes les fonctionnalités de votre abonnement jusqu'au "
+            "<strong>{period_end_date}</strong>, sans frais supplémentaire.</p>"
+            "<p>Vous pouvez annuler cette résiliation et reprendre le renouvellement automatique à tout "
+            "moment avant cette date, depuis les paramètres de votre compte.</p>"
+            "<p>-- L'équipe Vireel</p>"
+        ),
+    ),
+    "subscription_reactivated": EmailTemplate(
+        subject="Votre abonnement Vireel {plan_name} est réactivé",
+        html=(
+            "<p>Bonjour,</p>"
+            "<p>Le renouvellement automatique de votre abonnement <strong>{plan_name}</strong> a bien "
+            "été réactivé.</p>"
+            "<p>Il se renouvellera normalement à la prochaine échéance.</p>"
+            "<p>-- L'équipe Vireel</p>"
+        ),
+    ),
+    "subscription_paused": EmailTemplate(
+        subject="Votre abonnement Vireel {plan_name} est en pause",
+        html=(
+            "<p>Bonjour,</p>"
+            "<p>Votre abonnement <strong>{plan_name}</strong> est désormais en pause : vous ne serez "
+            "pas facturé tant qu'il le restera.</p>"
+            "<p>Vous pouvez le reprendre à tout moment depuis les paramètres de votre compte.</p>"
+            "<p>-- L'équipe Vireel</p>"
+        ),
+    ),
+    "subscription_resumed": EmailTemplate(
+        subject="Votre abonnement Vireel {plan_name} a repris",
+        html=(
+            "<p>Bonjour,</p>"
+            "<p>Votre abonnement <strong>{plan_name}</strong> a repris : la facturation reprendra "
+            "normalement à la prochaine échéance.</p>"
             "<p>-- L'équipe Vireel</p>"
         ),
     ),

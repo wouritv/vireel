@@ -789,6 +789,9 @@ def _get_authenticated_user_id_optional(request: Request) -> Optional[str]:
     except HTTPException:
         return None
 
+_ISO_UTC_OFFSET_SUFFIX = "+00:00"
+
+
 def _parse_iso_datetime(value: Any) -> Optional[datetime]:
     if not value:
         return None
@@ -797,7 +800,7 @@ def _parse_iso_datetime(value: Any) -> Optional[datetime]:
         return None
     # Accept both native ISO and trailing Z formats.
     if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
+        text = text[:-1] + _ISO_UTC_OFFSET_SUFFIX
     try:
         parsed = datetime.fromisoformat(text)
     except Exception:
@@ -9092,8 +9095,30 @@ async def _get_active_stripe_souscription(user_id: str) -> Dict[str, Any]:
     return subscription
 
 
+def _user_email_from_request(request: Optional[Request]) -> Optional[str]:
+    """The caller's email, off the X-User-Email header the dashboard already
+    sends on every subscription-lifecycle action (see Settings.jsx's
+    runSubAction) -- used only to address a notification email, never for
+    access control (identity/authorization is get_user_id_header's verified
+    JWT). request is Optional only so a direct/internal call that isn't a
+    real HTTP request (e.g. a test) can omit it and simply skip the email."""
+    if request is None:
+        return None
+    return request.headers.get("X-User-Email") or None
+
+
+async def _get_subscription_plan_name(subscription: Dict[str, Any]) -> str:
+    plan = await supabase_get_abonnement(str(subscription.get("abonnement") or ""))
+    return str((plan or {}).get("name") or "Vireel")
+
+
+def _format_iso_date_fr(iso_value: Optional[str]) -> str:
+    parsed = _parse_iso_datetime(iso_value)
+    return parsed.strftime("%d/%m/%Y") if parsed else ""
+
+
 @app.post("/api/souscription/cancel", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
-async def cancel_souscription(user_id: Annotated[str, Depends(get_user_id_header)]):
+async def cancel_souscription(user_id: Annotated[str, Depends(get_user_id_header)], request: Request = None):
     """Stop the subscription from auto-renewing -- access continues until
     the current period's payment_end_date, matching Stripe's own
     cancel_at_period_end semantics (no refund, no early cutoff)."""
@@ -9107,15 +9132,21 @@ async def cancel_souscription(user_id: Annotated[str, Depends(get_user_id_header
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
 
-    return await supabase_update_souscription_row(
+    result = await supabase_update_souscription_row(
         str(subscription["id"]),
         {"auto_renew": False, "canceled_at": datetime.now(timezone.utc).isoformat()},
         user_id=user_id,
     )
+    _send_transactional_email(
+        _user_email_from_request(request), "subscription_canceled",
+        plan_name=await _get_subscription_plan_name(subscription),
+        period_end_date=_format_iso_date_fr(subscription.get("payment_end_date")),
+    )
+    return result
 
 
 @app.post("/api/souscription/reactivate", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
-async def reactivate_souscription(user_id: Annotated[str, Depends(get_user_id_header)]):
+async def reactivate_souscription(user_id: Annotated[str, Depends(get_user_id_header)], request: Request = None):
     """Undo a pending cancellation while the subscription is still within
     its current paid period -- the mirror of cancel_souscription."""
     _require_stripe_ready()
@@ -9128,15 +9159,20 @@ async def reactivate_souscription(user_id: Annotated[str, Depends(get_user_id_he
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
 
-    return await supabase_update_souscription_row(
+    result = await supabase_update_souscription_row(
         str(subscription["id"]),
         {"auto_renew": True, "canceled_at": None, "reactivated_at": datetime.now(timezone.utc).isoformat()},
         user_id=user_id,
     )
+    _send_transactional_email(
+        _user_email_from_request(request), "subscription_reactivated",
+        plan_name=await _get_subscription_plan_name(subscription),
+    )
+    return result
 
 
 @app.post("/api/souscription/pause", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
-async def pause_souscription(user_id: Annotated[str, Depends(get_user_id_header)]):
+async def pause_souscription(user_id: Annotated[str, Depends(get_user_id_header)], request: Request = None):
     """Pause billing: Stripe still generates invoices on schedule but voids
     them immediately, so the customer is never charged while paused."""
     _require_stripe_ready()
@@ -9149,15 +9185,20 @@ async def pause_souscription(user_id: Annotated[str, Depends(get_user_id_header)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
 
-    return await supabase_update_souscription_row(
+    result = await supabase_update_souscription_row(
         str(subscription["id"]),
         {"paused_at": datetime.now(timezone.utc).isoformat()},
         user_id=user_id,
     )
+    _send_transactional_email(
+        _user_email_from_request(request), "subscription_paused",
+        plan_name=await _get_subscription_plan_name(subscription),
+    )
+    return result
 
 
 @app.post("/api/souscription/resume", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
-async def resume_souscription(user_id: Annotated[str, Depends(get_user_id_header)]):
+async def resume_souscription(user_id: Annotated[str, Depends(get_user_id_header)], request: Request = None):
     """Undo pause_souscription -- billing resumes on the next scheduled invoice."""
     _require_stripe_ready()
     if not is_supabase_configured():
@@ -9171,11 +9212,16 @@ async def resume_souscription(user_id: Annotated[str, Depends(get_user_id_header
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
 
-    return await supabase_update_souscription_row(
+    result = await supabase_update_souscription_row(
         str(subscription["id"]),
         {"resumed_at": datetime.now(timezone.utc).isoformat()},
         user_id=user_id,
     )
+    _send_transactional_email(
+        _user_email_from_request(request), "subscription_resumed",
+        plan_name=await _get_subscription_plan_name(subscription),
+    )
+    return result
 
 
 async def _assert_plan_change_within_limits(user_id: str, new_plan: Dict[str, Any]) -> None:
@@ -9236,6 +9282,7 @@ def _extract_subscription_period_end(stripe_subscription: "stripe.Subscription")
 @app.post("/api/souscription/change-plan", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def change_souscription_plan(
     payload: ChangeSubscriptionPlanRequest, user_id: Annotated[str, Depends(get_user_id_header)],
+    request: Request = None,
 ):
     """Swap the subscription's price for a different plan's, effective
     immediately (with Stripe proration), and reset credit/storage to the
@@ -9337,6 +9384,10 @@ async def change_souscription_plan(
         abonnement=str(new_plan.get("id")),
         payment_reference=str(new_souscription.get("id") or ""),
         souscription_id=str(new_souscription.get("id") or ""),
+    )
+    _send_transactional_email(
+        _user_email_from_request(request), "subscription_plan_changed",
+        plan_name=str(new_plan.get("name") or "Vireel"), amount=float(new_plan.get("price") or 0),
     )
     return new_souscription
 
@@ -14023,7 +14074,7 @@ def _is_token_expiring(account: Dict[str, Any], margin_seconds: int = 300) -> bo
     if not expires_at:
         return True
     try:
-        expires_dt = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        expires_dt = datetime.fromisoformat(str(expires_at).replace("Z", _ISO_UTC_OFFSET_SUFFIX))
         platform = str(account.get("platform") or "").lower()
         # Instagram tokens (via Meta) ont une fenêtre de 60 jours mais se dégradent silencieusement ;
         # forcer un refresh si l'expiration est dans moins de 5 jours.

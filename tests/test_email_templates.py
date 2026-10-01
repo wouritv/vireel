@@ -16,6 +16,11 @@ def test_every_template_renders_with_a_representative_context():
             "retry_message": "Une nouvelle tentative aura lieu le 01/01/2027.",
             "update_payment_url": "https://billing.stripe.com/session/abc",
         },
+        "subscription_plan_changed": {"amount": 49.99, "plan_name": "Gold"},
+        "subscription_canceled": {"plan_name": "Gold", "period_end_date": "15/11/2026"},
+        "subscription_reactivated": {"plan_name": "Gold"},
+        "subscription_paused": {"plan_name": "Gold"},
+        "subscription_resumed": {"plan_name": "Gold"},
     }
     assert set(contexts.keys()) == set(email_templates.EMAIL_TEMPLATES.keys())
 
@@ -51,3 +56,17 @@ def test_payment_failed_template_includes_update_payment_link():
     )
     assert "https://billing.stripe.com/session/abc" in rendered.html
     assert "Pro" in rendered.subject
+
+
+def test_subscription_canceled_template_includes_period_end_date():
+    rendered = email_templates.render_email(
+        "subscription_canceled", plan_name="Gold", period_end_date="15/11/2026",
+    )
+    assert "15/11/2026" in rendered.html
+    assert "Gold" in rendered.subject
+
+
+def test_subscription_plan_changed_template_includes_new_plan_and_amount():
+    rendered = email_templates.render_email("subscription_plan_changed", amount=49.99, plan_name="Gold")
+    assert "49.99" in rendered.html
+    assert "Gold" in rendered.subject
