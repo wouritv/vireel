@@ -128,7 +128,16 @@
     "operation": "Opération",
     "credits": "Crédits",
     "storage": "Stockage (Go)",
-    "historic": "Historique des opérations"
+    "historic": "Historique des opérations",
+    "errors": {
+      "no_active_subscription": "Aucun abonnement actif.",
+      "no_stripe_subscription": "Cet abonnement n'est pas géré via Stripe, il n'y a rien à modifier ici.",
+      "no_stripe_customer": "Aucun compte de facturation trouvé pour cet abonnement.",
+      "no_payment_method": "Aucune carte enregistrée.",
+      "plan_not_found": "Cette formule n'existe plus.",
+      "invalid_plan_price": "Le prix de cette formule est invalide. Merci de contacter le support.",
+      "plan_change_over_limit": "Cette offre autorise au maximum {{max}} compte(s) par réseau social. Supprimez les comptes en surplus avant de changer d'offre : {{details}}."
+    }
   },
   "reels": {
     "title": "Réels générés",

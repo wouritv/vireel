@@ -204,6 +204,15 @@ def _generic_error(
     return HTTPException(status_code=status_code, detail=detail)
 
 
+def _coded_error(status_code: int, code: str, message: str, **extra: Any) -> HTTPException:
+    """Business-logic error with a stable machine-readable `code` alongside
+    the English `message`, so the dashboard can show a translated message
+    (see dashboard/src/pages/Settings.jsx's translateApiError) instead of
+    this raw English text. `extra` carries values the translated message
+    needs to interpolate (e.g. plan_change_over_limit's max/details)."""
+    return HTTPException(status_code=status_code, detail={"code": code, "message": message, **extra})
+
+
 BREVO_API_KEY = os.getenv("BREVO_API_KEY")
 BREVO_FROM_EMAIL = os.getenv("BREVO_FROM_EMAIL", "noreply@vireel.co")
 
@@ -8604,15 +8613,15 @@ async def create_stripe_checkout_session(
 
     plan = await supabase_get_abonnement(payload.plan_id)
     if not plan:
-        raise HTTPException(status_code=404, detail="Subscription plan not found")
+        raise _coded_error(404, "plan_not_found", "Subscription plan not found")
 
     try:
         unit_amount = int(round(float(plan.get("price") or 0) * 100))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail=_INVALID_PLAN_PRICE)
+        raise _coded_error(400, "invalid_plan_price", _INVALID_PLAN_PRICE)
 
     if unit_amount <= 0:
-        raise HTTPException(status_code=400, detail=_INVALID_PLAN_PRICE)
+        raise _coded_error(400, "invalid_plan_price", _INVALID_PLAN_PRICE)
 
     default_base_url = _frontend_base_url(request)
     success_url = (payload.success_url or STRIPE_SUCCESS_URL or f"{default_base_url}/dashboard/abonnement?payment=success").strip()
@@ -9126,11 +9135,12 @@ async def _get_active_stripe_souscription(user_id: str) -> Dict[str, Any]:
     mode="subscription") and has nothing on Stripe to manage."""
     subscription = await get_user_abonnement(user_id)
     if not subscription:
-        raise HTTPException(status_code=404, detail="No active subscription")
+        raise _coded_error(404, "no_active_subscription", "No active subscription")
     if not subscription.get("stripe_subscription_id"):
-        raise HTTPException(
-            status_code=400,
-            detail="This subscription has no associated Stripe subscription to manage.",
+        raise _coded_error(
+            400,
+            "no_stripe_subscription",
+            "This subscription has no associated Stripe subscription to manage.",
         )
     return subscription
 
@@ -9325,12 +9335,12 @@ async def revoke_souscription_payment_method(user_id: Annotated[str, Depends(get
     subscription = await _get_active_stripe_souscription(user_id)
     customer_id = subscription.get("stripe_customer_id")
     if not customer_id:
-        raise HTTPException(status_code=404, detail="No Stripe customer on file")
+        raise _coded_error(404, "no_stripe_customer", "No Stripe customer on file")
 
     try:
         payment_method = _get_stripe_default_payment_method(customer_id)
         if not payment_method:
-            raise HTTPException(status_code=404, detail="No payment method on file")
+            raise _coded_error(404, "no_payment_method", "No payment method on file")
         stripe.PaymentMethod.detach(payment_method["id"])
     except HTTPException:
         raise
@@ -9359,7 +9369,7 @@ async def replace_souscription_payment_method(
     subscription = await _get_active_stripe_souscription(user_id)
     customer_id = subscription.get("stripe_customer_id")
     if not customer_id:
-        raise HTTPException(status_code=404, detail="No Stripe customer on file")
+        raise _coded_error(404, "no_stripe_customer", "No Stripe customer on file")
 
     default_base_url = _frontend_base_url(request)
     try:
@@ -9390,12 +9400,11 @@ async def _assert_plan_change_within_limits(user_id: str, new_plan: Dict[str, An
     over_limit_platforms = {platform: count for platform, count in counts.items() if count > new_max_social}
     if over_limit_platforms:
         details = ", ".join(f"{platform} ({count}/{new_max_social})" for platform, count in over_limit_platforms.items())
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Cette offre autorise au maximum {new_max_social} compte(s) par reseau social. "
-                f"Supprimez les comptes en surplus avant de changer d'offre : {details}."
-            ),
+        raise _coded_error(
+            409, "plan_change_over_limit",
+            f"Cette offre autorise au maximum {new_max_social} compte(s) par reseau social. "
+            f"Supprimez les comptes en surplus avant de changer d'offre : {details}.",
+            max=new_max_social, details=details,
         )
 
     user_data = await supabase_get_user_data(user_id)
@@ -9450,16 +9459,16 @@ async def change_souscription_plan(
     subscription = await _get_active_stripe_souscription(user_id)
     new_plan = await supabase_get_abonnement(payload.plan_id)
     if not new_plan:
-        raise HTTPException(status_code=404, detail="Subscription plan not found")
+        raise _coded_error(404, "plan_not_found", "Subscription plan not found")
 
     await _assert_plan_change_within_limits(user_id, new_plan)
 
     try:
         unit_amount = int(round(float(new_plan.get("price") or 0) * 100))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail=_INVALID_PLAN_PRICE)
+        raise _coded_error(400, "invalid_plan_price", _INVALID_PLAN_PRICE)
     if unit_amount <= 0:
-        raise HTTPException(status_code=400, detail=_INVALID_PLAN_PRICE)
+        raise _coded_error(400, "invalid_plan_price", _INVALID_PLAN_PRICE)
 
     try:
         stripe_subscription = stripe.Subscription.retrieve(subscription["stripe_subscription_id"])
@@ -11619,7 +11628,13 @@ async def _persist_film_summary_row(
         "source_type": source_type,
         "source_url": source_url_value,
         "source_s3_key": source_s3_key,
-        "source_duration_seconds": int(local_duration or 0),
+        # Truncating to an int here used to lose up to ~1s of precision --
+        # a segment whose end_ms was valid against the full-precision
+        # duration used for the original plan (_run_planning_and_validation_
+        # stages' duration_ms) could then fail render_film_summary_
+        # endpoint's "timecode hors limites" check, which recomputes
+        # source_duration_ms from this same stored value.
+        "source_duration_seconds": float(local_duration or 0.0),
         "target_duration_seconds": resolved_target_duration,
         "source_language": (source_language or "").strip()[:50] or None,
         "narration_language": resolved_narration_language or None,

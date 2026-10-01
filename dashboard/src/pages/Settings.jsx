@@ -283,6 +283,15 @@ export default function SettingsPage() {
     loadSubscriptionState();
   }, [user?.id]);
 
+  const translateApiError = (data, fallbackKey, fallbackText) => {
+    const detail = data?.detail;
+    if (detail && typeof detail === 'object' && detail.code) {
+      return t(`settings.errors.${detail.code}`, detail.message || fallbackText, detail);
+    }
+    if (typeof detail === 'string' && detail) return detail;
+    return t(fallbackKey, fallbackText);
+  };
+
   const runSubAction = async (action, body = null) => {
     if (!user?.id) return;
     setSubActionLoading(action);
@@ -299,7 +308,7 @@ export default function SettingsPage() {
         body: body ? JSON.stringify(body) : JSON.stringify({}),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.detail || t("settings.erreurInfo","Action abonnement impossible"));
+      if (!res.ok) throw new Error(translateApiError(data, "settings.erreurInfo", "Action abonnement impossible"));
       setSubMessage(t('settings.actionSuccess', 'Action terminée avec succès.'));
       await loadSubscriptionState();
       await refreshCredits();
@@ -357,7 +366,7 @@ export default function SettingsPage() {
         headers: { 'Content-Type': 'application/json', ...getAuthHeaders(user.id) },
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.detail || t("settings.paymentMethodError","Action impossible sur la carte."));
+      if (!res.ok) throw new Error(translateApiError(data, "settings.paymentMethodError", "Action impossible sur la carte."));
       setPaymentMethodMessage(t('settings.paymentMethodRevoked', 'Votre carte a été supprimée.'));
       await loadPaymentMethod();
     } catch (err) {
@@ -382,7 +391,7 @@ export default function SettingsPage() {
         },
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.detail || t("settings.paymentMethodError","Action impossible sur la carte."));
+      if (!res.ok) throw new Error(translateApiError(data, "settings.paymentMethodError", "Action impossible sur la carte."));
       if (data?.checkout_url) window.location.href = data.checkout_url;
     } catch (err) {
       setPaymentMethodError(err.message || t("settings.paymentMethodError","Action impossible sur la carte."));
