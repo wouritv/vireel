@@ -789,6 +789,9 @@ def _get_authenticated_user_id_optional(request: Request) -> Optional[str]:
     except HTTPException:
         return None
 
+_ISO_UTC_OFFSET_SUFFIX = "+00:00"
+
+
 def _parse_iso_datetime(value: Any) -> Optional[datetime]:
     if not value:
         return None
@@ -797,7 +800,7 @@ def _parse_iso_datetime(value: Any) -> Optional[datetime]:
         return None
     # Accept both native ISO and trailing Z formats.
     if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
+        text = text[:-1] + _ISO_UTC_OFFSET_SUFFIX
     try:
         parsed = datetime.fromisoformat(text)
     except Exception:
@@ -9110,12 +9113,8 @@ async def _get_subscription_plan_name(subscription: Dict[str, Any]) -> str:
 
 
 def _format_iso_date_fr(iso_value: Optional[str]) -> str:
-    if not iso_value:
-        return ""
-    try:
-        return datetime.fromisoformat(str(iso_value).replace("Z", "+00:00")).strftime("%d/%m/%Y")
-    except ValueError:
-        return ""
+    parsed = _parse_iso_datetime(iso_value)
+    return parsed.strftime("%d/%m/%Y") if parsed else ""
 
 
 @app.post("/api/souscription/cancel", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
@@ -14075,7 +14074,7 @@ def _is_token_expiring(account: Dict[str, Any], margin_seconds: int = 300) -> bo
     if not expires_at:
         return True
     try:
-        expires_dt = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        expires_dt = datetime.fromisoformat(str(expires_at).replace("Z", _ISO_UTC_OFFSET_SUFFIX))
         platform = str(account.get("platform") or "").lower()
         # Instagram tokens (via Meta) ont une fenêtre de 60 jours mais se dégradent silencieusement ;
         # forcer un refresh si l'expiration est dans moins de 5 jours.
