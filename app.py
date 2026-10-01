@@ -8599,6 +8599,23 @@ def _frontend_base_url(request: Request) -> str:
     return "http://localhost:5175"
 
 
+def _stripe_field(obj: Any, key: str, default: Any = None) -> Any:
+    """Safe bracket access for a Stripe resource object (Customer,
+    PaymentMethod, Card, Subscription, ...), a plain dict, or None.
+    Stripe's resource objects support obj[key] but not the dict method
+    obj.get(key) -- calling .get() raises a guided AttributeError ("...
+    is not a dict. Use .to_dict() to convert it.") since StripeObject
+    isn't a dict (see also _extract_subscription_period_end, which has
+    the same constraint inlined)."""
+    if obj is None:
+        return default
+    try:
+        value = obj[key]
+    except (KeyError, TypeError):
+        return default
+    return default if value is None else value
+
+
 async def _existing_stripe_customer_id(user_id: str) -> Optional[str]:
     """The Stripe Customer tied to this user's last paid plan, if any.
     Reusing it everywhere a Checkout Session is created for this user
@@ -8908,8 +8925,11 @@ def _sync_customer_default_payment_method(stripe_subscription_id: Optional[str],
         return
     try:
         subscription = stripe.Subscription.retrieve(stripe_subscription_id, expand=["default_payment_method"])
-        payment_method = subscription.get("default_payment_method")
-        payment_method_id = payment_method["id"] if isinstance(payment_method, dict) else payment_method
+        payment_method = _stripe_field(subscription, "default_payment_method")
+        # Unexpanded, Stripe would hand back a bare id string here instead
+        # of an object -- expand=[...] above means that never happens in
+        # practice, but staying defensive costs nothing.
+        payment_method_id = payment_method if isinstance(payment_method, str) else _stripe_field(payment_method, "id")
         if not payment_method_id:
             return
         stripe.Customer.modify(stripe_customer_id, invoice_settings={"default_payment_method": payment_method_id})
@@ -9349,14 +9369,15 @@ def _get_stripe_default_payment_method(customer_id: str) -> Optional["stripe.Pay
     """The card Stripe currently bills for this customer, falling back to
     the first attached card if no explicit default is set (e.g. a
     customer created before this feature, or one whose default was
-    detached without a replacement)."""
+    detached without a replacement). See _stripe_field: a Stripe resource
+    object only reliably supports bracket access, never .get()."""
     customer = stripe.Customer.retrieve(customer_id, expand=["invoice_settings.default_payment_method"])
-    invoice_settings = customer["invoice_settings"] if customer.get("invoice_settings") else None
-    default_pm = invoice_settings["default_payment_method"] if invoice_settings else None
+    invoice_settings = _stripe_field(customer, "invoice_settings")
+    default_pm = _stripe_field(invoice_settings, "default_payment_method")
     if default_pm:
         return default_pm
     payment_methods = stripe.PaymentMethod.list(customer=customer_id, type="card")
-    data = payment_methods["data"] if payment_methods else []
+    data = _stripe_field(payment_methods, "data") or []
     return data[0] if data else None
 
 
@@ -9382,13 +9403,13 @@ async def get_souscription_payment_method(user_id: Annotated[str, Depends(get_us
     if not payment_method:
         return {"has_payment_method": False}
 
-    card = payment_method["card"] if payment_method.get("card") else {}
+    card = _stripe_field(payment_method, "card") or {}
     return {
         "has_payment_method": True,
-        "brand": card.get("brand"),
-        "last4": card.get("last4"),
-        "exp_month": card.get("exp_month"),
-        "exp_year": card.get("exp_year"),
+        "brand": _stripe_field(card, "brand"),
+        "last4": _stripe_field(card, "last4"),
+        "exp_month": _stripe_field(card, "exp_month"),
+        "exp_year": _stripe_field(card, "exp_year"),
     }
 
 

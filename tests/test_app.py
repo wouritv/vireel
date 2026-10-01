@@ -4959,10 +4959,16 @@ def test_handle_subscription_purchase_syncs_default_payment_method(monkeypatch):
 
 
 def test_sync_customer_default_payment_method_sets_default_from_expanded_subscription(monkeypatch):
+    # A plain dict would silently accept subscription.get(...) and hide
+    # the real SDK's failure mode -- _FakeStripeObjectNoGet (defined
+    # below) mimics a real stripe.StripeObject, which only supports
+    # bracket access, to actually catch a .get() regression here.
     app = _import_app_with_stubs(monkeypatch)
     fake_stripe = MagicMock()
     monkeypatch.setattr(app, "stripe", fake_stripe)
-    fake_stripe.Subscription.retrieve.return_value = {"default_payment_method": {"id": "pm_abc"}}
+    fake_stripe.Subscription.retrieve.return_value = _FakeStripeObjectNoGet(
+        {"default_payment_method": _FakeStripeObjectNoGet({"id": "pm_abc"})},
+    )
 
     app._sync_customer_default_payment_method("sub_1", "cus_1")
 
@@ -4974,7 +4980,7 @@ def test_sync_customer_default_payment_method_accepts_unexpanded_string_id(monke
     app = _import_app_with_stubs(monkeypatch)
     fake_stripe = MagicMock()
     monkeypatch.setattr(app, "stripe", fake_stripe)
-    fake_stripe.Subscription.retrieve.return_value = {"default_payment_method": "pm_xyz"}
+    fake_stripe.Subscription.retrieve.return_value = _FakeStripeObjectNoGet({"default_payment_method": "pm_xyz"})
 
     app._sync_customer_default_payment_method("sub_1", "cus_1")
 
@@ -5000,6 +5006,54 @@ def test_sync_customer_default_payment_method_swallows_stripe_errors(monkeypatch
     fake_stripe.Subscription.retrieve.side_effect = RuntimeError("boom")
 
     app._sync_customer_default_payment_method("sub_1", "cus_1")  # must not raise
+
+
+def test_stripe_field_reads_real_stripe_object_without_get(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    obj = _FakeStripeObjectNoGet({"brand": "visa", "last4": None})
+    assert app._stripe_field(obj, "brand") == "visa"
+    assert app._stripe_field(obj, "last4") is None  # a present-but-null value still falls back to default
+    assert app._stripe_field(obj, "last4", "stand-in") == "stand-in"
+    assert app._stripe_field(obj, "missing_key", "fallback") == "fallback"
+
+
+def test_stripe_field_handles_plain_dict_and_none(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    assert app._stripe_field({"brand": "visa"}, "brand") == "visa"
+    assert app._stripe_field({"brand": "visa"}, "missing", "fallback") == "fallback"
+    assert app._stripe_field(None, "brand", "fallback") == "fallback"
+
+
+def test_get_stripe_default_payment_method_reads_customer_default_without_get(monkeypatch):
+    # A plain dict/MagicMock for `customer` would silently accept
+    # customer.get(...) and hide the real SDK's failure mode --
+    # _FakeStripeObjectNoGet mimics a real stripe.StripeObject (bracket
+    # access only) to actually catch a .get() regression here.
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    default_pm = _FakeStripeObjectNoGet({"id": "pm_default"})
+    invoice_settings = _FakeStripeObjectNoGet({"default_payment_method": default_pm})
+    fake_stripe.Customer.retrieve.return_value = _FakeStripeObjectNoGet({"invoice_settings": invoice_settings})
+
+    result = app._get_stripe_default_payment_method("cus_1")
+
+    assert result is default_pm
+    fake_stripe.PaymentMethod.list.assert_not_called()
+
+
+def test_get_stripe_default_payment_method_falls_back_to_first_attached_card(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    invoice_settings = _FakeStripeObjectNoGet({"default_payment_method": None})
+    fake_stripe.Customer.retrieve.return_value = _FakeStripeObjectNoGet({"invoice_settings": invoice_settings})
+    first_card = _FakeStripeObjectNoGet({"id": "pm_first"})
+    fake_stripe.PaymentMethod.list.return_value = _FakeStripeObjectNoGet({"data": [first_card]})
+
+    result = app._get_stripe_default_payment_method("cus_1")
+
+    assert result is first_card
 
 
 # ---------------------------------------------------------------------------
@@ -5036,12 +5090,15 @@ def test_handle_payment_method_setup_skips_detach_when_no_previous_card(monkeypa
 
 
 def test_get_souscription_payment_method_returns_card_summary(monkeypatch):
+    # Both payment_method and its nested "card" must be real
+    # stripe.StripeObject-like values here (bracket access only, no
+    # .get()) -- a plain dict would silently accept .get() and hide a
+    # regression (see _FakeStripeObjectNoGet).
     app = _import_app_with_stubs(monkeypatch)
     _stub_subscription_lifecycle_prereqs(monkeypatch, app)
-    monkeypatch.setattr(app, "_get_stripe_default_payment_method", MagicMock(return_value={
-        "id": "pm_1",
-        "card": {"brand": "visa", "last4": "4242", "exp_month": 12, "exp_year": 2027},
-    }))
+    card = _FakeStripeObjectNoGet({"brand": "visa", "last4": "4242", "exp_month": 12, "exp_year": 2027})
+    payment_method = _FakeStripeObjectNoGet({"id": "pm_1", "card": card})
+    monkeypatch.setattr(app, "_get_stripe_default_payment_method", MagicMock(return_value=payment_method))
 
     result = asyncio.run(app.get_souscription_payment_method(user_id="u1"))
 
