@@ -618,6 +618,31 @@ def validate_edit_plan_content(
     }
 
 
+def _clamped_legacy_end_ms(end_ms: Any, source_duration_ms: int, max_overage_ms: int) -> Optional[int]:
+    """source_duration_ms if end_ms overshoots it by no more than
+    max_overage_ms (the known truncation window -- see
+    _clamp_legacy_duration_truncation_overage), else None when end_ms
+    needs no clamping."""
+    if isinstance(end_ms, int) and source_duration_ms < end_ms <= source_duration_ms + max_overage_ms:
+        return source_duration_ms
+    return None
+
+
+def _clamp_voice_over_clips_overage(
+    clips: List[Dict[str, Any]], source_duration_ms: int, max_overage_ms: int,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    changed = False
+    fixed_clips = []
+    for clip in clips:
+        clip = dict(clip)
+        clamped = _clamped_legacy_end_ms(clip.get("end_ms"), source_duration_ms, max_overage_ms)
+        if clamped is not None:
+            clip["end_ms"] = clamped
+            changed = True
+        fixed_clips.append(clip)
+    return fixed_clips, changed
+
+
 def _clamp_legacy_duration_truncation_overage(
     segments: List[Dict[str, Any]], source_duration_ms: int, max_overage_ms: int = 999,
 ) -> Tuple[List[Dict[str, Any]], bool]:
@@ -636,19 +661,14 @@ def _clamp_legacy_duration_truncation_overage(
     for seg in segments:
         seg = dict(seg)
         if seg.get("type") == SEGMENT_TYPE_VOICE_OVER:
-            fixed_clips = []
-            for clip in seg.get("clips") or []:
-                clip = dict(clip)
-                end_ms = clip.get("end_ms")
-                if isinstance(end_ms, int) and source_duration_ms < end_ms <= source_duration_ms + max_overage_ms:
-                    clip["end_ms"] = source_duration_ms
-                    changed = True
-                fixed_clips.append(clip)
-            seg["clips"] = fixed_clips
+            seg["clips"], clips_changed = _clamp_voice_over_clips_overage(
+                seg.get("clips") or [], source_duration_ms, max_overage_ms,
+            )
+            changed = changed or clips_changed
         else:
-            end_ms = seg.get("end_ms")
-            if isinstance(end_ms, int) and source_duration_ms < end_ms <= source_duration_ms + max_overage_ms:
-                seg["end_ms"] = source_duration_ms
+            clamped = _clamped_legacy_end_ms(seg.get("end_ms"), source_duration_ms, max_overage_ms)
+            if clamped is not None:
+                seg["end_ms"] = clamped
                 changed = True
         fixed_segments.append(seg)
     return fixed_segments, changed
