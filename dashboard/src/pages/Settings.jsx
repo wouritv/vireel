@@ -868,7 +868,7 @@ export default function SettingsPage() {
                 </select>
                 <button
                   onClick={() => selectedPlan && runSubAction('change-plan', { plan_id: selectedPlan })}
-                  disabled={!selectedPlan || subActionLoading === 'change-plan'}
+                  disabled={!subscription || !selectedPlan || subActionLoading === 'change-plan'}
                   className="rounded-lg border border-blue-700 dark:border-primary/30 bg-blue-600 dark:bg-primary/10 px-3 py-2 text-xs text-white dark:text-primary hover:bg-blue-500 dark:hover:bg-primary/20 disabled:opacity-40"
                 >
                   {subActionLoading === 'change-plan' ? '...' : t('settings.change', 'Change')}

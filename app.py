@@ -9257,17 +9257,21 @@ async def change_souscription_plan(
             "abonnement": str(new_plan.get("id")),
             "plan_name": str(new_plan.get("name") or ""),
         }
+        # Subscription items only accept an existing product id in
+        # price_data (unlike Checkout Session line items, which allow
+        # inline product_data) -- Stripe rejects product_data here with
+        # "Received unknown parameter: items[0][price_data][product_data]".
+        # Price.create does support product_data to create the product and
+        # price together, giving a price id usable below.
+        new_price = stripe.Price.create(
+            currency=STRIPE_CURRENCY,
+            unit_amount=unit_amount,
+            recurring={"interval": "month"},
+            product_data={"name": str(new_plan.get("name") or "Abonnement")},
+        )
         updated_stripe_subscription = stripe.Subscription.modify(
             subscription["stripe_subscription_id"],
-            items=[{
-                "id": item_id,
-                "price_data": {
-                    "currency": STRIPE_CURRENCY,
-                    "unit_amount": unit_amount,
-                    "recurring": {"interval": "month"},
-                    "product_data": {"name": str(new_plan.get("name") or "Abonnement")},
-                },
-            }],
+            items=[{"id": item_id, "price": new_price.id}],
             proration_behavior="create_prorations",
             metadata=new_metadata,
         )
