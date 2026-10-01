@@ -102,6 +102,13 @@ export default function SettingsPage() {
   const [subError, setSubError] = useState('');
   const [subMessage, setSubMessage] = useState('');
 
+  // Payment method (card on file) state
+  const [paymentMethod, setPaymentMethod] = useState(null);
+  const [paymentMethodLoading, setPaymentMethodLoading] = useState(false);
+  const [paymentMethodActionLoading, setPaymentMethodActionLoading] = useState('');
+  const [paymentMethodError, setPaymentMethodError] = useState('');
+  const [paymentMethodMessage, setPaymentMethodMessage] = useState('');
+
   const creditsToAdd = Math.round(buyAmount * CREDIT_RATE);
   const canBuyCredits = Boolean(subscription);
 
@@ -300,6 +307,86 @@ export default function SettingsPage() {
       setSubError(err.message || t("settings.aboError","Erreur abonnement"));
     } finally {
       setSubActionLoading('');
+    }
+  };
+
+  const loadPaymentMethod = async () => {
+    if (!user?.id) return;
+    setPaymentMethodLoading(true);
+    setPaymentMethodError('');
+    try {
+      const res = await fetch(getApiUrl('/api/souscription/payment-method'), { headers: getAuthHeaders(user.id) });
+      if (!res.ok) {
+        setPaymentMethod(null);
+        return;
+      }
+      const data = await res.json();
+      setPaymentMethod(data?.has_payment_method ? data : null);
+    } catch {
+      setPaymentMethod(null);
+    } finally {
+      setPaymentMethodLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadPaymentMethod();
+  }, [user?.id]);
+
+  // Detect the redirect back from the card-replacement Checkout Session
+  // (mode="setup", see replace_souscription_payment_method).
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const paymentMethodStatus = params.get('payment_method');
+    if (paymentMethodStatus === 'success') {
+      setPaymentMethodMessage(t('settings.paymentMethodReplaced', 'Votre carte a été mise à jour.'));
+      loadPaymentMethod();
+    } else if (paymentMethodStatus === 'cancel') {
+      setPaymentMethodMessage('');
+    }
+  }, []);
+
+  const handleRevokePaymentMethod = async () => {
+    if (!user?.id) return;
+    setPaymentMethodActionLoading('revoke');
+    setPaymentMethodError('');
+    setPaymentMethodMessage('');
+    try {
+      const res = await fetch(getApiUrl('/api/souscription/payment-method/revoke'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders(user.id) },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.detail || t("settings.paymentMethodError","Action impossible sur la carte."));
+      setPaymentMethodMessage(t('settings.paymentMethodRevoked', 'Votre carte a été supprimée.'));
+      await loadPaymentMethod();
+    } catch (err) {
+      setPaymentMethodError(err.message || t("settings.paymentMethodError","Action impossible sur la carte."));
+    } finally {
+      setPaymentMethodActionLoading('');
+    }
+  };
+
+  const handleReplacePaymentMethod = async () => {
+    if (!user?.id) return;
+    setPaymentMethodActionLoading('replace');
+    setPaymentMethodError('');
+    setPaymentMethodMessage('');
+    try {
+      const res = await fetch(getApiUrl('/api/souscription/payment-method/replace'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(user.id),
+          ...(user?.email ? { 'X-User-Email': user.email } : {}),
+        },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.detail || t("settings.paymentMethodError","Action impossible sur la carte."));
+      if (data?.checkout_url) window.location.href = data.checkout_url;
+    } catch (err) {
+      setPaymentMethodError(err.message || t("settings.paymentMethodError","Action impossible sur la carte."));
+      setPaymentMethodActionLoading('');
     }
   };
 
@@ -874,6 +961,64 @@ export default function SettingsPage() {
                   {subActionLoading === 'change-plan' ? '...' : t('settings.change', 'Change')}
                 </button>
               </div>
+            </div>
+
+            <div className="rounded-lg border border-slate-300 dark:border-white/10 bg-white/5 p-4 mb-4">
+              <p className="text-xs text-slate-600 dark:text-zinc-400 mb-2">{t('settings.paymentMethod', 'Moyen de paiement')}</p>
+
+              {paymentMethodError ? (
+                <div className="mb-3 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+                  {paymentMethodError}
+                </div>
+              ) : null}
+              {paymentMethodMessage ? (
+                <div className="mb-3 rounded-lg border border-green-500/30 bg-green-500/10 px-3 py-2 text-xs text-green-300">
+                  {paymentMethodMessage}
+                </div>
+              ) : null}
+
+              {paymentMethodLoading ? (
+                <div className="text-sm text-slate-500 dark:text-zinc-400 inline-flex items-center gap-2">
+                  <Loader2 size={14} className="animate-spin" /> {t('settings.loadingPaymentMethod', 'Chargement de la carte...')}
+                </div>
+              ) : (
+                <div className="flex flex-wrap items-center gap-3">
+                  <div className="flex items-center gap-2 rounded-lg border border-slate-300 dark:border-white/10 bg-white dark:bg-black/30 px-3 py-2">
+                    <CreditCardIcon size={16} className="text-slate-500 dark:text-zinc-400" />
+                    {paymentMethod ? (
+                      <span className="text-sm text-slate-900 dark:text-white">
+                        <span className="font-semibold uppercase">{paymentMethod.brand}</span>
+                        {' •••• '}{paymentMethod.last4}
+                        <span className="text-slate-500 dark:text-zinc-400">
+                          {' '}({String(paymentMethod.exp_month).padStart(2, '0')}/{paymentMethod.exp_year})
+                        </span>
+                      </span>
+                    ) : (
+                      <span className="text-sm text-slate-500 dark:text-zinc-400">
+                        {t('settings.noPaymentMethod', 'Aucune carte enregistrée')}
+                      </span>
+                    )}
+                  </div>
+
+                  <button
+                    onClick={handleReplacePaymentMethod}
+                    disabled={!subscription || paymentMethodActionLoading !== ''}
+                    className="rounded-lg border border-blue-700 dark:border-primary/30 bg-blue-600 dark:bg-primary/10 px-3 py-2 text-xs text-white dark:text-primary hover:bg-blue-500 dark:hover:bg-primary/20 disabled:opacity-40"
+                  >
+                    {paymentMethodActionLoading === 'replace' ? '...' : (paymentMethod ? t('settings.replaceCard', 'Remplacer') : t('settings.addCard', 'Ajouter une carte'))}
+                  </button>
+
+                  {paymentMethod ? (
+                    <button
+                      onClick={handleRevokePaymentMethod}
+                      disabled={paymentMethodActionLoading !== ''}
+                      className="rounded-lg border border-rose-300 dark:border-red-500/30 bg-rose-100 dark:bg-red-500/10 px-3 py-2 text-xs text-rose-800 dark:text-red-300 hover:bg-rose-200 dark:hover:bg-red-500/20 disabled:opacity-40"
+                    >
+                      {paymentMethodActionLoading === 'revoke' ? '...' : t('settings.revokeCard', 'Supprimer')}
+                    </button>
+                  ) : null}
+                </div>
+              )}
             </div>
 
             <div className="rounded-lg border border-slate-300 dark:border-white/10 overflow-hidden">

@@ -187,7 +187,7 @@ export default function AbonnementPage() {
         <div className="h-full overflow-y-auto p-8 max-w-5xl mx-auto animate-[fadeIn_0.3s_ease-out]">
             {/* Header */}
             <div className="mb-8">
-                <h1 className="text-3xl font-bold mb-2">{t("abonnement.title","Abonnement")}</h1>
+                <h1 className="text-3xl font-bold mb-2">{t("abonnement.title","Plan d'abonnement")}</h1>
                 <p className="text-slate-500 dark:text-zinc-400 text-sm">{t("abonnement.subtitle","Découvrez nos formules d'abonnements et choisissez celle qui vous convient")}</p>
                 {currentPlan ? (
                     <p className="mt-2 text-xs text-slate-500 dark:text-zinc-400">
@@ -221,11 +221,7 @@ export default function AbonnementPage() {
                 {items.map((plan) => {
                     const styles = colorStyles[plan.color];
                     const Icon = iconMap[plan.icon] || Star; // Default to Star if icon is not found
-                    let buttonLabel = t("abonnement.choisir","Choisir");
-
-                    if (souscription && plan.id === souscription.abonnement && plan.ordre < 3) {
-                        buttonLabel = t("abonnement.upgrade","Changer de formule");
-                    }
+                    const buttonLabel = t("abonnement.choisir","Choisir");
 
                     return (
                         <div

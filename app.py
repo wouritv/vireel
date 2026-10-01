@@ -8826,6 +8826,39 @@ async def _allocate_plan_resources(user_id: str, abonnement: str, payment_refere
     )
 
 
+async def _handle_payment_method_setup(session: "stripe.checkout.Session") -> dict:
+    """Completes a card-replacement flow (see
+    replace_souscription_payment_method): makes the newly collected card
+    the customer's default for future invoices, then detaches whichever
+    card was previously the default -- so this is a real swap, not just
+    adding a second card on file."""
+    customer_id = session.customer
+    setup_intent_id = session.setup_intent
+    if not customer_id or not setup_intent_id:
+        return {"received": True, "ignored": "missing_customer_or_setup_intent"}
+
+    setup_intent = stripe.SetupIntent.retrieve(setup_intent_id)
+    new_payment_method_id = setup_intent.payment_method
+    if not new_payment_method_id:
+        return {"received": True, "ignored": "no_payment_method_on_setup_intent"}
+
+    previous_payment_method = _get_stripe_default_payment_method(customer_id)
+    previous_payment_method_id = previous_payment_method["id"] if previous_payment_method else None
+
+    stripe.Customer.modify(customer_id, invoice_settings={"default_payment_method": new_payment_method_id})
+
+    if previous_payment_method_id and previous_payment_method_id != new_payment_method_id:
+        try:
+            stripe.PaymentMethod.detach(previous_payment_method_id)
+        except Exception:
+            logger.warning(
+                "Failed to detach replaced payment method %s for customer %s",
+                previous_payment_method_id, customer_id,
+            )
+
+    return {"received": True}
+
+
 async def _handle_subscription_purchase(ctx: dict) -> dict:
     """Handle a standard plan subscription checkout."""
     abonnement = ctx["metadata"].get("abonnement")
@@ -8997,7 +9030,14 @@ async def stripe_webhook(request: Request):
     if event.type != "checkout.session.completed":
         return {"received": True, "ignored": event.type}
 
-    ctx = _extract_session_context(event.data.object)
+    session = event.data.object
+    if session.mode == "setup":
+        # A card-replacement flow (see replace_souscription_payment_method)
+        # carries no price/amount/subscription -- _extract_session_context
+        # below assumes a purchase and must never see this kind of session.
+        return await _handle_payment_method_setup(session)
+
+    ctx = _extract_session_context(session)
     if not ctx["user_id"]:
         raise HTTPException(status_code=400, detail="Missing user_id in metadata")
 
@@ -9222,6 +9262,119 @@ async def resume_souscription(user_id: Annotated[str, Depends(get_user_id_header
         plan_name=await _get_subscription_plan_name(subscription),
     )
     return result
+
+
+def _get_stripe_default_payment_method(customer_id: str) -> Optional["stripe.PaymentMethod"]:
+    """The card Stripe currently bills for this customer, falling back to
+    the first attached card if no explicit default is set (e.g. a
+    customer created before this feature, or one whose default was
+    detached without a replacement)."""
+    customer = stripe.Customer.retrieve(customer_id, expand=["invoice_settings.default_payment_method"])
+    invoice_settings = customer["invoice_settings"] if customer.get("invoice_settings") else None
+    default_pm = invoice_settings["default_payment_method"] if invoice_settings else None
+    if default_pm:
+        return default_pm
+    payment_methods = stripe.PaymentMethod.list(customer=customer_id, type="card")
+    data = payment_methods["data"] if payment_methods else []
+    return data[0] if data else None
+
+
+@app.get("/api/souscription/payment-method", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def get_souscription_payment_method(user_id: Annotated[str, Depends(get_user_id_header)]):
+    """The card Stripe currently bills for this user's subscription, for a
+    read-only preview in Settings (brand/last4/expiry only -- Stripe never
+    exposes the full card number server-side, by design)."""
+    _require_stripe_ready()
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    subscription = await _get_active_stripe_souscription(user_id)
+    customer_id = subscription.get("stripe_customer_id")
+    if not customer_id:
+        return {"has_payment_method": False}
+
+    try:
+        payment_method = _get_stripe_default_payment_method(customer_id)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
+
+    if not payment_method:
+        return {"has_payment_method": False}
+
+    card = payment_method["card"] if payment_method.get("card") else {}
+    return {
+        "has_payment_method": True,
+        "brand": card.get("brand"),
+        "last4": card.get("last4"),
+        "exp_month": card.get("exp_month"),
+        "exp_year": card.get("exp_year"),
+    }
+
+
+@app.post("/api/souscription/payment-method/revoke", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def revoke_souscription_payment_method(user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Detach the card Stripe currently bills. Future automatic renewal
+    invoices will fail until a new default payment method is set (see
+    replace_souscription_payment_method below) -- the same outcome as if
+    the card had simply expired, which Stripe already handles via
+    invoice.payment_failed (_handle_subscription_payment_failed)."""
+    _require_stripe_ready()
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    subscription = await _get_active_stripe_souscription(user_id)
+    customer_id = subscription.get("stripe_customer_id")
+    if not customer_id:
+        raise HTTPException(status_code=404, detail="No Stripe customer on file")
+
+    try:
+        payment_method = _get_stripe_default_payment_method(customer_id)
+        if not payment_method:
+            raise HTTPException(status_code=404, detail="No payment method on file")
+        stripe.PaymentMethod.detach(payment_method["id"])
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
+
+    return {"success": True}
+
+
+@app.post("/api/souscription/payment-method/replace", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def replace_souscription_payment_method(
+    request: Request, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Starts a Stripe-hosted card collection flow (a Checkout Session in
+    mode="setup") to replace the card on file. The actual swap -- making
+    the new card the customer's default and detaching the old one --
+    happens once Stripe confirms the setup, in the webhook
+    (_handle_payment_method_setup), the same deferred-to-webhook pattern
+    every other Stripe purchase/change in this app follows, since the
+    frontend's redirect back here has no guarantee the webhook has
+    already run."""
+    _require_stripe_ready()
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    subscription = await _get_active_stripe_souscription(user_id)
+    customer_id = subscription.get("stripe_customer_id")
+    if not customer_id:
+        raise HTTPException(status_code=404, detail="No Stripe customer on file")
+
+    default_base_url = _frontend_base_url(request)
+    try:
+        session = stripe.checkout.Session.create(
+            mode="setup",
+            customer=customer_id,
+            payment_method_types=["card"],
+            success_url=f"{default_base_url}/dashboard/settings?payment_method=success",
+            cancel_url=f"{default_base_url}/dashboard/settings?payment_method=cancel",
+            metadata={"userid": user_id},
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
+
+    return {"checkout_url": session.url}
 
 
 async def _assert_plan_change_within_limits(user_id: str, new_plan: Dict[str, Any]) -> None:
