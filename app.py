@@ -9267,7 +9267,15 @@ async def change_souscription_plan(
             currency=STRIPE_CURRENCY,
             unit_amount=unit_amount,
             recurring={"interval": "month"},
-            product_data={"name": str(new_plan.get("name") or "Abonnement")},
+            product_data={
+                "name": str(new_plan.get("name") or "Abonnement"),
+                "description": "Abonnement mensuel, renouvele automatiquement chaque mois",
+                # Required once Stripe Tax/Managed Payments is on for the
+                # account -- Subscription.modify rejects the item with
+                # "the product tax code is missing" otherwise. Same code
+                # used for the initial checkout (create_stripe_checkout_session).
+                "tax_code": "txcd_10103001",
+            },
         )
         updated_stripe_subscription = stripe.Subscription.modify(
             subscription["stripe_subscription_id"],
