@@ -131,7 +131,7 @@
     "historic": "Operation history",
     "errors": {
       "no_active_subscription": "No active subscription.",
-      "no_stripe_subscription": "This subscription isn't managed through Stripe, so there's nothing to update here.",
+      "no_stripe_subscription": "This subscription isn't a recurring Stripe subscription. Change plan to create a recurring subscription before using this action.",
       "no_stripe_customer": "No billing account found for this subscription.",
       "no_payment_method": "No card on file.",
       "plan_not_found": "This plan no longer exists.",

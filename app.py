@@ -8599,22 +8599,32 @@ def _frontend_base_url(request: Request) -> str:
     return "http://localhost:5175"
 
 
-@app.post("/api/stripe/checkout-session", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
-async def create_stripe_checkout_session(
-    request: Request,
-    payload: StripeCheckoutRequest,
-    user_id: Annotated[str, Depends(get_user_id_header)],   # ✅ ici, dans la signature
-):
-    """Create a hosted Stripe Checkout session for a subscription plan."""
-    _require_stripe_ready()
+async def _existing_stripe_customer_id(user_id: str) -> Optional[str]:
+    """The Stripe Customer tied to this user's last paid plan, if any.
+    Reusing it everywhere a Checkout Session is created for this user
+    (subscribing, changing plan, buying credits) -- instead of always
+    passing a bare customer_email, which lets Stripe silently create a
+    brand new guest Customer each time -- keeps a single Stripe Customer
+    per user, so a card saved in one of those flows shows up as reusable
+    in the others too."""
+    previous_subscription = await supabase_get_latest_user_paid_subscription(user_id)
+    return previous_subscription.get("stripe_customer_id") if previous_subscription else None
 
-    if not is_supabase_configured():
-        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
 
-    plan = await supabase_get_abonnement(payload.plan_id)
-    if not plan:
-        raise _coded_error(404, "plan_not_found", "Subscription plan not found")
-
+async def _create_recurring_subscription_checkout(
+    request: Request, user_id: str, plan: Dict[str, Any], *,
+    success_url: str, cancel_url: str, previous_souscription_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Creates a mode="subscription" Checkout Session for `plan`, reusing
+    the user's existing Stripe Customer when there is one (see
+    _existing_stripe_customer_id). previous_souscription_id, when given,
+    is carried in the session/subscription metadata so
+    _handle_subscription_purchase can close that row out once this
+    Checkout actually completes -- used when a plan change has to create
+    a brand new Stripe subscription because the current one isn't
+    Stripe-recurring (see change_souscription_plan). Never closes the old
+    row itself: an abandoned Checkout must leave the current plan
+    untouched."""
     try:
         unit_amount = int(round(float(plan.get("price") or 0) * 100))
     except (TypeError, ValueError):
@@ -8623,25 +8633,16 @@ async def create_stripe_checkout_session(
     if unit_amount <= 0:
         raise _coded_error(400, "invalid_plan_price", _INVALID_PLAN_PRICE)
 
-    default_base_url = _frontend_base_url(request)
-    success_url = (payload.success_url or STRIPE_SUCCESS_URL or f"{default_base_url}/dashboard/abonnement?payment=success").strip()
-    cancel_url = (payload.cancel_url or STRIPE_CANCEL_URL or f"{default_base_url}/dashboard/abonnement?payment=cancel").strip()
-
     metadata = {
         "userid": user_id,
         "abonnement": str(plan.get("id")),
         "plan_name": str(plan.get("name") or ""),
         "payment_mode": "stripe",
     }
+    if previous_souscription_id:
+        metadata["previous_souscription_id"] = previous_souscription_id
 
-    # Reuse the Stripe Customer from a previous plan purchase when we have
-    # one on file, instead of always passing customer_email -- otherwise
-    # every re-subscription (change of plan, resubscribing after a lapse)
-    # creates a brand new Stripe Customer with no history of the last one.
-    existing_customer_id = None
-    previous_subscription = await supabase_get_latest_user_paid_subscription(user_id)
-    if previous_subscription:
-        existing_customer_id = previous_subscription.get("stripe_customer_id")
+    existing_customer_id = await _existing_stripe_customer_id(user_id)
 
     try:
         session = stripe.checkout.Session.create(
@@ -8679,6 +8680,31 @@ async def create_stripe_checkout_session(
         raise HTTPException(status_code=502, detail=f"Stripe checkout error: {exc}")
 
     return {"checkout_url": session.url, "session_id": session.id}
+
+
+@app.post("/api/stripe/checkout-session", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def create_stripe_checkout_session(
+    request: Request,
+    payload: StripeCheckoutRequest,
+    user_id: Annotated[str, Depends(get_user_id_header)],   # ✅ ici, dans la signature
+):
+    """Create a hosted Stripe Checkout session for a subscription plan."""
+    _require_stripe_ready()
+
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    plan = await supabase_get_abonnement(payload.plan_id)
+    if not plan:
+        raise _coded_error(404, "plan_not_found", "Subscription plan not found")
+
+    default_base_url = _frontend_base_url(request)
+    success_url = (payload.success_url or STRIPE_SUCCESS_URL or f"{default_base_url}/dashboard/abonnement?payment=success").strip()
+    cancel_url = (payload.cancel_url or STRIPE_CANCEL_URL or f"{default_base_url}/dashboard/abonnement?payment=cancel").strip()
+
+    return await _create_recurring_subscription_checkout(
+        request, user_id, plan, success_url=success_url, cancel_url=cancel_url,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -8889,6 +8915,22 @@ async def _handle_subscription_purchase(ctx: dict) -> dict:
         stripe_subscription_id=ctx.get("stripe_subscription_id"),
         stripe_customer_id=ctx.get("stripe_customer_id"),
     )
+
+    previous_souscription_id = ctx["metadata"].get("previous_souscription_id")
+    if previous_souscription_id:
+        # Changing plan from a non-Stripe-recurring subscription goes
+        # through a fresh Checkout (see change_souscription_plan /
+        # _create_recurring_subscription_checkout) instead of modifying a
+        # Stripe Subscription in place -- only now, once that Checkout has
+        # actually completed, is it safe to retire the old row so it stops
+        # matching get_user_abonnement's "active" filter alongside this new
+        # one. Doing this before payment succeeded would risk leaving the
+        # user with neither row if they abandoned the Checkout.
+        await supabase_update_souscription_row(
+            previous_souscription_id,
+            {"payment_end_date": datetime.now(timezone.utc).isoformat()},
+            user_id=ctx["user_id"],
+        )
 
     await _allocate_plan_resources(
         user_id=ctx["user_id"],
@@ -9129,10 +9171,13 @@ class ChangeSubscriptionPlanRequest(BaseModel):
 
 async def _get_active_stripe_souscription(user_id: str) -> Dict[str, Any]:
     """The active souscription row for a user, guaranteed to carry a
-    stripe_subscription_id -- shared by cancel/reactivate/pause/resume/
-    change-plan, which all need one to act on. A row without it predates
-    Stripe recurring billing (a one-off "payment" mode checkout from before
-    mode="subscription") and has nothing on Stripe to manage."""
+    stripe_subscription_id -- shared by cancel/reactivate/pause/resume and
+    the payment-method endpoints, which all need one to act on. A row
+    without it predates Stripe recurring billing (a one-off "payment" mode
+    checkout from before mode="subscription") and has nothing on Stripe to
+    manage -- change_souscription_plan handles that case itself (it
+    creates a fresh recurring subscription instead of calling this), so by
+    the time this raises, changing plan is the only way out for the user."""
     subscription = await get_user_abonnement(user_id)
     if not subscription:
         raise _coded_error(404, "no_active_subscription", "No active subscription")
@@ -9140,7 +9185,8 @@ async def _get_active_stripe_souscription(user_id: str) -> Dict[str, Any]:
         raise _coded_error(
             400,
             "no_stripe_subscription",
-            "This subscription has no associated Stripe subscription to manage.",
+            "This subscription is not a recurring Stripe subscription. "
+            "Change plan to create a recurring subscription before using this action.",
         )
     return subscription
 
@@ -9456,12 +9502,31 @@ async def change_souscription_plan(
     if not is_supabase_configured():
         raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
 
-    subscription = await _get_active_stripe_souscription(user_id)
+    subscription = await get_user_abonnement(user_id)
+    if not subscription:
+        raise _coded_error(404, "no_active_subscription", "No active subscription")
+
     new_plan = await supabase_get_abonnement(payload.plan_id)
     if not new_plan:
         raise _coded_error(404, "plan_not_found", "Subscription plan not found")
 
     await _assert_plan_change_within_limits(user_id, new_plan)
+
+    if not subscription.get("stripe_subscription_id"):
+        # Legacy pre-recurring-billing subscription (see
+        # _get_active_stripe_souscription's docstring) -- there is no
+        # Stripe Subscription to modify in place, so "changing plan" here
+        # means subscribing fresh via a real mode="subscription" Checkout.
+        # _create_recurring_subscription_checkout validates new_plan's
+        # price itself; the old row is only retired once that Checkout
+        # actually completes (see _handle_subscription_purchase).
+        default_base_url = _frontend_base_url(request)
+        return await _create_recurring_subscription_checkout(
+            request, user_id, new_plan,
+            success_url=f"{default_base_url}/dashboard/settings?plan_change=success",
+            cancel_url=f"{default_base_url}/dashboard/settings?plan_change=cancel",
+            previous_souscription_id=str(subscription["id"]),
+        )
 
     try:
         unit_amount = int(round(float(new_plan.get("price") or 0) * 100))
@@ -9894,12 +9959,30 @@ async def buy_credits_checkout(
         "amount_usd":     str(amount_usd),
     }
 
+    # Reuse the subscription's Stripe Customer when there is one (see
+    # _existing_stripe_customer_id) instead of a bare customer_email --
+    # otherwise this mode="payment" Checkout risks creating a second,
+    # disconnected guest Customer, so a card added here wouldn't be the
+    # one Stripe already has on file for the subscription, and vice versa.
+    existing_customer_id = await _existing_stripe_customer_id(user_id)
+
     try:
         session = stripe.checkout.Session.create(
             mode="payment",
             success_url=success_url,
             cancel_url=cancel_url,
-            customer_email=request.headers.get("X-User-Email") or None,
+            **(
+                {"customer": existing_customer_id}
+                if existing_customer_id
+                else {"customer_email": request.headers.get("X-User-Email") or None}
+            ),
+            # Attaches whatever card is used here to the Customer for
+            # future reuse (instead of a one-off, forgotten payment
+            # method), so it also shows up as a usable saved card next
+            # time -- for another credit purchase or, via
+            # replace_souscription_payment_method, as the subscription's
+            # billing card.
+            payment_intent_data={"setup_future_usage": "off_session"},
             line_items=[
                 {
                     "quantity": 1,
