@@ -10798,6 +10798,21 @@ async def _execute_scheduled_social_post_job(job_id: str, user_id: str, platform
         await _update_publish_job_status(job_id, "failed", error_message=str(exc))
 
 
+async def _publish_or_schedule_social_post(
+    user_id: str, account: Dict[str, Any], publish_priority: int, is_scheduled: bool,
+    scheduled_for: Optional[datetime], tz: Optional[str], text_value: str, background_id: Optional[str],
+    comments: List["SocialPostCommentInput"], media_url: Optional[str], media_type: Optional[str],
+) -> Dict[str, Any]:
+    if is_scheduled:
+        return await _schedule_social_post_job(
+            user_id, account, publish_priority, scheduled_for, tz,
+            text_value, background_id, comments, media_url, media_type,
+        )
+    return await _publish_social_post_now(
+        user_id, account, publish_priority, text_value, background_id, comments, media_url, media_type,
+    )
+
+
 @app.post("/api/social/posts", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
     await _assert_user_has_active_subscription_for_publish(user_id)
@@ -10830,14 +10845,9 @@ async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotate
     results: Dict[str, Any] = {}
     for account in accounts:
         result_key = str(account.get("id") or account.get("platform"))
-        if is_scheduled:
-            results[result_key] = await _schedule_social_post_job(
-                user_id, account, publish_priority, scheduled_for, payload.timezone,
-                text_value, background_id, comments, media_url, media_type,
-            )
-            continue
-        results[result_key] = await _publish_social_post_now(
-            user_id, account, publish_priority, text_value, background_id, comments, media_url, media_type,
+        results[result_key] = await _publish_or_schedule_social_post(
+            user_id, account, publish_priority, is_scheduled, scheduled_for, payload.timezone,
+            text_value, background_id, comments, media_url, media_type,
         )
 
     overall_success = all(result.get("success") for result in results.values())
