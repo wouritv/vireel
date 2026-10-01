@@ -5035,7 +5035,7 @@ def test_extract_subscription_period_end_returns_none_when_absent_everywhere(mon
 
 def test_change_souscription_plan_swaps_price_and_resets_resources(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    fake_stripe, _ = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    fake_stripe, update_mock = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
     fake_stripe.Subscription.retrieve.return_value = _FakeStripeSubscriptionObject(
         {"items": {"data": [{"id": "si_123"}]}},
         metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
@@ -5079,6 +5079,18 @@ def test_change_souscription_plan_swaps_price_and_resets_resources(monkeypatch):
     allocate_kwargs = allocate_mock.await_args.kwargs
     assert allocate_kwargs["abonnement"] == "new-plan"
     assert allocate_kwargs["souscription_id"] == "sous-2"
+
+    # The old (e.g. Silver) row must be closed out immediately -- with
+    # proration, Stripe keeps the same billing-cycle end, so the new row's
+    # payment_end_date would otherwise match the old row's almost exactly,
+    # leaving both "active" per get_user_abonnement's filter and making
+    # which one it returns arbitrary (reported bug: it kept showing the
+    # old plan as active after a successful upgrade).
+    update_mock.assert_awaited_once()
+    update_args, update_kwargs = update_mock.await_args
+    assert update_args[0] == "sous-1"
+    assert "payment_end_date" in update_args[1]
+    assert update_kwargs["user_id"] == "u1"
 
 
 def test_change_souscription_plan_404_for_unknown_plan(monkeypatch):

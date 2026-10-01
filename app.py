@@ -9308,6 +9308,18 @@ async def change_souscription_plan(
     current_period_end = _extract_subscription_period_end(updated_stripe_subscription)
     period_end = datetime.fromtimestamp(current_period_end, tz=timezone.utc) if current_period_end else None
 
+    # With proration, Stripe keeps the same billing-cycle end for the
+    # underlying subscription -- the new row below gets (essentially) the
+    # same payment_end_date as the old one, so both would otherwise match
+    # get_user_abonnement's "active" filter (payment_end_date >= now) at
+    # once, and which one it returns is unordered/arbitrary. Close the old
+    # row out now so only the new plan's row is "active" going forward.
+    await supabase_update_souscription_row(
+        str(subscription["id"]),
+        {"payment_end_date": datetime.now(timezone.utc).isoformat()},
+        user_id=user_id,
+    )
+
     new_souscription = await supabase_insert_souscription(
         user_id=user_id,
         abonnement=str(new_plan.get("id")),
