@@ -8826,7 +8826,7 @@ async def _allocate_plan_resources(user_id: str, abonnement: str, payment_refere
     )
 
 
-async def _handle_payment_method_setup(session: "stripe.checkout.Session") -> dict:
+def _handle_payment_method_setup(session: "stripe.checkout.Session") -> dict:
     """Completes a card-replacement flow (see
     replace_souscription_payment_method): makes the newly collected card
     the customer's default for future invoices, then detaches whichever
@@ -9035,7 +9035,7 @@ async def stripe_webhook(request: Request):
         # A card-replacement flow (see replace_souscription_payment_method)
         # carries no price/amount/subscription -- _extract_session_context
         # below assumes a purchase and must never see this kind of session.
-        return await _handle_payment_method_setup(session)
+        return _handle_payment_method_setup(session)
 
     ctx = _extract_session_context(session)
     if not ctx["user_id"]:
@@ -9279,7 +9279,7 @@ def _get_stripe_default_payment_method(customer_id: str) -> Optional["stripe.Pay
     return data[0] if data else None
 
 
-@app.get("/api/souscription/payment-method", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+@app.get("/api/souscription/payment-method", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def get_souscription_payment_method(user_id: Annotated[str, Depends(get_user_id_header)]):
     """The card Stripe currently bills for this user's subscription, for a
     read-only preview in Settings (brand/last4/expiry only -- Stripe never

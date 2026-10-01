@@ -4792,7 +4792,7 @@ def test_stripe_webhook_dispatches_setup_session_to_payment_method_handler(monke
     session = types.SimpleNamespace(mode="setup", customer="cus_1", setup_intent="seti_1")
     fake_event = types.SimpleNamespace(type="checkout.session.completed", data=types.SimpleNamespace(object=session))
     monkeypatch.setattr(app, "_verify_and_parse_event", lambda payload, signature: fake_event)
-    setup_mock = AsyncMock(return_value={"received": True})
+    setup_mock = MagicMock(return_value={"received": True})
     monkeypatch.setattr(app, "_handle_payment_method_setup", setup_mock)
     purchase_mock = AsyncMock()
     monkeypatch.setattr(app, "_handle_subscription_purchase", purchase_mock)
@@ -4800,7 +4800,7 @@ def test_stripe_webhook_dispatches_setup_session_to_payment_method_handler(monke
     result = asyncio.run(app.stripe_webhook(_FakeWebhookRequest()))
 
     assert result == {"received": True}
-    setup_mock.assert_awaited_once_with(session)
+    setup_mock.assert_called_once_with(session)
     purchase_mock.assert_not_awaited()
 
 
@@ -4816,7 +4816,7 @@ def test_handle_payment_method_setup_sets_default_and_detaches_old(monkeypatch):
     monkeypatch.setattr(app, "_get_stripe_default_payment_method", MagicMock(return_value={"id": "pm_old"}))
     session = types.SimpleNamespace(customer="cus_1", setup_intent="seti_1")
 
-    result = asyncio.run(app._handle_payment_method_setup(session))
+    result = app._handle_payment_method_setup(session)
 
     assert result == {"received": True}
     fake_stripe.Customer.modify.assert_called_once_with("cus_1", invoice_settings={"default_payment_method": "pm_new"})
@@ -4831,7 +4831,7 @@ def test_handle_payment_method_setup_skips_detach_when_no_previous_card(monkeypa
     monkeypatch.setattr(app, "_get_stripe_default_payment_method", MagicMock(return_value=None))
     session = types.SimpleNamespace(customer="cus_1", setup_intent="seti_1")
 
-    result = asyncio.run(app._handle_payment_method_setup(session))
+    result = app._handle_payment_method_setup(session)
 
     assert result == {"received": True}
     fake_stripe.PaymentMethod.detach.assert_not_called()
