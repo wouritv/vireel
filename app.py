@@ -9487,47 +9487,31 @@ def _extract_subscription_period_end(stripe_subscription: "stripe.Subscription")
         return None
 
 
-@app.post("/api/souscription/change-plan", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
-async def change_souscription_plan(
-    payload: ChangeSubscriptionPlanRequest, user_id: Annotated[str, Depends(get_user_id_header)],
-    request: Request = None,
-):
-    """Swap the subscription's price for a different plan's, effective
-    immediately (with Stripe proration), and reset credit/storage to the
-    new plan's allowance the same way a fresh purchase would -- mirrors
-    _allocate_plan_resources's existing "a changed plan resets monthly
-    allowances" behavior, just triggered synchronously here instead of via
-    a webhook."""
-    _require_stripe_ready()
-    if not is_supabase_configured():
-        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+async def _change_plan_via_fresh_checkout(
+    request: Request, user_id: str, subscription: Dict[str, Any], new_plan: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Legacy pre-recurring-billing subscription (see
+    _get_active_stripe_souscription's docstring) -- there is no Stripe
+    Subscription to modify in place, so "changing plan" here means
+    subscribing fresh via a real mode="subscription" Checkout.
+    _create_recurring_subscription_checkout validates new_plan's price
+    itself; the old row is only retired once that Checkout actually
+    completes (see _handle_subscription_purchase)."""
+    default_base_url = _frontend_base_url(request)
+    return await _create_recurring_subscription_checkout(
+        request, user_id, new_plan,
+        success_url=f"{default_base_url}/dashboard/settings?plan_change=success",
+        cancel_url=f"{default_base_url}/dashboard/settings?plan_change=cancel",
+        previous_souscription_id=str(subscription["id"]),
+    )
 
-    subscription = await get_user_abonnement(user_id)
-    if not subscription:
-        raise _coded_error(404, "no_active_subscription", "No active subscription")
 
-    new_plan = await supabase_get_abonnement(payload.plan_id)
-    if not new_plan:
-        raise _coded_error(404, "plan_not_found", "Subscription plan not found")
-
-    await _assert_plan_change_within_limits(user_id, new_plan)
-
-    if not subscription.get("stripe_subscription_id"):
-        # Legacy pre-recurring-billing subscription (see
-        # _get_active_stripe_souscription's docstring) -- there is no
-        # Stripe Subscription to modify in place, so "changing plan" here
-        # means subscribing fresh via a real mode="subscription" Checkout.
-        # _create_recurring_subscription_checkout validates new_plan's
-        # price itself; the old row is only retired once that Checkout
-        # actually completes (see _handle_subscription_purchase).
-        default_base_url = _frontend_base_url(request)
-        return await _create_recurring_subscription_checkout(
-            request, user_id, new_plan,
-            success_url=f"{default_base_url}/dashboard/settings?plan_change=success",
-            cancel_url=f"{default_base_url}/dashboard/settings?plan_change=cancel",
-            previous_souscription_id=str(subscription["id"]),
-        )
-
+def _apply_recurring_plan_change(
+    subscription: Dict[str, Any], new_plan: Dict[str, Any],
+) -> "stripe.Subscription":
+    """Swaps an already-recurring subscription's price in place, with
+    proration -- the counterpart of _change_plan_via_fresh_checkout for a
+    subscription that already has a real Stripe Subscription to modify."""
     try:
         unit_amount = int(round(float(new_plan.get("price") or 0) * 100))
     except (TypeError, ValueError):
@@ -9570,7 +9554,7 @@ async def change_souscription_plan(
                 "tax_code": "txcd_10103001",
             },
         )
-        updated_stripe_subscription = stripe.Subscription.modify(
+        return stripe.Subscription.modify(
             subscription["stripe_subscription_id"],
             items=[{"id": item_id, "price": new_price.id}],
             proration_behavior="create_prorations",
@@ -9579,6 +9563,14 @@ async def change_souscription_plan(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
 
+
+async def _finalize_plan_change(
+    user_id: str, request: Optional[Request], subscription: Dict[str, Any], new_plan: Dict[str, Any],
+    updated_stripe_subscription: "stripe.Subscription",
+) -> Dict[str, Any]:
+    """Persists an in-place Stripe plan swap: retires the old row, records
+    the new one, resets plan resources, and notifies the user -- the
+    bookkeeping half of _apply_recurring_plan_change's Stripe call."""
     current_period_end = _extract_subscription_period_end(updated_stripe_subscription)
     period_end = datetime.fromtimestamp(current_period_end, tz=timezone.utc) if current_period_end else None
 
@@ -9617,6 +9609,40 @@ async def change_souscription_plan(
         plan_name=str(new_plan.get("name") or "Vireel"), amount=float(new_plan.get("price") or 0),
     )
     return new_souscription
+
+
+@app.post("/api/souscription/change-plan", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def change_souscription_plan(
+    payload: ChangeSubscriptionPlanRequest, user_id: Annotated[str, Depends(get_user_id_header)],
+    request: Request = None,
+):
+    """Swap the subscription's price for a different plan's, effective
+    immediately (with Stripe proration), and reset credit/storage to the
+    new plan's allowance the same way a fresh purchase would -- mirrors
+    _allocate_plan_resources's existing "a changed plan resets monthly
+    allowances" behavior, just triggered synchronously here instead of via
+    a webhook. A subscription with no stripe_subscription_id goes through
+    _change_plan_via_fresh_checkout instead (see
+    _get_active_stripe_souscription's docstring for why)."""
+    _require_stripe_ready()
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    subscription = await get_user_abonnement(user_id)
+    if not subscription:
+        raise _coded_error(404, "no_active_subscription", "No active subscription")
+
+    new_plan = await supabase_get_abonnement(payload.plan_id)
+    if not new_plan:
+        raise _coded_error(404, "plan_not_found", "Subscription plan not found")
+
+    await _assert_plan_change_within_limits(user_id, new_plan)
+
+    if not subscription.get("stripe_subscription_id"):
+        return await _change_plan_via_fresh_checkout(request, user_id, subscription, new_plan)
+
+    updated_stripe_subscription = _apply_recurring_plan_change(subscription, new_plan)
+    return await _finalize_plan_change(user_id, request, subscription, new_plan, updated_stripe_subscription)
 
 
 # ---------------------------------------------------------------------------
