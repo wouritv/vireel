@@ -131,7 +131,7 @@
     "historic": "Historique des opérations",
     "errors": {
       "no_active_subscription": "Aucun abonnement actif.",
-      "no_stripe_subscription": "Cet abonnement n'est pas géré via Stripe, il n'y a rien à modifier ici.",
+      "no_stripe_subscription": "Cet abonnement n'est pas un abonnement Stripe récurrent. Changez de formule pour créer un abonnement récurrent avant d'utiliser cette action.",
       "no_stripe_customer": "Aucun compte de facturation trouvé pour cet abonnement.",
       "no_payment_method": "Aucune carte enregistrée.",
       "plan_not_found": "Cette formule n'existe plus.",

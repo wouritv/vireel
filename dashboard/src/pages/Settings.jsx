@@ -309,6 +309,14 @@ export default function SettingsPage() {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(translateApiError(data, "settings.erreurInfo", "Action abonnement impossible"));
+      // change-plan on a subscription that isn't Stripe-recurring returns
+      // a Checkout Session to pay for the new plan instead of the usual
+      // updated-subscription payload (see change_souscription_plan) --
+      // the old plan only changes once that Checkout actually completes.
+      if (data?.checkout_url) {
+        window.location.href = data.checkout_url;
+        return;
+      }
       setSubMessage(t('settings.actionSuccess', 'Action terminée avec succès.'));
       await loadSubscriptionState();
       await refreshCredits();

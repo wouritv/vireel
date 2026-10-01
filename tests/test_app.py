@@ -4615,6 +4615,55 @@ def test_create_stripe_checkout_session_reuses_existing_stripe_customer(monkeypa
     assert "customer_email" not in kwargs
 
 
+def test_buy_credits_checkout_reuses_existing_stripe_customer(monkeypatch):
+    # The card used to buy credits must be the same one on file for the
+    # subscription (and vice versa) -- see _existing_stripe_customer_id --
+    # so this mode="payment" Checkout must reuse the subscription's Stripe
+    # Customer instead of a bare customer_email, which risks a second,
+    # disconnected guest Customer.
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    fake_session = MagicMock(url="https://checkout.stripe.com/pay/cs_test_credits", id="cs_test_credits")
+    fake_stripe.checkout.Session.create.return_value = fake_session
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_enforce_subscription_retention_policy", AsyncMock(return_value={"state": "active"}))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value={"stripe_customer_id": "cus_existing"}))
+
+    payload = app.BuyCreditsRequest(amount_usd=10.0)
+    result = asyncio.run(app.buy_credits_checkout(
+        request=_FakeCheckoutRequest(), payload=payload, user_id="u1",
+    ))
+
+    assert result["checkout_url"] == fake_session.url
+    _, kwargs = fake_stripe.checkout.Session.create.call_args
+    assert kwargs["customer"] == "cus_existing"
+    assert "customer_email" not in kwargs
+    assert kwargs["payment_intent_data"] == {"setup_future_usage": "off_session"}
+
+
+def test_buy_credits_checkout_falls_back_to_customer_email_without_existing_customer(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    fake_session = MagicMock(url="https://checkout.stripe.com/pay/cs_test_credits2", id="cs_test_credits2")
+    fake_stripe.checkout.Session.create.return_value = fake_session
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_enforce_subscription_retention_policy", AsyncMock(return_value={"state": "active"}))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value=None))
+
+    payload = app.BuyCreditsRequest(amount_usd=10.0)
+    asyncio.run(app.buy_credits_checkout(
+        request=_FakeCheckoutRequest(headers={"X-User-Email": "user@example.com"}), payload=payload, user_id="u1",
+    ))
+
+    _, kwargs = fake_stripe.checkout.Session.create.call_args
+    assert kwargs["customer_email"] == "user@example.com"
+    assert "customer" not in kwargs
+
+
 def test_extract_session_context_captures_stripe_subscription_and_customer_ids(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     session = types.SimpleNamespace(
@@ -4824,6 +4873,64 @@ def test_stripe_webhook_dispatches_setup_session_to_payment_method_handler(monke
     assert result == {"received": True}
     setup_mock.assert_called_once_with(session)
     purchase_mock.assert_not_awaited()
+
+
+def _fake_subscription_purchase_ctx(**overrides):
+    ctx = {
+        "metadata": {"abonnement": "plan-1", "plan_name": "Pro"},
+        "user_id": "u1",
+        "payment_mode": "stripe",
+        "amount_total": 29.99,
+        "payment_reference": "cs_test_1",
+        "payment_date": datetime.now(timezone.utc),
+        "session_id": "cs_test_1",
+        "customer_email": "user@example.com",
+        "stripe_subscription_id": "sub_new",
+        "stripe_customer_id": "cus_new",
+    }
+    ctx.update(overrides)
+    return ctx
+
+
+def test_handle_subscription_purchase_closes_out_previous_souscription(monkeypatch):
+    # Changing plan from a non-Stripe-recurring subscription creates a
+    # fresh Checkout carrying previous_souscription_id in its metadata
+    # (see change_souscription_plan / _create_recurring_subscription_checkout)
+    # -- once that Checkout completes, this webhook handler must retire the
+    # old row so it stops matching get_user_abonnement's "active" filter
+    # alongside the brand new one.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-new"}))
+    monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+    update_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
+
+    ctx = _fake_subscription_purchase_ctx(
+        metadata={"abonnement": "plan-1", "plan_name": "Pro", "previous_souscription_id": "sous-legacy"},
+    )
+    asyncio.run(app._handle_subscription_purchase(ctx))
+
+    update_mock.assert_awaited_once()
+    args, kwargs = update_mock.await_args
+    assert args[0] == "sous-legacy"
+    assert "payment_end_date" in args[1]
+    assert kwargs["user_id"] == "u1"
+
+
+def test_handle_subscription_purchase_without_previous_souscription_touches_nothing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-new"}))
+    monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+    update_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
+
+    asyncio.run(app._handle_subscription_purchase(_fake_subscription_purchase_ctx()))
+
+    update_mock.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -5400,6 +5507,39 @@ def test_change_souscription_plan_allows_when_within_limits(monkeypatch):
         payload=app.ChangeSubscriptionPlanRequest(plan_id="gold"), user_id="u1",
     ))
     assert result == {"id": "sous-2"}
+
+
+def test_change_souscription_plan_starts_fresh_checkout_for_non_recurring_subscription(monkeypatch):
+    # A subscription with no stripe_subscription_id (see
+    # _get_active_stripe_souscription's docstring) has no Stripe
+    # Subscription to modify in place -- changing plan must instead start
+    # a brand new recurring Checkout for the chosen plan, and must never
+    # touch stripe.Subscription.retrieve/modify.
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe, update_mock = _stub_subscription_lifecycle_prereqs(
+        monkeypatch, app, subscription={"id": "sous-legacy", "stripe_subscription_id": None},
+    )
+    fake_session = MagicMock(url="https://checkout.stripe.com/pay/cs_test_plan", id="cs_test_plan")
+    fake_stripe.checkout.Session.create.return_value = fake_session
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "gold", "name": "Gold", "price": 49.99, "max_social_account": 3}))
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value=None))
+
+    result = asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="gold"), user_id="u1",
+        request=_FakeCheckoutRequest(),
+    ))
+
+    assert result == {"checkout_url": fake_session.url, "session_id": fake_session.id}
+    fake_stripe.Subscription.retrieve.assert_not_called()
+    fake_stripe.Subscription.modify.assert_not_called()
+    update_mock.assert_not_awaited()  # old row is only closed out once the Checkout completes
+
+    _, kwargs = fake_stripe.checkout.Session.create.call_args
+    assert kwargs["mode"] == "subscription"
+    assert kwargs["metadata"]["abonnement"] == "gold"
+    assert kwargs["metadata"]["previous_souscription_id"] == "sous-legacy"
 
 
 # ---------------------------------------------------------------------------
