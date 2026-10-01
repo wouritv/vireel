@@ -944,6 +944,14 @@ async def get_user_abonnement(user_id: str) -> Optional[Dict[str, Any]]:
 		.not_.is_("abonnement", "null")
 		.is_("account_disabled_at", "null")
 		.gte("payment_end_date", now_iso)
+		# Without an explicit order, which row postgrest returns is
+		# unordered/arbitrary once more than one row matches (e.g. a legacy
+		# one-off "payment" row with no stripe_subscription_id, alongside a
+		# real Stripe-subscription row created later) -- see the change-plan
+		# handler in app.py, which already has to work around this by
+		# expiring the old row. Ordering by payment_end_date picks the
+		# currently governing row deterministically.
+		.order("payment_end_date", desc=True)
 		.limit(1)
 		.execute()
 	)

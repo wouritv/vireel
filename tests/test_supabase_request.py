@@ -1134,6 +1134,28 @@ def test_subscription_read_paths_return_rows(monkeypatch):
     assert asyncio.run(supabase_request.update_souscription_row("sub-1", {"payment_status": "cancelled"})) == {"id": "sub-updated"}
 
 
+def test_get_user_abonnement_orders_by_payment_end_date_desc(monkeypatch):
+    # Without an explicit order, postgrest's row order when more than one
+    # row matches (e.g. a legacy row with no stripe_subscription_id
+    # alongside a real one created later, both still "active") is
+    # unordered/arbitrary -- the query must request a deterministic order
+    # so the currently governing row is the one returned.
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_SOUSCRIPTION_TABLE: [_FakeResponse(data=[{"id": "sub-active", "abonnement": None}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.get_user_abonnement("u1"))
+    assert result["id"] == "sub-active"
+    assert _event_args(fake_client.events, supabase_request.SUPABASE_SOUSCRIPTION_TABLE, "order") == ("payment_end_date",)
+    order_kwargs = next(
+        kwargs for table, method, _args, kwargs in fake_client.events
+        if table == supabase_request.SUPABASE_SOUSCRIPTION_TABLE and method == "order"
+    )
+    assert order_kwargs == {"desc": True}
+
+
 def test_get_user_abonnement_falls_back_to_priority_one_on_error(monkeypatch):
     supabase_request = _import_supabase_request_with_stubs(monkeypatch)
     fake_client = _FakeClient(

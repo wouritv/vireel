@@ -5359,8 +5359,9 @@ def test_change_souscription_plan_blocks_when_over_social_account_limit(monkeypa
     with pytest.raises(app.HTTPException) as exc_info:
         asyncio.run(coro)
     assert exc_info.value.status_code == 409
-    assert "facebook" in exc_info.value.detail
-    assert "instagram" not in exc_info.value.detail
+    assert exc_info.value.detail["code"] == "plan_change_over_limit"
+    assert "facebook" in exc_info.value.detail["details"]
+    assert "instagram" not in exc_info.value.detail["details"]
 
 
 def test_change_souscription_plan_blocks_when_over_storage_limit(monkeypatch):

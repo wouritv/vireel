@@ -128,7 +128,16 @@
     "operation": "Operation",
     "credits": "Credits",
     "storage": "Storage (GB)",
-    "historic": "Operation history"
+    "historic": "Operation history",
+    "errors": {
+      "no_active_subscription": "No active subscription.",
+      "no_stripe_subscription": "This subscription isn't managed through Stripe, so there's nothing to update here.",
+      "no_stripe_customer": "No billing account found for this subscription.",
+      "no_payment_method": "No card on file.",
+      "plan_not_found": "This plan no longer exists.",
+      "invalid_plan_price": "This plan's price is invalid. Please contact support.",
+      "plan_change_over_limit": "This plan allows at most {{max}} account(s) per social network. Remove the extra accounts before changing plan: {{details}}."
+    }
   },
   "reels": {
     "title": "Generated Reels",
