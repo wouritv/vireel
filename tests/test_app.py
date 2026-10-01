@@ -4783,6 +4783,122 @@ def test_stripe_webhook_dispatches_payment_failed_invoice(monkeypatch):
     failed_mock.assert_called_once_with(invoice)
 
 
+def test_stripe_webhook_dispatches_setup_session_to_payment_method_handler(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "STRIPE_WEBHOOK_SECRET", "whsec_test")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "stripe", MagicMock())
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    session = types.SimpleNamespace(mode="setup", customer="cus_1", setup_intent="seti_1")
+    fake_event = types.SimpleNamespace(type="checkout.session.completed", data=types.SimpleNamespace(object=session))
+    monkeypatch.setattr(app, "_verify_and_parse_event", lambda payload, signature: fake_event)
+    setup_mock = MagicMock(return_value={"received": True})
+    monkeypatch.setattr(app, "_handle_payment_method_setup", setup_mock)
+    purchase_mock = AsyncMock()
+    monkeypatch.setattr(app, "_handle_subscription_purchase", purchase_mock)
+
+    result = asyncio.run(app.stripe_webhook(_FakeWebhookRequest()))
+
+    assert result == {"received": True}
+    setup_mock.assert_called_once_with(session)
+    purchase_mock.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Payment method preview/revoke/replace: card on file shown in Settings.
+# ---------------------------------------------------------------------------
+
+def test_handle_payment_method_setup_sets_default_and_detaches_old(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    fake_stripe.SetupIntent.retrieve.return_value = types.SimpleNamespace(payment_method="pm_new")
+    monkeypatch.setattr(app, "_get_stripe_default_payment_method", MagicMock(return_value={"id": "pm_old"}))
+    session = types.SimpleNamespace(customer="cus_1", setup_intent="seti_1")
+
+    result = app._handle_payment_method_setup(session)
+
+    assert result == {"received": True}
+    fake_stripe.Customer.modify.assert_called_once_with("cus_1", invoice_settings={"default_payment_method": "pm_new"})
+    fake_stripe.PaymentMethod.detach.assert_called_once_with("pm_old")
+
+
+def test_handle_payment_method_setup_skips_detach_when_no_previous_card(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    fake_stripe.SetupIntent.retrieve.return_value = types.SimpleNamespace(payment_method="pm_new")
+    monkeypatch.setattr(app, "_get_stripe_default_payment_method", MagicMock(return_value=None))
+    session = types.SimpleNamespace(customer="cus_1", setup_intent="seti_1")
+
+    result = app._handle_payment_method_setup(session)
+
+    assert result == {"received": True}
+    fake_stripe.PaymentMethod.detach.assert_not_called()
+
+
+def test_get_souscription_payment_method_returns_card_summary(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    monkeypatch.setattr(app, "_get_stripe_default_payment_method", MagicMock(return_value={
+        "id": "pm_1",
+        "card": {"brand": "visa", "last4": "4242", "exp_month": 12, "exp_year": 2027},
+    }))
+
+    result = asyncio.run(app.get_souscription_payment_method(user_id="u1"))
+
+    assert result == {
+        "has_payment_method": True, "brand": "visa", "last4": "4242", "exp_month": 12, "exp_year": 2027,
+    }
+
+
+def test_get_souscription_payment_method_no_card_on_file(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    monkeypatch.setattr(app, "_get_stripe_default_payment_method", MagicMock(return_value=None))
+
+    result = asyncio.run(app.get_souscription_payment_method(user_id="u1"))
+
+    assert result == {"has_payment_method": False}
+
+
+def test_revoke_souscription_payment_method_detaches_card(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe, _ = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    monkeypatch.setattr(app, "_get_stripe_default_payment_method", MagicMock(return_value={"id": "pm_1"}))
+
+    result = asyncio.run(app.revoke_souscription_payment_method(user_id="u1"))
+
+    assert result == {"success": True}
+    fake_stripe.PaymentMethod.detach.assert_called_once_with("pm_1")
+
+
+def test_revoke_souscription_payment_method_404_without_card(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    monkeypatch.setattr(app, "_get_stripe_default_payment_method", MagicMock(return_value=None))
+
+    coro = app.revoke_souscription_payment_method(user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 404
+
+
+def test_replace_souscription_payment_method_returns_setup_checkout_url(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe, _ = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    fake_stripe.checkout.Session.create.return_value = types.SimpleNamespace(url="https://checkout.stripe.com/setup/cs_test_1")
+
+    result = asyncio.run(app.replace_souscription_payment_method(
+        request=_FakeCheckoutRequest(), user_id="u1",
+    ))
+
+    assert result == {"checkout_url": "https://checkout.stripe.com/setup/cs_test_1"}
+    _, create_kwargs = fake_stripe.checkout.Session.create.call_args
+    assert create_kwargs["mode"] == "setup"
+    assert create_kwargs["customer"] == "cus_456"
+
+
 # ---------------------------------------------------------------------------
 # Transactional emails: templated sends via Brevo, and the failed-renewal
 # notification (invoice.payment_failed).

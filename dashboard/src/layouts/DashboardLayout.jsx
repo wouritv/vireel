@@ -332,7 +332,7 @@ export default function DashboardLayout() {
                                                       onClick={() => setIsUserMenuOpen(false)}
                                                       className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-slate-700 dark:text-zinc-200 hover:bg-white/5"
                                                   >
-                                                      <CreditCard size={16} /> {t("nav.abonnements", "Abonnement")}
+                                                      <CreditCard size={16} /> {t("nav.abonnements", "Plan d'abonnement")}
                                                   </NavLink>
                                                   <a
                                                       href="https://docs.vireel.co/"
