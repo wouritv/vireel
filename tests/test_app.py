@@ -5021,11 +5021,7 @@ def test_change_souscription_plan_swaps_price_and_resets_resources(monkeypatch):
     _, price_create_kwargs = fake_stripe.Price.create.call_args
     assert price_create_kwargs == {
         "currency": app.STRIPE_CURRENCY, "unit_amount": 4999, "recurring": {"interval": "month"},
-        "product_data": {
-            "name": "Premium",
-            "description": "Abonnement mensuel, renouvele automatiquement chaque mois",
-            "tax_code": "txcd_10103001",
-        },
+        "product_data": {"name": "Premium", "tax_code": "txcd_10103001"},
     }
     _, modify_kwargs = fake_stripe.Subscription.modify.call_args
     assert modify_kwargs["items"] == [{"id": "si_123", "price": "price_new_1"}]

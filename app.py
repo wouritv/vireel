@@ -9269,11 +9269,13 @@ async def change_souscription_plan(
             recurring={"interval": "month"},
             product_data={
                 "name": str(new_plan.get("name") or "Abonnement"),
-                "description": "Abonnement mensuel, renouvele automatiquement chaque mois",
-                # Required once Stripe Tax/Managed Payments is on for the
-                # account -- Subscription.modify rejects the item with
-                # "the product tax code is missing" otherwise. Same code
-                # used for the initial checkout (create_stripe_checkout_session).
+                # Unlike Checkout Session's line_items[].price_data.product_data
+                # (create_stripe_checkout_session), Price.create's product_data
+                # does not accept "description" -- Stripe rejects it with
+                # "Received unknown parameter: product_data[description]".
+                # tax_code is required once Stripe Tax/Managed Payments is on
+                # for the account, or Subscription.modify rejects the item
+                # with "the product tax code is missing".
                 "tax_code": "txcd_10103001",
             },
         )
