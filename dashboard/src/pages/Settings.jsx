@@ -832,7 +832,7 @@ export default function SettingsPage() {
               </button>
               <button
                 onClick={() => runSubAction('reactivate')}
-                disabled={subActionLoading === 'reactivate'}
+                disabled={!subscription || subActionLoading === 'reactivate'}
                 className="rounded-lg border border-emerald-300 dark:border-green-500/30 bg-emerald-100 dark:bg-green-500/10 px-3 py-2 text-xs text-emerald-800 dark:text-green-300 hover:bg-emerald-200 dark:hover:bg-green-500/20 disabled:opacity-40"
               >
                 {subActionLoading === 'reactivate' ? '...' : t('settings.reactivate', 'Reactivate')}
