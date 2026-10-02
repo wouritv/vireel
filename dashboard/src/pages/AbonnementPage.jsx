@@ -6,10 +6,18 @@ import { useAuth } from "../state/AuthContext";
 import { useUserCredits } from "../state/UserCreditsContext";
 import { useTranslation } from "../state/LanguageContext";
 
+// Every value here must be a complete, literal Tailwind class string --
+// Tailwind's build-time scanner only picks up classes it can see written
+// out in full in source files, so a template literal like
+// `bg-gradient-to-br from-${plan.color}-500/30` (the previous approach,
+// used directly in the JSX below) can never work: whatever color name
+// comes back from the DB, Tailwind never generates that class, so the
+// icon chip silently rendered with no gradient at all, for every color.
 const colorStyles = {
     zinc: {
         border: "border-zinc-500/20",
         bg: "bg-zinc-500/10",
+        gradient: "bg-gradient-to-br from-zinc-500/30 to-zinc-700/30",
         icon: "text-slate-700 dark:text-zinc-300",
         button: "border-zinc-500/20 bg-zinc-500/10 text-slate-700 dark:text-zinc-300 hover:bg-zinc-500/15",
         check: "text-slate-500 dark:text-zinc-400",
@@ -17,6 +25,7 @@ const colorStyles = {
     blue: {
         border: "border-blue-500/30",
         bg: "bg-blue-500/10",
+        gradient: "bg-gradient-to-br from-blue-500/30 to-blue-700/30",
         icon: "text-blue-300",
         button: "border-blue-500/20 bg-blue-500/10 text-blue-300 hover:bg-blue-500/15",
         check: "text-blue-400",
@@ -24,6 +33,7 @@ const colorStyles = {
     purple: {
         border: "border-purple-500/20",
         bg: "bg-purple-500/10",
+        gradient: "bg-gradient-to-br from-purple-500/30 to-purple-700/30",
         icon: "text-purple-300",
         button: "border-purple-500/20 bg-purple-500/10 text-purple-300 hover:bg-purple-500/15",
         check: "text-purple-400",
@@ -31,20 +41,41 @@ const colorStyles = {
     amber: {
         border: "border-amber-500/30",
         bg: "bg-amber-500/10",
+        gradient: "bg-gradient-to-br from-amber-500/30 to-amber-700/30",
         icon: "text-amber-300",
         button: "border-amber-500/20 bg-amber-500/10 text-amber-300 hover:bg-amber-500/15",
         check: "text-amber-400",
     },
+    green: {
+        border: "border-emerald-500/30",
+        bg: "bg-emerald-500/10",
+        gradient: "bg-gradient-to-br from-emerald-500/30 to-emerald-700/30",
+        icon: "text-emerald-300",
+        button: "border-emerald-500/20 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/15",
+        check: "text-emerald-400",
+    },
+    red: {
+        border: "border-rose-500/30",
+        bg: "bg-rose-500/10",
+        gradient: "bg-gradient-to-br from-rose-500/30 to-rose-700/30",
+        icon: "text-rose-300",
+        button: "border-rose-500/20 bg-rose-500/10 text-rose-300 hover:bg-rose-500/15",
+        check: "text-rose-400",
+    },
 };
 // A plan whose "color" column doesn't match any key above (e.g. a newly
-// added plan) falls back here instead of crashing on `styles.border`.
+// added plan, or a value not yet mapped) falls back here instead of
+// crashing on `styles.border`.
 const defaultColorStyle = colorStyles.zinc;
 
+// Keyed defensively on common casings (Crown/crown) since the exact
+// string in the DB's "icon" column isn't guaranteed to match a
+// component's PascalCase export name.
 const iconMap = {
-    Crown: Crown,
-    star: Star,
-    Sparkles: Sparkles,
-    Zap: Zap,
+    Crown: Crown, crown: Crown,
+    Star: Star, star: Star,
+    Sparkles: Sparkles, sparkles: Sparkles,
+    Zap: Zap, zap: Zap,
 };
 
 export default function AbonnementPage() {
@@ -195,7 +226,7 @@ export default function AbonnementPage() {
     },[])
 
     return (
-        <div className="h-full overflow-y-auto p-8 max-w-5xl mx-auto animate-[fadeIn_0.3s_ease-out]">
+        <div className="h-full overflow-y-auto p-8 max-w-7xl mx-auto animate-[fadeIn_0.3s_ease-out]">
             {/* Header */}
             <div className="mb-8">
                 <h1 className="text-3xl font-bold mb-2">{t("abonnement.title","Plan d'abonnement")}</h1>
@@ -210,7 +241,7 @@ export default function AbonnementPage() {
 
             {/* Plans -- responsive to however many plans the catalog has
                 (was hardcoded to 3 columns, broke once a 4th plan was added) */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-6 items-start">
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-8 items-start">
 
                 {loading && (
                     <span className="inline-flex items-center gap-2">
@@ -240,8 +271,8 @@ export default function AbonnementPage() {
                     return (
                         <div
                             key={plan.name}
-                            className={`relative flex flex-col rounded-2xl border ${styles.border} ${styles.bg} p-6 ${
-                                plan.highlighted ? "ring-2 ring-blue-500/40 scale-[1.03]" : ""
+                            className={`relative flex flex-col rounded-2xl border ${styles.border} ${styles.bg} p-7 ${
+                                plan.highlighted ? "z-10 ring-2 ring-blue-500/40 scale-[1.02]" : ""
                             } transition`}
                         >
                             {plan.highlighted && (
@@ -252,7 +283,7 @@ export default function AbonnementPage() {
 
                             {/* Icon + nom */}
                             <div className="flex items-center gap-3 mb-2">
-                                <div className={`p-2 rounded-lg bg-gradient-to-br from-${plan.color}-500/30 to-${plan.color}-700/30`}>
+                                <div className={`p-2 rounded-lg ${styles.gradient}`}>
                                     <Icon size={20} className={styles.icon} />
                                 </div>
                                 <h2 className="text-lg font-bold">{plan.name}</h2>
