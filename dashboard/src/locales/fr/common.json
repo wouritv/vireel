@@ -578,7 +578,8 @@
     "offre5": "Traduction de texte et sous-titres",
     "commentsPerPost": "commentaires / publication",
     "statsIncluded": "Statistiques sociales sur la page d'accueil",
-    "statsExcluded": "Pas de statistiques sociales sur la page d'accueil"
+    "statsExcluded": "Pas de statistiques sociales sur la page d'accueil",
+    "aiFeaturesHeading": "Fonctionnalités IA incluses dans les crédits"
   },
   "landing": {
     "feature": "Fonctionnalités",

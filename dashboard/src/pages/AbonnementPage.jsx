@@ -283,6 +283,13 @@ export default function AbonnementPage() {
                     const buttonLabel = t("abonnement.choisir","Choisir");
                     const commentCount = Number(plan.commentaire);
                     const hasCommentCount = Number.isFinite(commentCount) && commentCount > 0;
+                    // description is a JSON array (same shape as features),
+                    // listed under its own "Fonctionnalites IA incluses dans
+                    // les credits" heading -- tolerate a plain string too in
+                    // case a row hasn't been migrated to the array shape yet.
+                    const descriptionItems = Array.isArray(plan.description)
+                        ? plan.description
+                        : (plan.description ? [plan.description] : []);
 
                     return (
                         <div
@@ -312,18 +319,28 @@ export default function AbonnementPage() {
                                 </p>
                             )}
 
-                            {/* Description */}
-                            {plan.description && (
-                                <p className="text-sm text-slate-600 dark:text-zinc-400 mb-4">
-                                    {plan.description}
-                                </p>
-                            )}
-
                             {/* Prix */}
                             <div className="mb-6">
                                 <span className="text-3xl font-bold">{plan.price}€</span>
                                 <span className="text-slate-500 dark:text-zinc-400 text-sm"> / {t("abonnement.mois","mois")}</span>
                             </div>
+
+                            {/* Fonctionnalites IA incluses dans les credits */}
+                            {descriptionItems.length > 0 && (
+                                <div className="mb-6">
+                                    <p className="text-xs font-semibold text-slate-700 dark:text-zinc-200 mb-2">
+                                        {t("abonnement.aiFeaturesHeading", "Fonctionnalités IA incluses dans les crédits")}
+                                    </p>
+                                    <ul className="flex flex-col gap-1.5">
+                                        {descriptionItems.map((item) => (
+                                            <li key={item} className="flex items-start gap-2 text-sm text-slate-700 dark:text-zinc-300">
+                                                <Check size={14} className={`${styles.check} mt-0.5 shrink-0`} />
+                                                <span>{item}</span>
+                                            </li>
+                                        ))}
+                                    </ul>
+                                </div>
+                            )}
 
                             {/* Liste des services */}
                             <ul className="flex flex-col gap-3 mb-8 flex-1">

@@ -577,7 +577,8 @@
     "offre5": "Text and subtitle translation",
     "commentsPerPost": "comments / post",
     "statsIncluded": "Social stats on the home page",
-    "statsExcluded": "No social stats on the home page"
+    "statsExcluded": "No social stats on the home page",
+    "aiFeaturesHeading": "AI features included in the credits"
   },
   "landing": {
     "feature": "Features",
