@@ -826,12 +826,18 @@ SOUSCRIPTION_COLUMNS = (
 )
 
 async def list_abonnements() -> List[Dict[str, Any]]:
-	"""Récupère tous les abonnements disponibles."""
+	"""Récupère tous les abonnements disponibles, dans leur ordre
+	d'affichage explicite (colonne "ordre", croissant) plutôt que par
+	created_at, qui ne correspondait a rien de voulu pour l'affichage.
+	Renvoie aussi les lignes sans ordre (ex. un plan retire de la vente) --
+	c'est a l'appelant public-facing (app.py's list_abonnements endpoint)
+	de les filtrer, puisque cette fonction est aussi utilisee pour
+	resoudre le nom d'un plan dans l'historique d'un abonnement existant."""
 	client = await get_client()
 	response = (
 		await client.table(SUPABASE_ABONNEMENTS_TABLE)
 		.select(ABONNEMENT_COLUMNS)
-		.order("created_at", desc=False)
+		.order("ordre", desc=False)
 		.execute()
 	)
 	return response.data

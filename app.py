@@ -9153,11 +9153,16 @@ async def stripe_webhook(request: Request):
 
 @app.get("/api/abonnements", responses={503: {"description": "Service Unavailable"}})
 async def list_abonnements():
-    """List available subscription plans from Supabase."""
+    """List available subscription plans from Supabase, in ascending
+    "ordre" and excluding any plan with no ordre set -- that's how a plan
+    is retired from sale without deleting its row (see the "ordre"
+    migration), which would otherwise break plan-name lookups for
+    existing subscribers on that plan."""
     if not is_supabase_configured():
         raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
     plans = await supabase_list_abonnements()
-    return {"plans": plans}
+    visible_plans = [plan for plan in plans if plan.get("ordre") is not None]
+    return {"plans": visible_plans}
 
 
 @app.get("/api/souscription", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})

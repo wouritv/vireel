@@ -4598,6 +4598,24 @@ class _FakeCheckoutRequest:
         self.headers = headers or {}
 
 
+def test_list_abonnements_endpoint_filters_out_plans_without_ordre(monkeypatch):
+    # A plan with no "ordre" set is retired from sale (see the "ordre"
+    # migration) without deleting its row -- the public-facing endpoint
+    # must hide it, while supabase_list_abonnements itself still returns
+    # it (needed to resolve plan names for existing subscribers' history).
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_list_abonnements", AsyncMock(return_value=[
+        {"id": "a1", "name": "Discover", "ordre": 1},
+        {"id": "a2", "name": "Retired", "ordre": None},
+        {"id": "a3", "name": "Publish", "ordre": 2},
+    ]))
+
+    result = asyncio.run(app.list_abonnements())
+
+    assert [plan["id"] for plan in result["plans"]] == ["a1", "a3"]
+
+
 def test_create_stripe_checkout_session_uses_subscription_mode(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     fake_stripe = MagicMock()
