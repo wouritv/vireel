@@ -526,6 +526,8 @@
     "postComposerFailed": "Publishing failed.",
     "postComposerCommentsFailed": "Post published, but {{count}} comment(s) could not be posted on: {{platforms}}. {{error}}",
     "postComposerCommentsLabel": "Comments (posted by the page)",
+    "postComposerCommentsUnavailableLinkedin": "Not available on LinkedIn: LinkedIn's API does not allow posting comments with this type of access. Select a Facebook account too to add comments.",
+    "postComposerCommentsFacebookOnly": "Facebook only: these comments will not be posted on the selected LinkedIn account(s).",
     "postComposerAddComment": "Add a comment",
     "postComposerNoComments": "No comments yet.",
     "postComposerCommentN": "Comment {{n}}",
