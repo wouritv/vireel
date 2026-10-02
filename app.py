@@ -9153,11 +9153,16 @@ async def stripe_webhook(request: Request):
 
 @app.get("/api/abonnements", responses={503: {"description": "Service Unavailable"}})
 async def list_abonnements():
-    """List available subscription plans from Supabase."""
+    """List available subscription plans from Supabase, in ascending
+    "ordre" and excluding any plan with no ordre set -- that's how a plan
+    is retired from sale without deleting its row (see the "ordre"
+    migration), which would otherwise break plan-name lookups for
+    existing subscribers on that plan."""
     if not is_supabase_configured():
         raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
     plans = await supabase_list_abonnements()
-    return {"plans": plans}
+    visible_plans = [plan for plan in plans if plan.get("ordre") is not None]
+    return {"plans": visible_plans}
 
 
 @app.get("/api/souscription", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
@@ -11243,6 +11248,17 @@ async def _publish_or_schedule_social_post(
 async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotated[str, Depends(get_user_id_header)]):
     await _assert_user_has_active_subscription_for_publish(user_id)
 
+    comments = payload.comments or []
+    max_comments = await _get_user_max_comments_per_post(user_id)
+    if len(comments) > max_comments:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Votre offre autorise au maximum {max_comments} commentaire(s) par publication. "
+                "Reduisez le nombre de commentaires ou passez a une offre superieure."
+            ),
+        )
+
     text_value = (payload.text or "").strip()
     media_url = (payload.media_url or "").strip() or None
     # Meta's own APIs only require text on a plain text-only post (Graph API
@@ -11263,7 +11279,6 @@ async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotate
     # background style the moment media is attached), so only default to
     # the first preset when there's no attached media at all.
     background_id = (payload.background_id or anonymous_stories.BACKGROUND_PRESETS[0]["id"]) if not media_url else None
-    comments = payload.comments or []
 
     # Keyed by account id (not platform) so publishing to several accounts
     # of the same platform (e.g. two Facebook Pages) reports each one
@@ -13690,6 +13705,19 @@ async def _get_user_max_social_accounts(user_id: str) -> int:
         return max(1, int((plan or {}).get("max_social_account") or 1))
     except (TypeError, ValueError):
         return 1
+
+
+async def _get_user_max_comments_per_post(user_id: str) -> int:
+    """How many follow-up comments a single publication can carry under
+    the user's active plan (abonnement.commentaire) -- defaults to 0 (no
+    comments) when there is no active plan/the column is unset, since
+    create_social_post already requires an active subscription before
+    this is ever checked (see _assert_user_has_active_subscription_for_publish)."""
+    plan = await _get_active_plan_for_user(user_id)
+    try:
+        return max(0, int((plan or {}).get("commentaire") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 async def _find_social_account_by_platform_user(

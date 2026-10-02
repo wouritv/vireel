@@ -776,6 +776,10 @@ def test_list_abonnements_returns_data(monkeypatch):
 
     result = asyncio.run(supabase_request.list_abonnements())
     assert result == [{"id": "a1"}]
+    # Explicit display order (see the "ordre" migration) replaces the
+    # previous created_at ordering, which had nothing to do with how
+    # plans should be presented.
+    assert _event_args(fake_client.events, supabase_request.SUPABASE_ABONNEMENTS_TABLE, "order") == ("ordre",)
 
 
 def test_get_abonnement_returns_none_when_not_found(monkeypatch):
