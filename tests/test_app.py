@@ -996,6 +996,37 @@ def test_sweep_output_directory_removes_stale_files(monkeypatch):
     assert removed_count >= 0
 
 
+def test_sweep_output_directory_exempts_voice_previews_dir(monkeypatch):
+    # voice_previews is a persistent cache (see synthesize_tts_segment /
+    # get_film_summary_voice_preview_endpoint), not per-job output -- it
+    # must survive the sweep exactly like thumbnails_dir. Before this fix,
+    # it had no exemption: once 30+ minutes passed without a new voice
+    # being previewed, the whole directory (and every already-cached
+    # voice .mp3) got rmtree'd, breaking every preview with "No such file
+    # or directory: '.../voice_previews/<voice>.mp3.tmp-...'" until the
+    # next request happened to regenerate it.
+    app = _import_app_with_stubs(monkeypatch)
+    import time
+    monkeypatch.setattr(app, "OUTPUT_DIR", "/tmp/output")
+    monkeypatch.setattr(app, "FILM_SUMMARY_VOICE_PREVIEWS_DIR", "/tmp/output/voice_previews")
+    monkeypatch.setattr(app, "OUTPUT_SWEEP_MIN_AGE_SECONDS", 1800)
+
+    file_list = ["voice_previews", "stale-job"]
+    old_time = time.time() - 7200  # 2 hours ago, well past the stale threshold
+    monkeypatch.setattr(app.os, "listdir", lambda path: file_list)
+    monkeypatch.setattr(app.os.path, "getmtime", lambda p: old_time)
+    monkeypatch.setattr(app.os.path, "isdir", lambda p: p == "/tmp/output" or "stale-job" in str(p) or "voice_previews" in str(p))
+    monkeypatch.setattr(app, "_active_output_paths", lambda: set())
+
+    rmtree_mock = MagicMock()
+    monkeypatch.setattr(app.shutil, "rmtree", rmtree_mock)
+
+    removed_count = app._sweep_output_directory(time.time())
+
+    rmtree_mock.assert_called_once_with("/tmp/output/stale-job", ignore_errors=True)
+    assert removed_count == 1
+
+
 def test_active_output_paths_returns_paths_for_processing_jobs(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     app.jobs.clear()

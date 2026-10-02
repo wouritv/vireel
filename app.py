@@ -1367,12 +1367,20 @@ def _sweep_output_directory(now_ts: float) -> int:
     removed = 0
     active_paths = _active_output_paths()
     thumbnails_dir = os.path.abspath(os.path.join(OUTPUT_DIR, "thumbnails"))
+    # Persistent cache (see synthesize_tts_segment / FILM_SUMMARY_VOICE_PREVIEWS_DIR),
+    # not per-job output -- it must survive the sweep exactly like
+    # thumbnails_dir, or it goes stale (mtime untouched) and gets wiped
+    # entirely as soon as 30+ minutes pass without a new voice being
+    # previewed, breaking every already-cached voice preview until the
+    # next request regenerates it (reported bug: "No such file or
+    # directory: 'output/voice_previews/<voice>.mp3.tmp-...'").
+    voice_previews_dir = os.path.abspath(FILM_SUMMARY_VOICE_PREVIEWS_DIR)
 
     for child in os.listdir(OUTPUT_DIR):
         child_path = os.path.join(OUTPUT_DIR, child)
         abs_child = os.path.abspath(child_path)
 
-        if abs_child == thumbnails_dir:
+        if abs_child in (thumbnails_dir, voice_previews_dir):
             continue
         if abs_child in active_paths:
             continue
