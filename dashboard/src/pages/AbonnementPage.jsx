@@ -1,5 +1,5 @@
 import React, {useEffect, useState} from "react";
-import {Check, CreditCardIcon, Star, Crown, Sparkles, Loader2, Coins, Plus, Minus} from "lucide-react";
+import {Check, X, CreditCardIcon, Star, Crown, Sparkles, Zap, Loader2, Coins, Plus, Minus, MessageCircle} from "lucide-react";
 import {getApiUrl} from "../config.js";
 import { getAuthHeaders } from "../lib/apiAuth";
 import { useAuth } from "../state/AuthContext";
@@ -28,12 +28,23 @@ const colorStyles = {
         button: "border-purple-500/20 bg-purple-500/10 text-purple-300 hover:bg-purple-500/15",
         check: "text-purple-400",
     },
+    amber: {
+        border: "border-amber-500/30",
+        bg: "bg-amber-500/10",
+        icon: "text-amber-300",
+        button: "border-amber-500/20 bg-amber-500/10 text-amber-300 hover:bg-amber-500/15",
+        check: "text-amber-400",
+    },
 };
+// A plan whose "color" column doesn't match any key above (e.g. a newly
+// added plan) falls back here instead of crashing on `styles.border`.
+const defaultColorStyle = colorStyles.zinc;
 
 const iconMap = {
     Crown: Crown,
     star: Star,
     Sparkles: Sparkles,
+    Zap: Zap,
 };
 
 export default function AbonnementPage() {
@@ -197,8 +208,9 @@ export default function AbonnementPage() {
                 {paymentMessage ? <p className="mt-3 text-sm text-green-300">{paymentMessage}</p> : null}
             </div>
 
-            {/* Plans */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-start">
+            {/* Plans -- responsive to however many plans the catalog has
+                (was hardcoded to 3 columns, broke once a 4th plan was added) */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-6 items-start">
 
                 {loading && (
                     <span className="inline-flex items-center gap-2">
@@ -219,9 +231,11 @@ export default function AbonnementPage() {
                 )}
 
                 {items.map((plan) => {
-                    const styles = colorStyles[plan.color];
+                    const styles = colorStyles[plan.color] || defaultColorStyle;
                     const Icon = iconMap[plan.icon] || Star; // Default to Star if icon is not found
                     const buttonLabel = t("abonnement.choisir","Choisir");
+                    const commentCount = Number(plan.commentaire);
+                    const hasCommentCount = Number.isFinite(commentCount) && commentCount > 0;
 
                     return (
                         <div
@@ -237,12 +251,26 @@ export default function AbonnementPage() {
                             )}
 
                             {/* Icon + nom */}
-                            <div className="flex items-center gap-3 mb-4">
+                            <div className="flex items-center gap-3 mb-2">
                                 <div className={`p-2 rounded-lg bg-gradient-to-br from-${plan.color}-500/30 to-${plan.color}-700/30`}>
                                     <Icon size={20} className={styles.icon} />
                                 </div>
                                 <h2 className="text-lg font-bold">{plan.name}</h2>
                             </div>
+
+                            {/* Cible */}
+                            {plan.cible && (
+                                <p className={`text-xs font-medium uppercase tracking-wide mb-3 ${styles.icon}`}>
+                                    {plan.cible}
+                                </p>
+                            )}
+
+                            {/* Description */}
+                            {plan.description && (
+                                <p className="text-sm text-slate-600 dark:text-zinc-400 mb-4">
+                                    {plan.description}
+                                </p>
+                            )}
 
                             {/* Prix */}
                             <div className="mb-6">
@@ -252,6 +280,25 @@ export default function AbonnementPage() {
 
                             {/* Liste des services */}
                             <ul className="flex flex-col gap-3 mb-8 flex-1">
+                                {hasCommentCount && (
+                                    <li className="flex items-start gap-2 text-sm text-slate-700 dark:text-zinc-300">
+                                        <MessageCircle size={16} className={`${styles.check} mt-0.5 shrink-0`} />
+                                        <span>{commentCount.toLocaleString()} {t("abonnement.commentsPerPost", "commentaires / publication")}</span>
+                                    </li>
+                                )}
+                                <li className="flex items-start gap-2 text-sm text-slate-700 dark:text-zinc-300">
+                                    {plan.statistique ? (
+                                        <>
+                                            <Check size={16} className={`${styles.check} mt-0.5 shrink-0`} />
+                                            <span>{t("abonnement.statsIncluded", "Statistiques sociales sur la page d'accueil")}</span>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <X size={16} className="text-slate-400 dark:text-zinc-600 mt-0.5 shrink-0" />
+                                            <span className="text-slate-400 dark:text-zinc-500">{t("abonnement.statsExcluded", "Pas de statistiques sociales sur la page d'accueil")}</span>
+                                        </>
+                                    )}
+                                </li>
                                 {plan.features.map((feature) => (
                                     <li key={feature} className="flex items-start gap-2 text-sm text-slate-700 dark:text-zinc-300">
                                         <Check size={16} className={`${styles.check} mt-0.5 shrink-0`} />

@@ -574,7 +574,10 @@
     "offre2": "Caption generation",
     "offre3": "Social media posting and monitoring",
     "offre4": "Subtitle and viral hook generation",
-    "offre5": "Text and subtitle translation"
+    "offre5": "Text and subtitle translation",
+    "commentsPerPost": "comments / post",
+    "statsIncluded": "Social stats on the home page",
+    "statsExcluded": "No social stats on the home page"
   },
   "landing": {
     "feature": "Features",

@@ -575,7 +575,10 @@
     "offre2": "Génération de captions",
     "offre3": "Publication et suivi sur les réseaux sociaux",
     "offre4": "Génération des sous titres et hooks viraux",
-    "offre5": "Traduction de texte et sous-titres"
+    "offre5": "Traduction de texte et sous-titres",
+    "commentsPerPost": "commentaires / publication",
+    "statsIncluded": "Statistiques sociales sur la page d'accueil",
+    "statsExcluded": "Pas de statistiques sociales sur la page d'accueil"
   },
   "landing": {
     "feature": "Fonctionnalités",
