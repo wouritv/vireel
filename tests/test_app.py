@@ -3798,6 +3798,58 @@ def test_post_to_socials_publishes_reel_clip_to_selected_account(monkeypatch):
     assert data["results"]["fb-acct"]["success"] is True
 
 
+def test_create_social_post_blocks_when_over_comment_limit(monkeypatch):
+    # abonnement.commentaire caps how many follow-up comments a single
+    # publication can carry -- a request with more than that must be
+    # rejected before any account is touched or anything is published.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_get_active_plan_for_user", AsyncMock(return_value={"commentaire": 1}))
+    resolve_accounts_mock = AsyncMock()
+    monkeypatch.setattr(app, "_resolve_accounts_for_publish", resolve_accounts_mock)
+
+    payload = app.CreateSocialPostRequest(
+        text="Hello", account_ids=["acct-1"],
+        comments=[app.SocialPostCommentInput(text="first"), app.SocialPostCommentInput(text="second")],
+    )
+    coro = app.create_social_post(payload=payload, user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+
+    assert exc_info.value.status_code == 403
+    assert "1 commentaire" in exc_info.value.detail
+    resolve_accounts_mock.assert_not_awaited()
+
+
+def test_create_social_post_allows_comments_within_limit(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_get_active_plan_for_user", AsyncMock(return_value={"commentaire": 2}))
+    monkeypatch.setattr(app, "_resolve_accounts_for_publish", AsyncMock(return_value=[{"id": "acct-1", "platform": "facebook"}]))
+    monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
+    monkeypatch.setattr(app, "_publish_or_schedule_social_post", AsyncMock(return_value={"success": True}))
+
+    payload = app.CreateSocialPostRequest(
+        text="Hello", account_ids=["acct-1"],
+        comments=[app.SocialPostCommentInput(text="first"), app.SocialPostCommentInput(text="second")],
+    )
+    result = asyncio.run(app.create_social_post(payload=payload, user_id="u1"))
+
+    assert result["success"] is True
+
+
+def test_get_user_max_comments_per_post_defaults_to_zero_without_plan(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_get_active_plan_for_user", AsyncMock(return_value=None))
+    assert asyncio.run(app._get_user_max_comments_per_post("u1")) == 0
+
+
+def test_get_user_max_comments_per_post_reads_plan_column(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_get_active_plan_for_user", AsyncMock(return_value={"commentaire": 5}))
+    assert asyncio.run(app._get_user_max_comments_per_post("u1")) == 5
+
+
 def test_film_summary_voice_preview_rejects_unknown_voice(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     with TestClient(app.app) as client:
@@ -6244,6 +6296,7 @@ def _social_post_account(platform="facebook"):
 def test_create_social_post_rejects_empty_text(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
 
     with TestClient(app.app) as client:
         resp = client.post(
@@ -6257,6 +6310,7 @@ def test_create_social_post_rejects_empty_text(monkeypatch):
 def test_create_social_post_rejects_unsupported_platform_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "acct-1", "platform": "tiktok"}))
 
     with TestClient(app.app) as client:
@@ -6271,6 +6325,7 @@ def test_create_social_post_rejects_unsupported_platform_account(monkeypatch):
 def test_create_social_post_publishes_now_and_posts_comments(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value=_social_post_account()))
@@ -6320,6 +6375,7 @@ def test_create_social_post_publishes_attached_photo(monkeypatch):
     # background can't be combined with media.
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value=_social_post_account()))
@@ -6366,6 +6422,7 @@ def test_create_social_post_allows_empty_text_with_attached_media(monkeypatch):
     # once media is attached.
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value=_social_post_account()))
@@ -6393,6 +6450,7 @@ def test_create_social_post_allows_empty_text_with_attached_media(monkeypatch):
 def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value=_social_post_account()))
@@ -6428,6 +6486,7 @@ def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
 def test_create_social_post_schedules_job_without_publishing(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     accounts_by_id = {
         "fb-acct": {"id": "fb-acct", "platform": "facebook"},
