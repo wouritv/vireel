@@ -3109,14 +3109,26 @@ def test_normalize_film_summary_row_includes_content_when_requested(monkeypatch)
     row = {
         "id": "fs_1", "title": "T", "status": "completed", "stage": "completed",
         "edit_plan": {"segments": []}, "scene_index": [], "classification": {},
-        "validation_report": {"valid": True}, "preview_s3_key": "preview/key.mp4", "final_s3_key": "final/key.mp4",
+        "validation_report": {"valid": True}, "source_s3_key": "source/key.mp4",
+        "preview_s3_key": "preview/key.mp4", "final_s3_key": "final/key.mp4",
     }
     item = app._normalize_film_summary_row(row, include_content=True)
     assert item["edit_plan"] == {"segments": []}
     assert item["validation_report"] == {"valid": True}
     # generate_presigned_url is stubbed to return "" in this test environment.
+    assert item["source_url"] == ""
     assert item["preview_url"] == ""
     assert item["final_url"] == ""
+
+
+def test_normalize_film_summary_row_omits_source_url_once_source_cleared(monkeypatch):
+    # _finalize_film_summary_render clears source_s3_key after a
+    # successful render to free storage -- the editor only needs
+    # source_url during awaiting_review, while it's still set.
+    app = _import_app_with_stubs(monkeypatch)
+    row = {"id": "fs_1", "status": "completed", "stage": "completed", "classification": {}}
+    item = app._normalize_film_summary_row(row, include_content=True)
+    assert "source_url" not in item
 
 
 def _awaiting_review_film_summary_row(**overrides):

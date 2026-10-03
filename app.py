@@ -11628,6 +11628,15 @@ def _normalize_film_summary_row(row: Dict[str, Any], *, include_content: bool = 
         item["validation_report"] = row.get("validation_report") or {}
         item["manual_selection"] = row.get("manual_selection") or []
         bucket_name = os.environ.get("AWS_S3_BUCKET", "my-clips-bucket")
+        # The manual clip-picker editor needs the original source video
+        # (not just the preview/final render) to let the user see each
+        # scene in full -- source_s3_key is always populated by the time
+        # analysis finishes (even for a youtube source, see
+        # _run_film_summary_analysis_pipeline) and only cleared once the
+        # final render completes (_finalize_film_summary_render), so it's
+        # reliably available throughout the awaiting_review window.
+        if row.get("source_s3_key"):
+            item["source_url"] = generate_presigned_url(bucket_name, row["source_s3_key"], expiration=3600)
         if row.get("preview_s3_key"):
             item["preview_url"] = generate_presigned_url(bucket_name, row["preview_s3_key"], expiration=3600)
         if row.get("final_s3_key"):
