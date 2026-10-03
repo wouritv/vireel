@@ -1,21 +1,21 @@
-import { Loader2, Music, Save } from "lucide-react";
-import { formatMsClock } from "../lib/filmSummary";
+import { Loader2, Music, Plus, Save } from "lucide-react";
+import { useMemo } from "react";
+import FilmSummaryMusicTrackRow from "./FilmSummaryMusicTrackRow";
 
-const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
-
-// Music section of FilmSummaryAudioSubtitleSettings: a mood-grouped track
-// picker sourced from the app's existing background-music library (no
-// custom upload for film summaries), plus a start/end range over the final
-// video's duration telling the renderer where to play it. Kept as its own
-// small component so FilmSummaryAudioSubtitleSettings doesn't have to mix
-// this with the subtitle section's very different controls.
+// Music section of FilmSummaryAudioSubtitleSettings: a repeatable list of
+// background-music tracks sourced from the app's existing mood-grouped
+// music library (no custom upload for film summaries) -- "une musique de
+// fond peut s'appliquer a une ou plusieurs scenes", so each entry gets its
+// own track pick, its own preview, and its own start/end range over the
+// final video's duration, instead of the single-track/single-range picker
+// this used to be. Per-row UI lives in FilmSummaryMusicTrackRow so this
+// component stays a simple list manager (add/remove/patch one entry, then
+// save the whole list) instead of one large function mixing both concerns.
 export default function FilmSummaryMusicSettings({
     tracksByMood,
     tracksLoading,
     tracksError,
-    musicTrackId,
-    musicStartMs,
-    musicEndMs,
+    musicTracks,
     totalDurationMs,
     onChange,
     onSave,
@@ -24,26 +24,33 @@ export default function FilmSummaryMusicSettings({
     error,
     t,
 }) {
-    const safeDurationMs = Math.max(1000, Math.round(totalDurationMs || 0));
-    const hasTrack = Boolean(musicTrackId);
-
-    const handleTrackChange = (e) => {
-        const nextTrackId = e.target.value || null;
-        onChange({
-            musicTrackId: nextTrackId,
-            musicStartMs: nextTrackId ? musicStartMs ?? 0 : null,
-            musicEndMs: nextTrackId ? musicEndMs ?? safeDurationMs : null,
+    const tracksById = useMemo(() => {
+        const map = {};
+        Object.values(tracksByMood || {}).forEach((moodTracks) => {
+            moodTracks.forEach((track) => {
+                map[track.track_id] = track;
+            });
         });
+        return map;
+    }, [tracksByMood]);
+
+    const firstTrackId = useMemo(() => {
+        const moods = Object.values(tracksByMood || {});
+        return moods.length ? moods[0]?.[0]?.track_id || "" : "";
+    }, [tracksByMood]);
+
+    const tracks = musicTracks || [];
+
+    const updateEntry = (index, patch) => {
+        onChange(tracks.map((entry, i) => (i === index ? { ...entry, ...patch } : entry)));
     };
 
-    const handleStartChange = (e) => {
-        const next = clamp(Number(e.target.value) || 0, 0, (musicEndMs ?? safeDurationMs) - 500);
-        onChange({ musicStartMs: next });
+    const removeEntry = (index) => {
+        onChange(tracks.filter((_, i) => i !== index));
     };
 
-    const handleEndChange = (e) => {
-        const next = clamp(Number(e.target.value) || safeDurationMs, (musicStartMs ?? 0) + 500, safeDurationMs);
-        onChange({ musicEndMs: next });
+    const addEntry = () => {
+        onChange([...tracks, { track_id: firstTrackId || null, start_ms: null, end_ms: null }]);
     };
 
     return (
@@ -55,56 +62,37 @@ export default function FilmSummaryMusicSettings({
 
             {tracksError ? <p className="text-xs text-red-300">{tracksError}</p> : null}
 
-            <select
-                value={musicTrackId || ""}
-                onChange={handleTrackChange}
-                disabled={tracksLoading}
-                className="input-field w-full dark:text-white"
-            >
-                <option value="">{t("filmSummary.music.none", "Aucune musique")}</option>
-                {Object.entries(tracksByMood || {}).map(([mood, tracks]) => (
-                    <optgroup key={mood} label={mood}>
-                        {tracks.map((track) => (
-                            <option key={track.track_id} value={track.track_id}>
-                                {track.label}
-                            </option>
-                        ))}
-                    </optgroup>
-                ))}
-            </select>
-
-            {hasTrack ? (
+            {tracks.length === 0 ? (
+                <p className="text-xs text-slate-500 dark:text-zinc-400">
+                    {t("filmSummary.music.none", "Aucune musique de fond.")}
+                </p>
+            ) : (
                 <div className="space-y-2">
-                    <div className="flex items-center justify-between text-xs text-slate-500 dark:text-zinc-400">
-                        <span>{t("filmSummary.music.startLabel", "Debut")}: {formatMsClock(musicStartMs || 0)}</span>
-                        <span>{t("filmSummary.music.endLabel", "Fin")}: {formatMsClock(musicEndMs ?? safeDurationMs)}</span>
-                    </div>
-                    <label className="block text-[11px] text-slate-500 dark:text-zinc-400">
-                        {t("filmSummary.music.startSlider", "Position de debut")}
-                        <input
-                            type="range"
-                            min={0}
-                            max={safeDurationMs}
-                            step={500}
-                            value={musicStartMs || 0}
-                            onChange={handleStartChange}
-                            className="mt-1 w-full accent-emerald-500"
+                    {tracks.map((entry, index) => (
+                        <FilmSummaryMusicTrackRow
+                            key={`music-track-${index}`}
+                            entry={entry}
+                            tracksByMood={tracksByMood}
+                            tracksById={tracksById}
+                            totalDurationMs={totalDurationMs}
+                            disabled={tracksLoading}
+                            onChange={(patch) => updateEntry(index, patch)}
+                            onRemove={() => removeEntry(index)}
+                            t={t}
                         />
-                    </label>
-                    <label className="block text-[11px] text-slate-500 dark:text-zinc-400">
-                        {t("filmSummary.music.endSlider", "Position de fin")}
-                        <input
-                            type="range"
-                            min={0}
-                            max={safeDurationMs}
-                            step={500}
-                            value={musicEndMs ?? safeDurationMs}
-                            onChange={handleEndChange}
-                            className="mt-1 w-full accent-emerald-500"
-                        />
-                    </label>
+                    ))}
                 </div>
-            ) : null}
+            )}
+
+            <button
+                type="button"
+                onClick={addEntry}
+                disabled={tracksLoading || !firstTrackId}
+                className="inline-flex items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-white/5 px-4 py-2 text-xs font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-white/10 disabled:opacity-50"
+            >
+                <Plus size={13} />
+                {t("filmSummary.music.add", "Ajouter une musique")}
+            </button>
 
             {error ? <p className="text-xs text-red-300">{error}</p> : null}
 

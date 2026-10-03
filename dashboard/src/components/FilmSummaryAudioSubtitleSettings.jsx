@@ -30,10 +30,11 @@ const DEFAULT_SUBTITLE_STYLE = {
     animation: "word-highlight",
 };
 
-// Audio/subtitles panel for a film summary while awaiting_review: music
-// (mood-grouped track from the existing library + a start/end range over
-// the final video) and subtitles (enable toggle + the Reels/Captions theme
-// system), each its own small sub-component, each saved independently via
+// Audio/subtitles panel for a film summary while awaiting_review: music (a
+// list of mood-grouped tracks from the existing library, each with its own
+// start/end range over the final video -- see FilmSummaryMusicSettings) and
+// subtitles (enable toggle + the Reels/Captions theme system), each its own
+// small sub-component, each saved independently via
 // PATCH /api/film-summaries/{id}/audio-settings. Available for both the
 // automatic and manual edit modes -- it's unrelated to clip picking.
 export default function FilmSummaryAudioSubtitleSettings({ filmSummary, user, totalDurationMs, onUpdated, t }) {
@@ -41,9 +42,7 @@ export default function FilmSummaryAudioSubtitleSettings({ filmSummary, user, to
     const [tracksLoading, setTracksLoading] = useState(true);
     const [tracksError, setTracksError] = useState("");
 
-    const [musicTrackId, setMusicTrackId] = useState(filmSummary.music_track_id || null);
-    const [musicStartMs, setMusicStartMs] = useState(Number.isFinite(filmSummary.music_start_ms) ? filmSummary.music_start_ms : 0);
-    const [musicEndMs, setMusicEndMs] = useState(Number.isFinite(filmSummary.music_end_ms) ? filmSummary.music_end_ms : totalDurationMs);
+    const [musicTracks, setMusicTracks] = useState(Array.isArray(filmSummary.music_tracks) ? filmSummary.music_tracks : []);
     const [savingMusic, setSavingMusic] = useState(false);
     const [musicSavedFlash, setMusicSavedFlash] = useState(false);
     const [musicError, setMusicError] = useState("");
@@ -77,21 +76,20 @@ export default function FilmSummaryAudioSubtitleSettings({ filmSummary, user, to
         setTimeout(() => setFlash(false), 2000);
     };
 
-    const handleMusicChange = (patch) => {
-        if ("musicTrackId" in patch) setMusicTrackId(patch.musicTrackId);
-        if ("musicStartMs" in patch) setMusicStartMs(patch.musicStartMs);
-        if ("musicEndMs" in patch) setMusicEndMs(patch.musicEndMs);
-    };
-
     const handleSaveMusic = async () => {
         if (!user?.id) return;
         setSavingMusic(true);
         setMusicError("");
         try {
+            const sanitizedTracks = musicTracks
+                .filter((entry) => entry?.track_id)
+                .map((entry) => ({
+                    track_id: entry.track_id,
+                    start_ms: typeof entry.start_ms === "number" ? Math.round(entry.start_ms) : null,
+                    end_ms: typeof entry.end_ms === "number" ? Math.round(entry.end_ms) : null,
+                }));
             const updated = await updateFilmSummaryAudioSettings(filmSummary.id, user.id, {
-                music_track_id: musicTrackId,
-                music_start_ms: musicTrackId ? Math.round(musicStartMs) : null,
-                music_end_ms: musicTrackId ? Math.round(musicEndMs) : null,
+                music_tracks: sanitizedTracks,
             });
             onUpdated?.(updated);
             flashSaved(setMusicSavedFlash);
@@ -126,11 +124,9 @@ export default function FilmSummaryAudioSubtitleSettings({ filmSummary, user, to
                 tracksByMood={tracksByMood}
                 tracksLoading={tracksLoading}
                 tracksError={tracksError}
-                musicTrackId={musicTrackId}
-                musicStartMs={musicStartMs}
-                musicEndMs={musicEndMs}
+                musicTracks={musicTracks}
                 totalDurationMs={totalDurationMs}
-                onChange={handleMusicChange}
+                onChange={setMusicTracks}
                 onSave={handleSaveMusic}
                 saving={savingMusic}
                 savedFlash={musicSavedFlash}

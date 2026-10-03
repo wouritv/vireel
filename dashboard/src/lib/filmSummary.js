@@ -80,9 +80,15 @@ async function readJsonOrThrow(response, fallbackMessage) {
 }
 
 /**
- * GET /api/film-summaries/music-tracks -> { tracks_by_mood: { "<mood>": [{track_id, label}, ...] } },
- * the existing mood-grouped background-music library shared with the rest
- * of the app (no custom upload for film summaries).
+ * GET /api/film-summaries/music-tracks -> { tracks_by_mood: { "<mood>":
+ * [{track_id, label, preview_url, license}, ...] } }, the existing
+ * mood-grouped background-music library shared with the rest of the app (no
+ * custom upload for film summaries). `preview_url` is a static,
+ * getApiUrl()-relative URL playable straight from an <audio>/Audio(). An
+ * entry has `license` set to {title, author, source, license_name,
+ * license_url, attribution_text} when the operator-maintained manifest has
+ * attribution info for it (e.g. Incompetech Creative-Commons tracks), or
+ * null otherwise -- null is normal, not an error.
  */
 export async function fetchFilmSummaryMusicTracks(userId) {
     const response = await fetch(getApiUrl("/api/film-summaries/music-tracks"), {
@@ -93,8 +99,10 @@ export async function fetchFilmSummaryMusicTracks(userId) {
 
 /**
  * PATCH /api/film-summaries/{id}/audio-settings -- `patch` is any subset of
- * {music_track_id, music_start_ms, music_end_ms, subtitles_enabled, subtitle_style};
- * callers send only the fields they changed. Returns the normalized
+ * {music_tracks, subtitles_enabled, subtitle_style}; callers send only the
+ * fields they changed. `music_tracks` (when sent) replaces the whole list:
+ * [{track_id, start_ms, end_ms}, ...], both start_ms/end_ms null meaning
+ * that track plays over the whole final video. Returns the normalized
  * full-content film summary row.
  */
 export async function updateFilmSummaryAudioSettings(filmSummaryId, userId, patch) {
