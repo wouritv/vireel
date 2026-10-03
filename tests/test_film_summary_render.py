@@ -261,6 +261,47 @@ def test_mix_background_music_loops_and_ducks_to_low_volume(monkeypatch):
     assert "-shortest" in cmd
 
 
+def test_mix_background_music_range_with_no_range_behaves_like_whole_video(monkeypatch):
+    whole_video_calls = []
+    monkeypatch.setattr(
+        render, "mix_background_music",
+        lambda inp, music, out, volume=render.MUSIC_VOLUME: whole_video_calls.append((inp, music, out, volume)),
+    )
+    render.mix_background_music_range("/tmp/in.mp4", "/tmp/music.mp3", "/tmp/out.mp4", start_ms=None, end_ms=None, volume=0.2)
+
+    assert whole_video_calls == [("/tmp/in.mp4", "/tmp/music.mp3", "/tmp/out.mp4", 0.2)]
+
+
+def test_mix_background_music_range_builds_enable_filter_for_closed_range(monkeypatch):
+    calls = _capture_ffmpeg_calls(monkeypatch)
+    render.mix_background_music_range("/tmp/in.mp4", "/tmp/music.mp3", "/tmp/out.mp4", start_ms=1000, end_ms=5000, volume=0.1)
+    cmd = calls[0]
+    filter_complex = cmd[cmd.index("-filter_complex") + 1]
+
+    assert "enable='between(t,1.000,5.000)'" in filter_complex
+    assert "volume=0.1" in filter_complex
+    assert "amix=inputs=2" in filter_complex
+    assert "-stream_loop" in cmd
+    assert cmd[cmd.index("-stream_loop") + 1] == "-1"
+    assert "-shortest" in cmd
+
+
+def test_mix_background_music_range_open_ended_start_only(monkeypatch):
+    calls = _capture_ffmpeg_calls(monkeypatch)
+    render.mix_background_music_range("/tmp/in.mp4", "/tmp/music.mp3", "/tmp/out.mp4", start_ms=2000, end_ms=None)
+    filter_complex = calls[0][calls[0].index("-filter_complex") + 1]
+
+    assert f"enable='between(t,2.000,{render._OPEN_ENDED_RANGE_END_SECONDS:.3f})'" in filter_complex
+
+
+def test_mix_background_music_range_open_ended_end_only(monkeypatch):
+    calls = _capture_ffmpeg_calls(monkeypatch)
+    render.mix_background_music_range("/tmp/in.mp4", "/tmp/music.mp3", "/tmp/out.mp4", start_ms=None, end_ms=3000)
+    filter_complex = calls[0][calls[0].index("-filter_complex") + 1]
+
+    assert "enable='between(t,0.000,3.000)'" in filter_complex
+
+
 def test_normalize_audio_loudness_uses_loudnorm_filter(monkeypatch):
     calls = _capture_ffmpeg_calls(monkeypatch)
     render.normalize_audio_loudness("/tmp/in.mp4", "/tmp/out.mp4")
@@ -427,6 +468,33 @@ def test_render_edit_plan_resolves_music_from_plan_mood_and_passes_it_to_voice_o
     # argument at all -- original_dialogue/breathing segments simply cannot
     # receive background music through this pipeline.
     assert len(original_calls) == 1
+
+
+def test_render_edit_plan_skip_mood_music_never_resolves_track(monkeypatch, tmp_path):
+    monkeypatch.setattr(render, "_target_canvas", lambda path: CANVAS)
+    resolve_calls = []
+    monkeypatch.setattr(render, "resolve_background_music_track", lambda mood: resolve_calls.append(mood) or "/music/x.mp3")
+    voice_over_calls = []
+    monkeypatch.setattr(
+        render, "_build_voice_over_segment_clip",
+        lambda segment, source, narration, work_dir, canvas, music=None: voice_over_calls.append(music) or str(tmp_path / "seg_1_final.mp4"),
+    )
+    monkeypatch.setattr(render, "_build_original_segment_clip", lambda *a, **k: str(tmp_path / "seg_2_final.mp4"))
+    monkeypatch.setattr(render, "concat_video_clips", lambda paths, out, work_dir: None)
+    monkeypatch.setattr(render, "normalize_audio_loudness", lambda inp, out: None)
+    monkeypatch.setattr(render, "encode_preview", lambda inp, out, **k: None)
+    monkeypatch.setattr(render, "probe_media_duration_seconds", lambda path: 13.0)
+
+    plan = _sample_plan()
+    plan["music_mood"] = "tense"
+    render.render_edit_plan(
+        plan=plan, source_video_path="/tmp/source.mp4", voiceover_paths_by_segment_id={},
+        work_dir=str(tmp_path), final_output_path=str(tmp_path / "final.mp4"), preview_output_path=str(tmp_path / "preview.mp4"),
+        skip_mood_music=True,
+    )
+
+    assert resolve_calls == []
+    assert voice_over_calls == [None]
 
 
 def test_render_edit_plan_raises_when_no_segments(monkeypatch, tmp_path):

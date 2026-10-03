@@ -43,6 +43,12 @@ MUSIC_DIR = os.environ.get("FILM_SUMMARY_MUSIC_DIR", "music")
 MUSIC_VOLUME = float(os.environ.get("FILM_SUMMARY_MUSIC_VOLUME", "0.10"))
 MUSIC_TRACK_EXTENSIONS = (".mp3", ".wav", ".m4a", ".aac")
 
+# Stands in for "no end" in mix_background_music_range's `between(t, ...)`
+# gate -- large enough to cover any real render, so an open-ended
+# "start_ms set, end_ms None" range plays for the rest of the video exactly
+# like a literal unbounded end would.
+_OPEN_ENDED_RANGE_END_SECONDS = 1e9
+
 
 def _run_ffmpeg(cmd: List[str], timeout_seconds: int = FFMPEG_STEP_TIMEOUT_SECONDS) -> None:
     # This module previously had no logging at all: a stalled render gave
@@ -231,6 +237,45 @@ def mix_background_music(input_path: str, music_path: str, output_path: str, vol
     _run_ffmpeg(cmd)
 
 
+def mix_background_music_range(
+    input_path: str, music_path: str, output_path: str,
+    start_ms: Optional[int] = None, end_ms: Optional[int] = None, volume: float = MUSIC_VOLUME,
+) -> None:
+    """Layers a looped, low-volume instrumental bed under input_path's
+    existing audio, audible only within [start_ms, end_ms] of input_path's
+    own timeline -- used for a film summary row's explicitly user-chosen
+    music_track_id (mixed once over the whole final assembled video, unlike
+    mix_background_music's per-segment, mood-based mix). Both None means
+    audible for the whole duration; that case is kept as cheap/simple as
+    mix_background_music itself, by delegating to it directly instead of
+    building an `enable=` gate nothing would ever constrain.
+
+    For the gated case, an ffmpeg `volume` filter with an
+    `enable='between(t,{start_sec},{end_sec})'` expression is applied to the
+    looped music input before the `amix`, analogous to mix_background_
+    music's own filter graph. A one-sided range (only start_ms or only
+    end_ms given) still uses `between`, substituting 0 for a missing start
+    or _OPEN_ENDED_RANGE_END_SECONDS for a missing end."""
+    if start_ms is None and end_ms is None:
+        mix_background_music(input_path, music_path, output_path, volume=volume)
+        return
+
+    start_seconds = max(0.0, (start_ms or 0) / 1000.0)
+    end_seconds = max(start_seconds, end_ms / 1000.0) if end_ms is not None else _OPEN_ENDED_RANGE_END_SECONDS
+    enable_expr = f"between(t,{start_seconds:.3f},{end_seconds:.3f})"
+
+    filter_complex = (
+        f"[1:a]volume={volume}:enable='{enable_expr}'[music];"
+        f"[0:a][music]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
+    )
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path, "-stream_loop", "-1", "-i", music_path,
+        "-filter_complex", filter_complex, "-map", "0:v", "-map", "[aout]",
+        "-c:v", "copy", "-c:a", "aac", "-shortest", output_path,
+    ]
+    _run_ffmpeg(cmd)
+
+
 def normalize_audio_loudness(input_path: str, output_path: str) -> None:
     cmd = ["ffmpeg", "-y", "-i", input_path, "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-c:v", "copy", output_path]
     _run_ffmpeg(cmd)
@@ -296,6 +341,7 @@ def render_edit_plan(
     *, plan: Dict[str, Any], source_video_path: str, voiceover_paths_by_segment_id: Dict[str, str],
     work_dir: str, final_output_path: str, preview_output_path: str,
     on_segment_done: Optional[Callable[[int, int], None]] = None,
+    skip_mood_music: bool = False,
 ) -> Dict[str, Any]:
     """Assemble the validated edit plan into a preview and a final MP4
     (spec 7.10). Returns {"segment_count", "final_duration_seconds"}.
@@ -309,10 +355,16 @@ def render_edit_plan(
     `on_segment_done(index, total)`, called synchronously after each
     segment's clip finishes (this runs inside asyncio.to_thread, so the
     callback must itself be thread-safe -- see app.py's caller), lets the
-    caller report real incremental progress instead."""
+    caller report real incremental progress instead.
+
+    `skip_mood_music=True` entirely bypasses the per-segment, mood-based
+    auto-pick (resolve_background_music_track is never even called) --
+    used when the caller (app.py) is about to layer a user's explicit
+    music_track_id on top afterward instead, over the correct final-video
+    range rather than per-segment. Default behavior (False) is unchanged."""
     os.makedirs(work_dir, exist_ok=True)
     canvas = _target_canvas(source_video_path)
-    music_track_path = resolve_background_music_track(str(plan.get("music_mood") or DEFAULT_MUSIC_MOOD))
+    music_track_path = None if skip_mood_music else resolve_background_music_track(str(plan.get("music_mood") or DEFAULT_MUSIC_MOOD))
     if music_track_path:
         logger.info("Using background music track for mood '%s': %s", plan.get("music_mood"), music_track_path)
 

@@ -12634,6 +12634,11 @@ async def render_film_summary_endpoint(
         voice_id=voice_id,
         render_required_credits=render_required_credits,
         narration_language=row.get("narration_language") or "",
+        music_track_id=row.get("music_track_id"),
+        music_start_ms=row.get("music_start_ms"),
+        music_end_ms=row.get("music_end_ms"),
+        subtitles_enabled=bool(row.get("subtitles_enabled")),
+        subtitle_style=row.get("subtitle_style"),
     ))
 
     return {"job_id": render_job_id, "film_summary_id": film_summary_id, "status": "rendering"}
@@ -12642,11 +12647,15 @@ async def render_film_summary_endpoint(
 async def _run_film_summary_render_job(
     job_id: str, user_id: str, film_summary_id: str, project_id: Optional[str], source_s3_key: Optional[str],
     output_dir: str, plan: Dict[str, Any], voice_id: str, render_required_credits: float, narration_language: str,
+    music_track_id: Optional[str] = None, music_start_ms: Optional[int] = None, music_end_ms: Optional[int] = None,
+    subtitles_enabled: bool = False, subtitle_style: Optional[Dict[str, Any]] = None,
 ) -> None:
     try:
         await reel_job_manager.start_job(job_id)
         await _run_film_summary_render_pipeline_stages(
             job_id, user_id, film_summary_id, project_id, source_s3_key, output_dir, plan, voice_id, narration_language,
+            music_track_id=music_track_id, music_start_ms=music_start_ms, music_end_ms=music_end_ms,
+            subtitles_enabled=subtitles_enabled, subtitle_style=subtitle_style,
         )
     except film_summary.FilmSummaryValidationError as exc:
         await reel_job_manager.fail_job(job_id, str(exc), error_code=exc.code)
@@ -12668,9 +12677,147 @@ async def _run_film_summary_render_job(
             shutil.rmtree(output_dir, ignore_errors=True)
 
 
+# Maps a film_summaries row's camelCase subtitle_style snapshot (the shape
+# CaptionsModal.jsx's DEFAULT_STYLE / caption_style_themes.style uses) to the
+# snake_case keys _DEFAULT_AUTO_CAPTION_STYLE_KWARGS/SubtitleRequest use.
+# Mirrors CaptionsModal.jsx's handleSetAsDefaultStyle mapping exactly -- copy
+# it, don't invent a new one -- except that `position` itself is hardcoded
+# to "bottom" below rather than read from the row, the same established
+# convention that call site uses.
+_FILM_SUMMARY_SUBTITLE_STYLE_FIELD_MAP: Dict[str, str] = {
+    "position_x": "positionX",
+    "position_y": "positionY",
+    "font_size": "fontSize",
+    "font_name": "fontFamily",
+    "font_color": "fontColor",
+    "highlight_color": "highlightColor",
+    "border_color": "borderColor",
+    "border_width": "borderWidth",
+    "text_shadow_color": "textShadowColor",
+    "shadow_blur": "shadowBlur",
+    "shadow_offset_x": "shadowOffsetX",
+    "shadow_offset_y": "shadowOffsetY",
+    "bg_color": "bgColor",
+    "bg_opacity": "bgOpacity",
+    "text_case": "textCase",
+    "bold": "bold",
+    "italic": "italic",
+    "words_per_line": "wordsPerLine",
+    "animation": "animation",
+}
+
+
+def _map_film_summary_subtitle_style(subtitle_style: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Resolves a film_summaries row's subtitle_style into the same
+    snake_case kwargs shape _DEFAULT_AUTO_CAPTION_STYLE_KWARGS has, falling
+    back to that factory default's own values for any key the row's
+    subtitle_style is missing (including when it is None/empty, e.g.
+    subtitles_enabled was turned on without ever opening the style
+    editor)."""
+    camel_style = subtitle_style if isinstance(subtitle_style, dict) else {}
+    kwargs = {"position": "bottom"}
+    for snake_key, camel_key in _FILM_SUMMARY_SUBTITLE_STYLE_FIELD_MAP.items():
+        kwargs[snake_key] = camel_style.get(camel_key, _DEFAULT_AUTO_CAPTION_STYLE_KWARGS[snake_key])
+    return kwargs
+
+
+def _build_film_summary_subtitle_style(subtitle_style: Optional[Dict[str, Any]]) -> SubtitleStyleOptions:
+    """Builds the subtitles.SubtitleStyleOptions burn_subtitles needs from a
+    film_summaries row's camelCase subtitle_style snapshot (see
+    _map_film_summary_subtitle_style for the field mapping)."""
+    kwargs = _map_film_summary_subtitle_style(subtitle_style)
+    return SubtitleStyleOptions(
+        font_name=kwargs["font_name"],
+        font_color=kwargs["font_color"],
+        border_color=kwargs["border_color"],
+        border_width=kwargs["border_width"],
+        bg_color=kwargs["bg_color"],
+        bg_opacity=kwargs["bg_opacity"],
+        text_shadow_color=kwargs["text_shadow_color"],
+        shadow_blur=kwargs["shadow_blur"],
+        shadow_offset_x=kwargs["shadow_offset_x"],
+        shadow_offset_y=kwargs["shadow_offset_y"],
+        bold=kwargs["bold"],
+        italic=kwargs["italic"],
+        text_case=kwargs["text_case"],
+        highlight_color=kwargs["highlight_color"],
+    )
+
+
+async def _apply_film_summary_music_range(
+    output_dir: str, final_path: str, resolved_music_path: Optional[str],
+    music_start_ms: Optional[int], music_end_ms: Optional[int],
+) -> str:
+    """Phase 3 post-processing step (a): if the row resolved a real
+    music_track_id (see _resolve_music_track_path), mixes it once over
+    final_path's own [music_start_ms, music_end_ms] range -- both None
+    means the whole video -- and returns the new path. Returns final_path
+    unchanged when there is no resolved track, so the pipeline behaves
+    exactly as today for any film summary without this setting. The
+    per-segment mood-based mix render_edit_plan would otherwise perform is
+    already skipped by the caller (skip_mood_music=True) whenever this
+    runs, so the two music sources never stack."""
+    if not resolved_music_path:
+        return final_path
+    new_path = os.path.join(output_dir, "final_with_music.mp4")
+    try:
+        await asyncio.to_thread(
+            film_summary_render.mix_background_music_range,
+            final_path, resolved_music_path, new_path, start_ms=music_start_ms, end_ms=music_end_ms,
+        )
+    except film_summary.FilmSummaryValidationError:
+        raise
+    except Exception as exc:
+        raise film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.RENDER_FAILED, f"Background music mix failed: {exc}") from exc
+    return new_path
+
+
+async def _apply_film_summary_subtitle_burn_in(
+    output_dir: str, final_path: str, subtitles_enabled: bool, subtitle_style: Optional[Dict[str, Any]],
+) -> str:
+    """Phase 3 post-processing step (b): if subtitles_enabled, transcribes
+    the (possibly music-mixed) final_path fresh -- generate_srt_from_video
+    is the same "no pre-existing transcript matches this exact audio"
+    codepath _generate_subtitle_srt's is_dubbed branch already uses for a
+    produced video whose exact spoken timing cannot be assumed to match any
+    existing transcript -- and burns it in with the row's mapped style.
+    Returns final_path unchanged when subtitles_enabled is false, so the
+    pipeline behaves exactly as today for any film summary without this
+    setting. Temporary .srt/.ass files are cleaned up before returning,
+    mirroring _burn_default_captions_for_clip's own cleanup."""
+    if not subtitles_enabled:
+        return final_path
+    style_kwargs = _map_film_summary_subtitle_style(subtitle_style)
+    srt_path = os.path.join(output_dir, "film_summary_subtitles.srt")
+    new_path = os.path.join(output_dir, "final_with_subtitles.mp4")
+    try:
+        await asyncio.to_thread(
+            generate_srt_from_video, final_path, srt_path, max_words_per_line=style_kwargs["words_per_line"],
+        )
+        style_options = _build_film_summary_subtitle_style(subtitle_style)
+        await asyncio.to_thread(
+            burn_subtitles, final_path, srt_path, new_path,
+            alignment=style_kwargs["position"], fontsize=style_kwargs["font_size"], style_options=style_options,
+        )
+    except film_summary.FilmSummaryValidationError:
+        raise
+    except Exception as exc:
+        raise film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.RENDER_FAILED, f"Subtitle burn-in failed: {exc}") from exc
+    finally:
+        for temp_path in (srt_path, f"{os.path.splitext(srt_path)[0]}.ass"):
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+    return new_path
+
+
 async def _run_film_summary_render_pipeline_stages(
     job_id: str, user_id: str, film_summary_id: str, project_id: Optional[str], source_s3_key: Optional[str],
     output_dir: str, plan: Dict[str, Any], voice_id: str, narration_language: str,
+    music_track_id: Optional[str] = None, music_start_ms: Optional[int] = None, music_end_ms: Optional[int] = None,
+    subtitles_enabled: bool = False, subtitle_style: Optional[Dict[str, Any]] = None,
 ) -> None:
     bucket_name = os.environ.get("AWS_S3_BUCKET", "my-clips-bucket")
     source_path = os.path.join(output_dir, "source.mp4")
@@ -12726,6 +12873,11 @@ async def _run_film_summary_render_pipeline_stages(
 
     final_path = os.path.join(output_dir, "final.mp4")
     preview_path = os.path.join(output_dir, "preview.mp4")
+    # Resolved up front (before render_edit_plan runs) so skip_mood_music
+    # can be threaded into that call -- the user's explicit track is
+    # layered on afterward over the correct final-video range instead,
+    # rather than per-segment, so the two must never both apply.
+    resolved_music_path = _resolve_music_track_path(music_track_id) if music_track_id else None
     try:
         render_result = await asyncio.to_thread(
             film_summary_render.render_edit_plan,
@@ -12733,6 +12885,7 @@ async def _run_film_summary_render_pipeline_stages(
             voiceover_paths_by_segment_id=voiceover_paths, work_dir=os.path.join(output_dir, "work"),
             final_output_path=final_path, preview_output_path=preview_path,
             on_segment_done=_on_segment_done,
+            skip_mood_music=bool(resolved_music_path),
         )
     except film_summary.FilmSummaryValidationError:
         raise
@@ -12740,6 +12893,22 @@ async def _run_film_summary_render_pipeline_stages(
         raise film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.RENDER_FAILED, str(exc)) from exc
 
     await reel_job_manager.update_progress(job_id, 90, film_summary.FilmSummaryStage.RENDERING_FINAL)
+
+    # Phase 3 post-processing: an explicit music track mixed over the final
+    # video's own range, then subtitle burn-in over the (possibly
+    # music-mixed) result -- in that order, so burned-in subtitles are never
+    # re-encoded away by the music mix. Either runs only if its setting is
+    # present on the row; when neither does, final_path is untouched and the
+    # preview render_edit_plan already built stays valid as-is.
+    path_before_post_processing = final_path
+    final_path = await _apply_film_summary_music_range(
+        output_dir, final_path, resolved_music_path, music_start_ms, music_end_ms,
+    )
+    final_path = await _apply_film_summary_subtitle_burn_in(
+        output_dir, final_path, subtitles_enabled, subtitle_style,
+    )
+    if final_path != path_before_post_processing:
+        await asyncio.to_thread(film_summary_render.encode_preview, final_path, preview_path)
 
     preview_s3_key = f"{_FILM_SUMMARIES_PREFIX}{user_id}/{film_summary_id}/preview.mp4"
     final_s3_key = f"{_FILM_SUMMARIES_PREFIX}{user_id}/{film_summary_id}/final.mp4"

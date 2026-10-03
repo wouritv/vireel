@@ -3897,6 +3897,220 @@ def test_render_pipeline_reports_incremental_progress_per_segment(monkeypatch, t
     assert all(45 <= pct <= 85 for pct in reported_percentages)
 
 
+def test_map_film_summary_subtitle_style_maps_camel_case_and_fills_defaults(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    kwargs = app._map_film_summary_subtitle_style({
+        "fontSize": 22, "fontFamily": "Impact", "highlightColor": "#00FF00", "wordsPerLine": 7,
+    })
+
+    # Position is always hardcoded to "bottom" -- never read from the row --
+    # consistent with CaptionsModal.jsx's own handleSetAsDefaultStyle.
+    assert kwargs["position"] == "bottom"
+    assert kwargs["font_size"] == 22
+    assert kwargs["font_name"] == "Impact"
+    assert kwargs["highlight_color"] == "#00FF00"
+    assert kwargs["words_per_line"] == 7
+    # Anything the row's subtitle_style didn't set falls back to the factory
+    # default auto-caption style.
+    assert kwargs["font_color"] == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS["font_color"]
+    assert kwargs["bg_opacity"] == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS["bg_opacity"]
+
+
+def test_map_film_summary_subtitle_style_handles_missing_style(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    kwargs = app._map_film_summary_subtitle_style(None)
+
+    assert kwargs["position"] == "bottom"
+    assert kwargs["font_size"] == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS["font_size"]
+    assert kwargs["words_per_line"] == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS["words_per_line"]
+
+
+def test_build_film_summary_subtitle_style_builds_style_options(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    captured = {}
+
+    class _StyleOptions:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(app, "SubtitleStyleOptions", _StyleOptions)
+
+    app._build_film_summary_subtitle_style({"fontColor": "#111111", "borderWidth": 9})
+
+    assert captured["font_color"] == "#111111"
+    assert captured["border_width"] == 9
+    assert captured["highlight_color"] == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS["highlight_color"]
+
+
+def test_apply_film_summary_music_range_skips_when_no_resolved_path(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    calls = []
+    monkeypatch.setattr(app.film_summary_render, "mix_background_music_range", lambda *a, **k: calls.append((a, k)))
+
+    final_path = str(tmp_path / "final.mp4")
+    result = asyncio.run(app._apply_film_summary_music_range(str(tmp_path), final_path, None, None, None))
+
+    assert result == final_path
+    assert calls == []
+
+
+def test_apply_film_summary_music_range_mixes_when_resolved_path_given(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        app.film_summary_render, "mix_background_music_range",
+        lambda inp, music, out, start_ms=None, end_ms=None: calls.append((inp, music, out, start_ms, end_ms)),
+    )
+
+    final_path = str(tmp_path / "final.mp4")
+    result = asyncio.run(app._apply_film_summary_music_range(str(tmp_path), final_path, "/music/tense/track.mp3", 1000, 5000))
+
+    assert result == str(tmp_path / "final_with_music.mp4")
+    assert calls == [(final_path, "/music/tense/track.mp3", str(tmp_path / "final_with_music.mp4"), 1000, 5000)]
+
+
+def test_apply_film_summary_subtitle_burn_in_skips_when_disabled(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    calls = []
+    monkeypatch.setattr(app, "generate_srt_from_video", lambda *a, **k: calls.append((a, k)))
+
+    final_path = str(tmp_path / "final.mp4")
+    result = asyncio.run(app._apply_film_summary_subtitle_burn_in(str(tmp_path), final_path, False, None))
+
+    assert result == final_path
+    assert calls == []
+
+
+def test_apply_film_summary_subtitle_burn_in_burns_and_cleans_up_temp_files(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    srt_path = str(tmp_path / "film_summary_subtitles.srt")
+    ass_path = str(tmp_path / "film_summary_subtitles.ass")
+    transcribe_calls = []
+    burn_calls = []
+
+    def _fake_transcribe(input_path, out_srt_path, max_words_per_line=4):
+        transcribe_calls.append((input_path, out_srt_path, max_words_per_line))
+        with open(out_srt_path, "w", encoding="utf-8") as handle:
+            handle.write("1\n00:00:00,000 --> 00:00:01,000\nhello\n")
+        # A real burn_subtitles writes (and later removes) a sibling .ass
+        # file next to the srt -- write one here so the cleanup assertion
+        # below actually exercises something.
+        with open(ass_path, "w", encoding="utf-8") as handle:
+            handle.write("[Script Info]\n")
+        return True
+
+    def _fake_burn(input_path, srt_path_arg, output_path, alignment=None, fontsize=None, style_options=None):
+        burn_calls.append((input_path, srt_path_arg, output_path, alignment, fontsize))
+        return True
+
+    monkeypatch.setattr(app, "generate_srt_from_video", _fake_transcribe)
+    monkeypatch.setattr(app, "burn_subtitles", _fake_burn)
+
+    class _StyleOptions:
+        def __init__(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(app, "SubtitleStyleOptions", _StyleOptions)
+
+    final_path = str(tmp_path / "final.mp4")
+    result = asyncio.run(app._apply_film_summary_subtitle_burn_in(
+        str(tmp_path), final_path, True, {"wordsPerLine": 6, "fontSize": 20},
+    ))
+
+    assert result == str(tmp_path / "final_with_subtitles.mp4")
+    assert transcribe_calls == [(final_path, srt_path, 6)]
+    assert burn_calls == [(final_path, srt_path, str(tmp_path / "final_with_subtitles.mp4"), "bottom", 20)]
+    assert not os.path.exists(srt_path)
+    assert not os.path.exists(ass_path)
+
+
+def test_run_film_summary_render_pipeline_applies_music_and_subtitles_and_reencodes_preview(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "download_s3_object", lambda bucket, key, path: True)
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda *a, **k: True)
+    monkeypatch.setattr(app.film_summary_render, "MUSIC_DIR", str(tmp_path))
+    tense_dir = tmp_path / "tense"
+    tense_dir.mkdir()
+    (tense_dir / "epic_theme.mp3").write_bytes(b"fake")
+    app._finalize_film_summary_render = AsyncMock()
+    app.reel_job_manager.update_progress = AsyncMock()
+
+    render_calls = []
+
+    def _fake_render_edit_plan(*, on_segment_done, **kwargs):
+        render_calls.append(kwargs.get("skip_mood_music"))
+        return {"segment_count": 1, "final_duration_seconds": 10.0}
+
+    monkeypatch.setattr(app.film_summary_render, "render_edit_plan", _fake_render_edit_plan)
+
+    music_calls = []
+    monkeypatch.setattr(
+        app.film_summary_render, "mix_background_music_range",
+        lambda inp, music, out, start_ms=None, end_ms=None: music_calls.append((inp, music, out, start_ms, end_ms)) or open(out, "wb").write(b"x"),
+    )
+    subtitle_calls = []
+    monkeypatch.setattr(app, "generate_srt_from_video", lambda *a, **k: True)
+
+    def _fake_burn(input_path, srt_path_arg, output_path, alignment=None, fontsize=None, style_options=None):
+        subtitle_calls.append((input_path, output_path))
+        open(output_path, "wb").write(b"x")
+        return True
+
+    monkeypatch.setattr(app, "burn_subtitles", _fake_burn)
+
+    class _StyleOptions:
+        def __init__(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(app, "SubtitleStyleOptions", _StyleOptions)
+
+    preview_reencode_calls = []
+    monkeypatch.setattr(
+        app.film_summary_render, "encode_preview",
+        lambda inp, out, **k: preview_reencode_calls.append((inp, out)),
+    )
+
+    plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "original_dialogue", "start_ms": 0, "end_ms": 1000}]}
+    asyncio.run(app._run_film_summary_render_pipeline_stages(
+        "job-1", "u1", "fs-1", "proj-1", "source-key", str(tmp_path), plan, "cedar", "fr",
+        music_track_id="tense/epic_theme.mp3", music_start_ms=0, music_end_ms=5000,
+        subtitles_enabled=True, subtitle_style={"fontSize": 18},
+    ))
+
+    # The explicit track resolved, so render_edit_plan must have skipped its
+    # own per-segment mood-based pick.
+    assert render_calls == [True]
+    assert len(music_calls) == 1
+    assert music_calls[0][3:] == (0, 5000)
+    assert len(subtitle_calls) == 1
+    # Subtitles burned onto the music-mixed path, not the original final.mp4.
+    assert subtitle_calls[0][0] == str(tmp_path / "final_with_music.mp4")
+    # Preview re-encoded once at the end, from the fully post-processed path.
+    assert preview_reencode_calls == [(str(tmp_path / "final_with_subtitles.mp4"), str(tmp_path / "preview.mp4"))]
+
+
+def test_run_film_summary_render_pipeline_leaves_preview_untouched_without_new_settings(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "download_s3_object", lambda bucket, key, path: True)
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda *a, **k: True)
+    app._finalize_film_summary_render = AsyncMock()
+    app.reel_job_manager.update_progress = AsyncMock()
+    monkeypatch.setattr(app.film_summary_render, "render_edit_plan", lambda *a, on_segment_done, **k: {"segment_count": 1, "final_duration_seconds": 10.0})
+    preview_reencode_calls = []
+    monkeypatch.setattr(app.film_summary_render, "encode_preview", lambda *a, **k: preview_reencode_calls.append(a))
+
+    plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "original_dialogue", "start_ms": 0, "end_ms": 1000}]}
+    asyncio.run(app._run_film_summary_render_pipeline_stages(
+        "job-1", "u1", "fs-1", "proj-1", "source-key", str(tmp_path), plan, "cedar", "fr",
+    ))
+
+    # Neither post-processing step had a setting to act on, so the preview
+    # render_edit_plan already built is never touched again.
+    assert preview_reencode_calls == []
+
+
 def test_share_film_summary_rejects_when_not_completed(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
