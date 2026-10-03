@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertCircle, ArrowLeft, Ban, Download, Loader2, RefreshCw, Share2, Trash2 } from "lucide-react";
+import { AlertCircle, ArrowLeft, Ban, Download, Loader2, RefreshCw, Share2, Trash2, Wand2 } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
 import { getApiUrl, fetchAppConfig } from "../config";
 import { getAuthHeaders } from "../lib/apiAuth";
@@ -8,6 +8,8 @@ import { useTranslation } from "../state/LanguageContext";
 import { errorMessageForCode } from "../lib/filmSummary";
 import FilmSummaryProcessingPanel from "../components/FilmSummaryProcessingPanel";
 import FilmSummaryReviewPanel from "../components/FilmSummaryReviewPanel";
+import FilmSummaryClipPickerEditor from "../components/FilmSummaryClipPickerEditor";
+import FilmSummaryAudioSubtitleSettings from "../components/FilmSummaryAudioSubtitleSettings";
 import SharePostModal from "../components/SharePostModal";
 
 // Statuses for which the film summary's own job_id is still meaningful to
@@ -38,6 +40,12 @@ export default function FilmSummaryProjectDetailPage() {
     const [deleting, setDeleting] = useState(false);
     const [allowedVoices, setAllowedVoices] = useState([]);
     const [defaultVoice, setDefaultVoice] = useState("cedar");
+    // "Mode manuel" (see FilmSummaryClipPickerEditor): an optional alternate
+    // path through awaiting_review, reachable via a button next to the
+    // default automatic review flow -- it never changes which view shows
+    // for any other status, and closes itself back to the normal review
+    // flow once narration generation succeeds (onNarrationReady below).
+    const [manualEditorOpen, setManualEditorOpen] = useState(false);
 
     const [showShareModal, setShowShareModal] = useState(false);
     const [shareTitle, setShareTitle] = useState("");
@@ -91,6 +99,7 @@ export default function FilmSummaryProjectDetailPage() {
 
     useEffect(() => {
         loadFilmSummary();
+        setManualEditorOpen(false);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [projectId, user?.id]);
 
@@ -416,14 +425,47 @@ export default function FilmSummaryProjectDetailPage() {
                     ) : null}
 
                     {status === "awaiting_review" ? (
-                        <FilmSummaryReviewPanel
-                            filmSummary={filmSummary}
-                            projectId={projectId}
-                            user={user}
-                            allowedVoices={allowedVoices}
-                            defaultVoice={defaultVoice}
-                            onRefresh={loadFilmSummary}
-                        />
+                        manualEditorOpen ? (
+                            <FilmSummaryClipPickerEditor
+                                filmSummary={filmSummary}
+                                user={user}
+                                onCancel={() => setManualEditorOpen(false)}
+                                onNarrationReady={(updated) => {
+                                    setFilmSummary(updated);
+                                    setManualEditorOpen(false);
+                                }}
+                            />
+                        ) : (
+                            <div className="space-y-4">
+                                {Array.isArray(filmSummary.scene_index) && filmSummary.scene_index.length > 0 ? (
+                                    <div className="flex items-center justify-end">
+                                        <button
+                                            type="button"
+                                            onClick={() => setManualEditorOpen(true)}
+                                            className="inline-flex items-center gap-2 rounded-xl border border-primary/40 bg-primary/10 px-4 py-2.5 text-sm font-medium text-primary hover:bg-primary/20"
+                                        >
+                                            <Wand2 size={14} />
+                                            {t("filmSummary.manual.openButton", "Mode manuel : choisir mes plans")}
+                                        </button>
+                                    </div>
+                                ) : null}
+                                <FilmSummaryReviewPanel
+                                    filmSummary={filmSummary}
+                                    projectId={projectId}
+                                    user={user}
+                                    allowedVoices={allowedVoices}
+                                    defaultVoice={defaultVoice}
+                                    onRefresh={loadFilmSummary}
+                                />
+                                <FilmSummaryAudioSubtitleSettings
+                                    filmSummary={filmSummary}
+                                    user={user}
+                                    totalDurationMs={filmSummary.validation_report?.total_estimated_duration_ms || 300000}
+                                    onUpdated={setFilmSummary}
+                                    t={t}
+                                />
+                            </div>
+                        )
                     ) : null}
 
                     {status === "completed" ? (

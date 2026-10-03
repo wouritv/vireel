@@ -721,6 +721,45 @@ def validate_edited_plan_patch(raw: Any, *, movie_metadata: Dict[str, Any], targ
     )
 
 
+def _clip_signature(clip: Dict[str, Any]) -> Tuple[Any, Any, Any]:
+    return (clip.get("scene_id"), clip.get("start_ms"), clip.get("end_ms"))
+
+
+def validate_manual_selection_partition(plan: Dict[str, Any], manual_selection: List[Dict[str, Any]]) -> None:
+    """The one invariant the manual-mode planning model must never violate
+    (see generate_narration_for_selected_clips): every clip produced across
+    the plan's voice_over segments, concatenated in sequence order, must be
+    exactly manual_selection -- same (scene_id, start_ms, end_ms) tuples,
+    same count, same order, nothing added, dropped, reordered or altered.
+    The model may only decide how to GROUP that exact sequence into
+    segments and what to narrate for each group; it never chooses footage.
+
+    Also rejects any segment that isn't voice_over -- the user's manual
+    selection already is the final cut, so there is nothing left for an
+    original_dialogue/breathing segment to add in this mode.
+
+    Raises FilmSummaryValidationError(PLAN_INVALID, ...) on any violation;
+    returns None when the partition holds."""
+    produced: List[Tuple[Any, Any, Any]] = []
+    for seg in sorted(plan.get("segments") or [], key=lambda s: _safe_int(s.get("sequence"))):
+        if seg.get("type") != SEGMENT_TYPE_VOICE_OVER:
+            raise FilmSummaryValidationError(
+                FilmSummaryErrorCode.PLAN_INVALID,
+                f"Manual-mode plan must contain only voice_over segments, got segment "
+                f"{seg.get('id')} of type {seg.get('type')!r}",
+            )
+        produced.extend(_clip_signature(clip) for clip in (seg.get("clips") or []))
+
+    expected = [_clip_signature(clip) for clip in manual_selection]
+    if produced != expected:
+        raise FilmSummaryValidationError(
+            FilmSummaryErrorCode.PLAN_INVALID,
+            "Manual-mode plan's clips must be exactly the user's manual_selection, unmodified "
+            "and in the same order, merely grouped into voice_over segments -- got "
+            f"{produced} instead of the expected {expected}",
+        )
+
+
 def tts_cache_key(text: str, model: str, voice: str, instructions: str) -> str:
     """Idempotency cache key for TTS generation (spec section 14: "Cache
     par hash texte + modele + voix + instructions") -- lets a retry skip
@@ -888,6 +927,55 @@ PLANNING_CONSOLIDATION_NOTE = (
 )
 
 
+# Narrower counterpart to PLANNING_SYSTEM_PROMPT for the manual editor mode
+# (see generate_narration_for_selected_clips): the model is not choosing
+# footage here, only grouping the user's exact pre-ordered clips into
+# voice_over segments and narrating them. Kept as its own prompt rather
+# than overloading PLANNING_SYSTEM_PROMPT, whose VISUAL MATCHING / ORIGINAL
+# DIALOGUE / CINEMATIC BREATHING rules do not apply in this mode at all.
+MANUAL_NARRATION_SYSTEM_PROMPT = """You are Vireel's Film Summary Manual-Mode Narration Engine. A human editor has already chosen the exact footage for this summary -- every clip in manual_clips, in the exact order given -- by hand. Your ONLY job is to:
+1. Group these clips, in their given order, into one or more voice_over segments (consecutive, non-overlapping groups -- never reorder, merge across a gap, split a clip, drop a clip, or invent a new one).
+2. Write the spoken narration text for each group.
+
+You do not choose footage and have no permission to add, remove, reorder, trim, merge or otherwise alter any clip's scene_id, start_ms or end_ms. Every clip supplied in manual_clips must appear exactly once, unmodified, in exactly the same relative order, split across however many voice_over segments you choose (one or more clips per segment, your choice).
+
+INPUTS
+- movie_metadata: title, source duration, source language and technical metadata
+- narration_language: language of the generated voice-over
+- narration_style: requested storytelling style
+- manual_clips: the user's exact, pre-ordered clip selection -- each item has scene_id, start_ms, end_ms (immutable, copy verbatim into your output), plus speakers/transcript_overlap supplied only as narrative context
+
+NARRATION RULES
+1. Write natural, cinematic, emotionally precise narration suitable for AI speech, grounded only in the supplied transcript_overlap/speakers context for each clip -- never invent a fact, event, name or relationship it does not support. Never say "in this scene," "we can see," "the transcript says," or similar analytical phrases.
+2. Group clips the way a film editor would pace a cut: a tight run of short, related clips can share one voice-over block; a pivotal moment may deserve its own block. Do not create a new group for every single clip unless the content truly demands it, and do not force every clip into one giant block either.
+3. Each voice-over block's narration should roughly match the spoken duration implied by that block's clips; estimate speech at 125 to 150 words per minute.
+4. Respect the requested narration_style and narration_language.
+
+OUTPUT SCHEMA
+Return exactly this JSON shape -- every field required unless marked optional:
+{
+  "status": "ok" | "insufficient_evidence"   (optional, default "ok"),
+  "explanation": string   (required only when status is "insufficient_evidence"),
+  "characters": [],
+  "segments": [ <segment, see below> ],
+  "total_estimated_duration_ms": integer   (your own best-effort sum, backend recomputes the authoritative value),
+  "music_mood": "tense" | "dark" | "hopeful" | "romantic" | "melancholic" | "triumphant" | "comedic" | "neutral"   (optional, default "neutral"),
+  "unresolved_ambiguities": [string]
+}
+Every segment's "type" MUST be exactly "voice_over" -- never "original_dialogue" or "breathing": the user's manual selection already is the final cut, so there is nothing left for either of those segment types to add in this mode. Each segment object has:
+- "id": a stable unique string you invent (e.g. "seg_01").
+- "sequence": REQUIRED integer. Segments MUST be numbered 1, 2, 3, ... with no gaps and no repeats, strictly in playback order.
+- "type": always "voice_over".
+- "narration": string, the spoken voice-over text for this group.
+- "estimated_duration_ms": integer, your best estimate of this block's spoken duration.
+- "source_event_ids": [string] (may be empty).
+- "clips": the exact consecutive slice of manual_clips assigned to this group, COPIED VERBATIM in the same order -- same scene_id, start_ms, end_ms for each; you may add a "description" and/or "match_score" but must never change scene_id, start_ms or end_ms.
+
+OUTPUT CONTRACT
+Return JSON only. Do not use Markdown. Do not include commentary before or after the JSON.
+Before returning the JSON, silently verify: concatenating every segment's clips, in sequence order, reproduces manual_clips exactly -- same items, same order, nothing added, removed, reordered or modified; sequence numbers are contiguous starting at 1; every segment's type is "voice_over"."""
+
+
 TTS_INSTRUCTIONS_TEMPLATE = (
     "Speak in fluent {{LANGUAGE}} as a cinematic film narrator. Use a natural, controlled and "
     "emotionally responsive delivery. Maintain clarity at approximately 135 words per minute. "
@@ -1037,6 +1125,37 @@ def _build_planning_correction_message(
     }
 
 
+def _parse_planning_json_with_retry(
+    raw_text: str, *, attempt: int, max_attempts: int, messages: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Shared JSON-parse-with-one-retry-on-truncation step used by every
+    planning loop (generate_edit_plan, generate_narration_for_selected_
+    clips): a long response can get cut off mid-string by max_tokens (see
+    _call_planning_model), and json.loads then raises "Unterminated
+    string ..." -- worth one corrective retry instead of failing the whole
+    request outright, same mechanism as a validation-error retry.
+
+    Returns the parsed dict on success. On a parse failure before the last
+    attempt, appends the model's raw response plus a corrective follow-up
+    onto `messages` (in place) and returns None -- the caller should
+    `continue` its loop. Raises FilmSummaryValidationError once attempts
+    are exhausted."""
+    try:
+        return json.loads(raw_text)
+    except (TypeError, ValueError) as exc:
+        if attempt == max_attempts - 1:
+            raise FilmSummaryValidationError(FilmSummaryErrorCode.PLAN_INVALID, f"Invalid JSON from planning model: {exc}") from exc
+        messages.append({"role": "assistant", "content": raw_text})
+        messages.append({
+            "role": "user",
+            "content": (
+                f"Your previous response was not valid, complete JSON ({exc}). Return the complete "
+                "corrected plan as a single valid JSON object (same OUTPUT SCHEMA, JSON only), nothing else."
+            ),
+        })
+        return None
+
+
 async def generate_edit_plan(
     *, movie_metadata: Dict[str, Any], target_duration_ms: int, narration_language: str, narration_style: str,
     transcript_segments: List[Dict[str, Any]], scene_index: List[Dict[str, Any]],
@@ -1100,24 +1219,8 @@ async def generate_edit_plan(
         total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
         total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
 
-        try:
-            raw = json.loads(raw_text)
-        except (TypeError, ValueError) as exc:
-            if attempt == max_attempts - 1:
-                raise FilmSummaryValidationError(FilmSummaryErrorCode.PLAN_INVALID, f"Invalid JSON from planning model: {exc}") from exc
-            # Most often a response truncated by hitting max_tokens on a
-            # long plan (see _call_planning_model) rather than the model
-            # getting the syntax wrong -- worth one retry instead of
-            # failing the whole request outright, same self-correction
-            # mechanism used below for validation errors/warnings.
-            messages.append({"role": "assistant", "content": raw_text})
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"Your previous response was not valid, complete JSON ({exc}). Return the complete "
-                    "corrected plan as a single valid JSON object (same OUTPUT SCHEMA, JSON only), nothing else."
-                ),
-            })
+        raw = _parse_planning_json_with_retry(raw_text, attempt=attempt, max_attempts=max_attempts, messages=messages)
+        if raw is None:
             continue
 
         plan = validate_edit_plan_schema(raw, movie_metadata=movie_metadata, target_duration_ms=target_duration_ms)
@@ -1133,6 +1236,155 @@ async def generate_edit_plan(
         messages.append(_build_planning_correction_message(validation_report, plan, target_duration_ms, duration_tolerance_ratio))
 
     return {"plan": plan, "usage": total_usage}
+
+
+# ---------------------------------------------------------------------------
+# Manual editor mode (see supabase/migrations/20261003_film_summary_manual_
+# editor_fields.sql's edit_mode/manual_selection): the user picks and trims
+# their own clips directly, and the only AI step left is turning that exact
+# sequence into narrated voice_over segments -- see
+# generate_narration_for_selected_clips and MANUAL_NARRATION_SYSTEM_PROMPT.
+# ---------------------------------------------------------------------------
+
+def _manual_selection_total_duration_ms(manual_selection: List[Dict[str, Any]]) -> int:
+    return sum(max(0, _safe_int(clip.get("end_ms")) - _safe_int(clip.get("start_ms"))) for clip in manual_selection)
+
+
+def _build_manual_narration_payload(
+    *, movie_metadata: Dict[str, Any], narration_language: str, narration_style: str,
+    scene_index: List[Dict[str, Any]], manual_selection: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Annotates each of the user's exact clips with its scene's narrative
+    context (transcript_overlap/speakers, already joined onto scene_index
+    by build_scene_index) so the model can write grounded narration --
+    without ever handing it the freedom to pick different footage."""
+    scene_lookup = {s.get("scene_id"): s for s in scene_index}
+    manual_clips = []
+    for clip in manual_selection:
+        scene = scene_lookup.get(clip.get("scene_id")) or {}
+        manual_clips.append({
+            "scene_id": clip.get("scene_id"),
+            "start_ms": clip.get("start_ms"),
+            "end_ms": clip.get("end_ms"),
+            "speakers": scene.get("speakers") or [],
+            "transcript_overlap": scene.get("transcript_overlap") or "",
+        })
+    return {
+        "movie_metadata": movie_metadata,
+        "narration_language": narration_language,
+        "narration_style": narration_style,
+        "manual_clips": manual_clips,
+    }
+
+
+def _build_manual_narration_correction_message(
+    validation_report: Dict[str, Any], partition_error: Optional["FilmSummaryValidationError"],
+) -> Dict[str, str]:
+    """Same spirit as _build_planning_correction_message, plus the one
+    extra failure mode specific to this mode: the model regrouped,
+    dropped, reordered or altered one of the user's exact clips instead
+    of merely grouping+narrating them (see validate_manual_selection_
+    partition)."""
+    errors = "; ".join(validation_report.get("errors") or [])
+    warnings = "; ".join(validation_report.get("warnings") or [])
+
+    sentences = []
+    if partition_error is not None:
+        sentences.append(f"Your previous response violated the clip partition rule: {partition_error}.")
+    if errors:
+        sentences.append(f"Your previous plan failed automated validation with these blocking errors: {errors}.")
+    if warnings:
+        sentences.append(f"It also has these quality issues you should fix even though they did not block validation: {warnings}.")
+
+    return {
+        "role": "user",
+        "content": (
+            f"{' '.join(sentences)} Return a corrected full plan (same OUTPUT SCHEMA, JSON only) that groups "
+            "manual_clips, in the exact order given, into voice_over segments only -- every clip must appear "
+            "exactly once, unmodified (same scene_id/start_ms/end_ms), in the same relative order as "
+            "manual_clips; you may only choose how many segments to split them into and what to narrate for "
+            "each group, while fixing every issue above."
+        ),
+    }
+
+
+async def generate_narration_for_selected_clips(
+    *, movie_metadata: Dict[str, Any], narration_language: str, narration_style: str,
+    scene_index: List[Dict[str, Any]], manual_selection: List[Dict[str, Any]],
+    duration_tolerance_ratio: float = 0.15,
+) -> Dict[str, Any]:
+    """Manual-editor counterpart to generate_edit_plan: the model is not
+    choosing footage here -- manual_selection (the user's exact, pre-
+    ordered, possibly freely-trimmed clips, already validated in-bounds by
+    PUT /manual-selection) is the final cut. The model's only job is to
+    decide how to GROUP that exact sequence into voice_over segments and
+    write narration per group (see MANUAL_NARRATION_SYSTEM_PROMPT).
+
+    Returns the same {"plan", "usage"} shape as generate_edit_plan, plus a
+    "validation_report" (validate_edit_plan_content's own return shape).
+    Raises FilmSummaryValidationError when manual_selection is empty, when
+    every attempt still produces malformed JSON (see
+    _parse_planning_json_with_retry), or when the model's response still
+    fails the exact-partition invariant after exhausting every retry (see
+    validate_manual_selection_partition) -- a manual-mode plan must never
+    be allowed to silently diverge from what the user picked."""
+    if not manual_selection:
+        raise FilmSummaryValidationError(FilmSummaryErrorCode.PLAN_INVALID, "manual_selection is empty")
+
+    client = _get_openai_client()
+    model_name = os.environ.get("FILM_SUMMARY_PLANNING_MODEL", os.environ.get("OPENAI_MODEL", "gpt-4o"))
+    max_attempts = int(os.environ.get("FILM_SUMMARY_PLANNING_MAX_ATTEMPTS", "2"))
+
+    target_duration_ms = _manual_selection_total_duration_ms(manual_selection)
+    payload = _build_manual_narration_payload(
+        movie_metadata=movie_metadata, narration_language=narration_language, narration_style=narration_style,
+        scene_index=scene_index, manual_selection=manual_selection,
+    )
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": MANUAL_NARRATION_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(payload)},
+    ]
+    valid_scene_ids = [s.get("scene_id") for s in scene_index]
+    source_duration_ms = int(movie_metadata.get("source_duration_ms") or 0)
+
+    total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    plan: Dict[str, Any] = {}
+    validation_report: Dict[str, Any] = {"valid": False, "errors": [], "warnings": []}
+    partition_error: Optional[FilmSummaryValidationError] = None
+
+    for attempt in range(max(1, max_attempts)):
+        response = await asyncio.to_thread(_call_planning_model, client, model_name, messages)
+        raw_text = response.choices[0].message.content
+        usage = _usage_dict(response, model_name)
+        total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
+        total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+
+        raw = _parse_planning_json_with_retry(raw_text, attempt=attempt, max_attempts=max_attempts, messages=messages)
+        if raw is None:
+            continue
+
+        plan = validate_edit_plan_schema(raw, movie_metadata=movie_metadata, target_duration_ms=target_duration_ms)
+
+        partition_error = None
+        try:
+            validate_manual_selection_partition(plan, manual_selection)
+        except FilmSummaryValidationError as exc:
+            partition_error = exc
+
+        validation_report = validate_edit_plan_content(
+            plan, source_duration_ms=source_duration_ms, valid_scene_ids=valid_scene_ids,
+            duration_tolerance_ratio=duration_tolerance_ratio,
+        )
+        has_fixable_issue = partition_error is not None or not validation_report["valid"] or bool(validation_report["warnings"])
+        if not has_fixable_issue or attempt == max_attempts - 1:
+            break
+        messages.append({"role": "assistant", "content": raw_text})
+        messages.append(_build_manual_narration_correction_message(validation_report, partition_error))
+
+    if partition_error is not None:
+        raise partition_error
+
+    return {"plan": plan, "validation_report": validation_report, "usage": total_usage}
 
 
 def _build_utterance_segments(transcript: Any) -> List[Dict[str, Any]]:

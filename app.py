@@ -12485,6 +12485,59 @@ async def update_film_summary_manual_selection_endpoint(
     return _normalize_film_summary_row(updated, include_content=True)
 
 
+@app.post("/api/film-summaries/{film_summary_id}/generate-narration", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}})
+async def generate_film_summary_narration_endpoint(
+    film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Manual-editor phase 2 (see FilmSummaryManualSelectionUpdateRequest's
+    docstring and film_summary.generate_narration_for_selected_clips):
+    turns the user's already-persisted manual_selection into narrated
+    voice_over segments and persists the result into edit_plan/
+    validation_report, same way the automatic pipeline's planning stage
+    does. Re-callable as many times as the user likes while still awaiting
+    review (e.g. after tweaking their clip selection) -- regeneration is
+    deliberately covered by the original analysis credits, so this adds no
+    new credit/usage-limit logic of its own."""
+    row = await supabase_get_film_summary(film_summary_id, user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
+    if row.get("status") != film_summary.FilmSummaryStatus.AWAITING_REVIEW:
+        raise HTTPException(status_code=409, detail="Narration can only be generated while awaiting review")
+
+    manual_selection = row.get("manual_selection") or []
+    if not manual_selection:
+        raise HTTPException(status_code=400, detail="manual_selection is empty -- submit it via PUT manual-selection first")
+
+    movie_metadata = {
+        "title": row.get("title") or "",
+        "source_duration_ms": int((row.get("source_duration_seconds") or 0) * 1000),
+        "source_language": row.get("source_language") or "",
+        "narration_language": row.get("narration_language") or row.get("source_language") or "",
+    }
+    try:
+        result = await film_summary.generate_narration_for_selected_clips(
+            movie_metadata=movie_metadata, narration_language=movie_metadata["narration_language"],
+            narration_style=row.get("narration_style") or "", scene_index=row.get("scene_index") or [],
+            manual_selection=manual_selection, duration_tolerance_ratio=FILM_SUMMARY_DURATION_TOLERANCE_RATIO,
+        )
+    except Exception as exc:
+        # Any failure here (OpenAI transport/config error, malformed JSON
+        # after exhausting the retry, or the model breaking the exact-
+        # partition invariant) is a planning failure, never the user's
+        # fault -- same 502 convention as get_film_summary_voice_preview_
+        # endpoint's own OpenAI call, kept deliberately simple (no new
+        # retry/orchestration beyond what generate_narration_for_selected_
+        # clips itself already does).
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    plan, validation_report = result["plan"], result["validation_report"]
+    updated = await supabase_update_film_summary(film_summary_id, user_id, {
+        "edit_plan": plan, "validation_report": validation_report,
+        "target_duration_seconds": _plan_target_duration_seconds(plan),
+    })
+    return _normalize_film_summary_row(updated, include_content=True)
+
+
 @app.post("/api/film-summaries/{film_summary_id}/validate", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def validate_film_summary_plan_endpoint(film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     row = await supabase_get_film_summary(film_summary_id, user_id)

@@ -1,10 +1,14 @@
 // Shared helpers for the "Resume de film" (Film Summary) feature pages.
-// Pure UI logic only -- no HTTP calls -- mirrors the anonymousStories.js
-// module's conventions exactly (see FilmSummaryStatus / FilmSummaryStage /
-// FilmSummaryErrorCode in film_summary.py for the backend side of this
-// contract).
+// Mostly pure UI logic (mirrors the anonymousStories.js module's
+// conventions) plus, further down, a small set of fetch() wrappers for the
+// manual-editor endpoints (music tracks, audio/subtitle settings, manual
+// clip selection, narration generation) -- see FilmSummaryStatus /
+// FilmSummaryStage / FilmSummaryErrorCode in film_summary.py for the
+// backend side of this contract.
 
 import { resolveJobStepState, errorMessageForCodeWithNamespace } from "./jobStepStatus";
+import { getApiUrl } from "../config";
+import { getAuthHeaders } from "./apiAuth";
 
 /**
  * Normalize a raw /api/status/{job_id} job status to the frontend canonical
@@ -53,6 +57,84 @@ export function isFilmSummaryRejectionErrorCode(code) {
 export const SEGMENT_TYPE_VOICE_OVER = "voice_over";
 export const SEGMENT_TYPE_ORIGINAL_DIALOGUE = "original_dialogue";
 export const SEGMENT_TYPE_BREATHING = "breathing";
+
+// edit_mode values (film_summary row field) -- "manual" is set server-side
+// by PUT .../manual-selection the moment a selection is saved, so the
+// frontend never writes it directly.
+export const EDIT_MODE_AUTOMATIC = "automatic";
+export const EDIT_MODE_MANUAL = "manual";
+
+/**
+ * Shared response reader for the manual-editor endpoints below: parses the
+ * JSON body (tolerating an empty/invalid one) and, on a non-2xx response,
+ * throws an Error carrying the backend's `detail` when present -- same
+ * shape every film-summary page already builds inline around its own
+ * fetch() calls, just not duplicated four more times here.
+ */
+async function readJsonOrThrow(response, fallbackMessage) {
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        throw new Error(typeof data?.detail === "string" ? data.detail : fallbackMessage);
+    }
+    return data;
+}
+
+/**
+ * GET /api/film-summaries/music-tracks -> { tracks_by_mood: { "<mood>": [{track_id, label}, ...] } },
+ * the existing mood-grouped background-music library shared with the rest
+ * of the app (no custom upload for film summaries).
+ */
+export async function fetchFilmSummaryMusicTracks(userId) {
+    const response = await fetch(getApiUrl("/api/film-summaries/music-tracks"), {
+        headers: getAuthHeaders(userId),
+    });
+    return readJsonOrThrow(response, "Impossible de charger la bibliotheque musicale.");
+}
+
+/**
+ * PATCH /api/film-summaries/{id}/audio-settings -- `patch` is any subset of
+ * {music_track_id, music_start_ms, music_end_ms, subtitles_enabled, subtitle_style};
+ * callers send only the fields they changed. Returns the normalized
+ * full-content film summary row.
+ */
+export async function updateFilmSummaryAudioSettings(filmSummaryId, userId, patch) {
+    const response = await fetch(getApiUrl(`/api/film-summaries/${filmSummaryId}/audio-settings`), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders(userId) },
+        body: JSON.stringify(patch || {}),
+    });
+    return readJsonOrThrow(response, "Impossible d'enregistrer les reglages audio/sous-titres.");
+}
+
+/**
+ * PUT /api/film-summaries/{id}/manual-selection -- `manualSelection` is the
+ * chronologically-ordered list of {scene_id, start_ms, end_ms} the user
+ * kept from the shot picker. Sets edit_mode to "manual" server-side.
+ * Returns the normalized full-content film summary row.
+ */
+export async function saveFilmSummaryManualSelection(filmSummaryId, userId, manualSelection) {
+    const response = await fetch(getApiUrl(`/api/film-summaries/${filmSummaryId}/manual-selection`), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders(userId) },
+        body: JSON.stringify({ manual_selection: manualSelection || [] }),
+    });
+    return readJsonOrThrow(response, "Impossible d'enregistrer la selection des plans.");
+}
+
+/**
+ * POST /api/film-summaries/{id}/generate-narration -- no body; the server
+ * reads the already-persisted manual_selection and has the AI write
+ * narration grouped over those exact clips. Call this right after a
+ * successful saveFilmSummaryManualSelection(). Returns the normalized
+ * full-content row with `edit_plan` populated.
+ */
+export async function generateFilmSummaryNarration(filmSummaryId, userId) {
+    const response = await fetch(getApiUrl(`/api/film-summaries/${filmSummaryId}/generate-narration`), {
+        method: "POST",
+        headers: getAuthHeaders(userId),
+    });
+    return readJsonOrThrow(response, "Impossible de generer la narration a partir des plans choisis.");
+}
 
 /**
  * Format a millisecond duration as "mm:ss" (or "h:mm:ss" past an hour), for

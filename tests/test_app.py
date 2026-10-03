@@ -3299,6 +3299,88 @@ def test_update_film_summary_manual_selection_blocks_outside_awaiting_review(mon
     assert exc_info.value.status_code == 409
 
 
+def test_generate_film_summary_narration_404_when_missing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=None))
+
+    coro = app.generate_film_summary_narration_endpoint(film_summary_id="fs_1", user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 404
+
+
+def test_generate_film_summary_narration_blocks_outside_awaiting_review(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row(
+        status="completed", manual_selection=[{"scene_id": "scene_001", "start_ms": 0, "end_ms": 5000}],
+    )))
+
+    coro = app.generate_film_summary_narration_endpoint(film_summary_id="fs_1", user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+
+
+def test_generate_film_summary_narration_rejects_empty_manual_selection(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row(
+        manual_selection=[],
+    )))
+
+    coro = app.generate_film_summary_narration_endpoint(film_summary_id="fs_1", user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 400
+
+
+def test_generate_film_summary_narration_persists_edit_plan(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    manual_selection = [{"scene_id": "scene_001", "start_ms": 1000, "end_ms": 4000}]
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row(
+        manual_selection=manual_selection, edit_mode="manual",
+        title="My Movie", source_language="en", narration_language="en", narration_style="cinematic",
+    )))
+    fake_plan = {
+        "schema_version": "1.0", "segments": [], "target_duration_ms": 3000, "total_estimated_duration_ms": 3000,
+    }
+    fake_validation_report = {"valid": True, "errors": [], "warnings": [], "total_estimated_duration_ms": 3000}
+    generate_mock = AsyncMock(return_value={
+        "plan": fake_plan, "validation_report": fake_validation_report, "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    })
+    monkeypatch.setattr(app.film_summary, "generate_narration_for_selected_clips", generate_mock)
+    update_mock = AsyncMock(return_value=_awaiting_review_film_summary_row(
+        manual_selection=manual_selection, edit_mode="manual", edit_plan=fake_plan, validation_report=fake_validation_report,
+    ))
+    monkeypatch.setattr(app, "supabase_update_film_summary", update_mock)
+
+    result = asyncio.run(app.generate_film_summary_narration_endpoint(film_summary_id="fs_1", user_id="u1"))
+
+    generate_mock.assert_awaited_once()
+    assert generate_mock.await_args.kwargs["manual_selection"] == manual_selection
+    update_mock.assert_awaited_once_with("fs_1", "u1", {
+        "edit_plan": fake_plan, "validation_report": fake_validation_report, "target_duration_seconds": 3,
+    })
+    assert result["edit_plan"] == fake_plan
+    assert result["validation_report"] == fake_validation_report
+    assert result["edit_mode"] == "manual"
+
+
+def test_generate_film_summary_narration_returns_502_on_planning_failure(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    manual_selection = [{"scene_id": "scene_001", "start_ms": 1000, "end_ms": 4000}]
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row(
+        manual_selection=manual_selection,
+    )))
+    monkeypatch.setattr(app.film_summary, "generate_narration_for_selected_clips", AsyncMock(
+        side_effect=film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.PLAN_INVALID, "boom"),
+    ))
+
+    coro = app.generate_film_summary_narration_endpoint(film_summary_id="fs_1", user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 502
+
+
 def test_mark_film_summary_job_terminal_noops_without_supabase(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     # Neither SUPABASE_URL nor SUPABASE_SERVICE_ROLE_KEY are set in this test
