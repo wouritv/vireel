@@ -12332,6 +12332,33 @@ async def get_film_summary_voice_preview_endpoint(voice_id: str, _user_id: Annot
     return {"preview_url": f"/voice-previews/{resolved_voice}.mp3"}
 
 
+@app.get("/api/film-summaries/music-tracks", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
+async def list_film_summary_music_tracks_endpoint(_user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Lists the instrumental tracks available for background music,
+    grouped by mood (see film_summary_render.resolve_background_music_track).
+    Each track's "track_id" is the stable identifier the editor sends back
+    via PATCH .../audio-settings's music_track_id.
+
+    Declared before the /{film_summary_id} route below so this static
+    "music-tracks" segment isn't swallowed as a film_summary_id (same
+    reason as the voice-previews route above)."""
+    tracks_by_mood: Dict[str, List[Dict[str, str]]] = {}
+    for mood in film_summary.MUSIC_MOODS:
+        mood_dir = os.path.join(film_summary_render.MUSIC_DIR, mood)
+        if not os.path.isdir(mood_dir):
+            continue
+        filenames = sorted(
+            f for f in os.listdir(mood_dir) if f.lower().endswith(film_summary_render.MUSIC_TRACK_EXTENSIONS)
+        )
+        if not filenames:
+            continue
+        tracks_by_mood[mood] = [
+            {"track_id": f"{mood}/{filename}", "label": os.path.splitext(filename)[0].replace("_", " ").title()}
+            for filename in filenames
+        ]
+    return {"tracks_by_mood": tracks_by_mood}
+
+
 @app.get("/api/film-summaries/{film_summary_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def get_film_summary_endpoint(film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     row = await supabase_get_film_summary(film_summary_id, user_id)
@@ -12400,29 +12427,6 @@ def _resolve_music_track_path(track_id: str) -> Optional[str]:
         return None
     candidate = os.path.join(film_summary_render.MUSIC_DIR, mood, filename)
     return candidate if os.path.isfile(candidate) else None
-
-
-@app.get("/api/film-summaries/music-tracks", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
-async def list_film_summary_music_tracks_endpoint(_user_id: Annotated[str, Depends(get_user_id_header)]):
-    """Lists the instrumental tracks available for background music,
-    grouped by mood (see film_summary_render.resolve_background_music_track).
-    Each track's "track_id" is the stable identifier the editor sends back
-    via PATCH .../audio-settings's music_track_id."""
-    tracks_by_mood: Dict[str, List[Dict[str, str]]] = {}
-    for mood in film_summary.MUSIC_MOODS:
-        mood_dir = os.path.join(film_summary_render.MUSIC_DIR, mood)
-        if not os.path.isdir(mood_dir):
-            continue
-        filenames = sorted(
-            f for f in os.listdir(mood_dir) if f.lower().endswith(film_summary_render.MUSIC_TRACK_EXTENSIONS)
-        )
-        if not filenames:
-            continue
-        tracks_by_mood[mood] = [
-            {"track_id": f"{mood}/{filename}", "label": os.path.splitext(filename)[0].replace("_", " ").title()}
-            for filename in filenames
-        ]
-    return {"tracks_by_mood": tracks_by_mood}
 
 
 @app.patch("/api/film-summaries/{film_summary_id}/audio-settings", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
