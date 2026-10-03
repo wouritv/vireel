@@ -3119,6 +3119,174 @@ def test_normalize_film_summary_row_includes_content_when_requested(monkeypatch)
     assert item["final_url"] == ""
 
 
+def _awaiting_review_film_summary_row(**overrides):
+    row = {
+        "id": "fs_1", "status": "awaiting_review", "stage": "awaiting_user_review",
+        "source_duration_seconds": 100.0,
+        "scene_index": [{"scene_id": "scene_001", "start_ms": 0, "end_ms": 50000}],
+        "edit_plan": {}, "classification": {},
+    }
+    row.update(overrides)
+    return row
+
+
+def test_list_film_summary_music_tracks_groups_by_mood(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app.film_summary_render, "MUSIC_DIR", str(tmp_path))
+    tense_dir = tmp_path / "tense"
+    tense_dir.mkdir()
+    (tense_dir / "epic_theme.mp3").write_bytes(b"fake")
+    (tense_dir / "not_a_track.txt").write_bytes(b"fake")
+
+    result = asyncio.run(app.list_film_summary_music_tracks_endpoint(_user_id="u1"))
+
+    assert result == {"tracks_by_mood": {"tense": [{"track_id": "tense/epic_theme.mp3", "label": "Epic Theme"}]}}
+
+
+def test_resolve_music_track_path_rejects_path_traversal(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app.film_summary_render, "MUSIC_DIR", str(tmp_path))
+    (tmp_path / "secret.txt").write_bytes(b"fake")
+
+    assert app._resolve_music_track_path("tense/../secret.txt") is None
+    assert app._resolve_music_track_path("not-a-mood/track.mp3") is None
+    assert app._resolve_music_track_path("tense/missing.mp3") is None
+
+
+def test_update_film_summary_audio_settings_persists_valid_update(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app.film_summary_render, "MUSIC_DIR", str(tmp_path))
+    tense_dir = tmp_path / "tense"
+    tense_dir.mkdir()
+    (tense_dir / "epic_theme.mp3").write_bytes(b"fake")
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row()))
+    update_mock = AsyncMock(return_value=_awaiting_review_film_summary_row(
+        music_track_id="tense/epic_theme.mp3", music_start_ms=0, music_end_ms=5000, subtitles_enabled=True,
+    ))
+    monkeypatch.setattr(app, "supabase_update_film_summary", update_mock)
+
+    result = asyncio.run(app.update_film_summary_audio_settings_endpoint(
+        film_summary_id="fs_1",
+        payload=app.FilmSummaryAudioSettingsUpdateRequest(
+            music_track_id="tense/epic_theme.mp3", music_start_ms=0, music_end_ms=5000, subtitles_enabled=True,
+        ),
+        user_id="u1",
+    ))
+
+    update_mock.assert_awaited_once_with("fs_1", "u1", {
+        "music_track_id": "tense/epic_theme.mp3", "music_start_ms": 0, "music_end_ms": 5000, "subtitles_enabled": True,
+    })
+    assert result["music_track_id"] == "tense/epic_theme.mp3"
+    assert result["subtitles_enabled"] is True
+
+
+def test_update_film_summary_audio_settings_rejects_unknown_track(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app.film_summary_render, "MUSIC_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row()))
+
+    coro = app.update_film_summary_audio_settings_endpoint(
+        film_summary_id="fs_1",
+        payload=app.FilmSummaryAudioSettingsUpdateRequest(music_track_id="tense/missing.mp3"),
+        user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 400
+
+
+def test_update_film_summary_audio_settings_rejects_backwards_music_range(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row()))
+
+    coro = app.update_film_summary_audio_settings_endpoint(
+        film_summary_id="fs_1",
+        payload=app.FilmSummaryAudioSettingsUpdateRequest(music_start_ms=5000, music_end_ms=1000),
+        user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 400
+
+
+def test_update_film_summary_audio_settings_blocks_outside_awaiting_review(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row(status="rendering")))
+
+    coro = app.update_film_summary_audio_settings_endpoint(
+        film_summary_id="fs_1", payload=app.FilmSummaryAudioSettingsUpdateRequest(subtitles_enabled=True), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+
+
+def test_update_film_summary_manual_selection_persists_and_switches_mode(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row()))
+    update_mock = AsyncMock(return_value=_awaiting_review_film_summary_row(
+        manual_selection=[{"scene_id": "scene_001", "start_ms": 1000, "end_ms": 4000}], edit_mode="manual",
+    ))
+    monkeypatch.setattr(app, "supabase_update_film_summary", update_mock)
+
+    result = asyncio.run(app.update_film_summary_manual_selection_endpoint(
+        film_summary_id="fs_1",
+        payload=app.FilmSummaryManualSelectionUpdateRequest(
+            manual_selection=[{"scene_id": "scene_001", "start_ms": 1000, "end_ms": 4000}],
+        ),
+        user_id="u1",
+    ))
+
+    update_mock.assert_awaited_once_with("fs_1", "u1", {
+        "manual_selection": [{"scene_id": "scene_001", "start_ms": 1000, "end_ms": 4000}], "edit_mode": "manual",
+    })
+    assert result["edit_mode"] == "manual"
+
+
+def test_update_film_summary_manual_selection_rejects_unknown_scene_id(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row()))
+
+    coro = app.update_film_summary_manual_selection_endpoint(
+        film_summary_id="fs_1",
+        payload=app.FilmSummaryManualSelectionUpdateRequest(
+            manual_selection=[{"scene_id": "scene_999", "start_ms": 1000, "end_ms": 4000}],
+        ),
+        user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 400
+
+
+def test_update_film_summary_manual_selection_rejects_out_of_bounds_timecode(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row()))
+
+    coro = app.update_film_summary_manual_selection_endpoint(
+        film_summary_id="fs_1",
+        payload=app.FilmSummaryManualSelectionUpdateRequest(
+            manual_selection=[{"scene_id": "scene_001", "start_ms": 0, "end_ms": 999999}],
+        ),
+        user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 400
+
+
+def test_update_film_summary_manual_selection_blocks_outside_awaiting_review(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row(status="completed")))
+
+    coro = app.update_film_summary_manual_selection_endpoint(
+        film_summary_id="fs_1", payload=app.FilmSummaryManualSelectionUpdateRequest(manual_selection=[]), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+
+
 def test_mark_film_summary_job_terminal_noops_without_supabase(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     # Neither SUPABASE_URL nor SUPABASE_SERVICE_ROLE_KEY are set in this test

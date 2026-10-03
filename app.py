@@ -11579,6 +11579,20 @@ class FilmSummaryRenderRequest(BaseModel):
     voice_id: Optional[str] = None
 
 
+class FilmSummaryAudioSettingsUpdateRequest(BaseModel):
+    music_track_id: Optional[str] = None
+    music_start_ms: Optional[int] = None
+    music_end_ms: Optional[int] = None
+    subtitles_enabled: Optional[bool] = None
+    subtitle_style: Optional[Dict[str, Any]] = None
+
+
+class FilmSummaryManualSelectionUpdateRequest(BaseModel):
+    # [{"scene_id": "scene_003", "start_ms": 1200, "end_ms": 4800}, ...],
+    # in the order the user wants them in the final video.
+    manual_selection: List[Dict[str, Any]]
+
+
 def _normalize_film_summary_row(row: Dict[str, Any], *, include_content: bool = False) -> Dict[str, Any]:
     item = {
         "id": row.get("id"),
@@ -11600,12 +11614,19 @@ def _normalize_film_summary_row(row: Dict[str, Any], *, include_content: bool = 
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
         "completed_at": row.get("completed_at"),
+        "edit_mode": row.get("edit_mode") or "automatic",
+        "music_track_id": row.get("music_track_id"),
+        "music_start_ms": row.get("music_start_ms"),
+        "music_end_ms": row.get("music_end_ms"),
+        "subtitles_enabled": bool(row.get("subtitles_enabled") or False),
+        "subtitle_style": row.get("subtitle_style") or None,
     }
     if include_content:
         item["classification"] = row.get("classification") or {}
         item["scene_index"] = row.get("scene_index") or []
         item["edit_plan"] = row.get("edit_plan") or {}
         item["validation_report"] = row.get("validation_report") or {}
+        item["manual_selection"] = row.get("manual_selection") or []
         bucket_name = os.environ.get("AWS_S3_BUCKET", "my-clips-bucket")
         if row.get("preview_s3_key"):
             item["preview_url"] = generate_presigned_url(bucket_name, row["preview_s3_key"], expiration=3600)
@@ -12353,6 +12374,104 @@ async def update_film_summary_plan_endpoint(
     updated = await supabase_update_film_summary(film_summary_id, user_id, {
         "edit_plan": normalized_plan, "validation_report": validation_report,
         "target_duration_seconds": _plan_target_duration_seconds(normalized_plan),
+    })
+    return _normalize_film_summary_row(updated, include_content=True)
+
+
+def _resolve_music_track_path(track_id: str) -> Optional[str]:
+    """Validates/resolves a music_track_id ("<mood>/<filename>", as listed
+    by list_film_summary_music_tracks_endpoint) against
+    FILM_SUMMARY_MUSIC_DIR. Whitelisting the mood against MUSIC_MOODS and
+    rejecting any path separator in the filename keeps a client-supplied
+    track_id from escaping that directory (e.g. "../../etc/passwd")."""
+    if not track_id or "/" not in track_id:
+        return None
+    mood, _, filename = track_id.partition("/")
+    if mood not in film_summary.MUSIC_MOODS or not filename or "/" in filename or "\\" in filename:
+        return None
+    candidate = os.path.join(film_summary_render.MUSIC_DIR, mood, filename)
+    return candidate if os.path.isfile(candidate) else None
+
+
+@app.get("/api/film-summaries/music-tracks", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
+async def list_film_summary_music_tracks_endpoint(_user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Lists the instrumental tracks available for background music,
+    grouped by mood (see film_summary_render.resolve_background_music_track).
+    Each track's "track_id" is the stable identifier the editor sends back
+    via PATCH .../audio-settings's music_track_id."""
+    tracks_by_mood: Dict[str, List[Dict[str, str]]] = {}
+    for mood in film_summary.MUSIC_MOODS:
+        mood_dir = os.path.join(film_summary_render.MUSIC_DIR, mood)
+        if not os.path.isdir(mood_dir):
+            continue
+        filenames = sorted(
+            f for f in os.listdir(mood_dir) if f.lower().endswith(film_summary_render.MUSIC_TRACK_EXTENSIONS)
+        )
+        if not filenames:
+            continue
+        tracks_by_mood[mood] = [
+            {"track_id": f"{mood}/{filename}", "label": os.path.splitext(filename)[0].replace("_", " ").title()}
+            for filename in filenames
+        ]
+    return {"tracks_by_mood": tracks_by_mood}
+
+
+@app.patch("/api/film-summaries/{film_summary_id}/audio-settings", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
+async def update_film_summary_audio_settings_endpoint(
+    film_summary_id: str, payload: FilmSummaryAudioSettingsUpdateRequest, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Persists the user's background-music track/range and subtitle
+    toggle/style -- applied at render time (see render_edit_plan /
+    _run_film_summary_render_pipeline_stages, phase 3 of the manual-editor
+    work). Editable up to the same point as the plan itself."""
+    row = await supabase_get_film_summary(film_summary_id, user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
+    if row.get("status") != film_summary.FilmSummaryStatus.AWAITING_REVIEW:
+        raise HTTPException(status_code=409, detail="Audio/subtitle settings can only be edited while awaiting review")
+
+    updates = payload.model_dump(exclude_unset=True)
+
+    if updates.get("music_track_id") and not _resolve_music_track_path(updates["music_track_id"]):
+        raise HTTPException(status_code=400, detail="Unknown music track")
+
+    start_ms, end_ms = updates.get("music_start_ms"), updates.get("music_end_ms")
+    if start_ms is not None and end_ms is not None and end_ms <= start_ms:
+        raise HTTPException(status_code=400, detail="music_end_ms must be after music_start_ms")
+
+    if not updates:
+        return _normalize_film_summary_row(row, include_content=True)
+
+    updated = await supabase_update_film_summary(film_summary_id, user_id, updates)
+    return _normalize_film_summary_row(updated, include_content=True)
+
+
+@app.put("/api/film-summaries/{film_summary_id}/manual-selection", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
+async def update_film_summary_manual_selection_endpoint(
+    film_summary_id: str, payload: FilmSummaryManualSelectionUpdateRequest, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Persists the user's manually chosen plans (shots, each possibly
+    trimmed from their auto-detected scene_index boundaries) and switches
+    this film summary into manual edit mode. Phase 2 of the manual-editor
+    work (the AI-narration-from-selection step) reads this back via
+    generate_narration_for_selected_clips."""
+    row = await supabase_get_film_summary(film_summary_id, user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
+    if row.get("status") != film_summary.FilmSummaryStatus.AWAITING_REVIEW:
+        raise HTTPException(status_code=409, detail="Clip selection can only be edited while awaiting review")
+
+    known_scene_ids = {s.get("scene_id") for s in (row.get("scene_index") or [])}
+    source_duration_ms = int((row.get("source_duration_seconds") or 0) * 1000)
+    for clip in payload.manual_selection:
+        scene_id, start_ms, end_ms = clip.get("scene_id"), clip.get("start_ms"), clip.get("end_ms")
+        if scene_id not in known_scene_ids:
+            raise HTTPException(status_code=400, detail=f"Unknown scene_id {scene_id}")
+        if not isinstance(start_ms, int) or not isinstance(end_ms, int) or start_ms < 0 or end_ms <= start_ms or end_ms > source_duration_ms:
+            raise HTTPException(status_code=400, detail=f"Invalid timecode for scene_id {scene_id}")
+
+    updated = await supabase_update_film_summary(film_summary_id, user_id, {
+        "manual_selection": payload.manual_selection, "edit_mode": "manual",
     })
     return _normalize_film_summary_row(updated, include_content=True)
 
