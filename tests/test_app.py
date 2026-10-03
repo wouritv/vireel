@@ -1,6 +1,7 @@
 import importlib
 import asyncio
 import io
+import json
 import os
 import sys
 import time
@@ -3152,7 +3153,97 @@ def test_list_film_summary_music_tracks_groups_by_mood(monkeypatch, tmp_path):
 
     result = asyncio.run(app.list_film_summary_music_tracks_endpoint(_user_id="u1"))
 
-    assert result == {"tracks_by_mood": {"tense": [{"track_id": "tense/epic_theme.mp3", "label": "Epic Theme"}]}}
+    assert result == {"tracks_by_mood": {"tense": [{
+        "track_id": "tense/epic_theme.mp3", "label": "Epic Theme",
+        "preview_url": "/music-tracks-preview/tense/epic_theme.mp3", "license": None,
+    }]}}
+
+
+def test_list_film_summary_music_tracks_never_lists_licenses_manifest(monkeypatch, tmp_path):
+    # licenses.json sitting right next to the tracks in a mood directory
+    # must never surface as if it were a track itself.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app.film_summary_render, "MUSIC_DIR", str(tmp_path))
+    tense_dir = tmp_path / "tense"
+    tense_dir.mkdir()
+    (tense_dir / "epic_theme.mp3").write_bytes(b"fake")
+    (tense_dir / "licenses.json").write_text("{}")
+
+    result = asyncio.run(app.list_film_summary_music_tracks_endpoint(_user_id="u1"))
+
+    track_ids = [t["track_id"] for t in result["tracks_by_mood"]["tense"]]
+    assert "tense/licenses.json" not in track_ids
+    assert track_ids == ["tense/epic_theme.mp3"]
+
+
+def test_list_film_summary_music_tracks_attaches_matching_license(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app.film_summary_render, "MUSIC_DIR", str(tmp_path))
+    tense_dir = tmp_path / "tense"
+    tense_dir.mkdir()
+    (tense_dir / "epic_theme.mp3").write_bytes(b"fake")
+    license_record = {
+        "title": "Epic Theme", "author": "Kevin MacLeod", "source": "incompetech.com",
+        "license_name": "CC BY 3.0", "license_url": "https://creativecommons.org/licenses/by/3.0/",
+        "attribution_text": "\"Epic Theme\" by Kevin MacLeod (incompetech.com), licensed under CC BY 3.0",
+    }
+    (tmp_path / "licenses.json").write_text(json.dumps({"tense/epic_theme.mp3": license_record}))
+
+    result = asyncio.run(app.list_film_summary_music_tracks_endpoint(_user_id="u1"))
+
+    assert result["tracks_by_mood"]["tense"][0]["license"] == license_record
+
+
+def test_list_film_summary_music_tracks_license_null_when_not_in_manifest(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app.film_summary_render, "MUSIC_DIR", str(tmp_path))
+    tense_dir = tmp_path / "tense"
+    tense_dir.mkdir()
+    (tense_dir / "epic_theme.mp3").write_bytes(b"fake")
+    (tmp_path / "licenses.json").write_text(json.dumps({"tense/other_track.mp3": {"title": "Other"}}))
+
+    result = asyncio.run(app.list_film_summary_music_tracks_endpoint(_user_id="u1"))
+
+    assert result["tracks_by_mood"]["tense"][0]["license"] is None
+
+
+def test_list_film_summary_music_tracks_license_null_when_manifest_missing(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app.film_summary_render, "MUSIC_DIR", str(tmp_path))
+    tense_dir = tmp_path / "tense"
+    tense_dir.mkdir()
+    (tense_dir / "epic_theme.mp3").write_bytes(b"fake")
+    # No licenses.json written at all.
+
+    result = asyncio.run(app.list_film_summary_music_tracks_endpoint(_user_id="u1"))
+
+    assert result["tracks_by_mood"]["tense"][0]["license"] is None
+
+
+def test_list_film_summary_music_tracks_license_null_when_manifest_malformed(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app.film_summary_render, "MUSIC_DIR", str(tmp_path))
+    tense_dir = tmp_path / "tense"
+    tense_dir.mkdir()
+    (tense_dir / "epic_theme.mp3").write_bytes(b"fake")
+    (tmp_path / "licenses.json").write_text("{not valid json")
+
+    result = asyncio.run(app.list_film_summary_music_tracks_endpoint(_user_id="u1"))
+
+    assert result["tracks_by_mood"]["tense"][0]["license"] is None
+
+
+def test_load_film_summary_music_licenses_returns_empty_dict_when_missing(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app.film_summary_render, "MUSIC_DIR", str(tmp_path))
+    assert app._load_film_summary_music_licenses() == {}
+
+
+def test_load_film_summary_music_licenses_returns_empty_dict_on_malformed_json(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app.film_summary_render, "MUSIC_DIR", str(tmp_path))
+    (tmp_path / "licenses.json").write_text("not json at all")
+    assert app._load_film_summary_music_licenses() == {}
 
 
 def test_resolve_music_track_path_rejects_path_traversal(monkeypatch, tmp_path):
@@ -3172,24 +3263,48 @@ def test_update_film_summary_audio_settings_persists_valid_update(monkeypatch, t
     tense_dir.mkdir()
     (tense_dir / "epic_theme.mp3").write_bytes(b"fake")
     monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row()))
+    music_tracks = [{"track_id": "tense/epic_theme.mp3", "start_ms": 0, "end_ms": 5000}]
     update_mock = AsyncMock(return_value=_awaiting_review_film_summary_row(
-        music_track_id="tense/epic_theme.mp3", music_start_ms=0, music_end_ms=5000, subtitles_enabled=True,
+        music_tracks=music_tracks, subtitles_enabled=True,
     ))
     monkeypatch.setattr(app, "supabase_update_film_summary", update_mock)
 
     result = asyncio.run(app.update_film_summary_audio_settings_endpoint(
         film_summary_id="fs_1",
-        payload=app.FilmSummaryAudioSettingsUpdateRequest(
-            music_track_id="tense/epic_theme.mp3", music_start_ms=0, music_end_ms=5000, subtitles_enabled=True,
-        ),
+        payload=app.FilmSummaryAudioSettingsUpdateRequest(music_tracks=music_tracks, subtitles_enabled=True),
         user_id="u1",
     ))
 
     update_mock.assert_awaited_once_with("fs_1", "u1", {
-        "music_track_id": "tense/epic_theme.mp3", "music_start_ms": 0, "music_end_ms": 5000, "subtitles_enabled": True,
+        "music_tracks": music_tracks, "subtitles_enabled": True,
     })
-    assert result["music_track_id"] == "tense/epic_theme.mp3"
+    assert result["music_tracks"] == music_tracks
     assert result["subtitles_enabled"] is True
+
+
+def test_update_film_summary_audio_settings_persists_multiple_tracks(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app.film_summary_render, "MUSIC_DIR", str(tmp_path))
+    tense_dir = tmp_path / "tense"
+    tense_dir.mkdir()
+    (tense_dir / "epic_theme.mp3").write_bytes(b"fake")
+    (tense_dir / "other_theme.mp3").write_bytes(b"fake")
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row()))
+    music_tracks = [
+        {"track_id": "tense/epic_theme.mp3", "start_ms": 0, "end_ms": 5000},
+        {"track_id": "tense/other_theme.mp3", "start_ms": 5000, "end_ms": 10000},
+    ]
+    update_mock = AsyncMock(return_value=_awaiting_review_film_summary_row(music_tracks=music_tracks))
+    monkeypatch.setattr(app, "supabase_update_film_summary", update_mock)
+
+    result = asyncio.run(app.update_film_summary_audio_settings_endpoint(
+        film_summary_id="fs_1",
+        payload=app.FilmSummaryAudioSettingsUpdateRequest(music_tracks=music_tracks),
+        user_id="u1",
+    ))
+
+    update_mock.assert_awaited_once_with("fs_1", "u1", {"music_tracks": music_tracks})
+    assert result["music_tracks"] == music_tracks
 
 
 def test_update_film_summary_audio_settings_rejects_unknown_track(monkeypatch, tmp_path):
@@ -3199,7 +3314,9 @@ def test_update_film_summary_audio_settings_rejects_unknown_track(monkeypatch, t
 
     coro = app.update_film_summary_audio_settings_endpoint(
         film_summary_id="fs_1",
-        payload=app.FilmSummaryAudioSettingsUpdateRequest(music_track_id="tense/missing.mp3"),
+        payload=app.FilmSummaryAudioSettingsUpdateRequest(
+            music_tracks=[{"track_id": "tense/missing.mp3"}],
+        ),
         user_id="u1",
     )
     with pytest.raises(app.HTTPException) as exc_info:
@@ -3207,18 +3324,64 @@ def test_update_film_summary_audio_settings_rejects_unknown_track(monkeypatch, t
     assert exc_info.value.status_code == 400
 
 
-def test_update_film_summary_audio_settings_rejects_backwards_music_range(monkeypatch):
+def test_update_film_summary_audio_settings_rejects_second_entry_unknown_track(monkeypatch, tmp_path):
+    # The first entry resolves fine -- validation must still catch a bad
+    # track_id further down the list, not just the first one.
     app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app.film_summary_render, "MUSIC_DIR", str(tmp_path))
+    tense_dir = tmp_path / "tense"
+    tense_dir.mkdir()
+    (tense_dir / "epic_theme.mp3").write_bytes(b"fake")
     monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row()))
 
     coro = app.update_film_summary_audio_settings_endpoint(
         film_summary_id="fs_1",
-        payload=app.FilmSummaryAudioSettingsUpdateRequest(music_start_ms=5000, music_end_ms=1000),
+        payload=app.FilmSummaryAudioSettingsUpdateRequest(music_tracks=[
+            {"track_id": "tense/epic_theme.mp3"}, {"track_id": "tense/missing.mp3"},
+        ]),
         user_id="u1",
     )
     with pytest.raises(app.HTTPException) as exc_info:
         asyncio.run(coro)
     assert exc_info.value.status_code == 400
+
+
+def test_update_film_summary_audio_settings_rejects_backwards_music_range(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app.film_summary_render, "MUSIC_DIR", str(tmp_path))
+    tense_dir = tmp_path / "tense"
+    tense_dir.mkdir()
+    (tense_dir / "epic_theme.mp3").write_bytes(b"fake")
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row()))
+
+    coro = app.update_film_summary_audio_settings_endpoint(
+        film_summary_id="fs_1",
+        payload=app.FilmSummaryAudioSettingsUpdateRequest(
+            music_tracks=[{"track_id": "tense/epic_theme.mp3", "start_ms": 5000, "end_ms": 1000}],
+        ),
+        user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 400
+
+
+def test_update_film_summary_audio_settings_accepts_empty_music_tracks_list(monkeypatch):
+    # An empty list is a valid update (e.g. "remove all explicit tracks")
+    # and must not trip any per-entry validation.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row()))
+    update_mock = AsyncMock(return_value=_awaiting_review_film_summary_row(music_tracks=[]))
+    monkeypatch.setattr(app, "supabase_update_film_summary", update_mock)
+
+    result = asyncio.run(app.update_film_summary_audio_settings_endpoint(
+        film_summary_id="fs_1",
+        payload=app.FilmSummaryAudioSettingsUpdateRequest(music_tracks=[]),
+        user_id="u1",
+    ))
+
+    update_mock.assert_awaited_once_with("fs_1", "u1", {"music_tracks": []})
+    assert result["music_tracks"] == []
 
 
 def test_update_film_summary_audio_settings_blocks_outside_awaiting_review(monkeypatch):
@@ -3501,7 +3664,7 @@ def test_retry_film_summary_succeeds_from_awaiting_review_and_resets_manual_stat
     app = _import_app_with_stubs(monkeypatch)
     row = _awaiting_review_film_summary_row(
         manual_selection=[{"scene_id": "scene_001", "start_ms": 0, "end_ms": 1000}], edit_mode="manual",
-        music_track_id="tense/epic_theme.mp3", music_start_ms=0, music_end_ms=5000,
+        music_tracks=[{"track_id": "tense/epic_theme.mp3", "start_ms": 0, "end_ms": 5000}],
         subtitles_enabled=True, subtitle_style={"font": "Arial"},
     )
     update_mock = _setup_retry_film_summary_mocks(app, monkeypatch, row, tmp_path)
@@ -3518,7 +3681,7 @@ def test_retry_film_summary_succeeds_from_awaiting_review_and_resets_manual_stat
     assert updates["edit_mode"] == "automatic"
     # Independent user preferences must survive a regenerate untouched --
     # i.e. never even mentioned in the update payload.
-    for untouched_key in ("music_track_id", "music_start_ms", "music_end_ms", "subtitles_enabled", "subtitle_style"):
+    for untouched_key in ("music_tracks", "subtitles_enabled", "subtitle_style"):
         assert untouched_key not in updates
 
 
@@ -4115,19 +4278,19 @@ def test_build_film_summary_subtitle_style_builds_style_options(monkeypatch):
     assert captured["highlight_color"] == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS["highlight_color"]
 
 
-def test_apply_film_summary_music_range_skips_when_no_resolved_path(monkeypatch, tmp_path):
+def test_apply_film_summary_music_range_skips_when_no_resolved_entries(monkeypatch, tmp_path):
     app = _import_app_with_stubs(monkeypatch)
     calls = []
     monkeypatch.setattr(app.film_summary_render, "mix_background_music_range", lambda *a, **k: calls.append((a, k)))
 
     final_path = str(tmp_path / "final.mp4")
-    result = asyncio.run(app._apply_film_summary_music_range(str(tmp_path), final_path, None, None, None))
+    result = asyncio.run(app._apply_film_summary_music_range(str(tmp_path), final_path, []))
 
     assert result == final_path
     assert calls == []
 
 
-def test_apply_film_summary_music_range_mixes_when_resolved_path_given(monkeypatch, tmp_path):
+def test_apply_film_summary_music_range_mixes_single_resolved_entry(monkeypatch, tmp_path):
     app = _import_app_with_stubs(monkeypatch)
     calls = []
     monkeypatch.setattr(
@@ -4136,10 +4299,63 @@ def test_apply_film_summary_music_range_mixes_when_resolved_path_given(monkeypat
     )
 
     final_path = str(tmp_path / "final.mp4")
-    result = asyncio.run(app._apply_film_summary_music_range(str(tmp_path), final_path, "/music/tense/track.mp3", 1000, 5000))
+    result = asyncio.run(app._apply_film_summary_music_range(
+        str(tmp_path), final_path, [{"path": "/music/tense/track.mp3", "start_ms": 1000, "end_ms": 5000}],
+    ))
 
-    assert result == str(tmp_path / "final_with_music.mp4")
-    assert calls == [(final_path, "/music/tense/track.mp3", str(tmp_path / "final_with_music.mp4"), 1000, 5000)]
+    assert result == str(tmp_path / "final_with_music_0.mp4")
+    assert calls == [(final_path, "/music/tense/track.mp3", str(tmp_path / "final_with_music_0.mp4"), 1000, 5000)]
+
+
+def test_apply_film_summary_music_range_chains_multiple_entries_in_order(monkeypatch, tmp_path):
+    # Two tracks on non-overlapping ranges: each must be mixed exactly
+    # once, in order, each chained onto the previous mix's OUTPUT rather
+    # than both mixing from the original final_path.
+    app = _import_app_with_stubs(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        app.film_summary_render, "mix_background_music_range",
+        lambda inp, music, out, start_ms=None, end_ms=None: calls.append((inp, music, out, start_ms, end_ms)),
+    )
+
+    final_path = str(tmp_path / "final.mp4")
+    entries = [
+        {"path": "/music/tense/a.mp3", "start_ms": 0, "end_ms": 5000},
+        {"path": "/music/tense/b.mp3", "start_ms": 5000, "end_ms": 10000},
+    ]
+    result = asyncio.run(app._apply_film_summary_music_range(str(tmp_path), final_path, entries))
+
+    first_output = str(tmp_path / "final_with_music_0.mp4")
+    second_output = str(tmp_path / "final_with_music_1.mp4")
+    assert result == second_output
+    assert calls == [
+        (final_path, "/music/tense/a.mp3", first_output, 0, 5000),
+        (first_output, "/music/tense/b.mp3", second_output, 5000, 10000),
+    ]
+
+
+def test_resolve_film_summary_music_track_entries_skips_unresolvable_track(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app.film_summary_render, "MUSIC_DIR", str(tmp_path))
+    tense_dir = tmp_path / "tense"
+    tense_dir.mkdir()
+    (tense_dir / "epic_theme.mp3").write_bytes(b"fake")
+
+    music_tracks = [
+        {"track_id": "tense/epic_theme.mp3", "start_ms": 0, "end_ms": 5000},
+        {"track_id": "tense/missing.mp3", "start_ms": 5000, "end_ms": 10000},
+    ]
+    resolved = app._resolve_film_summary_music_track_entries(music_tracks)
+
+    assert len(resolved) == 1
+    assert resolved[0]["path"] == str(tense_dir / "epic_theme.mp3")
+    assert resolved[0]["start_ms"] == 0 and resolved[0]["end_ms"] == 5000
+
+
+def test_resolve_film_summary_music_track_entries_handles_empty_list(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    assert app._resolve_film_summary_music_track_entries([]) == []
+    assert app._resolve_film_summary_music_track_entries(None) == []
 
 
 def test_apply_film_summary_subtitle_burn_in_skips_when_disabled(monkeypatch, tmp_path):
@@ -4246,7 +4462,7 @@ def test_run_film_summary_render_pipeline_applies_music_and_subtitles_and_reenco
     plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "original_dialogue", "start_ms": 0, "end_ms": 1000}]}
     asyncio.run(app._run_film_summary_render_pipeline_stages(
         "job-1", "u1", "fs-1", "proj-1", "source-key", str(tmp_path), plan, "cedar", "fr",
-        music_track_id="tense/epic_theme.mp3", music_start_ms=0, music_end_ms=5000,
+        music_tracks=[{"track_id": "tense/epic_theme.mp3", "start_ms": 0, "end_ms": 5000}],
         subtitles_enabled=True, subtitle_style={"fontSize": 18},
     ))
 
@@ -4257,7 +4473,7 @@ def test_run_film_summary_render_pipeline_applies_music_and_subtitles_and_reenco
     assert music_calls[0][3:] == (0, 5000)
     assert len(subtitle_calls) == 1
     # Subtitles burned onto the music-mixed path, not the original final.mp4.
-    assert subtitle_calls[0][0] == str(tmp_path / "final_with_music.mp4")
+    assert subtitle_calls[0][0] == str(tmp_path / "final_with_music_0.mp4")
     # Preview re-encoded once at the end, from the fully post-processed path.
     assert preview_reencode_calls == [(str(tmp_path / "final_with_subtitles.mp4"), str(tmp_path / "preview.mp4"))]
 
@@ -4280,6 +4496,78 @@ def test_run_film_summary_render_pipeline_leaves_preview_untouched_without_new_s
     # Neither post-processing step had a setting to act on, so the preview
     # render_edit_plan already built is never touched again.
     assert preview_reencode_calls == []
+
+
+def test_run_film_summary_render_pipeline_skips_unresolvable_track_without_failing(monkeypatch, tmp_path):
+    # An unresolvable entry (e.g. its file was removed after being saved)
+    # is dropped with a warning rather than failing the whole render -- the
+    # remaining valid entry still gets mixed.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "download_s3_object", lambda bucket, key, path: True)
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda *a, **k: True)
+    monkeypatch.setattr(app.film_summary_render, "MUSIC_DIR", str(tmp_path))
+    tense_dir = tmp_path / "tense"
+    tense_dir.mkdir()
+    (tense_dir / "epic_theme.mp3").write_bytes(b"fake")
+    app._finalize_film_summary_render = AsyncMock()
+    app.reel_job_manager.update_progress = AsyncMock()
+
+    render_calls = []
+    monkeypatch.setattr(
+        app.film_summary_render, "render_edit_plan",
+        lambda *a, on_segment_done, **k: render_calls.append(k.get("skip_mood_music")) or {"segment_count": 1, "final_duration_seconds": 10.0},
+    )
+    music_calls = []
+    monkeypatch.setattr(
+        app.film_summary_render, "mix_background_music_range",
+        lambda inp, music, out, start_ms=None, end_ms=None: music_calls.append((inp, music, out, start_ms, end_ms)) or open(out, "wb").write(b"x"),
+    )
+    monkeypatch.setattr(app.film_summary_render, "encode_preview", lambda *a, **k: None)
+
+    plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "original_dialogue", "start_ms": 0, "end_ms": 1000}]}
+    asyncio.run(app._run_film_summary_render_pipeline_stages(
+        "job-1", "u1", "fs-1", "proj-1", "source-key", str(tmp_path), plan, "cedar", "fr",
+        music_tracks=[
+            {"track_id": "tense/missing.mp3", "start_ms": 0, "end_ms": 1000},
+            {"track_id": "tense/epic_theme.mp3", "start_ms": 1000, "end_ms": 2000},
+        ],
+    ))
+
+    # The missing entry never reached mix_background_music_range -- only
+    # the one valid entry was mixed, and the render still succeeded.
+    assert render_calls == [True]
+    assert len(music_calls) == 1
+    assert music_calls[0][1] == str(tense_dir / "epic_theme.mp3")
+
+
+def test_run_film_summary_render_pipeline_empty_music_tracks_behaves_like_no_explicit_track(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "download_s3_object", lambda bucket, key, path: True)
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda *a, **k: True)
+    app._finalize_film_summary_render = AsyncMock()
+    app.reel_job_manager.update_progress = AsyncMock()
+
+    render_calls = []
+    monkeypatch.setattr(
+        app.film_summary_render, "render_edit_plan",
+        lambda *a, on_segment_done, **k: render_calls.append(k.get("skip_mood_music")) or {"segment_count": 1, "final_duration_seconds": 10.0},
+    )
+    music_calls = []
+    monkeypatch.setattr(
+        app.film_summary_render, "mix_background_music_range",
+        lambda *a, **k: music_calls.append((a, k)),
+    )
+
+    plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "original_dialogue", "start_ms": 0, "end_ms": 1000}]}
+    asyncio.run(app._run_film_summary_render_pipeline_stages(
+        "job-1", "u1", "fs-1", "proj-1", "source-key", str(tmp_path), plan, "cedar", "fr",
+        music_tracks=[],
+    ))
+
+    # Mood-based automatic pick still runs (skip_mood_music=False) and no
+    # explicit mix happens.
+    assert render_calls == [False]
+    assert music_calls == []
 
 
 def test_share_film_summary_rejects_when_not_completed(monkeypatch):

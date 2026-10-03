@@ -2613,6 +2613,15 @@ FILM_SUMMARY_VOICE_PREVIEWS_DIR = os.path.join(OUTPUT_DIR, "voice_previews")
 os.makedirs(FILM_SUMMARY_VOICE_PREVIEWS_DIR, exist_ok=True)
 app.mount("/voice-previews", StaticFiles(directory=FILM_SUMMARY_VOICE_PREVIEWS_DIR), name="voice_previews")
 
+# Mount static files for serving the operator-maintained background-music
+# library itself (see list_film_summary_music_tracks_endpoint's preview_url),
+# so the editor can let the user audition a track before choosing it --
+# same pattern as the voice_previews mount above. licenses.json lives in this
+# same directory tree but is never listed as a track (see
+# list_film_summary_music_tracks_endpoint's MUSIC_TRACK_EXTENSIONS filter),
+# so it is reachable only by someone who already knows its exact path.
+app.mount("/music-tracks-preview", StaticFiles(directory=film_summary_render.MUSIC_DIR), name="music_tracks_preview")
+
 class ProcessRequest(BaseModel):
     url: str
 
@@ -11580,9 +11589,10 @@ class FilmSummaryRenderRequest(BaseModel):
 
 
 class FilmSummaryAudioSettingsUpdateRequest(BaseModel):
-    music_track_id: Optional[str] = None
-    music_start_ms: Optional[int] = None
-    music_end_ms: Optional[int] = None
+    # Each entry: {"track_id": "<mood>/<filename>", "start_ms": Optional[int],
+    # "end_ms": Optional[int]} -- both None means "whole video", same meaning
+    # as the old single-track music_start_ms/music_end_ms, now per-entry.
+    music_tracks: Optional[List[Dict[str, Any]]] = None
     subtitles_enabled: Optional[bool] = None
     subtitle_style: Optional[Dict[str, Any]] = None
 
@@ -11619,9 +11629,7 @@ def _normalize_film_summary_row(row: Dict[str, Any], *, include_content: bool = 
         "updated_at": row.get("updated_at"),
         "completed_at": row.get("completed_at"),
         "edit_mode": row.get("edit_mode") or "automatic",
-        "music_track_id": row.get("music_track_id"),
-        "music_start_ms": row.get("music_start_ms"),
-        "music_end_ms": row.get("music_end_ms"),
+        "music_tracks": row.get("music_tracks") or [],
         "subtitles_enabled": bool(row.get("subtitles_enabled") or False),
         "subtitle_style": row.get("subtitle_style") or None,
     }
@@ -12336,28 +12344,63 @@ async def get_film_summary_voice_preview_endpoint(voice_id: str, _user_id: Annot
     return {"preview_url": f"/voice-previews/{resolved_voice}.mp3"}
 
 
+def _load_film_summary_music_licenses() -> Dict[str, Dict[str, Any]]:
+    """Reads the operator-maintained <MUSIC_DIR>/licenses.json manifest
+    (track_id -> license record, see list_film_summary_music_tracks_
+    endpoint's docstring for the exact shape) so the user can verify
+    Incompetech-style attribution requirements before using a track they
+    dropped into MUSIC_DIR by hand. Never raises: a missing file or
+    malformed JSON is operator error, not something a request should fail
+    over, so both fall back to {} exactly like an empty manifest would.
+    Re-read on every call (no caching) so an edit to the file is picked up
+    on the next request without a server restart -- same cost class as the
+    os.listdir calls just below, since the file is small."""
+    licenses_path = os.path.join(film_summary_render.MUSIC_DIR, "licenses.json")
+    try:
+        with open(licenses_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except Exception:
+        return {}
+    return manifest if isinstance(manifest, dict) else {}
+
+
 @app.get("/api/film-summaries/music-tracks", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}})
 async def list_film_summary_music_tracks_endpoint(_user_id: Annotated[str, Depends(get_user_id_header)]):
     """Lists the instrumental tracks available for background music,
     grouped by mood (see film_summary_render.resolve_background_music_track).
     Each track's "track_id" is the stable identifier the editor sends back
-    via PATCH .../audio-settings's music_track_id.
+    via PATCH .../audio-settings's music_tracks entries. "preview_url" lets
+    the editor let the user audition a track (see the music_tracks_preview
+    static mount); "license" is that track's record from
+    _load_film_summary_music_licenses, or null when the manifest has no
+    entry for it (e.g. it was never recorded, or the manifest itself is
+    missing/malformed) -- never an error either way.
 
     Declared before the /{film_summary_id} route below so this static
     "music-tracks" segment isn't swallowed as a film_summary_id (same
     reason as the voice-previews route above)."""
-    tracks_by_mood: Dict[str, List[Dict[str, str]]] = {}
+    licenses = _load_film_summary_music_licenses()
+    tracks_by_mood: Dict[str, List[Dict[str, Any]]] = {}
     for mood in film_summary.MUSIC_MOODS:
         mood_dir = os.path.join(film_summary_render.MUSIC_DIR, mood)
         if not os.path.isdir(mood_dir):
             continue
+        # licenses.json itself must never surface as a track even if it were
+        # ever placed inside a mood subdirectory by mistake -- the extension
+        # whitelist below already excludes it, same as any other non-audio
+        # file in the directory.
         filenames = sorted(
             f for f in os.listdir(mood_dir) if f.lower().endswith(film_summary_render.MUSIC_TRACK_EXTENSIONS)
         )
         if not filenames:
             continue
         tracks_by_mood[mood] = [
-            {"track_id": f"{mood}/{filename}", "label": os.path.splitext(filename)[0].replace("_", " ").title()}
+            {
+                "track_id": f"{mood}/{filename}",
+                "label": os.path.splitext(filename)[0].replace("_", " ").title(),
+                "preview_url": f"/music-tracks-preview/{mood}/{filename}",
+                "license": licenses.get(f"{mood}/{filename}"),
+            }
             for filename in filenames
         ]
     return {"tracks_by_mood": tracks_by_mood}
@@ -12433,12 +12476,43 @@ def _resolve_music_track_path(track_id: str) -> Optional[str]:
     return candidate if os.path.isfile(candidate) else None
 
 
+def _validate_music_track_entry_resolves(entry: Dict[str, Any]) -> None:
+    """One focused check (of two) applied to every music_tracks entry by
+    _validate_music_tracks_update: its track_id must resolve via
+    _resolve_music_track_path, same validation update_film_summary_audio_
+    settings_endpoint always ran for the old single music_track_id field."""
+    track_id = entry.get("track_id")
+    if not track_id or not _resolve_music_track_path(track_id):
+        detail = f"Unknown music track: {track_id}" if track_id else "Unknown music track"
+        raise HTTPException(status_code=400, detail=detail)
+
+
+def _validate_music_track_entry_range(entry: Dict[str, Any]) -> None:
+    """The other focused check applied to every music_tracks entry: when
+    both start_ms/end_ms are given, end_ms must be after start_ms -- same
+    "end must be after start" rule the old music_end_ms/music_start_ms pair
+    enforced once for the whole row, now per-entry."""
+    start_ms, end_ms = entry.get("start_ms"), entry.get("end_ms")
+    if start_ms is not None and end_ms is not None and end_ms <= start_ms:
+        raise HTTPException(status_code=400, detail="music_end_ms must be after music_start_ms")
+
+
+def _validate_music_tracks_update(music_tracks: List[Dict[str, Any]]) -> None:
+    """Runs both per-entry checks above over every entry, raising 400 on
+    the first bad one (same "fail fast" behavior the old single-track
+    validation had)."""
+    for entry in music_tracks:
+        _validate_music_track_entry_resolves(entry)
+        _validate_music_track_entry_range(entry)
+
+
 @app.patch("/api/film-summaries/{film_summary_id}/audio-settings", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
 async def update_film_summary_audio_settings_endpoint(
     film_summary_id: str, payload: FilmSummaryAudioSettingsUpdateRequest, user_id: Annotated[str, Depends(get_user_id_header)],
 ):
-    """Persists the user's background-music track/range and subtitle
-    toggle/style -- applied at render time (see render_edit_plan /
+    """Persists the user's background-music tracks (a list, see
+    FilmSummaryAudioSettingsUpdateRequest's music_tracks docstring) and
+    subtitle toggle/style -- applied at render time (see render_edit_plan /
     _run_film_summary_render_pipeline_stages, phase 3 of the manual-editor
     work). Editable up to the same point as the plan itself."""
     row = await supabase_get_film_summary(film_summary_id, user_id)
@@ -12449,12 +12523,8 @@ async def update_film_summary_audio_settings_endpoint(
 
     updates = payload.model_dump(exclude_unset=True)
 
-    if updates.get("music_track_id") and not _resolve_music_track_path(updates["music_track_id"]):
-        raise HTTPException(status_code=400, detail="Unknown music track")
-
-    start_ms, end_ms = updates.get("music_start_ms"), updates.get("music_end_ms")
-    if start_ms is not None and end_ms is not None and end_ms <= start_ms:
-        raise HTTPException(status_code=400, detail="music_end_ms must be after music_start_ms")
+    if updates.get("music_tracks"):
+        _validate_music_tracks_update(updates["music_tracks"])
 
     if not updates:
         return _normalize_film_summary_row(row, include_content=True)
@@ -12689,9 +12759,7 @@ async def render_film_summary_endpoint(
         voice_id=voice_id,
         render_required_credits=render_required_credits,
         narration_language=row.get("narration_language") or "",
-        music_track_id=row.get("music_track_id"),
-        music_start_ms=row.get("music_start_ms"),
-        music_end_ms=row.get("music_end_ms"),
+        music_tracks=row.get("music_tracks"),
         subtitles_enabled=bool(row.get("subtitles_enabled")),
         subtitle_style=row.get("subtitle_style"),
     ))
@@ -12702,14 +12770,14 @@ async def render_film_summary_endpoint(
 async def _run_film_summary_render_job(
     job_id: str, user_id: str, film_summary_id: str, project_id: Optional[str], source_s3_key: Optional[str],
     output_dir: str, plan: Dict[str, Any], voice_id: str, render_required_credits: float, narration_language: str,
-    music_track_id: Optional[str] = None, music_start_ms: Optional[int] = None, music_end_ms: Optional[int] = None,
+    music_tracks: Optional[List[Dict[str, Any]]] = None,
     subtitles_enabled: bool = False, subtitle_style: Optional[Dict[str, Any]] = None,
 ) -> None:
     try:
         await reel_job_manager.start_job(job_id)
         await _run_film_summary_render_pipeline_stages(
             job_id, user_id, film_summary_id, project_id, source_s3_key, output_dir, plan, voice_id, narration_language,
-            music_track_id=music_track_id, music_start_ms=music_start_ms, music_end_ms=music_end_ms,
+            music_tracks=music_tracks,
             subtitles_enabled=subtitles_enabled, subtitle_style=subtitle_style,
         )
     except film_summary.FilmSummaryValidationError as exc:
@@ -12799,32 +12867,55 @@ def _build_film_summary_subtitle_style(subtitle_style: Optional[Dict[str, Any]])
     )
 
 
+def _resolve_film_summary_music_track_entries(music_tracks: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Resolves every music_tracks entry's track_id against MUSIC_DIR (see
+    _resolve_music_track_path), dropping -- with a logged warning, rather
+    than failing the whole render -- any entry whose track_id no longer
+    resolves. By this point update_film_summary_audio_settings_endpoint
+    already validated every entry at save time, so this is purely
+    defensive (e.g. a track file removed from disk after being selected).
+    Returns entries in the same order as music_tracks, each as
+    {"path": <resolved absolute path>, "start_ms": ..., "end_ms": ...},
+    ready for _apply_film_summary_music_range to mix in order."""
+    resolved_entries: List[Dict[str, Any]] = []
+    for entry in music_tracks or []:
+        track_id = entry.get("track_id")
+        resolved_path = _resolve_music_track_path(track_id) if track_id else None
+        if not resolved_path:
+            logger.warning(f"Film summary render: skipping music_tracks entry with unresolved track_id {track_id!r}")
+            continue
+        resolved_entries.append({"path": resolved_path, "start_ms": entry.get("start_ms"), "end_ms": entry.get("end_ms")})
+    return resolved_entries
+
+
 async def _apply_film_summary_music_range(
-    output_dir: str, final_path: str, resolved_music_path: Optional[str],
-    music_start_ms: Optional[int], music_end_ms: Optional[int],
+    output_dir: str, final_path: str, resolved_music_tracks: List[Dict[str, Any]],
 ) -> str:
-    """Phase 3 post-processing step (a): if the row resolved a real
-    music_track_id (see _resolve_music_track_path), mixes it once over
-    final_path's own [music_start_ms, music_end_ms] range -- both None
-    means the whole video -- and returns the new path. Returns final_path
-    unchanged when there is no resolved track, so the pipeline behaves
-    exactly as today for any film summary without this setting. The
+    """Phase 3 post-processing step (a): mixes every resolved music_tracks
+    entry (see _resolve_film_summary_music_track_entries) onto final_path,
+    each on its own [start_ms, end_ms] range -- both None means the whole
+    video, same meaning as before. Entries are chained: entry N's input is
+    entry N-1's output, and the very first entry's input is final_path as
+    it stood before this step. Returns final_path unchanged when
+    resolved_music_tracks is empty, so the pipeline behaves exactly as
+    today for any film summary with no (valid) explicit track. The
     per-segment mood-based mix render_edit_plan would otherwise perform is
-    already skipped by the caller (skip_mood_music=True) whenever this
-    runs, so the two music sources never stack."""
-    if not resolved_music_path:
-        return final_path
-    new_path = os.path.join(output_dir, "final_with_music.mp4")
-    try:
-        await asyncio.to_thread(
-            film_summary_render.mix_background_music_range,
-            final_path, resolved_music_path, new_path, start_ms=music_start_ms, end_ms=music_end_ms,
-        )
-    except film_summary.FilmSummaryValidationError:
-        raise
-    except Exception as exc:
-        raise film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.RENDER_FAILED, f"Background music mix failed: {exc}") from exc
-    return new_path
+    already skipped by the caller (skip_mood_music=True) whenever at least
+    one entry resolves, so the two music sources never stack."""
+    current_path = final_path
+    for index, entry in enumerate(resolved_music_tracks):
+        new_path = os.path.join(output_dir, f"final_with_music_{index}.mp4")
+        try:
+            await asyncio.to_thread(
+                film_summary_render.mix_background_music_range,
+                current_path, entry["path"], new_path, start_ms=entry.get("start_ms"), end_ms=entry.get("end_ms"),
+            )
+        except film_summary.FilmSummaryValidationError:
+            raise
+        except Exception as exc:
+            raise film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.RENDER_FAILED, f"Background music mix failed: {exc}") from exc
+        current_path = new_path
+    return current_path
 
 
 async def _apply_film_summary_subtitle_burn_in(
@@ -12871,7 +12962,7 @@ async def _apply_film_summary_subtitle_burn_in(
 async def _run_film_summary_render_pipeline_stages(
     job_id: str, user_id: str, film_summary_id: str, project_id: Optional[str], source_s3_key: Optional[str],
     output_dir: str, plan: Dict[str, Any], voice_id: str, narration_language: str,
-    music_track_id: Optional[str] = None, music_start_ms: Optional[int] = None, music_end_ms: Optional[int] = None,
+    music_tracks: Optional[List[Dict[str, Any]]] = None,
     subtitles_enabled: bool = False, subtitle_style: Optional[Dict[str, Any]] = None,
 ) -> None:
     bucket_name = os.environ.get("AWS_S3_BUCKET", "my-clips-bucket")
@@ -12929,10 +13020,10 @@ async def _run_film_summary_render_pipeline_stages(
     final_path = os.path.join(output_dir, "final.mp4")
     preview_path = os.path.join(output_dir, "preview.mp4")
     # Resolved up front (before render_edit_plan runs) so skip_mood_music
-    # can be threaded into that call -- the user's explicit track is
-    # layered on afterward over the correct final-video range instead,
-    # rather than per-segment, so the two must never both apply.
-    resolved_music_path = _resolve_music_track_path(music_track_id) if music_track_id else None
+    # can be threaded into that call -- the user's explicit track(s) are
+    # layered on afterward over each one's own range instead, rather than
+    # per-segment, so the two must never both apply.
+    resolved_music_tracks = _resolve_film_summary_music_track_entries(music_tracks)
     try:
         render_result = await asyncio.to_thread(
             film_summary_render.render_edit_plan,
@@ -12940,7 +13031,7 @@ async def _run_film_summary_render_pipeline_stages(
             voiceover_paths_by_segment_id=voiceover_paths, work_dir=os.path.join(output_dir, "work"),
             final_output_path=final_path, preview_output_path=preview_path,
             on_segment_done=_on_segment_done,
-            skip_mood_music=bool(resolved_music_path),
+            skip_mood_music=bool(resolved_music_tracks),
         )
     except film_summary.FilmSummaryValidationError:
         raise
@@ -12949,15 +13040,15 @@ async def _run_film_summary_render_pipeline_stages(
 
     await reel_job_manager.update_progress(job_id, 90, film_summary.FilmSummaryStage.RENDERING_FINAL)
 
-    # Phase 3 post-processing: an explicit music track mixed over the final
-    # video's own range, then subtitle burn-in over the (possibly
+    # Phase 3 post-processing: every explicit music track mixed in order
+    # over the final video, then subtitle burn-in over the (possibly
     # music-mixed) result -- in that order, so burned-in subtitles are never
     # re-encoded away by the music mix. Either runs only if its setting is
     # present on the row; when neither does, final_path is untouched and the
     # preview render_edit_plan already built stays valid as-is.
     path_before_post_processing = final_path
     final_path = await _apply_film_summary_music_range(
-        output_dir, final_path, resolved_music_path, music_start_ms, music_end_ms,
+        output_dir, final_path, resolved_music_tracks,
     )
     final_path = await _apply_film_summary_subtitle_burn_in(
         output_dir, final_path, subtitles_enabled, subtitle_style,
@@ -13078,9 +13169,9 @@ def _retry_film_summary_status_updates(previous_status: str, retry_job_id: str) 
     retry (automatic or failed/failed resubmission), plus -- only when
     retriggered from awaiting_review -- clearing any stale manual-editor
     state, since a full automatic regenerate makes it meaningless against
-    the brand-new plan about to replace it. music_track_id/music_start_ms/
-    music_end_ms/subtitles_enabled/subtitle_style are independent user
-    preferences and are deliberately left untouched here."""
+    the brand-new plan about to replace it. music_tracks/subtitles_enabled/
+    subtitle_style are independent user preferences and are deliberately
+    left untouched here."""
     updates: Dict[str, Any] = {
         "status": film_summary.FilmSummaryStatus.QUEUED,
         "stage": film_summary.FilmSummaryStage.UPLOADING,
