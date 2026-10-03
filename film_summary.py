@@ -116,6 +116,15 @@ SEGMENT_TYPES = (SEGMENT_TYPE_VOICE_OVER, SEGMENT_TYPE_ORIGINAL_DIALOGUE, SEGMEN
 MUSIC_MOODS = ("tense", "dark", "hopeful", "romantic", "melancholic", "triumphant", "comedic", "neutral")
 DEFAULT_MUSIC_MOOD = "neutral"
 
+# Hard cap on a film summary's total runtime (automatic or manual plans
+# alike): "il est preferable que les resumes de films ne depassent pas
+# 5mn" -- kept as a changeable env-configurable constant, same convention
+# as FILM_SUMMARY_PLANNING_MODEL below, and enforced as a BLOCKING check in
+# validate_edit_plan_content so every caller (generate_edit_plan,
+# generate_narration_for_selected_clips, and the /validate and /render
+# endpoints that re-run that same validator) rejects an over-length plan.
+FILM_SUMMARY_MAX_PLAN_DURATION_MS = int(os.environ.get("FILM_SUMMARY_MAX_PLAN_DURATION_MS", str(5 * 60 * 1000)))
+
 EDIT_PLAN_SCHEMA_VERSION = "1.0"
 
 
@@ -579,6 +588,20 @@ def _validate_duration_tolerance(total_ms: int, target_ms: int, duration_toleran
     ]
 
 
+def _validate_max_plan_duration(total_ms: int) -> List[str]:
+    """Blocking cap on a film summary's total runtime (automatic or
+    manual), independent of -- and checked in addition to -- the
+    target-duration tolerance above: a plan can be within tolerance of an
+    overly ambitious target_duration_ms and still need to be rejected for
+    exceeding FILM_SUMMARY_MAX_PLAN_DURATION_MS outright."""
+    if total_ms <= FILM_SUMMARY_MAX_PLAN_DURATION_MS:
+        return []
+    return [
+        f"La duree totale estimee de {total_ms}ms depasse la limite maximale autorisee de "
+        f"{FILM_SUMMARY_MAX_PLAN_DURATION_MS}ms pour un resume de film"
+    ]
+
+
 def validate_edit_plan_content(
     plan: Dict[str, Any], *, source_duration_ms: int, valid_scene_ids: Optional[List[str]] = None,
     duration_tolerance_ratio: float = 0.15,
@@ -609,6 +632,7 @@ def validate_edit_plan_content(
     total_ms = compute_total_estimated_duration_ms(segments)
     target_ms = int(plan.get("target_duration_ms") or 0)
     errors.extend(_validate_duration_tolerance(total_ms, target_ms, duration_tolerance_ratio))
+    errors.extend(_validate_max_plan_duration(total_ms))
 
     return {
         "valid": not errors,
@@ -758,6 +782,53 @@ def validate_manual_selection_partition(plan: Dict[str, Any], manual_selection: 
             "and in the same order, merely grouped into voice_over segments -- got "
             f"{produced} instead of the expected {expected}",
         )
+
+
+_NARRATION_TRANSLATION_INVARIANT_SEGMENT_FIELDS = ("id", "type", "sequence", "estimated_duration_ms", "source_event_ids")
+
+
+def _narration_translation_segment_signature(seg: Dict[str, Any]) -> Dict[str, Any]:
+    """The subset of a segment's fields a narration translation must never
+    touch (see validate_narration_translation_structure) -- everything
+    except `narration` itself (and, for voice_over, `actual_duration_ms`,
+    which the translation call never sets)."""
+    signature = {field: seg.get(field) for field in _NARRATION_TRANSLATION_INVARIANT_SEGMENT_FIELDS}
+    if seg.get("type") == SEGMENT_TYPE_VOICE_OVER:
+        signature["clips"] = [_clip_signature(c) for c in (seg.get("clips") or [])]
+    else:
+        signature["start_ms"] = seg.get("start_ms")
+        signature["end_ms"] = seg.get("end_ms")
+    return signature
+
+
+def validate_narration_translation_structure(original_plan: Dict[str, Any], translated_plan: Dict[str, Any]) -> None:
+    """The one invariant translate_edit_plan_narration's model must never
+    violate: the translated plan has exactly the same segments, in the
+    same order -- same id/type/sequence/clips/start_ms/end_ms/estimated_
+    duration_ms/source_event_ids as the original plan -- only each
+    voice_over segment's `narration` text may differ (total_estimated_
+    duration_ms/unresolved_ambiguities may be recomputed from it).
+
+    Raises FilmSummaryValidationError(PLAN_INVALID, ...) on any violation;
+    returns None when the invariant holds."""
+    original_segments = original_plan.get("segments") or []
+    translated_segments = translated_plan.get("segments") or []
+    if len(original_segments) != len(translated_segments):
+        raise FilmSummaryValidationError(
+            FilmSummaryErrorCode.PLAN_INVALID,
+            f"Translated plan has {len(translated_segments)} segments, expected exactly "
+            f"{len(original_segments)} (same count, same order, as the original plan)",
+        )
+
+    for original_seg, translated_seg in zip(original_segments, translated_segments):
+        original_signature = _narration_translation_segment_signature(original_seg)
+        translated_signature = _narration_translation_segment_signature(translated_seg)
+        if original_signature != translated_signature:
+            raise FilmSummaryValidationError(
+                FilmSummaryErrorCode.PLAN_INVALID,
+                f"Translated segment {translated_seg.get('id')} must keep every field unchanged except "
+                f"narration -- expected {original_signature}, got {translated_signature}",
+            )
 
 
 def tts_cache_key(text: str, model: str, voice: str, instructions: str) -> str:
@@ -974,6 +1045,45 @@ Every segment's "type" MUST be exactly "voice_over" -- never "original_dialogue"
 OUTPUT CONTRACT
 Return JSON only. Do not use Markdown. Do not include commentary before or after the JSON.
 Before returning the JSON, silently verify: concatenating every segment's clips, in sequence order, reproduces manual_clips exactly -- same items, same order, nothing added, removed, reordered or modified; sequence numbers are contiguous starting at 1; every segment's type is "voice_over"."""
+
+
+# Narrower still than MANUAL_NARRATION_SYSTEM_PROMPT (see translate_edit_
+# plan_narration): the plan -- footage, timing, segment structure -- is
+# already final and approved; the only thing wrong with it is the
+# narration's language ("il arrive qu'on ait fait une mauvaise selection au
+# debut"). The model's only job is to translate text, never to re-edit.
+NARRATION_TRANSLATION_SYSTEM_PROMPT = """You are Vireel's Film Summary Narration Translation Engine. An edit plan for a film summary already exists -- its footage, timing and segment structure are final and approved. The only problem is that its narration was written in the wrong language. Your ONLY job is to translate the spoken narration text of each voice_over segment into the requested target_language. You do not edit, re-cut, re-order, re-group, add, remove or re-time anything else.
+
+You have no permission to change any field other than a voice_over segment's "narration". Every other field -- "id", "type", "sequence", "clips" (and every clip's "scene_id", "start_ms", "end_ms"), "start_ms"/"end_ms" on non-voice_over segments, "estimated_duration_ms", "source_event_ids", "characters" and "music_mood" -- must be copied byte-for-byte identical to the input, in the same order, same count. A segment whose "type" is "original_dialogue" or "breathing" has no "narration" field at all (its "transcript_excerpt" is the original movie's own verbatim dialogue, not voice-over, and must never be translated or altered) -- copy that segment through completely unchanged.
+
+INPUTS
+- movie_metadata: title, source duration, source language and technical metadata
+- target_language: the language to translate every voice_over segment's narration into
+- characters, segments, music_mood: the existing plan's own fields, to copy through (segments' narration aside) exactly as given
+
+TRANSLATION RULES
+1. Translate only the "narration" string of each voice_over segment into target_language. Preserve its meaning, tone and register -- a natural, cinematic, emotionally precise translation suitable for AI speech, not a literal word-for-word rendering.
+2. Never shorten, lengthen, embellish, summarize or otherwise rewrite the narration's content beyond what translation requires. Keep roughly the same information density and pacing.
+3. Leave "estimated_duration_ms" exactly as given, even though the translated text's natural spoken length may differ slightly -- the backend recomputes real durations from actual TTS output, not from this estimate.
+4. Do not translate, alter or re-quote any "transcript_excerpt" (original_dialogue/breathing segments play the movie's own original-language audio verbatim).
+
+OUTPUT SCHEMA
+Return exactly this JSON shape -- every field required unless marked optional:
+{
+  "status": "ok"   (optional, default "ok"),
+  "characters": [ <copied through unchanged> ],
+  "segments": [ <segment, see below -- same count and order as the input> ],
+  "total_estimated_duration_ms": integer   (your own best-effort sum, backend recomputes the authoritative value),
+  "music_mood": <copied through unchanged>,
+  "unresolved_ambiguities": [string]   (may be empty)
+}
+Each segment object must have exactly the same shape and field values as the corresponding input segment, with this single exception: a "voice_over" segment's "narration" field holds the translated text instead of the original. Concretely:
+- When "type" is "voice_over": "id", "sequence", "type", "estimated_duration_ms", "source_event_ids", "clips" copied through unchanged; "narration" is the translation.
+- When "type" is "original_dialogue" or "breathing": "id", "sequence", "type", "start_ms", "end_ms", "transcript_excerpt", "speaker_ids" all copied through unchanged -- there is no "narration" field to translate.
+
+OUTPUT CONTRACT
+Return JSON only. Do not use Markdown. Do not include commentary before or after the JSON.
+Before returning the JSON, silently verify: the segment count, order, types, sequence numbers, clips, timecodes, estimated_duration_ms, source_event_ids, characters and music_mood are all byte-for-byte identical to the input; only each voice_over segment's narration text has changed, and it is a faithful translation into target_language."""
 
 
 TTS_INSTRUCTIONS_TEMPLATE = (
@@ -1385,6 +1495,132 @@ async def generate_narration_for_selected_clips(
         raise partition_error
 
     return {"plan": plan, "validation_report": validation_report, "usage": total_usage}
+
+
+# ---------------------------------------------------------------------------
+# Narration (re)translation (see NARRATION_TRANSLATION_SYSTEM_PROMPT /
+# translate_edit_plan_narration): lets the user fix a wrong narration
+# language choice on an already-approved plan -- footage, timing and
+# segment structure are untouched, only the voice_over text is rewritten in
+# the newly chosen language.
+# ---------------------------------------------------------------------------
+
+def _build_narration_translation_payload(
+    *, plan: Dict[str, Any], target_language: str, movie_metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Only the fields the translation model actually needs: the existing
+    plan's own characters/segments/music_mood (to copy through verbatim,
+    translating only each voice_over segment's narration) plus the
+    requested target_language and movie_metadata for context."""
+    return {
+        "movie_metadata": movie_metadata,
+        "target_language": target_language,
+        "characters": plan.get("characters") or [],
+        "segments": plan.get("segments") or [],
+        "music_mood": plan.get("music_mood") or DEFAULT_MUSIC_MOOD,
+    }
+
+
+def _build_narration_translation_correction_message(
+    validation_report: Dict[str, Any], structure_error: Optional["FilmSummaryValidationError"],
+) -> Dict[str, str]:
+    """Same spirit as _build_manual_narration_correction_message, plus the
+    one extra failure mode specific to this mode: the model altered,
+    reordered, dropped or added a segment/clip instead of merely
+    translating narration text (see validate_narration_translation_structure)."""
+    errors = "; ".join(validation_report.get("errors") or [])
+    warnings = "; ".join(validation_report.get("warnings") or [])
+
+    sentences = []
+    if structure_error is not None:
+        sentences.append(f"Your previous response violated the translation invariant: {structure_error}.")
+    if errors:
+        sentences.append(f"Your previous plan failed automated validation with these blocking errors: {errors}.")
+    if warnings:
+        sentences.append(f"It also has these quality issues you should fix even though they did not block validation: {warnings}.")
+
+    return {
+        "role": "user",
+        "content": (
+            f"{' '.join(sentences)} Return a corrected full plan (same OUTPUT SCHEMA, JSON only) that keeps "
+            "every field byte-for-byte identical to your previous response except each voice_over segment's "
+            "narration, translated into the requested target_language, while fixing every issue above."
+        ),
+    }
+
+
+async def translate_edit_plan_narration(
+    *, plan: Dict[str, Any], target_language: str, movie_metadata: Dict[str, Any],
+    duration_tolerance_ratio: float = 0.15,
+) -> Dict[str, Any]:
+    """AI-driven retranslation of an already-approved edit plan's narration
+    into a newly chosen target_language, keeping every clip, timecode and
+    segment exactly as-is (see validate_narration_translation_structure) --
+    lets the user correct a wrong narration-language choice after the fact
+    without regenerating or re-matching any footage ("l'IA va retraduire
+    dans la langue qu'on va choisir car il arrive qu'on ait fait une
+    mauvaise selection au debut").
+
+    Returns the same {"plan", "validation_report", "usage"} shape as
+    generate_narration_for_selected_clips. Raises FilmSummaryValidationError
+    when plan has no segments, when every attempt still produces malformed
+    JSON (see _parse_planning_json_with_retry), or when the model's
+    response still violates validate_narration_translation_structure after
+    exhausting every retry -- a translation must never be allowed to
+    silently alter the approved footage or timing."""
+    segments = plan.get("segments") or []
+    if not segments:
+        raise FilmSummaryValidationError(FilmSummaryErrorCode.PLAN_INVALID, "plan has no segments to translate")
+
+    client = _get_openai_client()
+    model_name = os.environ.get("FILM_SUMMARY_PLANNING_MODEL", os.environ.get("OPENAI_MODEL", "gpt-4o"))
+    max_attempts = int(os.environ.get("FILM_SUMMARY_PLANNING_MAX_ATTEMPTS", "2"))
+
+    target_duration_ms = int(plan.get("target_duration_ms") or compute_total_estimated_duration_ms(segments))
+    payload = _build_narration_translation_payload(plan=plan, target_language=target_language, movie_metadata=movie_metadata)
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": NARRATION_TRANSLATION_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(payload)},
+    ]
+    source_duration_ms = int(movie_metadata.get("source_duration_ms") or 0)
+
+    total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    translated_plan: Dict[str, Any] = {}
+    validation_report: Dict[str, Any] = {"valid": False, "errors": [], "warnings": []}
+    structure_error: Optional[FilmSummaryValidationError] = None
+
+    for attempt in range(max(1, max_attempts)):
+        response = await asyncio.to_thread(_call_planning_model, client, model_name, messages)
+        raw_text = response.choices[0].message.content
+        usage = _usage_dict(response, model_name)
+        total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
+        total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+
+        raw = _parse_planning_json_with_retry(raw_text, attempt=attempt, max_attempts=max_attempts, messages=messages)
+        if raw is None:
+            continue
+
+        translated_plan = validate_edit_plan_schema(raw, movie_metadata=movie_metadata, target_duration_ms=target_duration_ms)
+
+        structure_error = None
+        try:
+            validate_narration_translation_structure(plan, translated_plan)
+        except FilmSummaryValidationError as exc:
+            structure_error = exc
+
+        validation_report = validate_edit_plan_content(
+            translated_plan, source_duration_ms=source_duration_ms, duration_tolerance_ratio=duration_tolerance_ratio,
+        )
+        has_fixable_issue = structure_error is not None or not validation_report["valid"] or bool(validation_report["warnings"])
+        if not has_fixable_issue or attempt == max_attempts - 1:
+            break
+        messages.append({"role": "assistant", "content": raw_text})
+        messages.append(_build_narration_translation_correction_message(validation_report, structure_error))
+
+    if structure_error is not None:
+        raise structure_error
+
+    return {"plan": translated_plan, "validation_report": validation_report, "usage": total_usage}
 
 
 def _build_utterance_segments(transcript: Any) -> List[Dict[str, Any]]:

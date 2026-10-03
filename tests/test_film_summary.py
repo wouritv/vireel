@@ -396,6 +396,60 @@ def test_validate_edit_plan_content_warns_on_repeated_clip():
 
 
 # ---------------------------------------------------------------------------
+# FILM_SUMMARY_MAX_PLAN_DURATION_MS hard cap (blocking, both automatic and
+# manual plans go through validate_edit_plan_content)
+# ---------------------------------------------------------------------------
+
+def _plan_with_total_duration_ms(total_ms):
+    raw = _valid_raw_plan()
+    # Fold the whole total into the single voice_over segment's estimated
+    # duration and drop the original_dialogue segment, so total_estimated_
+    # duration_ms is exactly total_ms with nothing else to account for.
+    raw["segments"] = [raw["segments"][0]]
+    raw["segments"][0]["sequence"] = 1
+    raw["segments"][0]["estimated_duration_ms"] = total_ms
+    movie_metadata = {"title": "M", "source_duration_ms": 3600000, "source_language": "en", "narration_language": "en"}
+    return fs.validate_edit_plan_schema(raw, movie_metadata=movie_metadata, target_duration_ms=total_ms)
+
+
+def test_validate_edit_plan_content_passes_under_max_plan_duration():
+    plan = _plan_with_total_duration_ms(fs.FILM_SUMMARY_MAX_PLAN_DURATION_MS - 1000)
+    report = fs.validate_edit_plan_content(
+        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001"], duration_tolerance_ratio=0.5,
+    )
+    assert report["valid"] is True
+    assert report["errors"] == []
+
+
+def test_validate_edit_plan_content_rejects_plan_over_max_duration():
+    plan = _plan_with_total_duration_ms(fs.FILM_SUMMARY_MAX_PLAN_DURATION_MS + 1000)
+    report = fs.validate_edit_plan_content(
+        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001"], duration_tolerance_ratio=0.5,
+    )
+    assert report["valid"] is False
+    assert any("depasse la limite maximale" in e for e in report["errors"])
+
+
+def test_validate_edit_plan_content_max_duration_threshold_is_configurable(monkeypatch):
+    # A plan comfortably under the default 5-minute cap must start failing
+    # once the configurable threshold is lowered below its total -- proves
+    # the check reads FILM_SUMMARY_MAX_PLAN_DURATION_MS live rather than a
+    # value captured once at import time.
+    plan = _plan_with_total_duration_ms(60000)
+    report = fs.validate_edit_plan_content(
+        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001"], duration_tolerance_ratio=0.5,
+    )
+    assert report["valid"] is True
+
+    monkeypatch.setattr(fs, "FILM_SUMMARY_MAX_PLAN_DURATION_MS", 30000)
+    report = fs.validate_edit_plan_content(
+        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001"], duration_tolerance_ratio=0.5,
+    )
+    assert report["valid"] is False
+    assert any("depasse la limite maximale" in e for e in report["errors"])
+
+
+# ---------------------------------------------------------------------------
 # realign_plan_target_duration
 # ---------------------------------------------------------------------------
 
@@ -1115,6 +1169,167 @@ def test_generate_narration_for_selected_clips_converges_after_one_correction(mo
     assert produced_clips == [("scene_001", 0, 5000), ("scene_002", 1000, 6000)]
     sent_messages = fake_client.chat.completions.create.call_args_list[1].kwargs["messages"]
     assert "clip partition rule" in sent_messages[-1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# validate_narration_translation_structure
+# ---------------------------------------------------------------------------
+
+def test_validate_narration_translation_structure_allows_narration_only_change():
+    original_plan = _built_plan()
+    translated_plan = json.loads(json.dumps(original_plan))
+    translated_plan["segments"][0]["narration"] = "Traduction."
+    fs.validate_narration_translation_structure(original_plan, translated_plan)  # must not raise
+
+
+def test_validate_narration_translation_structure_rejects_altered_clip():
+    original_plan = _built_plan()
+    translated_plan = json.loads(json.dumps(original_plan))
+    translated_plan["segments"][0]["clips"][0]["end_ms"] = 1
+    with pytest.raises(fs.FilmSummaryValidationError) as exc_info:
+        fs.validate_narration_translation_structure(original_plan, translated_plan)
+    assert exc_info.value.code == fs.FilmSummaryErrorCode.PLAN_INVALID
+
+
+def test_validate_narration_translation_structure_rejects_segment_count_mismatch():
+    original_plan = _built_plan()
+    translated_plan = json.loads(json.dumps(original_plan))
+    translated_plan["segments"].pop()
+    with pytest.raises(fs.FilmSummaryValidationError):
+        fs.validate_narration_translation_structure(original_plan, translated_plan)
+
+
+def test_validate_narration_translation_structure_rejects_reordered_segments():
+    original_plan = _built_plan()
+    translated_plan = json.loads(json.dumps(original_plan))
+    translated_plan["segments"] = list(reversed(translated_plan["segments"]))
+    with pytest.raises(fs.FilmSummaryValidationError):
+        fs.validate_narration_translation_structure(original_plan, translated_plan)
+
+
+# ---------------------------------------------------------------------------
+# translate_edit_plan_narration (network call mocked)
+# ---------------------------------------------------------------------------
+
+def _translated_raw_plan(original_plan, narration_text="Il etait une fois."):
+    segments = []
+    for seg in original_plan["segments"]:
+        seg_copy = dict(seg)
+        if seg_copy.get("type") == fs.SEGMENT_TYPE_VOICE_OVER:
+            seg_copy["narration"] = narration_text
+            seg_copy["clips"] = [dict(c) for c in seg_copy.get("clips") or []]
+        segments.append(seg_copy)
+    return {
+        "status": "ok",
+        "characters": original_plan.get("characters") or [],
+        "segments": segments,
+        "total_estimated_duration_ms": original_plan.get("total_estimated_duration_ms"),
+        "music_mood": original_plan.get("music_mood"),
+        "unresolved_ambiguities": [],
+    }
+
+
+def test_translate_edit_plan_narration_translates_and_preserves_structure(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    original_plan = _built_plan()
+    translated_raw = _translated_raw_plan(original_plan, "Il etait une fois.")
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = _fake_openai_response(json.dumps(translated_raw))
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    movie_metadata = {"title": "M", "source_duration_ms": 3600000}
+    result = asyncio.run(fs.translate_edit_plan_narration(
+        plan=original_plan, target_language="fr", movie_metadata=movie_metadata,
+    ))
+
+    fake_client.chat.completions.create.assert_called_once()
+    translated_plan = result["plan"]
+    voice_over = next(s for s in translated_plan["segments"] if s["type"] == "voice_over")
+    dialogue = next(s for s in translated_plan["segments"] if s["type"] == "original_dialogue")
+    assert voice_over["narration"] == "Il etait une fois."
+    # Everything else -- clips, timing, the original (untranslated) quoted
+    # dialogue -- must come through unchanged.
+    assert voice_over["clips"] == original_plan["segments"][0]["clips"]
+    assert dialogue["transcript_excerpt"] == "I know."
+    assert dialogue["start_ms"] == 9000 and dialogue["end_ms"] == 12000
+    assert result["validation_report"]["valid"] is True
+    assert result["usage"]["prompt_tokens"] == 10
+
+
+def test_translate_edit_plan_narration_rejects_fabricated_clip_alteration(monkeypatch):
+    # Rejection path: a fabricated response that alters a clip (not just
+    # the narration) must never be allowed to silently diverge from the
+    # already-approved plan (see validate_narration_translation_structure)
+    # -- it must raise even after exhausting the corrective retry.
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    original_plan = _built_plan()
+    altered_raw = _translated_raw_plan(original_plan, "Traduction.")
+    altered_raw["segments"][0]["clips"][0]["end_ms"] = 999
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = _fake_openai_response(json.dumps(altered_raw))
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    movie_metadata = {"title": "M", "source_duration_ms": 3600000}
+    coro = fs.translate_edit_plan_narration(plan=original_plan, target_language="fr", movie_metadata=movie_metadata)
+    with pytest.raises(fs.FilmSummaryValidationError) as exc_info:
+        asyncio.run(coro)
+
+    assert exc_info.value.code == fs.FilmSummaryErrorCode.PLAN_INVALID
+    # Exhausted the corrective retry (default max attempts is 2) instead of
+    # raising immediately on the first bad response.
+    assert fake_client.chat.completions.create.call_count == 2
+
+
+def test_translate_edit_plan_narration_rejects_dropped_segment(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    original_plan = _built_plan()
+    raw = _translated_raw_plan(original_plan, "Traduction.")
+    raw["segments"] = raw["segments"][:1]  # the original_dialogue segment silently dropped
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = _fake_openai_response(json.dumps(raw))
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    movie_metadata = {"title": "M", "source_duration_ms": 3600000}
+    coro = fs.translate_edit_plan_narration(plan=original_plan, target_language="fr", movie_metadata=movie_metadata)
+    with pytest.raises(fs.FilmSummaryValidationError):
+        asyncio.run(coro)
+
+
+def test_translate_edit_plan_narration_converges_after_one_correction(monkeypatch):
+    # The model's first response alters a clip; its second response (after
+    # the corrective follow-up) keeps every field but narration unchanged
+    # and must be accepted.
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    original_plan = _built_plan()
+    broken_raw = _translated_raw_plan(original_plan, "Traduction cassee.")
+    broken_raw["segments"][0]["clips"][0]["end_ms"] = 999
+    fixed_raw = _translated_raw_plan(original_plan, "Traduction correcte.")
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.side_effect = [
+        _fake_openai_response(json.dumps(broken_raw)),
+        _fake_openai_response(json.dumps(fixed_raw)),
+    ]
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    movie_metadata = {"title": "M", "source_duration_ms": 3600000}
+    result = asyncio.run(fs.translate_edit_plan_narration(
+        plan=original_plan, target_language="fr", movie_metadata=movie_metadata,
+    ))
+
+    assert fake_client.chat.completions.create.call_count == 2
+    voice_over = next(s for s in result["plan"]["segments"] if s["type"] == "voice_over")
+    assert voice_over["narration"] == "Traduction correcte."
+    sent_messages = fake_client.chat.completions.create.call_args_list[1].kwargs["messages"]
+    assert "translation invariant" in sent_messages[-1]["content"]
+
+
+def test_translate_edit_plan_narration_raises_when_plan_has_no_segments(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    coro = fs.translate_edit_plan_narration(plan={"segments": []}, target_language="fr", movie_metadata={})
+    with pytest.raises(fs.FilmSummaryValidationError) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.code == fs.FilmSummaryErrorCode.PLAN_INVALID
 
 
 # ---------------------------------------------------------------------------

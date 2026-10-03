@@ -11593,6 +11593,10 @@ class FilmSummaryManualSelectionUpdateRequest(BaseModel):
     manual_selection: List[Dict[str, Any]]
 
 
+class FilmSummaryTranslateNarrationRequest(BaseModel):
+    narration_language: str
+
+
 def _normalize_film_summary_row(row: Dict[str, Any], *, include_content: bool = False) -> Dict[str, Any]:
     item = {
         "id": row.get("id"),
@@ -12542,6 +12546,53 @@ async def generate_film_summary_narration_endpoint(
     return _normalize_film_summary_row(updated, include_content=True)
 
 
+@app.post("/api/film-summaries/{film_summary_id}/translate-narration", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}})
+async def translate_film_summary_narration_endpoint(
+    film_summary_id: str, payload: FilmSummaryTranslateNarrationRequest, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Lets the user fix a wrong narration-language choice on an already-
+    generated plan after the fact (see film_summary.translate_edit_plan_
+    narration's docstring): footage, timing and segment structure are
+    untouched, only each voice_over segment's narration text is
+    retranslated. Persists the translated plan plus the row's own
+    narration_language (so any later TTS/regeneration reflects the
+    correction too), same 404/409/502 conventions as the sibling
+    generate_film_summary_narration_endpoint."""
+    row = await supabase_get_film_summary(film_summary_id, user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
+    if row.get("status") != film_summary.FilmSummaryStatus.AWAITING_REVIEW:
+        raise HTTPException(status_code=409, detail="Narration language can only be edited while awaiting review")
+
+    resolved_language, _ = _resolve_film_summary_narration_settings(payload.narration_language, row.get("narration_style"))
+    if not resolved_language:
+        raise HTTPException(status_code=400, detail="narration_language is required")
+
+    movie_metadata = {
+        "title": row.get("title") or "",
+        "source_duration_ms": int((row.get("source_duration_seconds") or 0) * 1000),
+        "narration_style": row.get("narration_style") or "",
+    }
+    try:
+        result = await film_summary.translate_edit_plan_narration(
+            plan=row.get("edit_plan") or {}, target_language=resolved_language, movie_metadata=movie_metadata,
+            duration_tolerance_ratio=FILM_SUMMARY_DURATION_TOLERANCE_RATIO,
+        )
+    except Exception as exc:
+        # Same 502 convention as generate_film_summary_narration_endpoint's
+        # own try/except: any failure here (OpenAI transport/config error,
+        # malformed JSON after exhausting the retry, or the model breaking
+        # the translation invariant) is a planning failure, never the
+        # user's fault.
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    plan, validation_report = result["plan"], result["validation_report"]
+    updated = await supabase_update_film_summary(film_summary_id, user_id, {
+        "edit_plan": plan, "validation_report": validation_report, "narration_language": resolved_language,
+    })
+    return _normalize_film_summary_row(updated, include_content=True)
+
+
 @app.post("/api/film-summaries/{film_summary_id}/validate", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def validate_film_summary_plan_endpoint(film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     row = await supabase_get_film_summary(film_summary_id, user_id)
@@ -13022,6 +13073,27 @@ async def cancel_film_summary_endpoint(film_summary_id: str, user_id: Annotated[
     return {"cancelled": True}
 
 
+def _retry_film_summary_status_updates(previous_status: str, retry_job_id: str) -> Dict[str, Any]:
+    """Status/stage reset applied by retry_film_summary_endpoint on every
+    retry (automatic or failed/failed resubmission), plus -- only when
+    retriggered from awaiting_review -- clearing any stale manual-editor
+    state, since a full automatic regenerate makes it meaningless against
+    the brand-new plan about to replace it. music_track_id/music_start_ms/
+    music_end_ms/subtitles_enabled/subtitle_style are independent user
+    preferences and are deliberately left untouched here."""
+    updates: Dict[str, Any] = {
+        "status": film_summary.FilmSummaryStatus.QUEUED,
+        "stage": film_summary.FilmSummaryStage.UPLOADING,
+        "job_id": retry_job_id,
+        "error_code": None,
+        "error_message": None,
+    }
+    if previous_status == film_summary.FilmSummaryStatus.AWAITING_REVIEW:
+        updates["manual_selection"] = None
+        updates["edit_mode"] = "automatic"
+    return updates
+
+
 @app.post("/api/film-summaries/{film_summary_id}/retry", responses={401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
 async def retry_film_summary_endpoint(film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     if not FILM_SUMMARY_ENABLED:
@@ -13030,8 +13102,8 @@ async def retry_film_summary_endpoint(film_summary_id: str, user_id: Annotated[s
     row = await supabase_get_film_summary(film_summary_id, user_id)
     if not row:
         raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
-    if row.get("status") != film_summary.FilmSummaryStatus.FAILED:
-        raise HTTPException(status_code=409, detail="Only a failed film summary can be retried")
+    if row.get("status") not in (film_summary.FilmSummaryStatus.FAILED, film_summary.FilmSummaryStatus.AWAITING_REVIEW):
+        raise HTTPException(status_code=409, detail="Only a failed or awaiting-review film summary can be retried")
 
     await _enforce_job_concurrency_limit(user_id)
 
@@ -13057,13 +13129,9 @@ async def retry_film_summary_endpoint(film_summary_id: str, user_id: Annotated[s
     )
     await reel_job_manager.enqueue_job(retry_job_id)
 
-    await supabase_update_film_summary(film_summary_id, user_id, {
-        "status": film_summary.FilmSummaryStatus.QUEUED,
-        "stage": film_summary.FilmSummaryStage.UPLOADING,
-        "job_id": retry_job_id,
-        "error_code": None,
-        "error_message": None,
-    })
+    await supabase_update_film_summary(
+        film_summary_id, user_id, _retry_film_summary_status_updates(row.get("status"), retry_job_id),
+    )
 
     _spawn_background_task(_run_film_summary_retry_job(
         job_id=retry_job_id,

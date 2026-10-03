@@ -3381,6 +3381,177 @@ def test_generate_film_summary_narration_returns_502_on_planning_failure(monkeyp
     assert exc_info.value.status_code == 502
 
 
+def test_translate_film_summary_narration_404_when_missing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=None))
+
+    coro = app.translate_film_summary_narration_endpoint(
+        film_summary_id="fs_1", payload=app.FilmSummaryTranslateNarrationRequest(narration_language="fr"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 404
+
+
+def test_translate_film_summary_narration_blocks_outside_awaiting_review(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row(
+        status="completed",
+    )))
+
+    coro = app.translate_film_summary_narration_endpoint(
+        film_summary_id="fs_1", payload=app.FilmSummaryTranslateNarrationRequest(narration_language="fr"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+
+
+def test_translate_film_summary_narration_rejects_empty_language(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row()))
+
+    coro = app.translate_film_summary_narration_endpoint(
+        film_summary_id="fs_1", payload=app.FilmSummaryTranslateNarrationRequest(narration_language="   "), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 400
+
+
+def test_translate_film_summary_narration_persists_plan_and_language(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    original_plan = {
+        "schema_version": "1.0", "segments": [{"id": "seg_01", "type": "voice_over", "narration": "Hello."}],
+        "target_duration_ms": 3000, "total_estimated_duration_ms": 3000,
+    }
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row(
+        edit_plan=original_plan, title="My Movie", source_language="en", narration_language="en", narration_style="cinematic",
+    )))
+    translated_plan = dict(original_plan, segments=[{"id": "seg_01", "type": "voice_over", "narration": "Bonjour."}])
+    translated_validation_report = {"valid": True, "errors": [], "warnings": [], "total_estimated_duration_ms": 3000}
+    translate_mock = AsyncMock(return_value={
+        "plan": translated_plan, "validation_report": translated_validation_report, "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    })
+    monkeypatch.setattr(app.film_summary, "translate_edit_plan_narration", translate_mock)
+    update_mock = AsyncMock(return_value=_awaiting_review_film_summary_row(
+        edit_plan=translated_plan, validation_report=translated_validation_report, narration_language="fr",
+    ))
+    monkeypatch.setattr(app, "supabase_update_film_summary", update_mock)
+
+    result = asyncio.run(app.translate_film_summary_narration_endpoint(
+        film_summary_id="fs_1", payload=app.FilmSummaryTranslateNarrationRequest(narration_language=" fr "), user_id="u1",
+    ))
+
+    translate_mock.assert_awaited_once()
+    assert translate_mock.await_args.kwargs["target_language"] == "fr"
+    assert translate_mock.await_args.kwargs["plan"] == original_plan
+    update_mock.assert_awaited_once_with("fs_1", "u1", {
+        "edit_plan": translated_plan, "validation_report": translated_validation_report, "narration_language": "fr",
+    })
+    assert result["edit_plan"] == translated_plan
+    assert result["narration_language"] == "fr"
+
+
+def test_translate_film_summary_narration_returns_502_on_planning_failure(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row(
+        edit_plan={"segments": [{"id": "seg_01", "type": "voice_over", "narration": "Hello."}]},
+    )))
+    monkeypatch.setattr(app.film_summary, "translate_edit_plan_narration", AsyncMock(
+        side_effect=film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.PLAN_INVALID, "boom"),
+    ))
+
+    coro = app.translate_film_summary_narration_endpoint(
+        film_summary_id="fs_1", payload=app.FilmSummaryTranslateNarrationRequest(narration_language="fr"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 502
+
+
+def _setup_retry_film_summary_mocks(app, monkeypatch, row, tmp_path):
+    """Shared plumbing for retry_film_summary_endpoint tests: supabase is
+    not configured in this test environment, so _enforce_job_concurrency_
+    limit/_reserve_job_credits already no-op on their own -- only the real
+    job-manager/background-task calls need stubbing. _spawn_background_task
+    is replaced with a stub that closes the coroutine without running it,
+    since _run_film_summary_retry_job's own behavior (S3 download, cached-
+    stage resume, ...) is exercised separately and isn't this endpoint's
+    concern."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=row))
+    monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
+    app.reel_job_manager.create_job = AsyncMock()
+    app.reel_job_manager.enqueue_job = AsyncMock()
+    spawned = {}
+
+    def _fake_spawn(coro):
+        spawned["coro"] = coro
+        coro.close()
+        return None
+
+    monkeypatch.setattr(app, "_spawn_background_task", _fake_spawn)
+    update_mock = AsyncMock(return_value=dict(row, status="queued"))
+    monkeypatch.setattr(app, "supabase_update_film_summary", update_mock)
+    return update_mock
+
+
+def test_retry_film_summary_succeeds_from_awaiting_review_and_resets_manual_state(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    row = _awaiting_review_film_summary_row(
+        manual_selection=[{"scene_id": "scene_001", "start_ms": 0, "end_ms": 1000}], edit_mode="manual",
+        music_track_id="tense/epic_theme.mp3", music_start_ms=0, music_end_ms=5000,
+        subtitles_enabled=True, subtitle_style={"font": "Arial"},
+    )
+    update_mock = _setup_retry_film_summary_mocks(app, monkeypatch, row, tmp_path)
+
+    result = asyncio.run(app.retry_film_summary_endpoint(film_summary_id="fs_1", user_id="u1"))
+
+    assert result["status"] == "queued"
+    update_mock.assert_awaited_once()
+    args, kwargs = update_mock.await_args
+    assert args[0] == "fs_1" and args[1] == "u1"
+    updates = args[2]
+    assert updates["status"] == film_summary.FilmSummaryStatus.QUEUED
+    assert updates["manual_selection"] is None
+    assert updates["edit_mode"] == "automatic"
+    # Independent user preferences must survive a regenerate untouched --
+    # i.e. never even mentioned in the update payload.
+    for untouched_key in ("music_track_id", "music_start_ms", "music_end_ms", "subtitles_enabled", "subtitle_style"):
+        assert untouched_key not in updates
+
+
+def test_retry_film_summary_succeeds_from_failed_without_resetting_manual_state(monkeypatch, tmp_path):
+    # No regression: retrying a FAILED film summary (the pre-existing
+    # behavior) must keep working exactly as before, with no manual_
+    # selection/edit_mode reset -- that reset only matters when retried
+    # from awaiting_review, where stale manual-editor state could exist.
+    app = _import_app_with_stubs(monkeypatch)
+    row = _awaiting_review_film_summary_row(status="failed")
+    update_mock = _setup_retry_film_summary_mocks(app, monkeypatch, row, tmp_path)
+
+    result = asyncio.run(app.retry_film_summary_endpoint(film_summary_id="fs_1", user_id="u1"))
+
+    assert result["status"] == "queued"
+    updates = update_mock.await_args.args[2]
+    assert updates["status"] == film_summary.FilmSummaryStatus.QUEUED
+    assert "manual_selection" not in updates
+    assert "edit_mode" not in updates
+
+
+@pytest.mark.parametrize("status", ["completed", "rendering", "queued", "processing", "cancelled", "rejected"])
+def test_retry_film_summary_blocked_from_other_statuses(monkeypatch, tmp_path, status):
+    app = _import_app_with_stubs(monkeypatch)
+    row = _awaiting_review_film_summary_row(status=status)
+    _setup_retry_film_summary_mocks(app, monkeypatch, row, tmp_path)
+
+    coro = app.retry_film_summary_endpoint(film_summary_id="fs_1", user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+
+
 def test_mark_film_summary_job_terminal_noops_without_supabase(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     # Neither SUPABASE_URL nor SUPABASE_SERVICE_ROLE_KEY are set in this test
