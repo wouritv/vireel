@@ -816,6 +816,58 @@ def test_generate_edit_plan_does_not_retry_forever_on_persistent_warning(monkeyp
     assert result["plan"]["segments"][1]["clips"][0]["scene_id"] == "scene_001"
 
 
+def test_generate_edit_plan_retries_on_truncated_json_and_converges(monkeypatch):
+    # A long plan can get cut off mid-string by max_tokens -- json.loads
+    # then raises, which used to abort the whole request outright instead
+    # of giving the model (now with much more max_tokens headroom, see
+    # _call_planning_model) another try.
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    truncated_json = '{"segments": [{"id": "seg_001", "sequence": 1, "type": "voice_over"'
+    valid_plan = _valid_raw_plan()
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.side_effect = [
+        _fake_openai_response(truncated_json, prompt_tokens=10, completion_tokens=16000),
+        _fake_openai_response(json.dumps(valid_plan), prompt_tokens=20, completion_tokens=8),
+    ]
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    movie_metadata = {"title": "M", "source_duration_ms": 3600000, "source_language": "en", "narration_language": "en"}
+    result = asyncio.run(fs.generate_edit_plan(
+        movie_metadata=movie_metadata, target_duration_ms=29000, narration_language="en", narration_style="cinematic",
+        transcript_segments=[], scene_index=[], generation_constraints={},
+    ))
+
+    assert fake_client.chat.completions.create.call_count == 2
+    assert result["plan"]["total_estimated_duration_ms"] == 29000
+    # Usage from the truncated attempt is still billed -- those tokens
+    # were genuinely consumed even though the response was unusable.
+    assert result["usage"] == {"prompt_tokens": 30, "completion_tokens": 16008}
+    sent_messages = fake_client.chat.completions.create.call_args_list[1].kwargs["messages"]
+    assert sent_messages[-2]["role"] == "assistant"
+    assert sent_messages[-2]["content"] == truncated_json
+    assert "not valid, complete JSON" in sent_messages[-1]["content"]
+
+
+def test_generate_edit_plan_raises_after_exhausting_attempts_on_malformed_json(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    truncated_json = '{"segments": ['
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = _fake_openai_response(truncated_json)
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    movie_metadata = {"title": "M", "source_duration_ms": 3600000, "source_language": "en", "narration_language": "en"}
+    coro = fs.generate_edit_plan(
+        movie_metadata=movie_metadata, target_duration_ms=600000, narration_language="en", narration_style="cinematic",
+        transcript_segments=[], scene_index=[], generation_constraints={},
+    )
+    with pytest.raises(fs.FilmSummaryValidationError) as exc_info:
+        asyncio.run(coro)
+
+    assert exc_info.value.code == fs.FilmSummaryErrorCode.PLAN_INVALID
+    assert fake_client.chat.completions.create.call_count == 2
+
+
 def test_generate_edit_plan_gives_up_after_max_attempts(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     still_invalid_plan = _valid_raw_plan()

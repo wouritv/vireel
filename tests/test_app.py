@@ -6078,6 +6078,40 @@ def test_post_platform_comment_facebook_uses_image_url_as_attachment(monkeypatch
     assert call["data"]["attachment_url"] == "https://s3.example/img.png"
 
 
+def test_post_comments_sequence_skips_linkedin_without_attempting(monkeypatch):
+    # LinkedIn's comments API is permanently out of reach for this app
+    # (403 ACCESS_DENIED, partnerApiSocialActions.CREATE) -- must be
+    # skipped outright rather than attempted and recorded as a failure,
+    # so the composer doesn't report a guaranteed, permanent failure as
+    # if the user could retry it.
+    app = _import_app_with_stubs(monkeypatch)
+    get_token_mock = AsyncMock()
+    monkeypatch.setattr(app, "get_valid_token", get_token_mock)
+    post_platform_comment_mock = AsyncMock()
+    monkeypatch.setattr(app, "_post_platform_comment", post_platform_comment_mock)
+
+    results = asyncio.run(app._post_comments_sequence(
+        "linkedin", {"platform_user_id": "u1"}, "urn:li:share:123",
+        [app.SocialPostCommentInput(text="Nice post")],
+    ))
+
+    assert results == []
+    get_token_mock.assert_not_awaited()
+    post_platform_comment_mock.assert_not_awaited()
+
+
+def test_post_comments_sequence_still_posts_for_facebook(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "get_valid_token", AsyncMock(return_value="page-token"))
+    monkeypatch.setattr(app, "_post_platform_comment", AsyncMock(return_value={"id": "c1"}))
+
+    results = asyncio.run(app._post_comments_sequence(
+        "facebook", {"id": "acct-1"}, "1234_5678", [app.SocialPostCommentInput(text="Nice post")],
+    ))
+
+    assert results == [{"success": True, "id": "c1", "text": "Nice post"}]
+
+
 class _FakeCommentImageUpload:
     def __init__(self, content: bytes, filename: str = "photo.png", content_type: str = "image/png"):
         self.filename = filename
@@ -6533,9 +6567,9 @@ def test_create_social_post_schedules_job_without_publishing(monkeypatch):
 
 def test_execute_scheduled_social_post_job_publishes_and_comments(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "_get_social_account", AsyncMock(return_value=_social_post_account("linkedin")))
-    monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "urn:li:share:999"}))
-    monkeypatch.setattr(app, "get_valid_token", AsyncMock(return_value="member-token"))
+    monkeypatch.setattr(app, "_get_social_account", AsyncMock(return_value=_social_post_account("facebook")))
+    monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "1234_5678"}))
+    monkeypatch.setattr(app, "get_valid_token", AsyncMock(return_value="page-token"))
     update_status_mock = AsyncMock()
     monkeypatch.setattr(app, "_update_publish_job_status", update_status_mock)
     post_comment_mock = AsyncMock(return_value={"id": "comment-urn"})
@@ -6548,14 +6582,42 @@ def test_execute_scheduled_social_post_job_publishes_and_comments(monkeypatch):
         "comments": [{"text": "A comment", "link": None, "image_url": None}],
     }
 
-    asyncio.run(app._execute_scheduled_social_post_job("job-9", "u1", "linkedin", task_payload))
+    asyncio.run(app._execute_scheduled_social_post_job("job-9", "u1", "facebook", task_payload))
 
     post_comment_mock.assert_awaited_once()
     done_call = [c for c in update_status_mock.await_args_list if len(c.args) > 1 and c.args[1] == "done"][0]
-    assert done_call.kwargs["external_id"] == "urn:li:share:999"
+    assert done_call.kwargs["external_id"] == "1234_5678"
     assert done_call.kwargs["extra_payload"]["comments_results"] == [
         {"success": True, "id": "comment-urn", "text": "A comment"}
     ]
+
+
+def test_execute_scheduled_social_post_job_skips_comments_on_linkedin(monkeypatch):
+    # See _post_comments_sequence: LinkedIn's comments API is permanently
+    # unreachable with this app's access (403 ACCESS_DENIED,
+    # partnerApiSocialActions.CREATE), so the scheduled-post path must
+    # skip it too, not just the immediate-publish path.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_get_social_account", AsyncMock(return_value=_social_post_account("linkedin")))
+    monkeypatch.setattr(app, "publish_post", AsyncMock(return_value={"id": "urn:li:share:999"}))
+    monkeypatch.setattr(app, "get_valid_token", AsyncMock(return_value="member-token"))
+    update_status_mock = AsyncMock()
+    monkeypatch.setattr(app, "_update_publish_job_status", update_status_mock)
+    post_comment_mock = AsyncMock()
+    monkeypatch.setattr(app, "_post_platform_comment", post_comment_mock)
+
+    task_payload = {
+        "source_type": "social_post",
+        "text": "Scheduled text",
+        "background_id": None,
+        "comments": [{"text": "A comment", "link": None, "image_url": None}],
+    }
+
+    asyncio.run(app._execute_scheduled_social_post_job("job-9", "u1", "linkedin", task_payload))
+
+    post_comment_mock.assert_not_awaited()
+    done_call = [c for c in update_status_mock.await_args_list if len(c.args) > 1 and c.args[1] == "done"][0]
+    assert done_call.kwargs["extra_payload"]["comments_results"] == []
 
 
 def test_execute_scheduled_social_post_job_marks_failed_without_account(monkeypatch):

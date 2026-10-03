@@ -11065,9 +11065,20 @@ async def _post_comments_sequence(
     -- the post itself already succeeded by the time this runs, so a single
     rejected comment (rate limit, moderation, ...) shouldn't take the
     remaining ones down with it."""
-    results: List[Dict[str, Any]] = []
     if not comments:
-        return results
+        return []
+    if platform_name == "linkedin":
+        # LinkedIn's Social Actions (comments) API requires a restricted
+        # partner product (Marketing Developer Platform) that this app's
+        # standard "Share on LinkedIn" access doesn't include -- every
+        # attempt fails with a 403 ACCESS_DENIED
+        # (partnerApiSocialActions.CREATE). This is permanent, not a
+        # transient failure worth surfacing as one (see
+        # SocialPostComposerModal.jsx, which hides the comments option
+        # once only LinkedIn accounts are selected for the same reason),
+        # so skip outright instead of attempting and recording a failure.
+        return []
+    results: List[Dict[str, Any]] = []
     token = await get_valid_token(account)
     for comment in comments:
         try:

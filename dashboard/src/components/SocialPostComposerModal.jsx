@@ -163,6 +163,20 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
     const selectedPreset = backgrounds.find((preset) => preset.id === backgroundId);
     const hasBackground = Boolean(selectedPreset) && selectedPreset.id !== NO_BACKGROUND_ID;
 
+    // LinkedIn's Social Actions (comments) API requires a restricted
+    // partner product (Marketing Developer Platform) that this app's
+    // standard "Share on LinkedIn" access doesn't include -- every
+    // comment attempt on a LinkedIn account fails with a 403
+    // ACCESS_DENIED (partnerApiSocialActions.CREATE). Comments are hidden
+    // entirely once only LinkedIn accounts are selected, instead of
+    // letting the user add comments that are guaranteed to fail; a mix of
+    // LinkedIn + another platform still shows comments (they'll post to
+    // the non-LinkedIn account(s)) with a note about the LinkedIn gap.
+    const selectedAccountsList = socialAccounts.filter((account) => selectedAccountIds[account.id]);
+    const hasNonLinkedInSelected = selectedAccountsList.some((account) => account.platform !== "linkedin");
+    const hasLinkedInSelected = selectedAccountsList.some((account) => account.platform === "linkedin");
+    const commentsAvailable = selectedAccountsList.length === 0 || hasNonLinkedInSelected;
+
     const handleAccountToggle = (accountId, checked) => {
         setSelectedAccountIds((prev) => ({ ...prev, [accountId]: checked }));
     };
@@ -633,6 +647,19 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
                         )}
                     </div>
 
+                    {!commentsAvailable ? (
+                        <div>
+                            <label className="block text-xs font-bold text-slate-500 dark:text-zinc-400 mb-2">
+                                {t("social.postComposerCommentsLabel", "Commentaires (publies par la page)")}
+                            </label>
+                            <p className="text-xs text-slate-400 dark:text-zinc-500">
+                                {t(
+                                    "social.postComposerCommentsUnavailableLinkedin",
+                                    "Indisponible sur LinkedIn : l'API de LinkedIn ne permet pas de publier des commentaires avec ce type d'acces. Selectionnez aussi un compte Facebook pour ajouter des commentaires."
+                                )}
+                            </p>
+                        </div>
+                    ) : (
                     <div>
                         <div className="flex items-center justify-between mb-2">
                             <label className="block text-xs font-bold text-slate-500 dark:text-zinc-400">
@@ -646,6 +673,14 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
                                 <Plus size={14} /> {t("social.postComposerAddComment", "Ajouter un commentaire")}
                             </button>
                         </div>
+                        {hasLinkedInSelected ? (
+                            <p className="mb-2 text-[11px] text-slate-500 dark:text-zinc-400">
+                                {t(
+                                    "social.postComposerCommentsFacebookOnly",
+                                    "Facebook uniquement : ces commentaires ne seront pas publies sur le(s) compte(s) LinkedIn selectionne(s)."
+                                )}
+                            </p>
+                        ) : null}
                         {comments.length === 0 ? (
                             <p className="text-xs text-slate-400 dark:text-zinc-500">
                                 {t("social.postComposerNoComments", "Aucun commentaire pour l'instant.")}
@@ -813,6 +848,7 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
                             })}
                         </div>
                     </div>
+                    )}
 
                     <div className="p-3 bg-slate-100 dark:bg-white/5 rounded-lg border border-slate-200 dark:border-white/5">
                         <div className="flex items-center justify-between mb-2">

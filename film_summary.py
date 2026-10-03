@@ -968,8 +968,15 @@ async def classify_media_type(
 
 
 def _call_planning_model(client, model_name: str, messages: List[Dict[str, Any]]):
+    # A long source (many confirmed plot points -> many segments) can
+    # produce an edit-plan JSON object that no longer fits in 8000 output
+    # tokens, silently truncating mid-string -- json.loads then fails with
+    # "Unterminated string ..." and, before generate_edit_plan's retry-on-
+    # malformed-JSON handling, used to abort the whole request outright.
+    # 16000 is gpt-4o's effective ceiling for this parameter; raising it
+    # leaves much more headroom before that happens again.
     return client.chat.completions.create(
-        model=model_name, messages=messages, temperature=0.6, max_tokens=8000,
+        model=model_name, messages=messages, temperature=0.6, max_tokens=16000,
         response_format={"type": "json_object"},
     )
 
@@ -1037,7 +1044,13 @@ async def generate_edit_plan(
 ) -> Dict[str, Any]:
     """Single consolidated planning call producing the edit-plan JSON
     contract (see module docstring). Raises FilmSummaryValidationError on a
-    malformed/insufficient-evidence response.
+    still-malformed response after exhausting every attempt, or an
+    insufficient-evidence one (see validate_edit_plan_schema).
+
+    Also self-corrects once on a truncated/malformed JSON response (most
+    often max_tokens cut the response short on a long plan) -- same retry
+    mechanism as below, just triggered by a json.loads failure instead of
+    a validation one.
 
     Self-corrects once on a blocking validation failure (duration outside
     tolerance, non-contiguous sequence numbers, overlapping dialogue, ...)
@@ -1083,15 +1096,31 @@ async def generate_edit_plan(
     for attempt in range(max(1, max_attempts)):
         response = await asyncio.to_thread(_call_planning_model, client, model_name, messages)
         raw_text = response.choices[0].message.content
-        try:
-            raw = json.loads(raw_text)
-        except (TypeError, ValueError) as exc:
-            raise FilmSummaryValidationError(FilmSummaryErrorCode.PLAN_INVALID, f"Invalid JSON from planning model: {exc}") from exc
-
-        plan = validate_edit_plan_schema(raw, movie_metadata=movie_metadata, target_duration_ms=target_duration_ms)
         usage = _usage_dict(response, model_name)
         total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
         total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+
+        try:
+            raw = json.loads(raw_text)
+        except (TypeError, ValueError) as exc:
+            if attempt == max_attempts - 1:
+                raise FilmSummaryValidationError(FilmSummaryErrorCode.PLAN_INVALID, f"Invalid JSON from planning model: {exc}") from exc
+            # Most often a response truncated by hitting max_tokens on a
+            # long plan (see _call_planning_model) rather than the model
+            # getting the syntax wrong -- worth one retry instead of
+            # failing the whole request outright, same self-correction
+            # mechanism used below for validation errors/warnings.
+            messages.append({"role": "assistant", "content": raw_text})
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"Your previous response was not valid, complete JSON ({exc}). Return the complete "
+                    "corrected plan as a single valid JSON object (same OUTPUT SCHEMA, JSON only), nothing else."
+                ),
+            })
+            continue
+
+        plan = validate_edit_plan_schema(raw, movie_metadata=movie_metadata, target_duration_ms=target_duration_ms)
 
         validation_report = validate_edit_plan_content(
             plan, source_duration_ms=source_duration_ms, valid_scene_ids=valid_scene_ids,
