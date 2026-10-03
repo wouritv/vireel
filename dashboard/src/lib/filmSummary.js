@@ -137,6 +137,35 @@ export async function generateFilmSummaryNarration(filmSummaryId, userId) {
 }
 
 /**
+ * POST /api/film-summaries/{id}/translate-narration -- body
+ * {narration_language}. Has the AI retranslate the already-generated
+ * narration into the given language (e.g. when the wrong one was picked at
+ * creation time). Returns the normalized full-content film summary row with
+ * `edit_plan` updated.
+ */
+export async function translateFilmSummaryNarration(filmSummaryId, userId, narrationLanguage) {
+    const response = await fetch(getApiUrl(`/api/film-summaries/${filmSummaryId}/translate-narration`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders(userId) },
+        body: JSON.stringify({ narration_language: narrationLanguage }),
+    });
+    return readJsonOrThrow(response, "Impossible de retraduire la narration.");
+}
+
+// Same language set as CaptionsModal.jsx's FALLBACK_LANGUAGES, for a
+// consistent dropdown across the app's language pickers. Shared here (moved
+// out of FilmSummaryCreatePage.jsx) since the review panel's narration
+// retranslation picker needs the exact same options.
+export const NARRATION_LANGUAGE_OPTIONS = [
+    { value: "fr", labelKey: "filmSummary.languageFrench", fallback: "Francais" },
+    { value: "en", labelKey: "filmSummary.languageEnglish", fallback: "Anglais" },
+    { value: "es", labelKey: "filmSummary.languageSpanish", fallback: "Espagnol" },
+    { value: "de", labelKey: "filmSummary.languageGerman", fallback: "Allemand" },
+    { value: "it", labelKey: "filmSummary.languageItalian", fallback: "Italien" },
+    { value: "pt", labelKey: "filmSummary.languagePortuguese", fallback: "Portugais" },
+];
+
+/**
  * Format a millisecond duration as "mm:ss" (or "h:mm:ss" past an hour), for
  * segment/clip timestamps in the review timeline.
  */

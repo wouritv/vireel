@@ -6,14 +6,14 @@ import {
     saveFilmSummaryManualSelection,
     generateFilmSummaryNarration,
 } from "../lib/filmSummary";
-import FilmSummaryShotTimeline, { shotTimelineLegend } from "./FilmSummaryShotTimeline";
+import FilmSummaryShotTimeline from "./FilmSummaryShotTimeline";
 
 // Builds the initial per-shot selection map: everything the user already
 // kept in a previous manual_selection stays enabled with its saved
-// start/end; everything else starts enabled with its full original
-// boundaries, so opening the editor for the very first time behaves like
-// "every shot is currently in the cut" rather than an empty, confusing
-// blank slate.
+// start/end; everything else starts *disabled* with its full original
+// boundaries, so opening the editor for the very first time -- when there's
+// no manual_selection yet at all -- presents an empty cut the user builds up
+// shot by shot, instead of starting with everything already selected.
 function buildInitialSelections(shots, manualSelection) {
     const savedByShotId = new Map((manualSelection || []).map((entry) => [entry.scene_id, entry]));
     const next = {};
@@ -21,7 +21,7 @@ function buildInitialSelections(shots, manualSelection) {
         const saved = savedByShotId.get(shot.scene_id);
         next[shot.scene_id] = saved
             ? { enabled: true, startMs: saved.start_ms, endMs: saved.end_ms }
-            : { enabled: true, startMs: shot.start_ms, endMs: shot.end_ms };
+            : { enabled: false, startMs: shot.start_ms, endMs: shot.end_ms };
     });
     return next;
 }
@@ -190,26 +190,41 @@ export default function FilmSummaryClipPickerEditor({ filmSummary, user, onCance
                         <div className="max-h-56 space-y-1.5 overflow-y-auto custom-scrollbar pr-1">
                             {shots.map((shot, index) => {
                                 const selection = selections[shot.scene_id];
+                                const startMs = selection?.startMs ?? shot.start_ms;
+                                const endMs = selection?.endMs ?? shot.end_ms;
                                 return (
-                                    <button
+                                    <div
                                         key={shot.scene_id}
-                                        type="button"
-                                        onClick={() => seekTo(selection?.startMs ?? shot.start_ms)}
-                                        className={`flex w-full items-center justify-between gap-2 rounded-lg border px-3 py-1.5 text-left text-xs ${
+                                        className={`flex w-full items-center gap-2 rounded-lg border px-3 py-1.5 text-xs ${
                                             selection?.enabled
                                                 ? "border-emerald-500/30 bg-emerald-500/5 text-slate-700 dark:text-zinc-200"
                                                 : "border-slate-300 dark:border-white/10 bg-white/5 text-slate-400 dark:text-zinc-500"
                                         }`}
                                     >
-                                        <span className="font-mono text-slate-500 dark:text-zinc-500">#{index + 1}</span>
-                                        <span className="flex-1 truncate">{shotTimelineLegend(shot, selection, t)}</span>
-                                        <span className="shrink-0 text-slate-400 dark:text-zinc-500">
-                                            {t("filmSummary.manual.originalRange", "original {{start}}-{{end}}", {
-                                                start: formatMsClock(shot.start_ms),
-                                                end: formatMsClock(shot.end_ms),
-                                            })}
-                                        </span>
-                                    </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => seekTo(startMs)}
+                                            className="flex flex-1 items-center gap-2 truncate text-left"
+                                        >
+                                            <span className="font-mono text-slate-500 dark:text-zinc-500">#{index + 1}</span>
+                                            <span className="truncate">{formatMsClock(startMs)} - {formatMsClock(endMs)}</span>
+                                        </button>
+                                        <input
+                                            type="checkbox"
+                                            checked={!!selection?.enabled}
+                                            onClick={(e) => e.stopPropagation()}
+                                            onChange={(e) => {
+                                                e.stopPropagation();
+                                                handleToggleShot(shot.scene_id);
+                                            }}
+                                            aria-label={
+                                                selection?.enabled
+                                                    ? t("filmSummary.manual.disableShot", "Retirer ce plan")
+                                                    : t("filmSummary.manual.enableShot", "Garder ce plan")
+                                            }
+                                            className="h-4 w-4 shrink-0 cursor-pointer accent-emerald-500"
+                                        />
+                                    </div>
                                 );
                             })}
                         </div>

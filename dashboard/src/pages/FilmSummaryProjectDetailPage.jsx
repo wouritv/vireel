@@ -9,7 +9,6 @@ import { errorMessageForCode } from "../lib/filmSummary";
 import FilmSummaryProcessingPanel from "../components/FilmSummaryProcessingPanel";
 import FilmSummaryReviewPanel from "../components/FilmSummaryReviewPanel";
 import FilmSummaryClipPickerEditor from "../components/FilmSummaryClipPickerEditor";
-import FilmSummaryAudioSubtitleSettings from "../components/FilmSummaryAudioSubtitleSettings";
 import SharePostModal from "../components/SharePostModal";
 
 // Statuses for which the film summary's own job_id is still meaningful to
@@ -185,6 +184,15 @@ export default function FilmSummaryProjectDetailPage() {
 
     const handleRetry = async () => {
         if (!filmSummary?.id || !user?.id) return;
+        if (
+            !globalThis.confirm(
+                t(
+                    "filmSummary.confirmRegenerateAll",
+                    "Relancer toute la generation depuis la video source ? Le plan de montage actuel et toutes les modifications (narration, selection manuelle des plans) seront perdus."
+                )
+            )
+        )
+            return;
         setRetrying(true);
         setError("");
         try {
@@ -456,13 +464,8 @@ export default function FilmSummaryProjectDetailPage() {
                                     allowedVoices={allowedVoices}
                                     defaultVoice={defaultVoice}
                                     onRefresh={loadFilmSummary}
-                                />
-                                <FilmSummaryAudioSubtitleSettings
-                                    filmSummary={filmSummary}
-                                    user={user}
-                                    totalDurationMs={filmSummary.validation_report?.total_estimated_duration_ms || 300000}
-                                    onUpdated={setFilmSummary}
-                                    t={t}
+                                    onRegenerateAll={handleRetry}
+                                    regenerating={retrying}
                                 />
                             </div>
                         )
