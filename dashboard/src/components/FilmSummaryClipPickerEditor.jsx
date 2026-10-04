@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Loader2, Sparkles } from "lucide-react";
+import { Loader2, Sparkles } from "lucide-react";
 import { useTranslation } from "../state/LanguageContext";
 import {
     formatMsClock,
@@ -43,8 +43,10 @@ function buildManualSelectionPayload(shots, selections) {
 // .../generate-narration), showing a loading state throughout, and hands
 // the resulting row back to the parent page so it can route into the
 // existing FilmSummaryReviewPanel -- same role as
-// FilmSummaryProjectDetailPage already does for the automatic flow.
-export default function FilmSummaryClipPickerEditor({ filmSummary, user, onCancel, onNarrationReady }) {
+// FilmSummaryProjectDetailPage already does for the automatic flow. No way
+// back to the automatic review once opened (by design) -- the user commits
+// to building a manual cut and confirms it via handleConfirm below.
+export default function FilmSummaryClipPickerEditor({ filmSummary, user, onNarrationReady }) {
     const { t } = useTranslation();
     const videoRef = useRef(null);
 
@@ -116,25 +118,14 @@ export default function FilmSummaryClipPickerEditor({ filmSummary, user, onCance
 
     return (
         <div className="space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                    <h2 className="title-contrast text-xl font-bold">{t("filmSummary.manual.title", "Mode manuel -- choix des plans")}</h2>
-                    <p className="mt-1 text-sm text-slate-500 dark:text-zinc-400">
-                        {t(
-                            "filmSummary.manual.subtitle",
-                            "Active ou desactive chaque plan et ajuste son debut/sa fin, puis laisse l'IA ecrire la voix off correspondante."
-                        )}
-                    </p>
-                </div>
-                <button
-                    type="button"
-                    onClick={onCancel}
-                    disabled={busy}
-                    className="inline-flex items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10 disabled:opacity-50"
-                >
-                    <ArrowLeft size={14} />
-                    {t("filmSummary.manual.backToAutomatic", "Retour au mode automatique")}
-                </button>
+            <div>
+                <h2 className="title-contrast text-xl font-bold">{t("filmSummary.manual.title", "Mode manuel -- choix des plans")}</h2>
+                <p className="mt-1 text-sm text-slate-500 dark:text-zinc-400">
+                    {t(
+                        "filmSummary.manual.subtitle",
+                        "Active ou desactive chaque plan et ajuste son debut/sa fin, puis laisse l'IA ecrire la voix off correspondante."
+                    )}
+                </p>
             </div>
 
             {error ? <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div> : null}
@@ -195,20 +186,25 @@ export default function FilmSummaryClipPickerEditor({ filmSummary, user, onCance
                                 return (
                                     <div
                                         key={shot.scene_id}
-                                        className={`flex w-full items-center gap-2 rounded-lg border px-3 py-1.5 text-xs ${
+                                        role="button"
+                                        tabIndex={0}
+                                        onClick={() => seekTo(startMs)}
+                                        onKeyDown={(e) => {
+                                            if (e.key === "Enter" || e.key === " ") {
+                                                e.preventDefault();
+                                                seekTo(startMs);
+                                            }
+                                        }}
+                                        className={`flex w-full cursor-pointer items-center gap-2 rounded-lg border px-3 py-1.5 text-xs ${
                                             selection?.enabled
                                                 ? "border-emerald-500/30 bg-emerald-500/5 text-slate-700 dark:text-zinc-200"
                                                 : "border-slate-300 dark:border-white/10 bg-white/5 text-slate-400 dark:text-zinc-500"
                                         }`}
                                     >
-                                        <button
-                                            type="button"
-                                            onClick={() => seekTo(startMs)}
-                                            className="flex flex-1 items-center gap-2 truncate text-left"
-                                        >
+                                        <span className="flex flex-1 items-center gap-2 truncate text-left">
                                             <span className="font-mono text-slate-500 dark:text-zinc-500">#{index + 1}</span>
                                             <span className="truncate">{formatMsClock(startMs)} - {formatMsClock(endMs)}</span>
-                                        </button>
+                                        </span>
                                         <input
                                             type="checkbox"
                                             checked={!!selection?.enabled}

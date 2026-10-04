@@ -437,7 +437,6 @@ export default function FilmSummaryProjectDetailPage() {
                             <FilmSummaryClipPickerEditor
                                 filmSummary={filmSummary}
                                 user={user}
-                                onCancel={() => setManualEditorOpen(false)}
                                 onNarrationReady={(updated) => {
                                     setFilmSummary(updated);
                                     setManualEditorOpen(false);
