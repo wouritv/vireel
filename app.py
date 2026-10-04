@@ -11999,6 +11999,7 @@ async def create_film_summary(
         target_duration_seconds=resolved_target_duration,
         narration_language=resolved_narration_language,
         narration_style=resolved_narration_style,
+        source_language=source_language,
     ))
 
     return {
@@ -12040,14 +12041,14 @@ async def _run_film_summary_analysis_job(
     job_id: str, user_id: str, film_summary_id: Optional[str], project_id: Optional[str],
     input_path: str, output_dir: str, local_duration: float,
     size_bytes: float, analysis_required_credits: float, target_duration_seconds: float,
-    narration_language: str, narration_style: str,
+    narration_language: str, narration_style: str, source_language: Optional[str] = None,
 ) -> None:
     try:
         await reel_job_manager.start_job(job_id)
         await _run_film_summary_analysis_pipeline_stages(
             job_id, user_id, film_summary_id, project_id, input_path,
             local_duration, size_bytes, analysis_required_credits, target_duration_seconds,
-            narration_language, narration_style,
+            narration_language, narration_style, source_language=source_language,
         )
     except film_summary.FilmSummaryValidationError as exc:
         await _handle_film_summary_validation_failure(exc, job_id, user_id, film_summary_id, project_id, analysis_required_credits)
@@ -12063,6 +12064,7 @@ async def _run_film_summary_analysis_job(
 
 async def _run_transcription_and_scene_detection_stages(
     job_id: str, user_id: str, film_summary_id: Optional[str], input_path: str,
+    source_language: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
     if film_summary_id and is_supabase_configured():
         await supabase_update_film_summary(film_summary_id, user_id, {
@@ -12072,7 +12074,7 @@ async def _run_transcription_and_scene_detection_stages(
     await reel_job_manager.update_progress(job_id, 20, film_summary.FilmSummaryStage.TRANSCRIBING)
 
     try:
-        transcript = await film_summary.transcribe_video_with_timecodes(input_path)
+        transcript = await film_summary.transcribe_video_with_timecodes(input_path, language_hint=source_language)
     except Exception as exc:
         raise film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.TRANSCRIPTION_FAILED, str(exc)) from exc
 
@@ -12081,6 +12083,12 @@ async def _run_transcription_and_scene_detection_stages(
     if not transcript_text or not transcript_segments:
         raise film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.TRANSCRIPTION_FAILED, "Empty transcript")
 
+    # The user's own choice always wins -- only fall back to whatever
+    # AssemblyAI reports when they left source_language on auto-detect, so
+    # an explicit choice can never be silently stomped by a (mis)detected
+    # value.
+    effective_source_language = source_language or transcript.get("language")
+
     if is_supabase_configured():
         await supabase_upsert_transcription({
             "user_id": user_id,
@@ -12088,7 +12096,7 @@ async def _run_transcription_and_scene_detection_stages(
             "clip_index": 0,
             "source_type": "video",
             "transcript_provider": "assemblyai",
-            "transcript_language": transcript.get("language"),
+            "transcript_language": effective_source_language,
             "transcript_text": transcript_text,
         })
 
@@ -12096,7 +12104,7 @@ async def _run_transcription_and_scene_detection_stages(
         await supabase_update_film_summary(film_summary_id, user_id, {
             "stage": film_summary.FilmSummaryStage.DETECTING_SCENES,
             "transcript_segments": transcript_segments,
-            "source_language": transcript.get("language"),
+            "source_language": effective_source_language,
         })
     await reel_job_manager.update_progress(job_id, 40, film_summary.FilmSummaryStage.DETECTING_SCENES)
 
@@ -12210,7 +12218,7 @@ async def _run_planning_and_validation_stages(
 async def _run_film_summary_analysis_pipeline_stages(
     job_id: str, user_id: str, film_summary_id: Optional[str], project_id: Optional[str], input_path: str,
     local_duration: float, size_bytes: float, analysis_required_credits: float, target_duration_seconds: float,
-    narration_language: str, narration_style: str,
+    narration_language: str, narration_style: str, source_language: Optional[str] = None,
 ) -> None:
     # Niveau 1 technical validation already ran synchronously in
     # create_film_summary, before the job/credits reservation even
@@ -12222,7 +12230,7 @@ async def _run_film_summary_analysis_pipeline_stages(
     # "processing continues only if validation succeeds" for the one stage
     # that actually dominates cost.
     transcript_segments, scene_index, detected_language = await _run_transcription_and_scene_detection_stages(
-        job_id, user_id, film_summary_id, input_path,
+        job_id, user_id, film_summary_id, input_path, source_language=source_language,
     )
     classification_usage = await _run_classification_gate(
         job_id, user_id, film_summary_id, local_duration, narration_language or detected_language,
@@ -13152,7 +13160,7 @@ async def _resume_film_summary_analysis_from_cache(
         transcript_segments, scene_index = cached_transcript_segments, cached_scene_index
     else:
         transcript_segments, scene_index, detected_language = await _run_transcription_and_scene_detection_stages(
-            job_id, user_id, film_summary_id, input_path,
+            job_id, user_id, film_summary_id, input_path, source_language=source_language,
         )
         source_language = source_language or detected_language
 

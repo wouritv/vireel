@@ -3579,6 +3579,64 @@ def test_scene_detection_timeout_fails_job_instead_of_hanging(monkeypatch):
     assert exc.value.code == app.film_summary.FilmSummaryErrorCode.SCENE_DETECTION_FAILED
 
 
+def test_transcription_stage_protects_explicit_source_language_from_detection(monkeypatch):
+    # The user chose French explicitly, but AssemblyAI's detection (mocked
+    # here as if it got it wrong) reports English -- the user's own choice
+    # must win, never be silently overwritten by the detected value.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    app.reel_job_manager.update_progress = AsyncMock()
+    transcribe_mock = AsyncMock(return_value={
+        "text": "bonjour", "language": "en",
+        "segments": [{"start_ms": 0, "end_ms": 1000, "speaker": "", "text": "bonjour"}],
+    })
+    monkeypatch.setattr(app.film_summary, "transcribe_video_with_timecodes", transcribe_mock)
+    monkeypatch.setattr(app.film_summary, "detect_scenes", lambda video_path, threshold: [])
+    monkeypatch.setattr(app.film_summary, "build_scene_index", lambda scenes, segments: [])
+    upsert_mock = AsyncMock()
+    app.supabase_upsert_transcription = upsert_mock
+    update_mock = AsyncMock()
+    app.supabase_update_film_summary = update_mock
+
+    asyncio.run(app._run_transcription_and_scene_detection_stages(
+        "job-1", "u1", "fs-1", "/tmp/input.mp4", source_language="fr",
+    ))
+
+    assert transcribe_mock.await_args.kwargs["language_hint"] == "fr"
+    assert upsert_mock.await_args.args[0]["transcript_language"] == "fr"
+    source_language_updates = [
+        call.args[2] for call in update_mock.await_args_list if "source_language" in call.args[2]
+    ]
+    assert len(source_language_updates) == 1
+    assert source_language_updates[0]["source_language"] == "fr"
+
+
+def test_transcription_stage_falls_back_to_detected_language_when_unset(monkeypatch):
+    # When the user left source_language on auto-detect (None), the
+    # detected language from AssemblyAI should be used as-is.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    app.reel_job_manager.update_progress = AsyncMock()
+    transcribe_mock = AsyncMock(return_value={
+        "text": "hello", "language": "en",
+        "segments": [{"start_ms": 0, "end_ms": 1000, "speaker": "", "text": "hello"}],
+    })
+    monkeypatch.setattr(app.film_summary, "transcribe_video_with_timecodes", transcribe_mock)
+    monkeypatch.setattr(app.film_summary, "detect_scenes", lambda video_path, threshold: [])
+    monkeypatch.setattr(app.film_summary, "build_scene_index", lambda scenes, segments: [])
+    upsert_mock = AsyncMock()
+    app.supabase_upsert_transcription = upsert_mock
+    update_mock = AsyncMock()
+    app.supabase_update_film_summary = update_mock
+
+    asyncio.run(app._run_transcription_and_scene_detection_stages(
+        "job-1", "u1", "fs-1", "/tmp/input.mp4", source_language=None,
+    ))
+
+    assert transcribe_mock.await_args.kwargs["language_hint"] is None
+    assert upsert_mock.await_args.args[0]["transcript_language"] == "en"
+
+
 def test_finalize_film_summary_analysis_never_debits_source_storage(monkeypatch):
     # The source video is transient (deleted once the render finishes -- see
     # test_finalize_film_summary_render_deletes_transient_source below), so
