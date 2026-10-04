@@ -9,6 +9,8 @@ import { errorMessageForCode } from "../lib/filmSummary";
 import FilmSummaryProcessingPanel from "../components/FilmSummaryProcessingPanel";
 import FilmSummaryReviewPanel from "../components/FilmSummaryReviewPanel";
 import FilmSummaryClipPickerEditor from "../components/FilmSummaryClipPickerEditor";
+import FilmSummaryCompletedSubtitlesPanel from "../components/FilmSummaryCompletedSubtitlesPanel";
+import FilmSummarySubtitleStylePreviewOverlay from "../components/FilmSummarySubtitleStylePreviewOverlay";
 import SharePostModal from "../components/SharePostModal";
 
 // Statuses for which the film summary's own job_id is still meaningful to
@@ -45,6 +47,11 @@ export default function FilmSummaryProjectDetailPage() {
     // for any other status, and closes itself back to the normal review
     // flow once narration generation succeeds (onNarrationReady below).
     const [manualEditorOpen, setManualEditorOpen] = useState(false);
+    // Mirrors FilmSummaryCompletedSubtitlesPanel's in-progress (not-yet-saved)
+    // subtitle style on the completed page, purely so the video wrapper's
+    // FilmSummarySubtitleStylePreviewOverlay can live-preview it -- the panel
+    // owns the real state and reports every change up via onLiveStyleChange.
+    const [liveSubtitleStyle, setLiveSubtitleStyle] = useState(null);
 
     const [showShareModal, setShowShareModal] = useState(false);
     const [shareTitle, setShareTitle] = useState("");
@@ -477,8 +484,14 @@ export default function FilmSummaryProjectDetailPage() {
                             <h3 className="text-lg font-bold text-white">{t("filmSummary.completedTitle", "Ton resume de film est pret")}</h3>
                             {filmSummary.final_url ? (
                                 <div className="grid gap-4 md:grid-cols-[7fr_3fr]">
-                                    <video src={filmSummary.final_url} controls preload="metadata" className="w-full rounded-xl bg-black" />
-                                    <div className="flex flex-row flex-wrap gap-2 md:flex-col md:items-stretch">
+                                    <div className="relative">
+                                        <video src={filmSummary.final_url} controls preload="metadata" className="w-full rounded-xl bg-black" />
+                                        <FilmSummarySubtitleStylePreviewOverlay
+                                            style={liveSubtitleStyle}
+                                            sampleText={t("filmSummary.subtitles.previewSample", "Exemple de sous-titre")}
+                                        />
+                                    </div>
+                                    <div className="flex flex-col gap-3 md:items-stretch">
                                         <a
                                             href={filmSummary.final_url}
                                             download
@@ -486,6 +499,15 @@ export default function FilmSummaryProjectDetailPage() {
                                         >
                                             <Download size={14} /> {t("filmSummary.downloadButton", "Telecharger")}
                                         </a>
+
+                                        <FilmSummaryCompletedSubtitlesPanel
+                                            filmSummary={filmSummary}
+                                            user={user}
+                                            onUpdated={setFilmSummary}
+                                            onLiveStyleChange={setLiveSubtitleStyle}
+                                            t={t}
+                                        />
+
                                         <button
                                             type="button"
                                             onClick={handleOpenShare}

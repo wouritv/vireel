@@ -142,6 +142,38 @@ export async function translateFilmSummaryNarration(filmSummaryId, userId, narra
     return readJsonOrThrow(response, "Impossible de retraduire la narration.");
 }
 
+/**
+ * POST /api/film-summaries/{id}/apply-subtitles -- no body; the server reads
+ * the row's already-persisted `subtitle_style` (save it first via
+ * updateFilmSummaryAudioSettings) and burns it into the real final video
+ * server-side (transcription + ffmpeg), re-uploading over the existing
+ * final/preview files and setting `subtitles_enabled: true`. Can take a
+ * little while -- callers should show a loading state. Returns the
+ * normalized full-content film summary row with `final_url`/`preview_url`
+ * pointing at the newly captioned video.
+ */
+export async function applyFilmSummarySubtitles(filmSummaryId, userId) {
+    const response = await fetch(getApiUrl(`/api/film-summaries/${filmSummaryId}/apply-subtitles`), {
+        method: "POST",
+        headers: getAuthHeaders(userId),
+    });
+    return readJsonOrThrow(response, "Impossible d'ajouter les sous-titres a la video.");
+}
+
+/**
+ * POST /api/film-summaries/{id}/remove-subtitles -- no body; restores the
+ * original un-captioned final/preview video and sets
+ * `subtitles_enabled: false`. Returns the normalized full-content film
+ * summary row.
+ */
+export async function removeFilmSummarySubtitles(filmSummaryId, userId) {
+    const response = await fetch(getApiUrl(`/api/film-summaries/${filmSummaryId}/remove-subtitles`), {
+        method: "POST",
+        headers: getAuthHeaders(userId),
+    });
+    return readJsonOrThrow(response, "Impossible de revenir a la video sans sous-titres.");
+}
+
 // Same language set as CaptionsModal.jsx's FALLBACK_LANGUAGES, for a
 // consistent dropdown across the app's language pickers. Shared here (moved
 // out of FilmSummaryCreatePage.jsx) since the review panel's narration
