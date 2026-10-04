@@ -3,14 +3,16 @@ import { useState } from "react";
 import { updateFilmSummaryAudioSettings } from "../lib/filmSummary";
 
 // Dialogue-volume section of FilmSummaryAudioSubtitleSettings: a single
-// slider controlling how audible the film's own original audio (dialogue,
-// ambience, ...) stays underneath the AI-generated narration. Replaces the
-// background-music picker this panel used to show -- there's no music
-// anymore, just the original film audio mixed under the voice-over, and the
-// user decides its intensity themselves instead of it being silenced by
-// default. Saved independently via the same
-// PATCH /api/film-summaries/{id}/audio-settings endpoint the other
-// sections here already use, just with a different key
+// slider controlling how audible the film's own original audio is during
+// original_dialogue segments (the moments in the montage that play the
+// movie's own dialogue verbatim, with no AI narration) -- never during
+// voice_over segments, where the film's own voice is always fully replaced
+// by the narration, unconditionally. Replaces the background-music picker
+// this panel used to show -- there's no music anymore, just the original
+// film audio in those dialogue segments, and the user decides its
+// intensity themselves instead of it being silenced by default. Saved
+// independently via the same PATCH /api/film-summaries/{id}/audio-settings
+// endpoint the other sections here already use, just with a different key
 // ({dialogue_volume: <0-100>}).
 export default function FilmSummaryDialogueVolumeSettings({ filmSummary, user, onUpdated, t }) {
     const initialVolume = filmSummary?.dialogue_volume ?? 20;
@@ -63,7 +65,7 @@ export default function FilmSummaryDialogueVolumeSettings({ filmSummary, user, o
             <p className="text-[11px] text-slate-500 dark:text-zinc-400">
                 {t(
                     "filmSummary.dialogueVolume.hint",
-                    "Volume du son original du film sous la voix off generee par l'IA. 0 = coupe entierement (silence), 100 = volume original complet."
+                    "Volume du son original du film pendant les sequences de dialogue incluses dans le montage (la voix du film n'est jamais presente pendant que le narrateur parle). 0 = coupe entierement (silence), 100 = volume original complet."
                 )}
             </p>
 

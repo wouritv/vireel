@@ -17,7 +17,7 @@ import subprocess
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from film_summary import FilmSummaryErrorCode, FilmSummaryValidationError, SEGMENT_TYPE_VOICE_OVER, probe_media_duration_seconds, probe_technical_metadata
+from film_summary import FilmSummaryErrorCode, FilmSummaryValidationError, SEGMENT_TYPE_ORIGINAL_DIALOGUE, SEGMENT_TYPE_VOICE_OVER, probe_media_duration_seconds, probe_technical_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,13 @@ def _target_canvas(source_path: str) -> Dict[str, Any]:
 
 def extract_source_subclip(
     source_path: str, start_ms: int, end_ms: int, output_path: str, *, canvas: Dict[str, Any],
+    audio_volume: float = 1.0,
 ) -> None:
+    """`audio_volume` scales the clip's own audio (1.0 = unchanged, the
+    default): used by _build_original_segment_clip to apply a user-chosen
+    dialogue_volume to original_dialogue segments. Omitted entirely from
+    the ffmpeg command at 1.0 so every other caller's command is
+    byte-for-byte what it was before this parameter existed."""
     start_seconds = max(0.0, start_ms / 1000.0)
     duration_seconds = max(0.05, (end_ms - start_ms) / 1000.0)
     vf = (
@@ -78,8 +84,10 @@ def extract_source_subclip(
     cmd = [
         "ffmpeg", "-y", "-ss", f"{start_seconds:.3f}", "-i", source_path, "-t", f"{duration_seconds:.3f}",
         "-vf", vf, "-c:v", "libx264", "-preset", EXPORT_VIDEO_PRESET, "-crf", EXPORT_VIDEO_CRF,
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "48000", "-ac", "2", output_path,
     ]
+    if audio_volume != 1.0:
+        cmd += ["-af", f"volume={audio_volume}"]
+    cmd += ["-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "48000", "-ac", "2", output_path]
     _run_ffmpeg(cmd)
 
 
@@ -194,8 +202,13 @@ def encode_preview(input_path: str, output_path: str, height: int = PREVIEW_HEIG
 
 def _build_voice_over_segment_clip(
     segment: Dict[str, Any], source_video_path: str, narration_path: Optional[str], work_dir: str, canvas: Dict[str, Any],
-    original_volume: float = 0.0,
 ) -> str:
+    """The film's own voice must never be audible while the AI narrator
+    speaks ("la voix du film ne dois pas etre presente pendant que le
+    narrateur parle") -- duck_and_mix_narration is always called with its
+    default original_volume=0.0 here, never a user-configurable value.
+    dialogue_volume only ever applies to original_dialogue segments, see
+    _build_original_segment_clip."""
     seg_id = segment["id"]
     target_seconds = max(0.05, (segment.get("actual_duration_ms") or segment.get("estimated_duration_ms") or 0) / 1000.0)
     clips = segment.get("clips") or []
@@ -217,17 +230,25 @@ def _build_voice_over_segment_clip(
 
     if narration_path and os.path.exists(narration_path):
         base_path = os.path.join(work_dir, f"{seg_id}_final.mp4")
-        duck_and_mix_narration(visual_path, narration_path, base_path, original_volume=original_volume)
+        duck_and_mix_narration(visual_path, narration_path, base_path)
     else:
         base_path = visual_path
 
     return base_path
 
 
-def _build_original_segment_clip(segment: Dict[str, Any], source_video_path: str, work_dir: str, canvas: Dict[str, Any]) -> str:
+def _build_original_segment_clip(
+    segment: Dict[str, Any], source_video_path: str, work_dir: str, canvas: Dict[str, Any],
+    dialogue_volume: float = 1.0,
+) -> str:
+    """`dialogue_volume` (see extract_source_subclip's audio_volume) only
+    ever applies when this is an original_dialogue segment (the caller,
+    render_edit_plan, only passes a non-default value for that type) --
+    breathing segments always keep their own original volume unscaled."""
     seg_id = segment["id"]
     output_path = os.path.join(work_dir, f"{seg_id}_final.mp4")
-    extract_source_subclip(source_video_path, segment.get("start_ms", 0), segment.get("end_ms", 0), output_path, canvas=canvas)
+    volume = dialogue_volume if segment.get("type") == SEGMENT_TYPE_ORIGINAL_DIALOGUE else 1.0
+    extract_source_subclip(source_video_path, segment.get("start_ms", 0), segment.get("end_ms", 0), output_path, canvas=canvas, audio_volume=volume)
     return output_path
 
 
@@ -235,7 +256,7 @@ def render_edit_plan(
     *, plan: Dict[str, Any], source_video_path: str, voiceover_paths_by_segment_id: Dict[str, str],
     work_dir: str, final_output_path: str, preview_output_path: str,
     on_segment_done: Optional[Callable[[int, int], None]] = None,
-    original_dialogue_volume: float = 0.0,
+    original_dialogue_volume: float = 1.0,
 ) -> Dict[str, Any]:
     """Assemble the validated edit plan into a preview and a final MP4
     (spec 7.10). Returns {"segment_count", "final_duration_seconds"}.
@@ -251,10 +272,15 @@ def render_edit_plan(
     callback must itself be thread-safe -- see app.py's caller), lets the
     caller report real incremental progress instead.
 
-    `original_dialogue_volume` (0.0-1.0) is how loud the film's own audio is
-    kept under the AI narration during voice_over segments -- see
-    duck_and_mix_narration. 0.0 (the default) fully replaces it with the
-    narration; the caller (app.py) resolves this from the row's
+    `original_dialogue_volume` (0.0-1.0) is how loud the film's own audio
+    plays during original_dialogue segments -- see
+    _build_original_segment_clip. The AI narrator's own segments
+    (voice_over) never use this: the film's voice must never be present
+    while the narrator speaks ("la voix du film ne dois pas etre presente
+    pendant que le narrateur parle"), so those always fully replace the
+    original audio with the narration, unconditionally. 1.0 (full,
+    unscaled original volume) is the behavior if this were never set; the
+    caller (app.py) resolves the actual value from the row's
     dialogue_volume setting."""
     os.makedirs(work_dir, exist_ok=True)
     canvas = _target_canvas(source_video_path)
@@ -268,9 +294,9 @@ def render_edit_plan(
         logger.info("Rendering segment %s (%d/%d, type=%s)", segment.get("id"), index + 1, len(segments), segment.get("type"))
         if segment.get("type") == SEGMENT_TYPE_VOICE_OVER:
             narration_path = voiceover_paths_by_segment_id.get(segment["id"])
-            clip_path = _build_voice_over_segment_clip(segment, source_video_path, narration_path, work_dir, canvas, original_dialogue_volume)
+            clip_path = _build_voice_over_segment_clip(segment, source_video_path, narration_path, work_dir, canvas)
         else:
-            clip_path = _build_original_segment_clip(segment, source_video_path, work_dir, canvas)
+            clip_path = _build_original_segment_clip(segment, source_video_path, work_dir, canvas, dialogue_volume=original_dialogue_volume)
         segment_clip_paths.append(clip_path)
         if on_segment_done:
             on_segment_done(index, len(segments))

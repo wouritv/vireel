@@ -11596,9 +11596,12 @@ class FilmSummaryRenderRequest(BaseModel):
 
 
 class FilmSummaryAudioSettingsUpdateRequest(BaseModel):
-    # How loud the film's own original audio is kept under the AI narration
-    # during voice_over segments, 0-100 (default 20) -- see duck_and_mix_
-    # narration's original_volume. 0 fully replaces it with the narration.
+    # How loud the film's own original audio plays during original_dialogue
+    # segments in the montage, 0-100 (default 20) -- see
+    # film_summary_render._build_original_segment_clip's dialogue_volume.
+    # Never applies to voice_over segments: the film's own voice must never
+    # be present while the AI narrator speaks, so that audio is always
+    # fully replaced by the narration, unconditionally.
     dialogue_volume: Optional[int] = None
     subtitles_enabled: Optional[bool] = None
     subtitle_style: Optional[Dict[str, Any]] = None
@@ -12411,9 +12414,9 @@ async def update_film_summary_audio_settings_endpoint(
     film_summary_id: str, payload: FilmSummaryAudioSettingsUpdateRequest, user_id: Annotated[str, Depends(get_user_id_header)],
 ):
     """Persists the user's dialogue-volume choice (how loud the film's own
-    audio stays under the AI narration, see FilmSummaryAudioSettingsUpdate
-    Request's dialogue_volume docstring) and subtitle toggle/style --
-    applied at render time (see render_edit_plan /
+    audio plays during original_dialogue segments, see
+    FilmSummaryAudioSettingsUpdateRequest's dialogue_volume docstring) and
+    subtitle toggle/style -- applied at render time (see render_edit_plan /
     _run_film_summary_render_pipeline_stages, phase 3 of the manual-editor
     work). Editable up to the same point as the plan itself."""
     row = await supabase_get_film_summary(film_summary_id, user_id)

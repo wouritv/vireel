@@ -1,11 +1,13 @@
 -- Removes the background-music feature entirely ("enleve tout ce qui a
 -- trait a la musique de fond, c'est plus pertinent") and replaces it with a
 -- single dialogue_volume setting: how loud the film's own original audio
--- is kept under the AI narration during voice_over segments, 0-100
--- (default 20). This also replaces the previous unconditional mute
--- (ORIGINAL_AUDIO_DUCK_VOLUME=0.0 in film_summary_render.py) with a
--- user-chosen value -- see duck_and_mix_narration's original_volume
--- parameter and update_film_summary_audio_settings_endpoint in app.py.
+-- plays during original_dialogue segments in the montage, 0-100 (default
+-- 20) -- see film_summary_render._build_original_segment_clip's
+-- dialogue_volume parameter and update_film_summary_audio_settings_
+-- endpoint in app.py. Never applies to voice_over segments: the film's own
+-- voice must never be present while the AI narrator speaks ("la voix du
+-- film ne dois pas etre presente pendant que le narrateur parle"), so that
+-- audio is always fully replaced by the narration, unconditionally.
 --
 -- music_tracks was added by 20261003_film_summary_multi_track_music.sql;
 -- that migration (and 20261003_film_summary_manual_editor_fields.sql
