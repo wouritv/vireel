@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertCircle, ArrowLeft, Ban, Download, Loader2, RefreshCw, Share2, Trash2 } from "lucide-react";
+import { AlertCircle, ArrowLeft, Ban, Download, Loader2, RefreshCw, Share2, Trash2, Wand2 } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
 import { getApiUrl, fetchAppConfig } from "../config";
 import { getAuthHeaders } from "../lib/apiAuth";
@@ -8,6 +8,9 @@ import { useTranslation } from "../state/LanguageContext";
 import { errorMessageForCode } from "../lib/filmSummary";
 import FilmSummaryProcessingPanel from "../components/FilmSummaryProcessingPanel";
 import FilmSummaryReviewPanel from "../components/FilmSummaryReviewPanel";
+import FilmSummaryClipPickerEditor from "../components/FilmSummaryClipPickerEditor";
+import FilmSummaryCompletedSubtitlesPanel from "../components/FilmSummaryCompletedSubtitlesPanel";
+import FilmSummarySubtitleStylePreviewOverlay from "../components/FilmSummarySubtitleStylePreviewOverlay";
 import SharePostModal from "../components/SharePostModal";
 
 // Statuses for which the film summary's own job_id is still meaningful to
@@ -38,6 +41,17 @@ export default function FilmSummaryProjectDetailPage() {
     const [deleting, setDeleting] = useState(false);
     const [allowedVoices, setAllowedVoices] = useState([]);
     const [defaultVoice, setDefaultVoice] = useState("cedar");
+    // "Mode manuel" (see FilmSummaryClipPickerEditor): an optional alternate
+    // path through awaiting_review, reachable via a button next to the
+    // default automatic review flow -- it never changes which view shows
+    // for any other status, and closes itself back to the normal review
+    // flow once narration generation succeeds (onNarrationReady below).
+    const [manualEditorOpen, setManualEditorOpen] = useState(false);
+    // Mirrors FilmSummaryCompletedSubtitlesPanel's in-progress (not-yet-saved)
+    // subtitle style on the completed page, purely so the video wrapper's
+    // FilmSummarySubtitleStylePreviewOverlay can live-preview it -- the panel
+    // owns the real state and reports every change up via onLiveStyleChange.
+    const [liveSubtitleStyle, setLiveSubtitleStyle] = useState(null);
 
     const [showShareModal, setShowShareModal] = useState(false);
     const [shareTitle, setShareTitle] = useState("");
@@ -91,6 +105,7 @@ export default function FilmSummaryProjectDetailPage() {
 
     useEffect(() => {
         loadFilmSummary();
+        setManualEditorOpen(false);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [projectId, user?.id]);
 
@@ -176,6 +191,15 @@ export default function FilmSummaryProjectDetailPage() {
 
     const handleRetry = async () => {
         if (!filmSummary?.id || !user?.id) return;
+        if (
+            !globalThis.confirm(
+                t(
+                    "filmSummary.confirmRegenerateAll",
+                    "Relancer toute la generation depuis la video source ? Le plan de montage actuel et toutes les modifications (narration, selection manuelle des plans) seront perdus."
+                )
+            )
+        )
+            return;
         setRetrying(true);
         setError("");
         try {
@@ -323,14 +347,28 @@ export default function FilmSummaryProjectDetailPage() {
                 <div className="min-w-0">
                     <h1 className="truncate text-3xl font-black tracking-tight">{filmSummary?.title || t("filmSummary.untitled", "Resume de film sans titre")}</h1>
                 </div>
-                <button
-                    type="button"
-                    onClick={() => navigate("/dashboard/film-summaries")}
-                    className="inline-flex shrink-0 items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
-                >
-                    <ArrowLeft size={14} />
-                    {t("filmSummary.backToList", "Retour aux resumes de film")}
-                </button>
+                <div className="flex shrink-0 flex-wrap items-center gap-2">
+                    {status === "awaiting_review" && !manualEditorOpen && Array.isArray(filmSummary?.scene_index) && filmSummary.scene_index.length > 0 ? (
+                        <button
+                            type="button"
+                            onClick={() => setManualEditorOpen(true)}
+                            className="inline-flex items-center gap-2 rounded-xl border border-primary/40 bg-primary/10 px-4 py-2.5 text-sm font-medium text-primary hover:bg-primary/20"
+                        >
+                            <Wand2 size={14} />
+                            {t("filmSummary.manual.openButton", "Mode manuel : choisir mes plans")}
+                        </button>
+                    ) : null}
+                    <button
+                        type="button"
+                        onClick={manualEditorOpen ? () => setManualEditorOpen(false) : () => navigate("/dashboard/film-summaries")}
+                        className="inline-flex items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
+                    >
+                        <ArrowLeft size={14} />
+                        {manualEditorOpen
+                            ? t("filmSummary.manual.backToAutomatic", "Retour au mode automatique")
+                            : t("filmSummary.backToList", "Retour aux resumes de film")}
+                    </button>
+                </div>
             </div>
 
             {error ? (
@@ -416,14 +454,29 @@ export default function FilmSummaryProjectDetailPage() {
                     ) : null}
 
                     {status === "awaiting_review" ? (
-                        <FilmSummaryReviewPanel
-                            filmSummary={filmSummary}
-                            projectId={projectId}
-                            user={user}
-                            allowedVoices={allowedVoices}
-                            defaultVoice={defaultVoice}
-                            onRefresh={loadFilmSummary}
-                        />
+                        manualEditorOpen ? (
+                            <FilmSummaryClipPickerEditor
+                                filmSummary={filmSummary}
+                                user={user}
+                                onNarrationReady={(updated) => {
+                                    setFilmSummary(updated);
+                                    setManualEditorOpen(false);
+                                }}
+                            />
+                        ) : (
+                            <div className="space-y-4">
+                                <FilmSummaryReviewPanel
+                                    filmSummary={filmSummary}
+                                    projectId={projectId}
+                                    user={user}
+                                    allowedVoices={allowedVoices}
+                                    defaultVoice={defaultVoice}
+                                    onRefresh={loadFilmSummary}
+                                    onRegenerateAll={handleRetry}
+                                    regenerating={retrying}
+                                />
+                            </div>
+                        )
                     ) : null}
 
                     {status === "completed" ? (
@@ -431,8 +484,14 @@ export default function FilmSummaryProjectDetailPage() {
                             <h3 className="text-lg font-bold text-white">{t("filmSummary.completedTitle", "Ton resume de film est pret")}</h3>
                             {filmSummary.final_url ? (
                                 <div className="grid gap-4 md:grid-cols-[7fr_3fr]">
-                                    <video src={filmSummary.final_url} controls preload="metadata" className="w-full rounded-xl bg-black" />
-                                    <div className="flex flex-row flex-wrap gap-2 md:flex-col md:items-stretch">
+                                    <div className="relative">
+                                        <video src={filmSummary.final_url} controls preload="metadata" className="w-full rounded-xl bg-black" />
+                                        <FilmSummarySubtitleStylePreviewOverlay
+                                            style={liveSubtitleStyle}
+                                            sampleText={t("filmSummary.subtitles.previewSample", "Exemple de sous-titre")}
+                                        />
+                                    </div>
+                                    <div className="flex flex-col gap-3 md:items-stretch">
                                         <a
                                             href={filmSummary.final_url}
                                             download
@@ -440,6 +499,15 @@ export default function FilmSummaryProjectDetailPage() {
                                         >
                                             <Download size={14} /> {t("filmSummary.downloadButton", "Telecharger")}
                                         </a>
+
+                                        <FilmSummaryCompletedSubtitlesPanel
+                                            filmSummary={filmSummary}
+                                            user={user}
+                                            onUpdated={setFilmSummary}
+                                            onLiveStyleChange={setLiveSubtitleStyle}
+                                            t={t}
+                                        />
+
                                         <button
                                             type="button"
                                             onClick={handleOpenShare}

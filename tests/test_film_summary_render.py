@@ -91,6 +91,14 @@ def test_extract_source_subclip_builds_scale_and_pad_filter(monkeypatch):
     assert "scale=1280:720:force_original_aspect_ratio=decrease" in cmd[cmd.index("-vf") + 1]
     assert "-ss" in cmd
     assert "1.000" in cmd
+    assert "-af" not in cmd
+
+
+def test_extract_source_subclip_applies_audio_volume_filter_when_not_default(monkeypatch):
+    calls = _capture_ffmpeg_calls(monkeypatch)
+    render.extract_source_subclip("/tmp/source.mp4", 1000, 4000, "/tmp/out.mp4", canvas=CANVAS, audio_volume=0.35)
+    cmd = calls[0]
+    assert cmd[cmd.index("-af") + 1] == "volume=0.35"
 
 
 def test_build_blank_segment_uses_lavfi_color_source(monkeypatch):
@@ -210,57 +218,6 @@ def test_duck_and_mix_narration_builds_amix_filter_when_volume_above_zero(monkey
     assert "normalize=0" in filter_complex
 
 
-# ---------------------------------------------------------------------------
-# resolve_background_music_track / mix_background_music
-# ---------------------------------------------------------------------------
-
-def test_resolve_background_music_track_returns_none_when_dir_missing(monkeypatch, tmp_path):
-    monkeypatch.setattr(render, "MUSIC_DIR", str(tmp_path / "does-not-exist"))
-    assert render.resolve_background_music_track("tense") is None
-
-
-def test_resolve_background_music_track_returns_none_when_mood_dir_empty(monkeypatch, tmp_path):
-    monkeypatch.setattr(render, "MUSIC_DIR", str(tmp_path))
-    (tmp_path / "tense").mkdir()
-    assert render.resolve_background_music_track("tense") is None
-
-
-def test_resolve_background_music_track_finds_track_for_mood(monkeypatch, tmp_path):
-    monkeypatch.setattr(render, "MUSIC_DIR", str(tmp_path))
-    mood_dir = tmp_path / "tense"
-    mood_dir.mkdir()
-    (mood_dir / "track.mp3").write_bytes(b"fake")
-    (mood_dir / "notes.txt").write_bytes(b"ignored, not an audio extension")
-
-    result = render.resolve_background_music_track("tense")
-
-    assert result == str(mood_dir / "track.mp3")
-
-
-def test_resolve_background_music_track_falls_back_to_neutral(monkeypatch, tmp_path):
-    monkeypatch.setattr(render, "MUSIC_DIR", str(tmp_path))
-    (tmp_path / "tense").mkdir()  # exists but empty
-    neutral_dir = tmp_path / "neutral"
-    neutral_dir.mkdir()
-    (neutral_dir / "calm.wav").write_bytes(b"fake")
-
-    result = render.resolve_background_music_track("tense")
-
-    assert result == str(neutral_dir / "calm.wav")
-
-
-def test_mix_background_music_loops_and_ducks_to_low_volume(monkeypatch):
-    calls = _capture_ffmpeg_calls(monkeypatch)
-    render.mix_background_music("/tmp/in.mp4", "/tmp/music.mp3", "/tmp/out.mp4", volume=0.1)
-    cmd = calls[0]
-    assert "-stream_loop" in cmd
-    assert cmd[cmd.index("-stream_loop") + 1] == "-1"
-    filter_complex = cmd[cmd.index("-filter_complex") + 1]
-    assert "volume=0.1" in filter_complex
-    assert "amix=inputs=2" in filter_complex
-    assert "-shortest" in cmd
-
-
 def test_normalize_audio_loudness_uses_loudnorm_filter(monkeypatch):
     calls = _capture_ffmpeg_calls(monkeypatch)
     render.normalize_audio_loudness("/tmp/in.mp4", "/tmp/out.mp4")
@@ -333,54 +290,50 @@ def test_build_voice_over_segment_clip_ignores_missing_narration_file(monkeypatc
     assert result.endswith("seg_4_visual.mp4")
 
 
-def test_build_voice_over_segment_clip_mixes_music_when_track_given(monkeypatch, tmp_path):
+def test_build_voice_over_segment_clip_never_passes_a_volume_to_duck_and_mix(monkeypatch, tmp_path):
+    # The film's own voice must never be present while the narrator speaks
+    # -- duck_and_mix_narration is always called with its own default
+    # (full mute), never with a caller-supplied value.
     monkeypatch.setattr(render, "extract_source_subclip", lambda *a, **k: None)
     monkeypatch.setattr(render, "pad_or_trim_to_duration", lambda inp, dur, out: None)
-    monkeypatch.setattr(render, "duck_and_mix_narration", lambda visual, narration, out: None)
-    music_calls = []
-    monkeypatch.setattr(render, "mix_background_music", lambda *a, **k: music_calls.append(a))
+    duck_calls = []
+    monkeypatch.setattr(
+        render, "duck_and_mix_narration",
+        lambda visual, narration, out, original_volume=0.0: duck_calls.append(original_volume),
+    )
 
     narration_path = tmp_path / "narration.mp3"
     narration_path.write_bytes(b"fake")
     segment = {"id": "seg_6", "estimated_duration_ms": 10000, "clips": [{"start_ms": 0, "end_ms": 1000}]}
 
-    result = render._build_voice_over_segment_clip(
-        segment, "/tmp/source.mp4", str(narration_path), str(tmp_path), CANVAS, "/tmp/music/tense/track.mp3",
-    )
+    result = render._build_voice_over_segment_clip(segment, "/tmp/source.mp4", str(narration_path), str(tmp_path), CANVAS)
 
-    assert len(music_calls) == 1
-    assert music_calls[0][1] == "/tmp/music/tense/track.mp3"
-    assert result.endswith("seg_6_with_music.mp4")
+    assert duck_calls == [0.0]
+    assert result.endswith("seg_6_final.mp4")
 
 
-def test_build_voice_over_segment_clip_skips_music_when_no_track(monkeypatch, tmp_path):
-    monkeypatch.setattr(render, "extract_source_subclip", lambda *a, **k: None)
-    monkeypatch.setattr(render, "pad_or_trim_to_duration", lambda inp, dur, out: None)
-    monkeypatch.setattr(render, "duck_and_mix_narration", lambda visual, narration, out: None)
-    music_calls = []
-    monkeypatch.setattr(render, "mix_background_music", lambda *a, **k: music_calls.append(a))
-
-    narration_path = tmp_path / "narration.mp3"
-    narration_path.write_bytes(b"fake")
-    segment = {"id": "seg_7", "estimated_duration_ms": 10000, "clips": [{"start_ms": 0, "end_ms": 1000}]}
-
-    result = render._build_voice_over_segment_clip(
-        segment, "/tmp/source.mp4", str(narration_path), str(tmp_path), CANVAS, None,
-    )
-
-    assert music_calls == []
-    assert result.endswith("seg_7_final.mp4")
-
-
-def test_build_original_segment_clip_extracts_subclip(monkeypatch, tmp_path):
+def test_build_original_segment_clip_applies_dialogue_volume_to_original_dialogue(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(render, "extract_source_subclip", lambda *a, **k: calls.append((a, k)))
-    segment = {"id": "seg_5", "start_ms": 1000, "end_ms": 3000}
+    segment = {"id": "seg_5", "type": "original_dialogue", "start_ms": 1000, "end_ms": 3000}
 
-    result = render._build_original_segment_clip(segment, "/tmp/source.mp4", str(tmp_path), CANVAS)
+    result = render._build_original_segment_clip(segment, "/tmp/source.mp4", str(tmp_path), CANVAS, dialogue_volume=0.35)
 
     assert result.endswith("seg_5_final.mp4")
     assert len(calls) == 1
+    assert calls[0][1]["audio_volume"] == 0.35
+
+
+def test_build_original_segment_clip_ignores_dialogue_volume_for_breathing(monkeypatch, tmp_path):
+    # Breathing segments always keep their own full, untouched volume --
+    # dialogue_volume only ever scales original_dialogue segments.
+    calls = []
+    monkeypatch.setattr(render, "extract_source_subclip", lambda *a, **k: calls.append((a, k)))
+    segment = {"id": "seg_7", "type": "breathing", "start_ms": 1000, "end_ms": 3000}
+
+    render._build_original_segment_clip(segment, "/tmp/source.mp4", str(tmp_path), CANVAS, dialogue_volume=0.35)
+
+    assert calls[0][1]["audio_volume"] == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -396,37 +349,57 @@ def _sample_plan():
     }
 
 
-def test_render_edit_plan_resolves_music_from_plan_mood_and_passes_it_to_voice_over_only(monkeypatch, tmp_path):
+def test_render_edit_plan_passes_original_dialogue_volume_to_original_segments_only(monkeypatch, tmp_path):
     monkeypatch.setattr(render, "_target_canvas", lambda path: CANVAS)
-    monkeypatch.setattr(render, "resolve_background_music_track", lambda mood: f"/music/{mood}/track.mp3")
     voice_over_calls = []
     monkeypatch.setattr(
         render, "_build_voice_over_segment_clip",
-        lambda segment, source, narration, work_dir, canvas, music=None: voice_over_calls.append(music) or str(tmp_path / "seg_1_final.mp4"),
+        lambda segment, source, narration, work_dir, canvas: voice_over_calls.append(True) or str(tmp_path / "seg_1_final.mp4"),
     )
     original_calls = []
     monkeypatch.setattr(
         render, "_build_original_segment_clip",
-        lambda segment, source, work_dir, canvas: original_calls.append(segment) or str(tmp_path / "seg_2_final.mp4"),
+        lambda segment, source, work_dir, canvas, dialogue_volume=1.0: original_calls.append(dialogue_volume) or str(tmp_path / "seg_2_final.mp4"),
     )
     monkeypatch.setattr(render, "concat_video_clips", lambda paths, out, work_dir: None)
     monkeypatch.setattr(render, "normalize_audio_loudness", lambda inp, out: None)
     monkeypatch.setattr(render, "encode_preview", lambda inp, out, **k: None)
     monkeypatch.setattr(render, "probe_media_duration_seconds", lambda path: 13.0)
 
-    plan = _sample_plan()
-    plan["music_mood"] = "tense"
     render.render_edit_plan(
-        plan=plan, source_video_path="/tmp/source.mp4", voiceover_paths_by_segment_id={},
+        plan=_sample_plan(), source_video_path="/tmp/source.mp4", voiceover_paths_by_segment_id={},
+        work_dir=str(tmp_path), final_output_path=str(tmp_path / "final.mp4"), preview_output_path=str(tmp_path / "preview.mp4"),
+        original_dialogue_volume=0.65,
+    )
+
+    # _build_voice_over_segment_clip's signature never takes a volume
+    # argument at all -- the film's voice must never be present while the
+    # narrator speaks, so that path never receives a configurable volume...
+    assert len(voice_over_calls) == 1
+    # ...while the given volume is threaded into the original_dialogue
+    # segment instead.
+    assert original_calls == [0.65]
+
+
+def test_render_edit_plan_defaults_original_dialogue_volume_to_full(monkeypatch, tmp_path):
+    monkeypatch.setattr(render, "_target_canvas", lambda path: CANVAS)
+    monkeypatch.setattr(render, "_build_voice_over_segment_clip", lambda *a, **k: str(tmp_path / "seg_1_final.mp4"))
+    original_calls = []
+    monkeypatch.setattr(
+        render, "_build_original_segment_clip",
+        lambda segment, source, work_dir, canvas, dialogue_volume=1.0: original_calls.append(dialogue_volume) or str(tmp_path / "seg_2_final.mp4"),
+    )
+    monkeypatch.setattr(render, "concat_video_clips", lambda paths, out, work_dir: None)
+    monkeypatch.setattr(render, "normalize_audio_loudness", lambda inp, out: None)
+    monkeypatch.setattr(render, "encode_preview", lambda inp, out, **k: None)
+    monkeypatch.setattr(render, "probe_media_duration_seconds", lambda path: 13.0)
+
+    render.render_edit_plan(
+        plan=_sample_plan(), source_video_path="/tmp/source.mp4", voiceover_paths_by_segment_id={},
         work_dir=str(tmp_path), final_output_path=str(tmp_path / "final.mp4"), preview_output_path=str(tmp_path / "preview.mp4"),
     )
 
-    # The resolved track is threaded into the voice_over segment...
-    assert voice_over_calls == ["/music/tense/track.mp3"]
-    # ...but _build_original_segment_clip's signature never takes a music
-    # argument at all -- original_dialogue/breathing segments simply cannot
-    # receive background music through this pipeline.
-    assert len(original_calls) == 1
+    assert original_calls == [1.0]
 
 
 def test_render_edit_plan_raises_when_no_segments(monkeypatch, tmp_path):

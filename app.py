@@ -87,6 +87,7 @@ from supabase_request import (
 	set_user_data_balance as supabase_set_user_data_balance,
 	deduct_user_credits as supabase_deduct_user_credits,
 	insert_user_data_history as supabase_insert_user_data_history,
+	upsert_user_data_history_entry as supabase_upsert_user_data_history_entry,
 	get_user_data_history as supabase_get_user_data_history,
 	get_latest_user_paid_subscription as supabase_get_latest_user_paid_subscription,
 	update_souscription_row as supabase_update_souscription_row,
@@ -2864,10 +2865,17 @@ def _enrich_clips_with_saved_rows(clips: List[Dict[str, Any]], saved_rows: List[
 async def _debit_auto_caption_credits_for_completed_job(job_id: str, user_id: Optional[str], saved_rows: List[Dict[str, Any]]) -> None:
     """Bills the per-clip auto-caption credit cost recorded on each saved
     reel row (see _burn_default_captions_for_clip) -- additive to the reel
-    generation charge in _finalize_completed_reel_billing, never folded
-    into it, since its storage side is already counted in that charge's
-    total_reel_size_bytes (reel_size_bytes is the post-burn, captioned
-    file size)."""
+    generation charge in _finalize_completed_reel_billing, but merged into
+    that same job_id's user_data_history row (same operation_id, via
+    upsert_user_data_history_entry) rather than its own separate line: to
+    the user this is one reel generation, so it should show up as one
+    history entry whose amount includes this cost and whose nature stays
+    "generation_reel" (the primary charge for this job_id is always billed
+    first -- see job_manager.debit_credits_for_job, called from
+    _finalize_completed_reel_billing before this function is). The storage
+    side is already counted in that charge's total_reel_size_bytes
+    (reel_size_bytes is the post-burn, captioned file size), so only credit
+    is added here."""
     auto_caption_credit_total = sum(
         float(((row.get("billing_details") or {}).get("auto_caption") or {}).get("credit_cost") or 0.0)
         for row in saved_rows
@@ -2877,13 +2885,13 @@ async def _debit_auto_caption_credits_for_completed_job(job_id: str, user_id: Op
     try:
         caption_debited = await supabase_deduct_user_credits(user_id, auto_caption_credit_total, 0.0)
         if caption_debited:
-            await supabase_insert_user_data_history(
+            await supabase_upsert_user_data_history_entry(
                 user_id=user_id,
                 credit=auto_caption_credit_total,
                 storage=0.0,
                 operation="output",
                 operation_type="sous_titre",
-                operation_id=f"{job_id}:auto_captions",
+                operation_id=job_id,
             )
     except Exception as caption_billing_error:
         logger.exception("Auto-caption billing update failed for job %s", job_id)
@@ -3029,9 +3037,17 @@ async def _upload_and_bill_preserved_source_video(job_id: str, user_id: Optional
     """Backs up the locally preserved source video to S3 and debits the
     storage it consumes from the user's quota, the same way every other
     reel artifact's storage is billed (see _build_reel_row_for_clip's
-    original_s3_key). Best-effort: the local copy is what actually powers
-    manual clipping (_resolve_preserved_source_video), so a failure here
-    never affects that -- it only means the backup/billing didn't happen."""
+    original_s3_key). Merged into this job_id's own user_data_history row
+    (same operation_id, via upsert_user_data_history_entry) instead of its
+    own separate line, same reasoning as
+    _debit_auto_caption_credits_for_completed_job -- this call can run
+    before or after that job's primary charge is billed (this function
+    runs earlier in the reel pipeline), but both already share
+    operation_type "generation_reel" so which one creates the row first
+    doesn't matter here. Best-effort: the local copy is what actually
+    powers manual clipping (_resolve_preserved_source_video), so a failure
+    here never affects that -- it only means the backup/billing didn't
+    happen."""
     if not user_id or not is_supabase_configured():
         return
     bucket = os.environ.get("AWS_S3_BUCKET", "")
@@ -3047,13 +3063,13 @@ async def _upload_and_bill_preserved_source_video(job_id: str, user_id: Optional
             return
         debited = await supabase_deduct_user_credits(user_id, 0.0, -storage_gb)
         if debited:
-            await supabase_insert_user_data_history(
+            await supabase_upsert_user_data_history_entry(
                 user_id=user_id,
                 credit=0.0,
                 storage=round(storage_gb, 6),
                 operation="output",
                 operation_type="generation_reel",
-                operation_id=f"{job_id}:source_video",
+                operation_id=job_id,
             )
     except Exception as exc:
         logger.warning("Failed to upload/bill preserved source video for job %s: %s", job_id, exc)
@@ -11579,6 +11595,28 @@ class FilmSummaryRenderRequest(BaseModel):
     voice_id: Optional[str] = None
 
 
+class FilmSummaryAudioSettingsUpdateRequest(BaseModel):
+    # How loud the film's own original audio plays during original_dialogue
+    # segments in the montage, 0-100 (default 20) -- see
+    # film_summary_render._build_original_segment_clip's dialogue_volume.
+    # Never applies to voice_over segments: the film's own voice must never
+    # be present while the AI narrator speaks, so that audio is always
+    # fully replaced by the narration, unconditionally.
+    dialogue_volume: Optional[int] = None
+    subtitles_enabled: Optional[bool] = None
+    subtitle_style: Optional[Dict[str, Any]] = None
+
+
+class FilmSummaryManualSelectionUpdateRequest(BaseModel):
+    # [{"scene_id": "scene_003", "start_ms": 1200, "end_ms": 4800}, ...],
+    # in the order the user wants them in the final video.
+    manual_selection: List[Dict[str, Any]]
+
+
+class FilmSummaryTranslateNarrationRequest(BaseModel):
+    narration_language: str
+
+
 def _normalize_film_summary_row(row: Dict[str, Any], *, include_content: bool = False) -> Dict[str, Any]:
     item = {
         "id": row.get("id"),
@@ -11600,13 +11638,27 @@ def _normalize_film_summary_row(row: Dict[str, Any], *, include_content: bool = 
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
         "completed_at": row.get("completed_at"),
+        "edit_mode": row.get("edit_mode") or "automatic",
+        "dialogue_volume": row.get("dialogue_volume") if row.get("dialogue_volume") is not None else 20,
+        "subtitles_enabled": bool(row.get("subtitles_enabled") or False),
+        "subtitle_style": row.get("subtitle_style") or None,
     }
     if include_content:
         item["classification"] = row.get("classification") or {}
         item["scene_index"] = row.get("scene_index") or []
         item["edit_plan"] = row.get("edit_plan") or {}
         item["validation_report"] = row.get("validation_report") or {}
+        item["manual_selection"] = row.get("manual_selection") or []
         bucket_name = os.environ.get("AWS_S3_BUCKET", "my-clips-bucket")
+        # The manual clip-picker editor needs the original source video
+        # (not just the preview/final render) to let the user see each
+        # scene in full -- source_s3_key is always populated by the time
+        # analysis finishes (even for a youtube source, see
+        # _run_film_summary_analysis_pipeline) and only cleared once the
+        # final render completes (_finalize_film_summary_render), so it's
+        # reliably available throughout the awaiting_review window.
+        if row.get("source_s3_key"):
+            item["source_url"] = generate_presigned_url(bucket_name, row["source_s3_key"], expiration=3600)
         if row.get("preview_s3_key"):
             item["preview_url"] = generate_presigned_url(bucket_name, row["preview_s3_key"], expiration=3600)
         if row.get("final_s3_key"):
@@ -12357,6 +12409,165 @@ async def update_film_summary_plan_endpoint(
     return _normalize_film_summary_row(updated, include_content=True)
 
 
+@app.patch("/api/film-summaries/{film_summary_id}/audio-settings", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
+async def update_film_summary_audio_settings_endpoint(
+    film_summary_id: str, payload: FilmSummaryAudioSettingsUpdateRequest, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Persists the user's dialogue-volume choice (how loud the film's own
+    audio plays during original_dialogue segments, see
+    FilmSummaryAudioSettingsUpdateRequest's dialogue_volume docstring) and
+    subtitle toggle/style -- applied at render time (see render_edit_plan /
+    _run_film_summary_render_pipeline_stages, phase 3 of the manual-editor
+    work). Editable up to the same point as the plan itself."""
+    row = await supabase_get_film_summary(film_summary_id, user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
+    if row.get("status") != film_summary.FilmSummaryStatus.AWAITING_REVIEW:
+        raise HTTPException(status_code=409, detail="Audio/subtitle settings can only be edited while awaiting review")
+
+    updates = payload.model_dump(exclude_unset=True)
+
+    dialogue_volume = updates.get("dialogue_volume")
+    if dialogue_volume is not None and not (0 <= dialogue_volume <= 100):
+        raise HTTPException(status_code=400, detail="dialogue_volume must be between 0 and 100")
+
+    if not updates:
+        return _normalize_film_summary_row(row, include_content=True)
+
+    updated = await supabase_update_film_summary(film_summary_id, user_id, updates)
+    return _normalize_film_summary_row(updated, include_content=True)
+
+
+@app.put("/api/film-summaries/{film_summary_id}/manual-selection", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
+async def update_film_summary_manual_selection_endpoint(
+    film_summary_id: str, payload: FilmSummaryManualSelectionUpdateRequest, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Persists the user's manually chosen plans (shots, each possibly
+    trimmed from their auto-detected scene_index boundaries) and switches
+    this film summary into manual edit mode. Phase 2 of the manual-editor
+    work (the AI-narration-from-selection step) reads this back via
+    generate_narration_for_selected_clips."""
+    row = await supabase_get_film_summary(film_summary_id, user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
+    if row.get("status") != film_summary.FilmSummaryStatus.AWAITING_REVIEW:
+        raise HTTPException(status_code=409, detail="Clip selection can only be edited while awaiting review")
+
+    known_scene_ids = {s.get("scene_id") for s in (row.get("scene_index") or [])}
+    source_duration_ms = int((row.get("source_duration_seconds") or 0) * 1000)
+    for clip in payload.manual_selection:
+        scene_id, start_ms, end_ms = clip.get("scene_id"), clip.get("start_ms"), clip.get("end_ms")
+        if scene_id not in known_scene_ids:
+            raise HTTPException(status_code=400, detail=f"Unknown scene_id {scene_id}")
+        if not isinstance(start_ms, int) or not isinstance(end_ms, int) or start_ms < 0 or end_ms <= start_ms or end_ms > source_duration_ms:
+            raise HTTPException(status_code=400, detail=f"Invalid timecode for scene_id {scene_id}")
+
+    updated = await supabase_update_film_summary(film_summary_id, user_id, {
+        "manual_selection": payload.manual_selection, "edit_mode": "manual",
+    })
+    return _normalize_film_summary_row(updated, include_content=True)
+
+
+@app.post("/api/film-summaries/{film_summary_id}/generate-narration", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}})
+async def generate_film_summary_narration_endpoint(
+    film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Manual-editor phase 2 (see FilmSummaryManualSelectionUpdateRequest's
+    docstring and film_summary.generate_narration_for_selected_clips):
+    turns the user's already-persisted manual_selection into narrated
+    voice_over segments and persists the result into edit_plan/
+    validation_report, same way the automatic pipeline's planning stage
+    does. Re-callable as many times as the user likes while still awaiting
+    review (e.g. after tweaking their clip selection) -- regeneration is
+    deliberately covered by the original analysis credits, so this adds no
+    new credit/usage-limit logic of its own."""
+    row = await supabase_get_film_summary(film_summary_id, user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
+    if row.get("status") != film_summary.FilmSummaryStatus.AWAITING_REVIEW:
+        raise HTTPException(status_code=409, detail="Narration can only be generated while awaiting review")
+
+    manual_selection = row.get("manual_selection") or []
+    if not manual_selection:
+        raise HTTPException(status_code=400, detail="manual_selection is empty -- submit it via PUT manual-selection first")
+
+    movie_metadata = {
+        "title": row.get("title") or "",
+        "source_duration_ms": int((row.get("source_duration_seconds") or 0) * 1000),
+        "source_language": row.get("source_language") or "",
+        "narration_language": row.get("narration_language") or row.get("source_language") or "",
+    }
+    try:
+        result = await film_summary.generate_narration_for_selected_clips(
+            movie_metadata=movie_metadata, narration_language=movie_metadata["narration_language"],
+            narration_style=row.get("narration_style") or "", scene_index=row.get("scene_index") or [],
+            manual_selection=manual_selection, duration_tolerance_ratio=FILM_SUMMARY_DURATION_TOLERANCE_RATIO,
+        )
+    except Exception as exc:
+        # Any failure here (OpenAI transport/config error, malformed JSON
+        # after exhausting the retry, or the model breaking the exact-
+        # partition invariant) is a planning failure, never the user's
+        # fault -- same 502 convention as get_film_summary_voice_preview_
+        # endpoint's own OpenAI call, kept deliberately simple (no new
+        # retry/orchestration beyond what generate_narration_for_selected_
+        # clips itself already does).
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    plan, validation_report = result["plan"], result["validation_report"]
+    updated = await supabase_update_film_summary(film_summary_id, user_id, {
+        "edit_plan": plan, "validation_report": validation_report,
+        "target_duration_seconds": _plan_target_duration_seconds(plan),
+    })
+    return _normalize_film_summary_row(updated, include_content=True)
+
+
+@app.post("/api/film-summaries/{film_summary_id}/translate-narration", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}})
+async def translate_film_summary_narration_endpoint(
+    film_summary_id: str, payload: FilmSummaryTranslateNarrationRequest, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Lets the user fix a wrong narration-language choice on an already-
+    generated plan after the fact (see film_summary.translate_edit_plan_
+    narration's docstring): footage, timing and segment structure are
+    untouched, only each voice_over segment's narration text is
+    retranslated. Persists the translated plan plus the row's own
+    narration_language (so any later TTS/regeneration reflects the
+    correction too), same 404/409/502 conventions as the sibling
+    generate_film_summary_narration_endpoint."""
+    row = await supabase_get_film_summary(film_summary_id, user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
+    if row.get("status") != film_summary.FilmSummaryStatus.AWAITING_REVIEW:
+        raise HTTPException(status_code=409, detail="Narration language can only be edited while awaiting review")
+
+    resolved_language, _ = _resolve_film_summary_narration_settings(payload.narration_language, row.get("narration_style"))
+    if not resolved_language:
+        raise HTTPException(status_code=400, detail="narration_language is required")
+
+    movie_metadata = {
+        "title": row.get("title") or "",
+        "source_duration_ms": int((row.get("source_duration_seconds") or 0) * 1000),
+        "narration_style": row.get("narration_style") or "",
+    }
+    try:
+        result = await film_summary.translate_edit_plan_narration(
+            plan=row.get("edit_plan") or {}, target_language=resolved_language, movie_metadata=movie_metadata,
+            duration_tolerance_ratio=FILM_SUMMARY_DURATION_TOLERANCE_RATIO,
+        )
+    except Exception as exc:
+        # Same 502 convention as generate_film_summary_narration_endpoint's
+        # own try/except: any failure here (OpenAI transport/config error,
+        # malformed JSON after exhausting the retry, or the model breaking
+        # the translation invariant) is a planning failure, never the
+        # user's fault.
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    plan, validation_report = result["plan"], result["validation_report"]
+    updated = await supabase_update_film_summary(film_summary_id, user_id, {
+        "edit_plan": plan, "validation_report": validation_report, "narration_language": resolved_language,
+    })
+    return _normalize_film_summary_row(updated, include_content=True)
+
+
 @app.post("/api/film-summaries/{film_summary_id}/validate", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
 async def validate_film_summary_plan_endpoint(film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     row = await supabase_get_film_summary(film_summary_id, user_id)
@@ -12453,19 +12664,177 @@ async def render_film_summary_endpoint(
         voice_id=voice_id,
         render_required_credits=render_required_credits,
         narration_language=row.get("narration_language") or "",
+        dialogue_volume=row.get("dialogue_volume"),
+        subtitles_enabled=bool(row.get("subtitles_enabled")),
+        subtitle_style=row.get("subtitle_style"),
     ))
 
     return {"job_id": render_job_id, "film_summary_id": film_summary_id, "status": "rendering"}
 
 
+async def _require_completed_film_summary_row(film_summary_id: str, user_id: str) -> Dict[str, Any]:
+    """Shared 404/409 gating for apply_film_summary_subtitles_endpoint and
+    remove_film_summary_subtitles_endpoint -- both only act on a finished
+    render, unlike the awaiting_review-gated editor endpoints above."""
+    row = await supabase_get_film_summary(film_summary_id, user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
+    if row.get("status") != film_summary.FilmSummaryStatus.COMPLETED:
+        raise HTTPException(status_code=409, detail="Subtitles can only be changed on a completed film summary")
+    return row
+
+
+def _download_and_reupload_s3_object(bucket_name: str, source_key: str, dest_key: str, local_path: str) -> None:
+    """Copies an S3 object by downloading it locally then re-uploading it
+    under a different key -- s3_uploader.py has no native "copy object"
+    helper. Used in both directions by the two endpoints below: to back up
+    the pristine final video the first time subtitles are applied post-
+    completion (final_s3_key -> final_clean_s3_key), and to restore it when
+    the user removes subtitles (final_clean_s3_key -> final_s3_key). Film
+    summary final videos are capped at ~5 minutes
+    (FILM_SUMMARY_MAX_PLAN_DURATION_MS) so this is cheap."""
+    if not download_s3_object(bucket_name, source_key, local_path):
+        raise HTTPException(status_code=502, detail=f"Failed to download {source_key} from storage")
+    if not upload_file_to_s3(local_path, bucket_name, dest_key):
+        raise HTTPException(status_code=502, detail=f"Failed to upload {dest_key} to storage")
+
+
+async def _ensure_film_summary_final_clean_backup(
+    row: Dict[str, Any], user_id: str, film_summary_id: str, bucket_name: str, local_path: str,
+) -> Dict[str, Any]:
+    """Lazily backs up the current final_s3_key object as final_clean_s3_key
+    the first time apply_film_summary_subtitles_endpoint is called for this
+    film summary, so a later remove-subtitles call has a pristine copy to
+    restore. Returns the row unchanged if that backup already exists.
+
+    Known limitation: if this film summary's ORIGINAL render already had
+    subtitles_enabled=True (the user chose subtitles up front, during
+    generation), this backup captures that already-captioned video as the
+    "clean" master -- no truly caption-free copy was ever kept in that case.
+    Accepted as-is; only a render-time change could fix it."""
+    if row.get("final_clean_s3_key"):
+        return row
+    final_clean_s3_key = f"{_FILM_SUMMARIES_PREFIX}{user_id}/{film_summary_id}/final_clean.mp4"
+    _download_and_reupload_s3_object(bucket_name, row["final_s3_key"], final_clean_s3_key, local_path)
+    return await supabase_update_film_summary(film_summary_id, user_id, {"final_clean_s3_key": final_clean_s3_key})
+
+
+async def _render_film_summary_subtitled_video(
+    output_dir: str, clean_local_path: str, subtitle_style: Optional[Dict[str, Any]],
+) -> Tuple[str, str]:
+    """Burns subtitles into the pristine clean video and regenerates the
+    preview from the result, wrapping failures the same way
+    _run_film_summary_render_pipeline_stages does for the same call --
+    except as a 502 here, since this is a synchronous request/response
+    endpoint rather than a background job with its own failure/refund
+    path."""
+    try:
+        captioned_path = await _apply_film_summary_subtitle_burn_in(output_dir, clean_local_path, True, subtitle_style)
+        preview_path = os.path.join(output_dir, "preview_with_subtitles.mp4")
+        await asyncio.to_thread(film_summary_render.encode_preview, captioned_path, preview_path)
+    except film_summary.FilmSummaryValidationError as exc:
+        raise HTTPException(status_code=502, detail=f"Subtitle burn-in failed: {exc}") from exc
+    return captioned_path, preview_path
+
+
+@app.post("/api/film-summaries/{film_summary_id}/apply-subtitles", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}})
+async def apply_film_summary_subtitles_endpoint(
+    film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Lets a user who skipped subtitles during the original render add them
+    after the fact ("si une personne n'a pas pu ajouter des sous titres
+    pendant la generation, a la fin il dois pouvoir le faire"). Reads the
+    row's current subtitle_style/transcribes+burns it onto the real final
+    video in place -- the frontend PATCHes the chosen style via the
+    existing update_film_summary_audio_settings_endpoint right before
+    calling this, same reuse as elsewhere in this feature. The very first
+    time this runs for a given film summary it also lazily backs up the
+    then-current final video as final_clean_s3_key (see
+    _ensure_film_summary_final_clean_backup), so remove_film_summary_
+    subtitles_endpoint has something to restore later.
+
+    Free: adds no new credit/billing charge, the same decision already made
+    for translate_film_summary_narration_endpoint's retranslation earlier in
+    this feature."""
+    row = await _require_completed_film_summary_row(film_summary_id, user_id)
+    if not row.get("final_s3_key"):
+        raise HTTPException(status_code=400, detail="This film summary has no final video to add subtitles to")
+
+    bucket_name = os.environ.get("AWS_S3_BUCKET", "my-clips-bucket")
+    output_dir = os.path.join(OUTPUT_DIR, f"subtitle_apply_{film_summary_id}_{uuid.uuid4().hex[:8]}")
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        backup_local_path = os.path.join(output_dir, "final_before_backup.mp4")
+        row = await _ensure_film_summary_final_clean_backup(row, user_id, film_summary_id, bucket_name, backup_local_path)
+
+        clean_local_path = os.path.join(output_dir, "final_clean.mp4")
+        if not download_s3_object(bucket_name, row["final_clean_s3_key"], clean_local_path):
+            raise HTTPException(status_code=502, detail="Failed to download the subtitle-free final video")
+
+        captioned_path, preview_path = await _render_film_summary_subtitled_video(
+            output_dir, clean_local_path, row.get("subtitle_style"),
+        )
+
+        if not upload_file_to_s3(captioned_path, bucket_name, row["final_s3_key"]):
+            raise HTTPException(status_code=502, detail="Failed to upload the captioned final video")
+        if not upload_file_to_s3(preview_path, bucket_name, row.get("preview_s3_key")):
+            raise HTTPException(status_code=502, detail="Failed to upload the regenerated preview")
+
+        updated = await supabase_update_film_summary(film_summary_id, user_id, {"subtitles_enabled": True})
+    finally:
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+    return _normalize_film_summary_row(updated, include_content=True)
+
+
+@app.post("/api/film-summaries/{film_summary_id}/remove-subtitles", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
+async def remove_film_summary_subtitles_endpoint(
+    film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Lets the user revert a completed film summary back to its original,
+    subtitle-free video ("s'il ne veut plus de sous titres il dois avoir un
+    bouton pour revenir a la video initiale sans sous-titres"), restoring
+    final_s3_key/preview_s3_key from the pristine backup final_clean_s3_key
+    (see _ensure_film_summary_final_clean_backup, written the first time
+    apply_film_summary_subtitles_endpoint ran for this row). subtitle_style
+    is left untouched so a later re-apply remembers the user's last chosen
+    style."""
+    row = await _require_completed_film_summary_row(film_summary_id, user_id)
+    final_clean_s3_key = row.get("final_clean_s3_key")
+    if not final_clean_s3_key:
+        raise HTTPException(status_code=400, detail="No subtitle-free version of this video is available")
+
+    bucket_name = os.environ.get("AWS_S3_BUCKET", "my-clips-bucket")
+    output_dir = os.path.join(OUTPUT_DIR, f"subtitle_remove_{film_summary_id}_{uuid.uuid4().hex[:8]}")
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        clean_local_path = os.path.join(output_dir, "final_clean.mp4")
+        _download_and_reupload_s3_object(bucket_name, final_clean_s3_key, row["final_s3_key"], clean_local_path)
+
+        preview_path = os.path.join(output_dir, "preview_clean.mp4")
+        await asyncio.to_thread(film_summary_render.encode_preview, clean_local_path, preview_path)
+        if not upload_file_to_s3(preview_path, bucket_name, row.get("preview_s3_key")):
+            raise HTTPException(status_code=502, detail="Failed to upload the regenerated preview")
+
+        updated = await supabase_update_film_summary(film_summary_id, user_id, {"subtitles_enabled": False})
+    finally:
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+    return _normalize_film_summary_row(updated, include_content=True)
+
+
 async def _run_film_summary_render_job(
     job_id: str, user_id: str, film_summary_id: str, project_id: Optional[str], source_s3_key: Optional[str],
     output_dir: str, plan: Dict[str, Any], voice_id: str, render_required_credits: float, narration_language: str,
+    dialogue_volume: Optional[int] = None,
+    subtitles_enabled: bool = False, subtitle_style: Optional[Dict[str, Any]] = None,
 ) -> None:
     try:
         await reel_job_manager.start_job(job_id)
         await _run_film_summary_render_pipeline_stages(
             job_id, user_id, film_summary_id, project_id, source_s3_key, output_dir, plan, voice_id, narration_language,
+            dialogue_volume=dialogue_volume,
+            subtitles_enabled=subtitles_enabled, subtitle_style=subtitle_style,
         )
     except film_summary.FilmSummaryValidationError as exc:
         await reel_job_manager.fail_job(job_id, str(exc), error_code=exc.code)
@@ -12487,9 +12856,119 @@ async def _run_film_summary_render_job(
             shutil.rmtree(output_dir, ignore_errors=True)
 
 
+# Maps a film_summaries row's camelCase subtitle_style snapshot (the shape
+# CaptionsModal.jsx's DEFAULT_STYLE / caption_style_themes.style uses) to the
+# snake_case keys _DEFAULT_AUTO_CAPTION_STYLE_KWARGS/SubtitleRequest use.
+# Mirrors CaptionsModal.jsx's handleSetAsDefaultStyle mapping exactly -- copy
+# it, don't invent a new one -- except that `position` itself is hardcoded
+# to "bottom" below rather than read from the row, the same established
+# convention that call site uses.
+_FILM_SUMMARY_SUBTITLE_STYLE_FIELD_MAP: Dict[str, str] = {
+    "position_x": "positionX",
+    "position_y": "positionY",
+    "font_size": "fontSize",
+    "font_name": "fontFamily",
+    "font_color": "fontColor",
+    "highlight_color": "highlightColor",
+    "border_color": "borderColor",
+    "border_width": "borderWidth",
+    "text_shadow_color": "textShadowColor",
+    "shadow_blur": "shadowBlur",
+    "shadow_offset_x": "shadowOffsetX",
+    "shadow_offset_y": "shadowOffsetY",
+    "bg_color": "bgColor",
+    "bg_opacity": "bgOpacity",
+    "text_case": "textCase",
+    "bold": "bold",
+    "italic": "italic",
+    "words_per_line": "wordsPerLine",
+    "animation": "animation",
+}
+
+
+def _map_film_summary_subtitle_style(subtitle_style: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Resolves a film_summaries row's subtitle_style into the same
+    snake_case kwargs shape _DEFAULT_AUTO_CAPTION_STYLE_KWARGS has, falling
+    back to that factory default's own values for any key the row's
+    subtitle_style is missing (including when it is None/empty, e.g.
+    subtitles_enabled was turned on without ever opening the style
+    editor)."""
+    camel_style = subtitle_style if isinstance(subtitle_style, dict) else {}
+    kwargs = {"position": "bottom"}
+    for snake_key, camel_key in _FILM_SUMMARY_SUBTITLE_STYLE_FIELD_MAP.items():
+        kwargs[snake_key] = camel_style.get(camel_key, _DEFAULT_AUTO_CAPTION_STYLE_KWARGS[snake_key])
+    return kwargs
+
+
+def _build_film_summary_subtitle_style(subtitle_style: Optional[Dict[str, Any]]) -> SubtitleStyleOptions:
+    """Builds the subtitles.SubtitleStyleOptions burn_subtitles needs from a
+    film_summaries row's camelCase subtitle_style snapshot (see
+    _map_film_summary_subtitle_style for the field mapping)."""
+    kwargs = _map_film_summary_subtitle_style(subtitle_style)
+    return SubtitleStyleOptions(
+        font_name=kwargs["font_name"],
+        font_color=kwargs["font_color"],
+        border_color=kwargs["border_color"],
+        border_width=kwargs["border_width"],
+        bg_color=kwargs["bg_color"],
+        bg_opacity=kwargs["bg_opacity"],
+        text_shadow_color=kwargs["text_shadow_color"],
+        shadow_blur=kwargs["shadow_blur"],
+        shadow_offset_x=kwargs["shadow_offset_x"],
+        shadow_offset_y=kwargs["shadow_offset_y"],
+        bold=kwargs["bold"],
+        italic=kwargs["italic"],
+        text_case=kwargs["text_case"],
+        highlight_color=kwargs["highlight_color"],
+    )
+
+
+async def _apply_film_summary_subtitle_burn_in(
+    output_dir: str, final_path: str, subtitles_enabled: bool, subtitle_style: Optional[Dict[str, Any]],
+) -> str:
+    """Phase 3 post-processing: if subtitles_enabled, transcribes
+    final_path fresh -- generate_srt_from_video
+    is the same "no pre-existing transcript matches this exact audio"
+    codepath _generate_subtitle_srt's is_dubbed branch already uses for a
+    produced video whose exact spoken timing cannot be assumed to match any
+    existing transcript -- and burns it in with the row's mapped style.
+    Returns final_path unchanged when subtitles_enabled is false, so the
+    pipeline behaves exactly as today for any film summary without this
+    setting. Temporary .srt/.ass files are cleaned up before returning,
+    mirroring _burn_default_captions_for_clip's own cleanup."""
+    if not subtitles_enabled:
+        return final_path
+    style_kwargs = _map_film_summary_subtitle_style(subtitle_style)
+    srt_path = os.path.join(output_dir, "film_summary_subtitles.srt")
+    new_path = os.path.join(output_dir, "final_with_subtitles.mp4")
+    try:
+        await asyncio.to_thread(
+            generate_srt_from_video, final_path, srt_path, max_words_per_line=style_kwargs["words_per_line"],
+        )
+        style_options = _build_film_summary_subtitle_style(subtitle_style)
+        await asyncio.to_thread(
+            burn_subtitles, final_path, srt_path, new_path,
+            alignment=style_kwargs["position"], fontsize=style_kwargs["font_size"], style_options=style_options,
+        )
+    except film_summary.FilmSummaryValidationError:
+        raise
+    except Exception as exc:
+        raise film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.RENDER_FAILED, f"Subtitle burn-in failed: {exc}") from exc
+    finally:
+        for temp_path in (srt_path, f"{os.path.splitext(srt_path)[0]}.ass"):
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+    return new_path
+
+
 async def _run_film_summary_render_pipeline_stages(
     job_id: str, user_id: str, film_summary_id: str, project_id: Optional[str], source_s3_key: Optional[str],
     output_dir: str, plan: Dict[str, Any], voice_id: str, narration_language: str,
+    dialogue_volume: Optional[int] = None,
+    subtitles_enabled: bool = False, subtitle_style: Optional[Dict[str, Any]] = None,
 ) -> None:
     bucket_name = os.environ.get("AWS_S3_BUCKET", "my-clips-bucket")
     source_path = os.path.join(output_dir, "source.mp4")
@@ -12545,6 +13024,7 @@ async def _run_film_summary_render_pipeline_stages(
 
     final_path = os.path.join(output_dir, "final.mp4")
     preview_path = os.path.join(output_dir, "preview.mp4")
+    original_dialogue_volume = (dialogue_volume if dialogue_volume is not None else 20) / 100.0
     try:
         render_result = await asyncio.to_thread(
             film_summary_render.render_edit_plan,
@@ -12552,6 +13032,7 @@ async def _run_film_summary_render_pipeline_stages(
             voiceover_paths_by_segment_id=voiceover_paths, work_dir=os.path.join(output_dir, "work"),
             final_output_path=final_path, preview_output_path=preview_path,
             on_segment_done=_on_segment_done,
+            original_dialogue_volume=original_dialogue_volume,
         )
     except film_summary.FilmSummaryValidationError:
         raise
@@ -12559,6 +13040,17 @@ async def _run_film_summary_render_pipeline_stages(
         raise film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.RENDER_FAILED, str(exc)) from exc
 
     await reel_job_manager.update_progress(job_id, 90, film_summary.FilmSummaryStage.RENDERING_FINAL)
+
+    # Phase 3 post-processing: subtitle burn-in over the final video, only
+    # when subtitles_enabled is set on the row; when it isn't, final_path is
+    # untouched and the preview render_edit_plan already built stays valid
+    # as-is.
+    path_before_post_processing = final_path
+    final_path = await _apply_film_summary_subtitle_burn_in(
+        output_dir, final_path, subtitles_enabled, subtitle_style,
+    )
+    if final_path != path_before_post_processing:
+        await asyncio.to_thread(film_summary_render.encode_preview, final_path, preview_path)
 
     preview_s3_key = f"{_FILM_SUMMARIES_PREFIX}{user_id}/{film_summary_id}/preview.mp4"
     final_s3_key = f"{_FILM_SUMMARIES_PREFIX}{user_id}/{film_summary_id}/final.mp4"
@@ -12668,6 +13160,27 @@ async def cancel_film_summary_endpoint(film_summary_id: str, user_id: Annotated[
     return {"cancelled": True}
 
 
+def _retry_film_summary_status_updates(previous_status: str, retry_job_id: str) -> Dict[str, Any]:
+    """Status/stage reset applied by retry_film_summary_endpoint on every
+    retry (automatic or failed/failed resubmission), plus -- only when
+    retriggered from awaiting_review -- clearing any stale manual-editor
+    state, since a full automatic regenerate makes it meaningless against
+    the brand-new plan about to replace it. dialogue_volume/subtitles_
+    enabled/subtitle_style are independent user preferences and are left
+    untouched here."""
+    updates: Dict[str, Any] = {
+        "status": film_summary.FilmSummaryStatus.QUEUED,
+        "stage": film_summary.FilmSummaryStage.UPLOADING,
+        "job_id": retry_job_id,
+        "error_code": None,
+        "error_message": None,
+    }
+    if previous_status == film_summary.FilmSummaryStatus.AWAITING_REVIEW:
+        updates["manual_selection"] = None
+        updates["edit_mode"] = "automatic"
+    return updates
+
+
 @app.post("/api/film-summaries/{film_summary_id}/retry", responses={401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
 async def retry_film_summary_endpoint(film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     if not FILM_SUMMARY_ENABLED:
@@ -12676,8 +13189,8 @@ async def retry_film_summary_endpoint(film_summary_id: str, user_id: Annotated[s
     row = await supabase_get_film_summary(film_summary_id, user_id)
     if not row:
         raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
-    if row.get("status") != film_summary.FilmSummaryStatus.FAILED:
-        raise HTTPException(status_code=409, detail="Only a failed film summary can be retried")
+    if row.get("status") not in (film_summary.FilmSummaryStatus.FAILED, film_summary.FilmSummaryStatus.AWAITING_REVIEW):
+        raise HTTPException(status_code=409, detail="Only a failed or awaiting-review film summary can be retried")
 
     await _enforce_job_concurrency_limit(user_id)
 
@@ -12703,13 +13216,9 @@ async def retry_film_summary_endpoint(film_summary_id: str, user_id: Annotated[s
     )
     await reel_job_manager.enqueue_job(retry_job_id)
 
-    await supabase_update_film_summary(film_summary_id, user_id, {
-        "status": film_summary.FilmSummaryStatus.QUEUED,
-        "stage": film_summary.FilmSummaryStage.UPLOADING,
-        "job_id": retry_job_id,
-        "error_code": None,
-        "error_message": None,
-    })
+    await supabase_update_film_summary(
+        film_summary_id, user_id, _retry_film_summary_status_updates(row.get("status"), retry_job_id),
+    )
 
     _spawn_background_task(_run_film_summary_retry_job(
         job_id=retry_job_id,

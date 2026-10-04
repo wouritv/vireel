@@ -14,6 +14,7 @@ from supabase_request import (
     deduct_user_credits as supabase_deduct_user_credits,
     refund_user_credits as supabase_refund_user_credits,
     insert_user_data_history as supabase_insert_user_data_history,
+    upsert_user_data_history_entry as supabase_upsert_user_data_history_entry,
     get_user_data as supabase_get_user_data,
 )
 
@@ -235,7 +236,14 @@ class JobManager:
             success = await supabase_refund_user_credits(user_id, abs(delta), storage_delta)
 
         if success:
-            await supabase_insert_user_data_history(
+            # This is a job's own primary charge -- upsert rather than
+            # plain-insert so any per-job sub-charge billed afterward under
+            # the same operation_id (e.g. a reel's auto-caption cost, see
+            # app.py's _debit_auto_caption_credits_for_completed_job) merges
+            # into this one row (summed) instead of becoming its own line,
+            # and so this call itself is idempotent if a job were ever
+            # settled twice.
+            await supabase_upsert_user_data_history_entry(
                 user_id=user_id,
                 credit=normalized_credits,
                 storage=normalized_storage_gb,

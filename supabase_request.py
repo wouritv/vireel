@@ -1800,6 +1800,63 @@ async def insert_user_data_history(
 	return rows[0] if rows else payload
 
 
+async def upsert_user_data_history_entry(
+	user_id: str,
+	credit: float,
+	storage: float,
+	operation: str,        # 'input' | 'output' | 'refund'
+	operation_type: str,   # 'subscription' | 'reels' | 'captions' | 'publications' | 'credit_purchase'
+	operation_id: str = "",
+) -> Dict[str, Any]:
+	"""Same ledger as insert_user_data_history, but merges into an existing
+	row for this (user_id, operation_id, operation) instead of always
+	appending a new one -- for when one job's completion bills several
+	sub-charges that belong to the same logical operation as its primary
+	charge (e.g. a reel generation job's auto-caption cost, or its
+	preserved-source-video storage cost): those should show up as one
+	user-facing history line with the amounts summed, not several.
+
+	The merged row's credit/storage are summed; its operation_type is left
+	exactly as it was when the row was first created -- "la nature de
+	l'operation reste l'operation principale" -- the operation_type passed
+	here is only used when there's no existing row yet to merge into, so
+	callers must insert/merge the primary charge before any sub-charge for
+	a job for this to land the type they expect (every current caller
+	already does: see job_manager.debit_credits_for_job, which always bills
+	a job's own primary charge before app.py's per-job sub-charges run).
+
+	Falls back to a plain insert when operation_id is empty (nothing to
+	key a merge on, same as insert_user_data_history's default)."""
+	if not operation_id:
+		return await insert_user_data_history(user_id, credit, storage, operation, operation_type, operation_id)
+
+	client = await get_client()
+	existing_response = (
+		await client.table(SUPABASE_USER_DATA_HISTORY_TABLE)
+		.select("*")
+		.eq("user_id", user_id)
+		.eq("operation_id", operation_id)
+		.eq("operation", operation)
+		.limit(1)
+		.execute()
+	)
+	existing_rows = existing_response.data or []
+	if not existing_rows:
+		return await insert_user_data_history(user_id, credit, storage, operation, operation_type, operation_id)
+
+	existing = existing_rows[0]
+	merged_credit = _ceil_credit(float(existing.get("credit") or 0.0) + float(credit or 0.0))
+	merged_storage = float(existing.get("storage") or 0.0) + float(storage or 0.0)
+	update_response = (
+		await client.table(SUPABASE_USER_DATA_HISTORY_TABLE)
+		.update({"credit": merged_credit, "storage": merged_storage})
+		.eq("id", existing["id"])
+		.execute()
+	)
+	rows = update_response.data or []
+	return rows[0] if rows else {**existing, "credit": merged_credit, "storage": merged_storage}
+
+
 async def get_user_data_history(
 	user_id: str,
 	page: int = 1,

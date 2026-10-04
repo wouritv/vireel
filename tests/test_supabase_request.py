@@ -1493,6 +1493,81 @@ def test_insert_credit_bank_entry_and_user_history(monkeypatch):
     assert history["operation_id"] == "h-1"
 
 
+def test_upsert_user_data_history_entry_inserts_when_no_existing_row(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {
+            supabase_request.SUPABASE_USER_DATA_HISTORY_TABLE: [
+                _FakeResponse(data=[]),  # the merge lookup finds nothing
+                _FakeResponse(data=[{"id": "h-new", "credit": 3, "storage": 0.0, "operation_type": "generation_reel"}]),
+            ],
+        }
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(
+        supabase_request.upsert_user_data_history_entry(
+            user_id="u1", credit=2.2, storage=0.0, operation="output",
+            operation_type="generation_reel", operation_id="job-1",
+        )
+    )
+
+    assert result["id"] == "h-new"
+    assert result["credit"] == 3
+    assert _event_count(fake_client.events, supabase_request.SUPABASE_USER_DATA_HISTORY_TABLE, "insert") == 1
+    assert _event_count(fake_client.events, supabase_request.SUPABASE_USER_DATA_HISTORY_TABLE, "update") == 0
+
+
+def test_upsert_user_data_history_entry_merges_into_existing_row_and_keeps_operation_type(monkeypatch):
+    # The second (sub-)charge for the same job_id must sum into the
+    # existing row's credit/storage rather than create a new row, and
+    # must never overwrite the operation_type the row was created with --
+    # "la nature de l'operation reste l'operation principale".
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {
+            supabase_request.SUPABASE_USER_DATA_HISTORY_TABLE: [
+                _FakeResponse(data=[{"id": "h-1", "credit": 3, "storage": 0.1, "operation_type": "generation_reel", "operation": "output"}]),
+                _FakeResponse(data=[{"id": "h-1", "credit": 5, "storage": 0.1, "operation_type": "generation_reel", "operation": "output"}]),
+            ],
+        }
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(
+        supabase_request.upsert_user_data_history_entry(
+            user_id="u1", credit=1.6, storage=0.0, operation="output",
+            operation_type="sous_titre", operation_id="job-1",
+        )
+    )
+
+    assert result["id"] == "h-1"
+    update_args = _event_args(fake_client.events, supabase_request.SUPABASE_USER_DATA_HISTORY_TABLE, "update")
+    # existing credit (3) + ceil(1.6) == 5, never the child's own operation_type.
+    assert update_args[0] == {"credit": 5, "storage": 0.1}
+    assert _event_count(fake_client.events, supabase_request.SUPABASE_USER_DATA_HISTORY_TABLE, "insert") == 0
+
+
+def test_upsert_user_data_history_entry_falls_back_to_insert_when_operation_id_empty(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_USER_DATA_HISTORY_TABLE: [_FakeResponse(data=[{"id": "h-no-key"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(
+        supabase_request.upsert_user_data_history_entry(
+            user_id="u1", credit=1.0, storage=0.0, operation="output",
+            operation_type="generation_reel", operation_id="",
+        )
+    )
+
+    assert result["id"] == "h-no-key"
+    # No merge lookup at all -- straight to insert, same as insert_user_data_history itself.
+    assert _event_count(fake_client.events, supabase_request.SUPABASE_USER_DATA_HISTORY_TABLE, "select") == 0
+    assert _event_count(fake_client.events, supabase_request.SUPABASE_USER_DATA_HISTORY_TABLE, "insert") == 1
+
+
 def test_get_user_data_history_query_and_pagination(monkeypatch):
     supabase_request = _import_supabase_request_with_stubs(monkeypatch)
     fake_client = _FakeClient(

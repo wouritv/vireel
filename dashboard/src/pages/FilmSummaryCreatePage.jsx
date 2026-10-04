@@ -8,7 +8,7 @@ import { useUserCredits } from "../state/UserCreditsContext";
 import { useTranslation } from "../state/LanguageContext";
 import MediaInput from "../components/MediaInput";
 import FilmSummaryProcessingPanel from "../components/FilmSummaryProcessingPanel";
-import { errorMessageForCode, normalizeFilmSummaryJobStatus as normalizeStatus } from "../lib/filmSummary";
+import { errorMessageForCode, normalizeFilmSummaryJobStatus as normalizeStatus, NARRATION_LANGUAGE_OPTIONS } from "../lib/filmSummary";
 
 const NARRATION_STYLE_KEYS = [
     {
@@ -31,17 +31,6 @@ const NARRATION_STYLE_KEYS = [
         descKey: "filmSummary.narrationStyleEnergeticDesc",
         descFallback: "Rythme rapide et dynamique, adapte a un resume court et percutant.",
     },
-];
-
-// Same language set as CaptionsModal.jsx's FALLBACK_LANGUAGES, for a
-// consistent dropdown across the app's language pickers.
-const LANGUAGE_OPTIONS = [
-    { value: "fr", labelKey: "filmSummary.languageFrench", fallback: "Francais" },
-    { value: "en", labelKey: "filmSummary.languageEnglish", fallback: "Anglais" },
-    { value: "es", labelKey: "filmSummary.languageSpanish", fallback: "Espagnol" },
-    { value: "de", labelKey: "filmSummary.languageGerman", fallback: "Allemand" },
-    { value: "it", labelKey: "filmSummary.languageItalian", fallback: "Italien" },
-    { value: "pt", labelKey: "filmSummary.languagePortuguese", fallback: "Portugais" },
 ];
 
 export default function FilmSummaryCreatePage() {
@@ -415,7 +404,7 @@ export default function FilmSummaryCreatePage() {
                                 className="input-field w-full dark:text-white"
                             >
                                 <option value="">{t("filmSummary.sourceLanguageAuto", "Detection automatique")}</option>
-                                {LANGUAGE_OPTIONS.map((option) => (
+                                {NARRATION_LANGUAGE_OPTIONS.map((option) => (
                                     <option key={option.value} value={option.value}>{t(option.labelKey, option.fallback)}</option>
                                 ))}
                             </select>
@@ -432,7 +421,7 @@ export default function FilmSummaryCreatePage() {
                                 className="input-field w-full dark:text-white"
                             >
                                 <option value="">{t("filmSummary.narrationLanguageAuto", "Meme langue que la source")}</option>
-                                {LANGUAGE_OPTIONS.map((option) => (
+                                {NARRATION_LANGUAGE_OPTIONS.map((option) => (
                                     <option key={option.value} value={option.value}>{t(option.labelKey, option.fallback)}</option>
                                 ))}
                             </select>

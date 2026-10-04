@@ -17,31 +17,14 @@ import subprocess
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from film_summary import DEFAULT_MUSIC_MOOD, FilmSummaryErrorCode, FilmSummaryValidationError, SEGMENT_TYPE_VOICE_OVER, probe_media_duration_seconds, probe_technical_metadata
+from film_summary import FilmSummaryErrorCode, FilmSummaryValidationError, SEGMENT_TYPE_ORIGINAL_DIALOGUE, SEGMENT_TYPE_VOICE_OVER, probe_media_duration_seconds, probe_technical_metadata
 
 logger = logging.getLogger(__name__)
 
 FFMPEG_STEP_TIMEOUT_SECONDS = int(os.environ.get("FFMPEG_STEP_TIMEOUT_SECONDS", str(2 * 3600)))
 EXPORT_VIDEO_PRESET = os.environ.get("VIREEL_EXPORT_PRESET", "veryfast")
 EXPORT_VIDEO_CRF = os.environ.get("VIREEL_EXPORT_CRF", "20")
-# The film's own dialogue must not remain audible under the AI voice-over
-# -- only the narration should be heard during voice_over segments (the
-# movie's own audio is meant to be heard only in original_dialogue/breathing
-# segments, which never go through this ducking path at all). Default fully
-# mutes the original track; set this above 0 to duck it under the narration
-# instead of silencing it outright.
-ORIGINAL_AUDIO_DUCK_VOLUME = float(os.environ.get("FILM_SUMMARY_ORIGINAL_AUDIO_DUCK_VOLUME", "0.0"))
 PREVIEW_HEIGHT = int(os.environ.get("FILM_SUMMARY_PREVIEW_HEIGHT", "480"))
-
-# Optional instrumental (no lyrics) background bed, mixed at low volume under
-# voice_over segments only -- see resolve_background_music_track. Entirely
-# filesystem-driven: drop royalty-free, vocal-free tracks into
-# MUSIC_DIR/<mood>/*.mp3 (moods: see film_summary.MUSIC_MOODS) to activate
-# it. With no tracks present (the default -- this repo ships none), the
-# render behaves exactly as if this feature didn't exist.
-MUSIC_DIR = os.environ.get("FILM_SUMMARY_MUSIC_DIR", "music")
-MUSIC_VOLUME = float(os.environ.get("FILM_SUMMARY_MUSIC_VOLUME", "0.10"))
-MUSIC_TRACK_EXTENSIONS = (".mp3", ".wav", ".m4a", ".aac")
 
 
 def _run_ffmpeg(cmd: List[str], timeout_seconds: int = FFMPEG_STEP_TIMEOUT_SECONDS) -> None:
@@ -84,7 +67,13 @@ def _target_canvas(source_path: str) -> Dict[str, Any]:
 
 def extract_source_subclip(
     source_path: str, start_ms: int, end_ms: int, output_path: str, *, canvas: Dict[str, Any],
+    audio_volume: float = 1.0,
 ) -> None:
+    """`audio_volume` scales the clip's own audio (1.0 = unchanged, the
+    default): used by _build_original_segment_clip to apply a user-chosen
+    dialogue_volume to original_dialogue segments. Omitted entirely from
+    the ffmpeg command at 1.0 so every other caller's command is
+    byte-for-byte what it was before this parameter existed."""
     start_seconds = max(0.0, start_ms / 1000.0)
     duration_seconds = max(0.05, (end_ms - start_ms) / 1000.0)
     vf = (
@@ -95,8 +84,10 @@ def extract_source_subclip(
     cmd = [
         "ffmpeg", "-y", "-ss", f"{start_seconds:.3f}", "-i", source_path, "-t", f"{duration_seconds:.3f}",
         "-vf", vf, "-c:v", "libx264", "-preset", EXPORT_VIDEO_PRESET, "-crf", EXPORT_VIDEO_CRF,
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "48000", "-ac", "2", output_path,
     ]
+    if audio_volume != 1.0:
+        cmd += ["-af", f"volume={audio_volume}"]
+    cmd += ["-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "48000", "-ac", "2", output_path]
     _run_ffmpeg(cmd)
 
 
@@ -163,17 +154,17 @@ def pad_or_trim_to_duration(input_path: str, target_seconds: float, output_path:
 
 def duck_and_mix_narration(
     visual_with_audio_path: str, narration_audio_path: str, output_path: str,
-    original_volume: float = ORIGINAL_AUDIO_DUCK_VOLUME,
+    original_volume: float = 0.0,
 ) -> None:
     """Put the narration track on this voice-over segment. By default
     (original_volume=0.0) the segment's own audio is fully replaced by the
     narration -- the viewer must hear only the voice-over here, never the
     film's original dialogue underneath it. If original_volume is raised
-    above 0 (FILM_SUMMARY_ORIGINAL_AUDIO_DUCK_VOLUME), the original audio is
-    instead ducked to that level and mixed under the narration rather than
-    silenced outright. `duration=first`/`-shortest` keep the result locked
-    to the visual track's length, which pad_or_trim_to_duration already
-    matched to the narration."""
+    above 0 (see the row's dialogue_volume setting, resolved by the caller),
+    the original audio is instead ducked to that level and mixed under the
+    narration rather than silenced outright. `duration=first`/`-shortest`
+    keep the result locked to the visual track's length, which
+    pad_or_trim_to_duration already matched to the narration."""
     if original_volume <= 0:
         cmd = [
             "ffmpeg", "-y", "-i", visual_with_audio_path, "-i", narration_audio_path,
@@ -195,42 +186,6 @@ def duck_and_mix_narration(
     _run_ffmpeg(cmd)
 
 
-def resolve_background_music_track(mood: str) -> Optional[str]:
-    """Picks one instrumental (no lyrics) track for `mood` from
-    MUSIC_DIR/<mood>/*, falling back to MUSIC_DIR/neutral/ if that mood has
-    no tracks, then to no track at all. Purely filesystem-driven -- until
-    someone drops royalty-free, vocal-free audio files into those folders,
-    this always returns None and the render is completely unaffected."""
-    seen_dirs = []
-    for candidate_mood in (mood or DEFAULT_MUSIC_MOOD, DEFAULT_MUSIC_MOOD):
-        mood_dir = os.path.join(MUSIC_DIR, candidate_mood)
-        if mood_dir in seen_dirs or not os.path.isdir(mood_dir):
-            continue
-        seen_dirs.append(mood_dir)
-        tracks = sorted(f for f in os.listdir(mood_dir) if f.lower().endswith(MUSIC_TRACK_EXTENSIONS))
-        if tracks:
-            return os.path.join(mood_dir, tracks[0])
-    return None
-
-
-def mix_background_music(input_path: str, music_path: str, output_path: str, volume: float = MUSIC_VOLUME) -> None:
-    """Layers a looped, low-volume instrumental bed under input_path's
-    existing audio (the narration mix duck_and_mix_narration already
-    produced). `-stream_loop -1` on the music input lets a short track cover
-    a long segment; `duration=first`/`-shortest` trim the result back to
-    input_path's own length so the loop never extends the segment."""
-    filter_complex = (
-        f"[1:a]volume={volume}[music];"
-        f"[0:a][music]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
-    )
-    cmd = [
-        "ffmpeg", "-y", "-i", input_path, "-stream_loop", "-1", "-i", music_path,
-        "-filter_complex", filter_complex, "-map", "0:v", "-map", "[aout]",
-        "-c:v", "copy", "-c:a", "aac", "-shortest", output_path,
-    ]
-    _run_ffmpeg(cmd)
-
-
 def normalize_audio_loudness(input_path: str, output_path: str) -> None:
     cmd = ["ffmpeg", "-y", "-i", input_path, "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-c:v", "copy", output_path]
     _run_ffmpeg(cmd)
@@ -247,8 +202,13 @@ def encode_preview(input_path: str, output_path: str, height: int = PREVIEW_HEIG
 
 def _build_voice_over_segment_clip(
     segment: Dict[str, Any], source_video_path: str, narration_path: Optional[str], work_dir: str, canvas: Dict[str, Any],
-    music_track_path: Optional[str] = None,
 ) -> str:
+    """The film's own voice must never be audible while the AI narrator
+    speaks ("la voix du film ne dois pas etre presente pendant que le
+    narrateur parle") -- duck_and_mix_narration is always called with its
+    default original_volume=0.0 here, never a user-configurable value.
+    dialogue_volume only ever applies to original_dialogue segments, see
+    _build_original_segment_clip."""
     seg_id = segment["id"]
     target_seconds = max(0.05, (segment.get("actual_duration_ms") or segment.get("estimated_duration_ms") or 0) / 1000.0)
     clips = segment.get("clips") or []
@@ -274,21 +234,21 @@ def _build_voice_over_segment_clip(
     else:
         base_path = visual_path
 
-    # Background music (see resolve_background_music_track) only ever plays
-    # under voice_over segments -- never under original_dialogue/breathing,
-    # where the film's own audio is meant to be the only thing heard.
-    if not music_track_path:
-        return base_path
-
-    with_music_path = os.path.join(work_dir, f"{seg_id}_with_music.mp4")
-    mix_background_music(base_path, music_track_path, with_music_path)
-    return with_music_path
+    return base_path
 
 
-def _build_original_segment_clip(segment: Dict[str, Any], source_video_path: str, work_dir: str, canvas: Dict[str, Any]) -> str:
+def _build_original_segment_clip(
+    segment: Dict[str, Any], source_video_path: str, work_dir: str, canvas: Dict[str, Any],
+    dialogue_volume: float = 1.0,
+) -> str:
+    """`dialogue_volume` (see extract_source_subclip's audio_volume) only
+    ever applies when this is an original_dialogue segment (the caller,
+    render_edit_plan, only passes a non-default value for that type) --
+    breathing segments always keep their own original volume unscaled."""
     seg_id = segment["id"]
     output_path = os.path.join(work_dir, f"{seg_id}_final.mp4")
-    extract_source_subclip(source_video_path, segment.get("start_ms", 0), segment.get("end_ms", 0), output_path, canvas=canvas)
+    volume = dialogue_volume if segment.get("type") == SEGMENT_TYPE_ORIGINAL_DIALOGUE else 1.0
+    extract_source_subclip(source_video_path, segment.get("start_ms", 0), segment.get("end_ms", 0), output_path, canvas=canvas, audio_volume=volume)
     return output_path
 
 
@@ -296,6 +256,7 @@ def render_edit_plan(
     *, plan: Dict[str, Any], source_video_path: str, voiceover_paths_by_segment_id: Dict[str, str],
     work_dir: str, final_output_path: str, preview_output_path: str,
     on_segment_done: Optional[Callable[[int, int], None]] = None,
+    original_dialogue_volume: float = 1.0,
 ) -> Dict[str, Any]:
     """Assemble the validated edit plan into a preview and a final MP4
     (spec 7.10). Returns {"segment_count", "final_duration_seconds"}.
@@ -309,12 +270,20 @@ def render_edit_plan(
     `on_segment_done(index, total)`, called synchronously after each
     segment's clip finishes (this runs inside asyncio.to_thread, so the
     callback must itself be thread-safe -- see app.py's caller), lets the
-    caller report real incremental progress instead."""
+    caller report real incremental progress instead.
+
+    `original_dialogue_volume` (0.0-1.0) is how loud the film's own audio
+    plays during original_dialogue segments -- see
+    _build_original_segment_clip. The AI narrator's own segments
+    (voice_over) never use this: the film's voice must never be present
+    while the narrator speaks ("la voix du film ne dois pas etre presente
+    pendant que le narrateur parle"), so those always fully replace the
+    original audio with the narration, unconditionally. 1.0 (full,
+    unscaled original volume) is the behavior if this were never set; the
+    caller (app.py) resolves the actual value from the row's
+    dialogue_volume setting."""
     os.makedirs(work_dir, exist_ok=True)
     canvas = _target_canvas(source_video_path)
-    music_track_path = resolve_background_music_track(str(plan.get("music_mood") or DEFAULT_MUSIC_MOOD))
-    if music_track_path:
-        logger.info("Using background music track for mood '%s': %s", plan.get("music_mood"), music_track_path)
 
     segments = sorted(plan.get("segments") or [], key=lambda s: s.get("sequence", 0))
     if not segments:
@@ -325,9 +294,9 @@ def render_edit_plan(
         logger.info("Rendering segment %s (%d/%d, type=%s)", segment.get("id"), index + 1, len(segments), segment.get("type"))
         if segment.get("type") == SEGMENT_TYPE_VOICE_OVER:
             narration_path = voiceover_paths_by_segment_id.get(segment["id"])
-            clip_path = _build_voice_over_segment_clip(segment, source_video_path, narration_path, work_dir, canvas, music_track_path)
+            clip_path = _build_voice_over_segment_clip(segment, source_video_path, narration_path, work_dir, canvas)
         else:
-            clip_path = _build_original_segment_clip(segment, source_video_path, work_dir, canvas)
+            clip_path = _build_original_segment_clip(segment, source_video_path, work_dir, canvas, dialogue_volume=original_dialogue_volume)
         segment_clip_paths.append(clip_path)
         if on_segment_done:
             on_segment_done(index, len(segments))
