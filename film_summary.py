@@ -1180,8 +1180,75 @@ def _describe_duration_gap(plan: Dict[str, Any], target_duration_ms: int) -> str
     )
 
 
+def _voice_over_clip_signature(clip: Dict[str, Any]) -> Tuple[Any, Any, Any]:
+    return (clip.get("scene_id"), clip.get("start_ms"), clip.get("end_ms"))
+
+
+def _find_repeated_voice_over_clips(segments: List[Dict[str, Any]]) -> List[Tuple[str, Tuple[Any, Any, Any]]]:
+    """Internal-only signal used exclusively by generate_edit_plan's own
+    corrective retry below -- deliberately NOT part of
+    validate_edit_plan_content/the user-facing validation report (clip
+    reuse must never surface as an error or warning the user has to act
+    on, see that function's docstring). Returns one (segment_id,
+    signature) pair per voice_over clip whose exact (scene_id, start_ms,
+    end_ms) signature already appeared earlier in plan order, so the
+    corrective message can name exactly which repeats to fix."""
+    seen: set = set()
+    repeats: List[Tuple[str, Tuple[Any, Any, Any]]] = []
+    for seg in segments:
+        if seg.get("type") != SEGMENT_TYPE_VOICE_OVER:
+            continue
+        for clip in seg.get("clips") or []:
+            signature = _voice_over_clip_signature(clip)
+            if signature in seen:
+                repeats.append((seg.get("id"), signature))
+            else:
+                seen.add(signature)
+    return repeats
+
+
+def _describe_repeated_voice_over_clips(repeats: List[Tuple[str, Tuple[Any, Any, Any]]]) -> str:
+    return "; ".join(
+        f"segment {seg_id} reuses the exact same clip (scene_id={scene_id}, start_ms={start_ms}, end_ms={end_ms}) "
+        "already used earlier in the plan"
+        for seg_id, (scene_id, start_ms, end_ms) in repeats
+    )
+
+
+def _deduplicate_voice_over_clips(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Final, unconditional guarantee that no exact clip (scene_id,
+    start_ms, end_ms) ever reaches more than one segment in the plan
+    generate_edit_plan returns -- "ne jamais utiliser la meme scene 2
+    fois ... l'utilisateur ne dois pas intervenir": this must hold by
+    construction, not merely by prompt instruction (VISUAL MATCHING RULE
+    6) or by the best-effort corrective retry above, and it must never
+    surface as an error/warning. Drops only the later duplicate
+    occurrence's clip entry, keeping the first use and every other
+    distinct clip in that segment untouched. A voice_over segment left
+    with no clips at all falls back to render's existing blank-segment
+    behavior (film_summary_render._build_voice_over_segment_clip) -- the
+    same graceful path already used whenever a segment has no usable
+    footage, instead of ever shipping a duplicate."""
+    seen: set = set()
+    deduped_segments = []
+    for seg in segments:
+        if seg.get("type") != SEGMENT_TYPE_VOICE_OVER or not seg.get("clips"):
+            deduped_segments.append(seg)
+            continue
+        kept_clips = []
+        for clip in seg["clips"]:
+            signature = _voice_over_clip_signature(clip)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            kept_clips.append(clip)
+        deduped_segments.append({**seg, "clips": kept_clips})
+    return deduped_segments
+
+
 def _build_planning_correction_message(
     validation_report: Dict[str, Any], plan: Dict[str, Any], target_duration_ms: int, duration_tolerance_ratio: float,
+    repeated_clips: Optional[List[Tuple[str, Tuple[Any, Any, Any]]]] = None,
 ) -> Dict[str, str]:
     errors = "; ".join(validation_report.get("errors") or [])
     warnings = "; ".join(validation_report.get("warnings") or [])
@@ -1193,6 +1260,7 @@ def _build_planning_correction_message(
         target_duration_ms > 0 and abs(total_ms - target_duration_ms) > target_duration_ms * duration_tolerance_ratio
     )
     duration_hint = _describe_duration_gap(plan, target_duration_ms) if duration_out_of_tolerance else ""
+    repeated_clips_text = _describe_repeated_voice_over_clips(repeated_clips or [])
 
     sentences = []
     if errors:
@@ -1203,6 +1271,11 @@ def _build_planning_correction_message(
         # used for blocking errors, instead of relying only on the planning
         # prompt's own best-effort instructions.
         sentences.append(f"It also has these quality issues you should fix even though they did not block validation: {warnings}.")
+    if repeated_clips_text:
+        sentences.append(
+            f"It also violates VISUAL MATCHING RULE 6 (never reuse the same exact clip unless genuinely "
+            f"unavoidable): {repeated_clips_text}. Replace each of these with a different confirmed moment."
+        )
 
     return {
         "role": "user",
@@ -1271,11 +1344,21 @@ async def generate_edit_plan(
     fresh independent attempt would, at the cost of a second call only
     when the first one actually had something to fix. A warning that
     still isn't resolved after the retry is never blocking -- the user
-    must always be able to render. Clip reuse is deliberately not one of
-    these checks at all ("insister sur le fait de pas utiliser le meme
-    clip plusieurs fois sauf cas de force majeure, le cas echeant ne plus
-    mettre d'avertissement pour cela") -- VISUAL MATCHING RULE 6 in
-    PLANNING_SYSTEM_PROMPT is the only place this is ever enforced."""
+    must always be able to render.
+
+    Clip reuse (the same exact scene_id/start_ms/end_ms used in more than
+    one voice_over segment) is never surfaced as an error or warning
+    ("ne plus mettre d'avertissement pour cela") -- VISUAL MATCHING RULE 6
+    in PLANNING_SYSTEM_PROMPT discourages it in the first place, and a
+    repeat still present after a model response is also fed back as a
+    silent corrective nudge (see _find_repeated_voice_over_clips/
+    _build_planning_correction_message) the same way a validation warning
+    is. But unlike every other check here, this one must never ship
+    unresolved either ("ne jamais utiliser la meme scene 2 fois ...
+    l'utilisateur ne dois pas intervenir") -- so after the loop below,
+    _deduplicate_voice_over_clips deterministically strips any repeat
+    still present in the returned plan, by construction, with no further
+    model call and nothing for the user to notice or act on."""
     client = _get_openai_client()
     model_name = os.environ.get("FILM_SUMMARY_PLANNING_MODEL", os.environ.get("OPENAI_MODEL", "gpt-4o"))
     max_attempts = int(os.environ.get("FILM_SUMMARY_PLANNING_MAX_ATTEMPTS", "2"))
@@ -1319,11 +1402,17 @@ async def generate_edit_plan(
             plan, source_duration_ms=source_duration_ms, valid_scene_ids=valid_scene_ids,
             duration_tolerance_ratio=duration_tolerance_ratio,
         )
-        has_fixable_issue = not validation_report["valid"] or bool(validation_report["warnings"])
+        repeated_clips = _find_repeated_voice_over_clips(plan.get("segments") or [])
+        has_fixable_issue = not validation_report["valid"] or bool(validation_report["warnings"]) or bool(repeated_clips)
         if not has_fixable_issue or attempt == max_attempts - 1:
             break
         messages.append({"role": "assistant", "content": raw_text})
-        messages.append(_build_planning_correction_message(validation_report, plan, target_duration_ms, duration_tolerance_ratio))
+        messages.append(_build_planning_correction_message(
+            validation_report, plan, target_duration_ms, duration_tolerance_ratio, repeated_clips,
+        ))
+
+    if plan.get("segments"):
+        plan["segments"] = _deduplicate_voice_over_clips(plan["segments"])
 
     return {"plan": plan, "usage": total_usage}
 

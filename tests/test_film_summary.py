@@ -706,6 +706,87 @@ def test_build_planning_correction_message_includes_warnings_too():
     assert "blocking errors" not in message["content"]
 
 
+def test_build_planning_correction_message_includes_repeated_clips_too():
+    # Clip reuse must never appear in validation_report (see
+    # validate_edit_plan_content's docstring), but is still worth one
+    # corrective retry via this separate repeated_clips argument.
+    report = {"errors": [], "warnings": []}
+    plan = {"total_estimated_duration_ms": 29000}
+    repeated_clips = [("seg_003", ("scene_183", 1439291, 1461583))]
+    message = fs._build_planning_correction_message(report, plan, 29000, 0.15, repeated_clips)
+    assert "scene_183" in message["content"]
+    assert "VISUAL MATCHING RULE 6" in message["content"]
+
+
+# ---------------------------------------------------------------------------
+# _find_repeated_voice_over_clips / _deduplicate_voice_over_clips
+# ---------------------------------------------------------------------------
+
+def _voice_over_segment(seg_id, sequence, clips):
+    return {
+        "id": seg_id, "sequence": sequence, "type": fs.SEGMENT_TYPE_VOICE_OVER,
+        "narration": "Some narration.", "estimated_duration_ms": 5000, "clips": clips,
+    }
+
+
+def test_find_repeated_voice_over_clips_detects_reuse_across_segments():
+    clip = {"scene_id": "scene_183", "start_ms": 1439291, "end_ms": 1461583}
+    segments = [
+        _voice_over_segment("seg_001", 1, [dict(clip)]),
+        _voice_over_segment("seg_002", 2, [{"scene_id": "scene_270", "start_ms": 0, "end_ms": 5000}]),
+        _voice_over_segment("seg_003", 3, [dict(clip)]),  # reuses seg_001's exact clip
+    ]
+    repeats = fs._find_repeated_voice_over_clips(segments)
+    assert repeats == [("seg_003", ("scene_183", 1439291, 1461583))]
+
+
+def test_find_repeated_voice_over_clips_ignores_non_voice_over_segments():
+    segments = [
+        {"id": "seg_001", "sequence": 1, "type": "original_dialogue", "start_ms": 0, "end_ms": 1000},
+        {"id": "seg_002", "sequence": 2, "type": "breathing", "start_ms": 0, "end_ms": 1000},
+    ]
+    assert fs._find_repeated_voice_over_clips(segments) == []
+
+
+def test_find_repeated_voice_over_clips_empty_when_all_distinct():
+    segments = [
+        _voice_over_segment("seg_001", 1, [{"scene_id": "scene_001", "start_ms": 0, "end_ms": 1000}]),
+        _voice_over_segment("seg_002", 2, [{"scene_id": "scene_002", "start_ms": 0, "end_ms": 1000}]),
+    ]
+    assert fs._find_repeated_voice_over_clips(segments) == []
+
+
+def test_deduplicate_voice_over_clips_drops_only_the_later_occurrence():
+    clip = {"scene_id": "scene_183", "start_ms": 1439291, "end_ms": 1461583}
+    other_clip = {"scene_id": "scene_270", "start_ms": 0, "end_ms": 5000}
+    segments = [
+        _voice_over_segment("seg_001", 1, [dict(clip)]),
+        _voice_over_segment("seg_002", 2, [dict(other_clip), dict(clip)]),  # dict(clip) here is the repeat
+    ]
+    deduped = fs._deduplicate_voice_over_clips(segments)
+    assert deduped[0]["clips"] == [clip]  # first occurrence untouched
+    assert deduped[1]["clips"] == [other_clip]  # only the repeat was dropped, other_clip kept
+    assert fs._find_repeated_voice_over_clips(deduped) == []
+
+
+def test_deduplicate_voice_over_clips_leaves_segment_with_no_clips_when_all_are_repeats():
+    clip = {"scene_id": "scene_183", "start_ms": 1439291, "end_ms": 1461583}
+    segments = [
+        _voice_over_segment("seg_001", 1, [dict(clip)]),
+        _voice_over_segment("seg_002", 2, [dict(clip)]),  # entirely a repeat of seg_001's only clip
+    ]
+    deduped = fs._deduplicate_voice_over_clips(segments)
+    assert deduped[1]["clips"] == []  # falls back to render's blank-segment path, never a duplicate
+
+
+def test_deduplicate_voice_over_clips_passes_through_segments_without_clips_or_type():
+    segments = [
+        {"id": "seg_001", "sequence": 1, "type": "original_dialogue", "start_ms": 0, "end_ms": 1000},
+        _voice_over_segment("seg_002", 2, []),
+    ]
+    assert fs._deduplicate_voice_over_clips(segments) == segments
+
+
 # ---------------------------------------------------------------------------
 # generate_edit_plan (network call mocked)
 # ---------------------------------------------------------------------------
@@ -826,6 +907,76 @@ def test_generate_edit_plan_does_not_retry_forever_on_persistent_warning(monkeyp
 
     assert fake_client.chat.completions.create.call_count == 2
     assert result["plan"]["segments"][1]["speaker_ids"] == ["char_missing"]
+
+
+def _raw_plan_with_repeated_clip():
+    repeated_clip = {"scene_id": "scene_183", "start_ms": 1439291, "end_ms": 1461583, "description": "x", "match_score": 0.9}
+    return {
+        "characters": [],
+        "segments": [
+            {
+                "id": "seg_001", "sequence": 1, "type": "voice_over", "narration": "First beat.",
+                "estimated_duration_ms": 13000, "clips": [dict(repeated_clip)], "source_event_ids": ["event_1"],
+            },
+            {
+                "id": "seg_002", "sequence": 2, "type": "voice_over", "narration": "Second beat.",
+                "estimated_duration_ms": 13000, "clips": [dict(repeated_clip)], "source_event_ids": ["event_1"],
+            },
+        ],
+        "unresolved_ambiguities": [],
+    }
+
+
+def test_generate_edit_plan_retries_on_repeated_clip_even_when_already_valid(monkeypatch):
+    # No duration/warning issue here (total 26000ms matches the target
+    # exactly) -- the repeat alone must still trigger one corrective retry,
+    # the same silent mechanism used for warnings (see generate_edit_plan).
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    repeated_clip_plan = _raw_plan_with_repeated_clip()
+    corrected_plan = _raw_plan_with_repeated_clip()
+    corrected_plan["segments"][1]["clips"] = [{"scene_id": "scene_270", "start_ms": 0, "end_ms": 5000, "description": "y", "match_score": 0.8}]
+
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.side_effect = [
+        _fake_openai_response(json.dumps(repeated_clip_plan)),
+        _fake_openai_response(json.dumps(corrected_plan)),
+    ]
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    movie_metadata = {"title": "M", "source_duration_ms": 3600000, "source_language": "en", "narration_language": "en"}
+    result = asyncio.run(fs.generate_edit_plan(
+        movie_metadata=movie_metadata, target_duration_ms=26000, narration_language="en", narration_style="cinematic",
+        transcript_segments=[], scene_index=[], generation_constraints={},
+    ))
+
+    assert fake_client.chat.completions.create.call_count == 2
+    sent_messages = fake_client.chat.completions.create.call_args_list[1].kwargs["messages"]
+    assert "scene_183" in sent_messages[-1]["content"]
+    assert "VISUAL MATCHING RULE 6" in sent_messages[-1]["content"]
+    assert result["plan"]["segments"][1]["clips"][0]["scene_id"] == "scene_270"
+
+
+def test_generate_edit_plan_deduplicates_repeated_clip_when_model_never_fixes_it(monkeypatch):
+    # "ne jamais utiliser la meme scene 2 fois ... l'utilisateur ne dois pas
+    # intervenir" -- even if the model keeps reusing the same clip across
+    # every attempt, the plan generate_edit_plan actually returns must
+    # never contain the duplicate, with no error/warning raised about it.
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    repeated_clip_plan = _raw_plan_with_repeated_clip()
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = _fake_openai_response(json.dumps(repeated_clip_plan))
+    monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
+
+    movie_metadata = {"title": "M", "source_duration_ms": 3600000, "source_language": "en", "narration_language": "en"}
+    result = asyncio.run(fs.generate_edit_plan(
+        movie_metadata=movie_metadata, target_duration_ms=26000, narration_language="en", narration_style="cinematic",
+        transcript_segments=[], scene_index=[], generation_constraints={},
+    ))
+
+    assert fake_client.chat.completions.create.call_count == 2  # respects max_attempts, no infinite loop
+    assert result["plan"]["segments"][0]["clips"][0]["scene_id"] == "scene_183"  # first use kept
+    assert result["plan"]["segments"][1]["clips"] == []  # later duplicate dropped, never shipped
+    assert fs._find_repeated_voice_over_clips(result["plan"]["segments"]) == []
 
 
 def test_generate_edit_plan_retries_on_truncated_json_and_converges(monkeypatch):
