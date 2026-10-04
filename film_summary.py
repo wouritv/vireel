@@ -67,6 +67,7 @@ class FilmSummaryStage:
     GENERATING_VOICE = "generating_voice"
     RENDERING_PREVIEW = "rendering_preview"
     RENDERING_FINAL = "rendering_final"
+    ADDING_SUBTITLES = "adding_subtitles"
     COMPLETED = "completed"
     REJECTED = "rejected"
     FAILED = "failed"

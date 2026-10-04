@@ -142,38 +142,6 @@ export async function translateFilmSummaryNarration(filmSummaryId, userId, narra
     return readJsonOrThrow(response, "Impossible de retraduire la narration.");
 }
 
-/**
- * POST /api/film-summaries/{id}/apply-subtitles -- no body; the server reads
- * the row's already-persisted `subtitle_style` (save it first via
- * updateFilmSummaryAudioSettings) and burns it into the real final video
- * server-side (transcription + ffmpeg), re-uploading over the existing
- * final/preview files and setting `subtitles_enabled: true`. Can take a
- * little while -- callers should show a loading state. Returns the
- * normalized full-content film summary row with `final_url`/`preview_url`
- * pointing at the newly captioned video.
- */
-export async function applyFilmSummarySubtitles(filmSummaryId, userId) {
-    const response = await fetch(getApiUrl(`/api/film-summaries/${filmSummaryId}/apply-subtitles`), {
-        method: "POST",
-        headers: getAuthHeaders(userId),
-    });
-    return readJsonOrThrow(response, "Impossible d'ajouter les sous-titres a la video.");
-}
-
-/**
- * POST /api/film-summaries/{id}/remove-subtitles -- no body; restores the
- * original un-captioned final/preview video and sets
- * `subtitles_enabled: false`. Returns the normalized full-content film
- * summary row.
- */
-export async function removeFilmSummarySubtitles(filmSummaryId, userId) {
-    const response = await fetch(getApiUrl(`/api/film-summaries/${filmSummaryId}/remove-subtitles`), {
-        method: "POST",
-        headers: getAuthHeaders(userId),
-    });
-    return readJsonOrThrow(response, "Impossible de revenir a la video sans sous-titres.");
-}
-
 // Same language set as CaptionsModal.jsx's FALLBACK_LANGUAGES, for a
 // consistent dropdown across the app's language pickers. Shared here (moved
 // out of FilmSummaryCreatePage.jsx) since the review panel's narration
@@ -210,8 +178,13 @@ export function formatMsClock(ms) {
 const ANALYSIS_STAGE_ORDER = ["transcribing", "detecting_scenes", "validating_film", "planning", "validating_plan"];
 
 // Render-phase pipeline stages, in the order
-// _run_film_summary_render_pipeline_stages reports them (10-40/45/90%).
-const RENDER_STAGE_ORDER = ["generating_voice", "rendering_preview", "rendering_final"];
+// _run_film_summary_render_pipeline_stages reports them (10-40/45/90/95%).
+// "adding_subtitles" is only ever reported when subtitles_enabled is set on
+// the row -- otherwise the pipeline jumps straight from rendering_final to
+// completed, and resolveJobStepState's "complete -> every step done" rule
+// still marks it done retroactively, same as any other step a given plan
+// happens to skip (e.g. generating_voice with zero voice_over segments).
+const RENDER_STAGE_ORDER = ["generating_voice", "rendering_preview", "rendering_final", "adding_subtitles"];
 
 // Step data for both phases -- a plain list instead of two near-identical
 // functions, so there's one small builder (buildProcessSteps below) instead
@@ -233,6 +206,7 @@ const RENDER_STEPS = [
     { key: "generating_voice", labelFallback: "Generation de la voix off", descFallback: "Synthese vocale de chaque segment narre." },
     { key: "rendering_preview", labelFallback: "Assemblage de l'apercu", descFallback: "Montage des extraits et de la narration." },
     { key: "rendering_final", labelFallback: "Finalisation de la video", descFallback: "Encodage et enregistrement du resultat final." },
+    { key: "adding_subtitles", labelFallback: "Ajout des sous-titres", descFallback: "Incrustation des sous-titres choisis dans la video finale." },
 ];
 
 // "detecting_scenes" -> "DetectingScenes", matching the stepXxx/stepXxxDesc
