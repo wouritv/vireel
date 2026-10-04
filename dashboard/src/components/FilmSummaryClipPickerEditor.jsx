@@ -36,16 +36,20 @@ function buildManualSelectionPayload(shots, selections) {
         }));
 }
 
-// The "Mode manuel" shot picker: the full original source video on top, the
-// chronological shot track (FilmSummaryShotTimeline) at the bottom. Once the
-// user confirms their cut, this saves it (PUT .../manual-selection) then
-// kicks off the AI narration pass over exactly those clips (POST
-// .../generate-narration), showing a loading state throughout, and hands
-// the resulting row back to the parent page so it can route into the
-// existing FilmSummaryReviewPanel -- same role as
-// FilmSummaryProjectDetailPage already does for the automatic flow. No way
-// back to the automatic review once opened (by design) -- the user commits
-// to building a manual cut and confirms it via handleConfirm below.
+// The advanced "free selection" shot picker -- a distinct, secondary mode
+// opened from FilmSummaryReviewPanel's sidebar (never the main toolbar: the
+// primary editing path is now the per-segment clip-swap flow in that panel,
+// see FilmSummaryClipSwapPicker), for when the creator wants to rebuild the
+// whole cut from scratch instead of refining the AI's proposed plan one
+// block at a time. The full original source video on top, the chronological
+// shot track (FilmSummaryShotTimeline) at the bottom. Once the user confirms
+// their cut, this saves it (PUT .../manual-selection) then kicks off the AI
+// narration pass over exactly those clips (POST .../generate-narration),
+// never keeping any narration from a previous plan that no longer matches
+// this selection, and hands the resulting row back to the parent page so it
+// routes into the same FilmSummaryReviewPanel for validation, same as the
+// automatic flow. No way back to the in-progress review once confirmed (by
+// design) -- the user commits to rebuilding the cut via handleConfirm below.
 export default function FilmSummaryClipPickerEditor({ filmSummary, user, onNarrationReady }) {
     const { t } = useTranslation();
     const videoRef = useRef(null);
@@ -119,11 +123,11 @@ export default function FilmSummaryClipPickerEditor({ filmSummary, user, onNarra
     return (
         <div className="space-y-4">
             <div>
-                <h2 className="title-contrast text-xl font-bold">{t("filmSummary.manual.title", "Mode manuel -- choix des plans")}</h2>
+                <h2 className="title-contrast text-xl font-bold">{t("filmSummary.manual.title", "Mode avance -- selection libre des scenes")}</h2>
                 <p className="mt-1 text-sm text-slate-500 dark:text-zinc-400">
                     {t(
                         "filmSummary.manual.subtitle",
-                        "Active ou desactive chaque plan et ajuste son debut/sa fin, puis laisse l'IA ecrire la voix off correspondante."
+                        "Repart de zero : choisis librement tous les plans a la main, puis l'IA reecrit entierement la narration autour de ta selection et te presente le nouveau plan pour validation."
                     )}
                 </p>
             </div>

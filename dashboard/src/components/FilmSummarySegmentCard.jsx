@@ -1,4 +1,4 @@
-import { Play } from "lucide-react";
+import { Pencil, Play } from "lucide-react";
 import { formatMsClock, SEGMENT_TYPE_BREATHING, SEGMENT_TYPE_ORIGINAL_DIALOGUE, SEGMENT_TYPE_VOICE_OVER } from "../lib/filmSummary";
 
 // One card per edit-plan segment inside FilmSummaryReviewPanel -- pulled
@@ -23,7 +23,7 @@ function SegmentTypeBadge({ type, t }) {
     return <span className={`inline-flex rounded-full border px-2 py-0.5 text-[11px] font-medium ${config.className}`}>{config.label}</span>;
 }
 
-export default function FilmSummarySegmentCard({ segment, onNarrationChange, onSeek, t }) {
+export default function FilmSummarySegmentCard({ segment, onNarrationChange, onEditClips, onSeek, t }) {
     const isVoiceOver = segment.type === SEGMENT_TYPE_VOICE_OVER;
     const isDialogue = segment.type === SEGMENT_TYPE_ORIGINAL_DIALOGUE;
     const clips = isVoiceOver ? (segment.clips || []) : [];
@@ -51,12 +51,21 @@ export default function FilmSummarySegmentCard({ segment, onNarrationChange, onS
                         className="input-field w-full resize-y text-sm dark:text-white"
                         placeholder={t("filmSummary.narrationFieldLabel", "Narration")}
                     />
-                    {clips.length ? (
-                        <div className="space-y-1">
+                    <div className="space-y-1">
+                        <div className="flex items-center justify-between">
                             <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400 dark:text-zinc-500">
                                 {t("filmSummary.clipsLabel", "Extraits utilises")}
                             </p>
-                            {clips.map((clip, index) => (
+                            <button
+                                type="button"
+                                onClick={() => onEditClips(segment.id)}
+                                className="inline-flex items-center gap-1 rounded-lg border border-primary/30 bg-primary/5 px-2 py-0.5 text-[11px] font-medium text-primary hover:bg-primary/10"
+                            >
+                                <Pencil size={11} /> {t("filmSummary.replaceClipsButton", "Remplacer les extraits")}
+                            </button>
+                        </div>
+                        {clips.length ? (
+                            clips.map((clip, index) => (
                                 <button
                                     // eslint-disable-next-line react/no-array-index-key
                                     key={`${clip.scene_id || "clip"}-${index}`}
@@ -70,9 +79,13 @@ export default function FilmSummarySegmentCard({ segment, onNarrationChange, onS
                                     </span>
                                     <span className="truncate">{clip.description || clip.scene_id}</span>
                                 </button>
-                            ))}
-                        </div>
-                    ) : null}
+                            ))
+                        ) : (
+                            <p className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-2 py-1 text-xs text-amber-300">
+                                {t("filmSummary.noClipsWarning", "Aucun extrait -- ce segment sera un fond noir tant qu'aucun extrait n'est ajoute.")}
+                            </p>
+                        )}
+                    </div>
                 </>
             ) : (
                 <button

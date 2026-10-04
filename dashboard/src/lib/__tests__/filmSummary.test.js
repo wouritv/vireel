@@ -4,7 +4,10 @@ import {
     errorMessageForCode,
     formatMsClock,
     isFilmSummaryRejectionErrorCode,
+    narrationSceneOverlapScore,
     normalizeFilmSummaryJobStatus,
+    rankSceneSuggestionsForSegment,
+    usedClipSignaturesExcluding,
 } from '../filmSummary';
 
 const identityT = (key, fallback) => fallback ?? key;
@@ -123,5 +126,97 @@ describe('buildFilmSummaryProcessSteps (render phase)', () => {
         for (const step of steps) {
             expect(step.state).toBe('done');
         }
+    });
+});
+
+describe('usedClipSignaturesExcluding', () => {
+    const segments = [
+        { id: 'seg_001', clips: [{ scene_id: 'scene_001', start_ms: 0, end_ms: 1000 }] },
+        { id: 'seg_002', clips: [{ scene_id: 'scene_002', start_ms: 2000, end_ms: 3000 }] },
+    ];
+
+    it('collects clip signatures from every segment except the excluded one', () => {
+        const used = usedClipSignaturesExcluding(segments, 'seg_001');
+        expect(used.has('scene_002|2000|3000')).toBe(true);
+        expect(used.has('scene_001|0|1000')).toBe(false);
+    });
+
+    it('returns an empty set when segments is empty or missing', () => {
+        expect(usedClipSignaturesExcluding([], 'seg_001').size).toBe(0);
+        expect(usedClipSignaturesExcluding(undefined, 'seg_001').size).toBe(0);
+    });
+});
+
+describe('narrationSceneOverlapScore', () => {
+    it('scores higher when significant words are shared', () => {
+        const score = narrationSceneOverlapScore(
+            'Marie decouvre la verite sur son pere.',
+            'Marie hurle: tu m\'as menti sur pere pendant toutes ces annees.'
+        );
+        expect(score).toBeGreaterThan(0);
+    });
+
+    it('returns zero when there is no shared vocabulary', () => {
+        const score = narrationSceneOverlapScore('Marie decouvre la verite.', 'Le chat dort sur le canape.');
+        expect(score).toBe(0);
+    });
+
+    it('returns zero when either text is empty', () => {
+        expect(narrationSceneOverlapScore('', 'some text here')).toBe(0);
+        expect(narrationSceneOverlapScore('some text here', '')).toBe(0);
+        expect(narrationSceneOverlapScore(undefined, undefined)).toBe(0);
+    });
+
+    it('ignores accents and case when matching words', () => {
+        const score = narrationSceneOverlapScore('La VERITE eclate enfin.', 'la verite finit par eclater.');
+        expect(score).toBeGreaterThan(0);
+    });
+});
+
+describe('rankSceneSuggestionsForSegment', () => {
+    const sceneIndex = [
+        { scene_id: 'scene_current', start_ms: 0, end_ms: 5000, speakers: ['A'], transcript_overlap: '' },
+        { scene_id: 'scene_relevant', start_ms: 6000, end_ms: 9000, speakers: ['A'], transcript_overlap: 'Marie decouvre la verite sur son pere caches depuis toujours.' },
+        { scene_id: 'scene_unrelated', start_ms: 500000, end_ms: 503000, speakers: ['B'], transcript_overlap: 'Le chat dort tranquillement sur le canape.' },
+        { scene_id: 'scene_flagged', start_ms: 7000, end_ms: 8000, speakers: ['A'], transcript_overlap: '', quality_flags: ['blurred'] },
+    ];
+    const segment = {
+        id: 'seg_001',
+        narration: 'Marie decouvre enfin la verite sur son pere.',
+        clips: [{ scene_id: 'scene_current', start_ms: 0, end_ms: 5000 }],
+    };
+
+    it('excludes scenes already used by this same segment', () => {
+        const ranked = rankSceneSuggestionsForSegment({ segment, sceneIndex, allSegments: [segment] });
+        expect(ranked.find((s) => s.scene_id === 'scene_current')).toBeUndefined();
+    });
+
+    it('ranks a narratively/temporally relevant scene above an unrelated distant one', () => {
+        const ranked = rankSceneSuggestionsForSegment({ segment, sceneIndex, allSegments: [segment] });
+        const relevantIndex = ranked.findIndex((s) => s.scene_id === 'scene_relevant');
+        const unrelatedIndex = ranked.findIndex((s) => s.scene_id === 'scene_unrelated');
+        expect(relevantIndex).toBeLessThan(unrelatedIndex);
+    });
+
+    it('penalizes a scene flagged by scene detection relative to an identical unflagged one', () => {
+        const unflaggedTwin = { ...sceneIndex[3], scene_id: 'scene_unflagged_twin', quality_flags: [] };
+        const ranked = rankSceneSuggestionsForSegment({
+            segment, sceneIndex: [...sceneIndex, unflaggedTwin], allSegments: [segment],
+        });
+        const flagged = ranked.find((s) => s.scene_id === 'scene_flagged');
+        const twin = ranked.find((s) => s.scene_id === 'scene_unflagged_twin');
+        expect(flagged.score).toBeLessThan(twin.score);
+    });
+
+    it('flags a scene already used by another segment without excluding it', () => {
+        const otherSegment = { id: 'seg_002', clips: [{ scene_id: 'scene_relevant', start_ms: 6000, end_ms: 9000 }] };
+        const ranked = rankSceneSuggestionsForSegment({ segment, sceneIndex, allSegments: [segment, otherSegment] });
+        const relevant = ranked.find((s) => s.scene_id === 'scene_relevant');
+        expect(relevant).toBeDefined();
+        expect(relevant.alreadyUsedElsewhere).toBe(true);
+    });
+
+    it('returns an empty list when sceneIndex is empty', () => {
+        expect(rankSceneSuggestionsForSegment({ segment, sceneIndex: [], allSegments: [segment] })).toEqual([]);
     });
 });

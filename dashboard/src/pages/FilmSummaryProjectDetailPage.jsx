@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertCircle, ArrowLeft, Ban, Download, Loader2, RefreshCw, Share2, Trash2, Wand2 } from "lucide-react";
+import { AlertCircle, ArrowLeft, Ban, Download, Loader2, RefreshCw, Share2, Trash2 } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
 import { getApiUrl, fetchAppConfig } from "../config";
 import { getAuthHeaders } from "../lib/apiAuth";
@@ -39,11 +39,14 @@ export default function FilmSummaryProjectDetailPage() {
     const [deleting, setDeleting] = useState(false);
     const [allowedVoices, setAllowedVoices] = useState([]);
     const [defaultVoice, setDefaultVoice] = useState("cedar");
-    // "Mode manuel" (see FilmSummaryClipPickerEditor): an optional alternate
-    // path through awaiting_review, reachable via a button next to the
-    // default automatic review flow -- it never changes which view shows
-    // for any other status, and closes itself back to the normal review
-    // flow once narration generation succeeds (onNarrationReady below).
+    // Advanced "free selection" mode (see FilmSummaryClipPickerEditor): a
+    // distinct, secondary path through awaiting_review -- rebuilds the
+    // entire cut from a flat scene browser instead of the primary
+    // per-segment clip-swap flow in FilmSummaryReviewPanel. Reachable via a
+    // button inside that panel's sidebar (never the page's main toolbar,
+    // since it must not read as the main path), and closes itself back to
+    // the normal review flow once narration generation succeeds
+    // (onNarrationReady below).
     const [manualEditorOpen, setManualEditorOpen] = useState(false);
 
     const [showShareModal, setShowShareModal] = useState(false);
@@ -341,16 +344,6 @@ export default function FilmSummaryProjectDetailPage() {
                     <h1 className="truncate text-3xl font-black tracking-tight">{filmSummary?.title || t("filmSummary.untitled", "Resume de film sans titre")}</h1>
                 </div>
                 <div className="flex shrink-0 flex-wrap items-center gap-2">
-                    {status === "awaiting_review" && !manualEditorOpen && Array.isArray(filmSummary?.scene_index) && filmSummary.scene_index.length > 0 ? (
-                        <button
-                            type="button"
-                            onClick={() => setManualEditorOpen(true)}
-                            className="inline-flex items-center gap-2 rounded-xl border border-primary/40 bg-primary/10 px-4 py-2.5 text-sm font-medium text-primary hover:bg-primary/20"
-                        >
-                            <Wand2 size={14} />
-                            {t("filmSummary.manual.openButton", "Mode manuel : choisir mes plans")}
-                        </button>
-                    ) : null}
                     <button
                         type="button"
                         onClick={manualEditorOpen ? () => setManualEditorOpen(false) : () => navigate("/dashboard/film-summaries")}
@@ -358,7 +351,7 @@ export default function FilmSummaryProjectDetailPage() {
                     >
                         <ArrowLeft size={14} />
                         {manualEditorOpen
-                            ? t("filmSummary.manual.backToAutomatic", "Retour au mode automatique")
+                            ? t("filmSummary.manual.backToReview", "Retour a l'edition du plan")
                             : t("filmSummary.backToList", "Retour aux resumes de film")}
                     </button>
                 </div>
@@ -467,6 +460,11 @@ export default function FilmSummaryProjectDetailPage() {
                                     onRefresh={loadFilmSummary}
                                     onRegenerateAll={handleRetry}
                                     regenerating={retrying}
+                                    onOpenFreeSelectionMode={
+                                        Array.isArray(filmSummary?.scene_index) && filmSummary.scene_index.length > 0
+                                            ? () => setManualEditorOpen(true)
+                                            : undefined
+                                    }
                                 />
                             </div>
                         )

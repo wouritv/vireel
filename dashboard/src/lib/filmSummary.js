@@ -243,3 +243,111 @@ export function buildFilmSummaryProcessSteps({ status, stage, t, phase }) {
         ? buildProcessSteps(RENDER_STEPS, RENDER_STAGE_ORDER, status, stage, t)
         : buildProcessSteps(ANALYSIS_STEPS, ANALYSIS_STAGE_ORDER, status, stage, t);
 }
+
+// ---------------------------------------------------------------------------
+// Per-segment clip-replacement suggestions (FilmSummaryClipSwapPicker): the
+// main review editor now lets the creator replace a single narrative
+// block's clips from ranked suggestions instead of rebuilding the whole cut
+// from a flat scene browser. Pure, client-side, no new backend call --
+// scene_index already carries everything used here (see film_summary.py's
+// build_scene_index: scene_id/start_ms/end_ms/duration_ms/speakers/
+// transcript_overlap/quality_flags).
+// ---------------------------------------------------------------------------
+
+function clipSignature(clip) {
+    return `${clip?.scene_id}|${clip?.start_ms}|${clip?.end_ms}`;
+}
+
+/**
+ * Every exact (scene_id, start_ms, end_ms) clip signature used by any
+ * voice_over segment of `segments` other than `excludeSegmentId` -- mirrors
+ * film_summary.py's _voice_over_clip_signature. Used only to flag a
+ * suggestion as "already used elsewhere" in the picker UI (a soft warning,
+ * never a block -- unlike the automatic planner, a deliberate user edit
+ * here is never silently overridden).
+ */
+export function usedClipSignaturesExcluding(segments, excludeSegmentId) {
+    const signatures = new Set();
+    (segments || []).forEach((seg) => {
+        if (seg.id === excludeSegmentId) return;
+        (seg.clips || []).forEach((clip) => signatures.add(clipSignature(clip)));
+    });
+    return signatures;
+}
+
+const STOPWORDS = new Set([
+    "le", "la", "les", "un", "une", "des", "de", "du", "et", "est", "il", "elle", "que", "qui", "dans", "sur",
+    "pour", "avec", "au", "aux", "ce", "ces", "son", "sa", "ses", "the", "a", "an", "of", "in", "on", "and",
+    "is", "to", "it", "that", "was", "were", "not", "you", "this",
+]);
+
+function tokenize(text) {
+    return (text || "")
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/[̀-ͯ]/g, "")
+        .match(/[a-z0-9]+/g) || [];
+}
+
+function significantWords(text) {
+    return new Set(tokenize(text).filter((word) => word.length > 2 && !STOPWORDS.has(word)));
+}
+
+/**
+ * Cheap lexical-overlap relevance score (0-1, higher is more relevant)
+ * between a segment's narration and a candidate scene's transcribed
+ * dialogue -- the fraction of the smaller word set's significant words
+ * that also appear in the other text. No AI call; only ever used to rank
+ * suggestions, never to validate the plan.
+ */
+export function narrationSceneOverlapScore(narration, transcriptOverlap) {
+    const narrationWords = significantWords(narration);
+    const sceneWords = significantWords(transcriptOverlap);
+    if (!narrationWords.size || !sceneWords.size) return 0;
+    let shared = 0;
+    narrationWords.forEach((word) => {
+        if (sceneWords.has(word)) shared += 1;
+    });
+    return shared / Math.min(narrationWords.size, sceneWords.size);
+}
+
+/**
+ * Ranks every scene_index entry as a clip-replacement suggestion for
+ * `segment`, highest relevance first, excluding scenes already used by
+ * that same segment. Rewards narration/dialogue word overlap and
+ * continuity with speakers already present in the segment's current
+ * clips, favors temporal proximity to those clips (nearby footage tends to
+ * match the same narrated beat), and penalizes a scene flagged by scene
+ * detection (quality_flags, e.g. blurred/black/transition frames -- same
+ * signal VISUAL MATCHING RULE 4 asks the planner to avoid) or already used
+ * by another segment of the plan (surfaced via `alreadyUsedElsewhere`, not
+ * excluded -- the creator decides, this is their deliberate edit).
+ */
+export function rankSceneSuggestionsForSegment({ segment, sceneIndex, allSegments }) {
+    const clips = segment?.clips || [];
+    const currentSceneIds = new Set(clips.map((clip) => clip.scene_id));
+    const sceneById = new Map((sceneIndex || []).map((scene) => [scene.scene_id, scene]));
+    const currentSpeakers = new Set();
+    clips.forEach((clip) => {
+        (sceneById.get(clip.scene_id)?.speakers || []).forEach((speaker) => currentSpeakers.add(speaker));
+    });
+    const referenceMs = clips.length ? clips[0].start_ms : null;
+    const usedElsewhere = usedClipSignaturesExcluding(allSegments, segment?.id);
+
+    return (sceneIndex || [])
+        .filter((scene) => !currentSceneIds.has(scene.scene_id))
+        .map((scene) => {
+            const overlapScore = narrationSceneOverlapScore(segment?.narration, scene.transcript_overlap);
+            const sharedSpeakerCount = (scene.speakers || []).filter((speaker) => currentSpeakers.has(speaker)).length;
+            let score = overlapScore * 3 + sharedSpeakerCount * 1.5;
+            if (referenceMs != null) {
+                const distanceMs = Math.abs((scene.start_ms ?? 0) - referenceMs);
+                score += Math.max(0, 2 - distanceMs / 60000);
+            }
+            score -= (scene.quality_flags?.length || 0) * 1.5;
+            const alreadyUsedElsewhere = usedElsewhere.has(clipSignature(scene));
+            if (alreadyUsedElsewhere) score -= 5;
+            return { ...scene, score, overlapScore, sharedSpeakerCount, alreadyUsedElsewhere };
+        })
+        .sort((a, b) => b.score - a.score);
+}

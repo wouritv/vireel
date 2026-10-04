@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, CheckCircle2, Languages, Loader2, RefreshCw, RotateCcw, Save } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Languages, Loader2, RefreshCw, RotateCcw, Save, Sparkles } from "lucide-react";
 import { getApiUrl } from "../config";
 import { getAuthHeaders } from "../lib/apiAuth";
 import { useTranslation } from "../state/LanguageContext";
 import { formatMsClock, NARRATION_LANGUAGE_OPTIONS, translateFilmSummaryNarration } from "../lib/filmSummary";
 import FilmSummarySegmentCard from "./FilmSummarySegmentCard";
 import FilmSummaryAudioSubtitleSettings from "./FilmSummaryAudioSubtitleSettings";
+import FilmSummaryClipSwapPicker from "./FilmSummaryClipSwapPicker";
 
 // The "awaiting_review" editor: source video for reference, the edit plan's
 // segment timeline (editable narration for voice_over segments), the
@@ -13,6 +14,12 @@ import FilmSummaryAudioSubtitleSettings from "./FilmSummaryAudioSubtitleSettings
 // component (like AnonymousStoryPublishModal was split out of
 // AnonymousStoryProjectDetailPage) since FilmSummaryProjectDetailPage
 // already carries the whole status state machine on top of this.
+//
+// This is now the feature's *primary* editing surface regardless of how the
+// plan was produced (automatic planning or the advanced free-selection mode,
+// see onOpenFreeSelectionMode below) -- editing a narrative block's clips
+// happens here, per-segment, via FilmSummaryClipSwapPicker, instead of
+// forcing a trip through a separate full-film scene browser.
 export default function FilmSummaryReviewPanel({
     filmSummary,
     projectId,
@@ -22,12 +29,14 @@ export default function FilmSummaryReviewPanel({
     onRefresh,
     onRegenerateAll,
     regenerating,
+    onOpenFreeSelectionMode,
 }) {
     const { t } = useTranslation();
     const [draftPlan, setDraftPlan] = useState(filmSummary.edit_plan || {});
     const [validationReport, setValidationReport] = useState(filmSummary.validation_report || {});
     const [voiceId, setVoiceId] = useState(filmSummary.voice_id || defaultVoice || "");
     const [narrationLanguage, setNarrationLanguage] = useState(filmSummary.narration_language || "");
+    const [swapSegmentId, setSwapSegmentId] = useState(null);
     const [translating, setTranslating] = useState(false);
     const [translateError, setTranslateError] = useState("");
     const [sourceUrl, setSourceUrl] = useState("");
@@ -85,6 +94,15 @@ export default function FilmSummaryReviewPanel({
             segments: (prev.segments || []).map((seg) => (seg.id === segmentId ? { ...seg, narration: value } : seg)),
         }));
     };
+
+    const updateClips = (segmentId, clips) => {
+        setDraftPlan((prev) => ({
+            ...prev,
+            segments: (prev.segments || []).map((seg) => (seg.id === segmentId ? { ...seg, clips } : seg)),
+        }));
+    };
+
+    const swapSegment = swapSegmentId ? segments.find((seg) => seg.id === swapSegmentId) : null;
 
     const handleSaveDraft = async () => {
         if (!user?.id) return;
@@ -224,6 +242,7 @@ export default function FilmSummaryReviewPanel({
                                     key={segment.id}
                                     segment={segment}
                                     onNarrationChange={updateNarration}
+                                    onEditClips={setSwapSegmentId}
                                     onSeek={handleSeek}
                                     t={t}
                                 />
@@ -303,6 +322,25 @@ export default function FilmSummaryReviewPanel({
                                 "Relance toute la generation depuis la video source -- a utiliser si le plan actuel ne te convient pas ou si la video generee a un probleme."
                             )}
                         </p>
+
+                        {onOpenFreeSelectionMode ? (
+                            <>
+                                <button
+                                    type="button"
+                                    onClick={onOpenFreeSelectionMode}
+                                    className="flex w-full items-center justify-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-700 dark:text-zinc-300 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
+                                >
+                                    <Sparkles size={14} />
+                                    {t("filmSummary.openFreeSelectionButton", "Mode avance : reconstruire depuis une selection libre")}
+                                </button>
+                                <p className="text-xs text-slate-500 dark:text-zinc-400">
+                                    {t(
+                                        "filmSummary.openFreeSelectionHint",
+                                        "Repart de zero : tu choisis librement tous les plans a la main, puis l'IA reecrit entierement la narration autour de ta selection."
+                                    )}
+                                </p>
+                            </>
+                        ) : null}
                     </div>
 
                     <div className="space-y-3 rounded-2xl border border-slate-300 dark:border-white/10 bg-white/5 p-4 md:p-5">
@@ -377,6 +415,21 @@ export default function FilmSummaryReviewPanel({
                     </div>
                 </aside>
             </div>
+
+            {swapSegment ? (
+                <FilmSummaryClipSwapPicker
+                    segment={swapSegment}
+                    sceneIndex={filmSummary.scene_index || []}
+                    allSegments={segments}
+                    sourceUrl={sourceUrl}
+                    onClose={() => setSwapSegmentId(null)}
+                    onConfirm={(clips) => {
+                        updateClips(swapSegment.id, clips);
+                        setSwapSegmentId(null);
+                    }}
+                    t={t}
+                />
+            ) : null}
         </div>
     );
 }
