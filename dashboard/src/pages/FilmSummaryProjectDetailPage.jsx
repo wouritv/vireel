@@ -8,7 +8,6 @@ import { useTranslation } from "../state/LanguageContext";
 import { errorMessageForCode } from "../lib/filmSummary";
 import FilmSummaryProcessingPanel from "../components/FilmSummaryProcessingPanel";
 import FilmSummaryReviewPanel from "../components/FilmSummaryReviewPanel";
-import FilmSummaryClipPickerEditor from "../components/FilmSummaryClipPickerEditor";
 import SharePostModal from "../components/SharePostModal";
 
 // Statuses for which the film summary's own job_id is still meaningful to
@@ -39,15 +38,6 @@ export default function FilmSummaryProjectDetailPage() {
     const [deleting, setDeleting] = useState(false);
     const [allowedVoices, setAllowedVoices] = useState([]);
     const [defaultVoice, setDefaultVoice] = useState("cedar");
-    // Advanced "free selection" mode (see FilmSummaryClipPickerEditor): a
-    // distinct, secondary path through awaiting_review -- rebuilds the
-    // entire cut from a flat scene browser instead of the primary
-    // per-segment clip-swap flow in FilmSummaryReviewPanel. Reachable via a
-    // button inside that panel's sidebar (never the page's main toolbar,
-    // since it must not read as the main path), and closes itself back to
-    // the normal review flow once narration generation succeeds
-    // (onNarrationReady below).
-    const [manualEditorOpen, setManualEditorOpen] = useState(false);
 
     const [showShareModal, setShowShareModal] = useState(false);
     const [shareTitle, setShareTitle] = useState("");
@@ -346,13 +336,11 @@ export default function FilmSummaryProjectDetailPage() {
                 <div className="flex shrink-0 flex-wrap items-center gap-2">
                     <button
                         type="button"
-                        onClick={manualEditorOpen ? () => setManualEditorOpen(false) : () => navigate("/dashboard/film-summaries")}
+                        onClick={() => navigate("/dashboard/film-summaries")}
                         className="inline-flex items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
                     >
                         <ArrowLeft size={14} />
-                        {manualEditorOpen
-                            ? t("filmSummary.manual.backToReview", "Retour a l'edition du plan")
-                            : t("filmSummary.backToList", "Retour aux resumes de film")}
+                        {t("filmSummary.backToList", "Retour aux resumes de film")}
                     </button>
                 </div>
             </div>
@@ -440,34 +428,18 @@ export default function FilmSummaryProjectDetailPage() {
                     ) : null}
 
                     {status === "awaiting_review" ? (
-                        manualEditorOpen ? (
-                            <FilmSummaryClipPickerEditor
+                        <div className="space-y-4">
+                            <FilmSummaryReviewPanel
                                 filmSummary={filmSummary}
+                                projectId={projectId}
                                 user={user}
-                                onNarrationReady={(updated) => {
-                                    setFilmSummary(updated);
-                                    setManualEditorOpen(false);
-                                }}
+                                allowedVoices={allowedVoices}
+                                defaultVoice={defaultVoice}
+                                onRefresh={loadFilmSummary}
+                                onRegenerateAll={handleRetry}
+                                regenerating={retrying}
                             />
-                        ) : (
-                            <div className="space-y-4">
-                                <FilmSummaryReviewPanel
-                                    filmSummary={filmSummary}
-                                    projectId={projectId}
-                                    user={user}
-                                    allowedVoices={allowedVoices}
-                                    defaultVoice={defaultVoice}
-                                    onRefresh={loadFilmSummary}
-                                    onRegenerateAll={handleRetry}
-                                    regenerating={retrying}
-                                    onOpenFreeSelectionMode={
-                                        Array.isArray(filmSummary?.scene_index) && filmSummary.scene_index.length > 0
-                                            ? () => setManualEditorOpen(true)
-                                            : undefined
-                                    }
-                                />
-                            </div>
-                        )
+                        </div>
                     ) : null}
 
                     {status === "completed" ? (

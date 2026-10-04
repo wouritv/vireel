@@ -2,14 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, X } from "lucide-react";
 import { formatMsClock } from "../lib/filmSummary";
 
-// The manual clip-picker's bottom track: one block per scene_index entry,
-// laid out left-to-right over the *full source duration* (not just the
-// enabled shots), each with a toggle and two drag handles to trim its
-// start/end -- the drag mechanics are adapted from ManualReelCreationPage's
-// single start/end handle pair, just keyed per-shot instead of global, and
-// clamped to that shot's own original [start_ms, end_ms] rather than the
-// whole timeline. Kept decoupled from the video player / submit logic,
-// which FilmSummaryClipPickerEditor owns.
+// A clip-trimming track: one block per shot, laid out left-to-right over
+// the *full source duration* (not just the shots passed in), each with a
+// toggle and two drag handles to trim its start/end -- the drag mechanics
+// are adapted from ManualReelCreationPage's single start/end handle pair,
+// just keyed per-shot instead of global, and clamped to that shot's own
+// original [start_ms, end_ms] rather than the whole timeline. Kept
+// decoupled from the video player / submit logic, which the caller owns
+// (FilmSummaryClipSwapPicker, scoped to one segment's clips).
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const MIN_TRIM_MS = 300;

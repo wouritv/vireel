@@ -11607,12 +11607,6 @@ class FilmSummaryAudioSettingsUpdateRequest(BaseModel):
     subtitle_style: Optional[Dict[str, Any]] = None
 
 
-class FilmSummaryManualSelectionUpdateRequest(BaseModel):
-    # [{"scene_id": "scene_003", "start_ms": 1200, "end_ms": 4800}, ...],
-    # in the order the user wants them in the final video.
-    manual_selection: List[Dict[str, Any]]
-
-
 class FilmSummaryTranslateNarrationRequest(BaseModel):
     narration_language: str
 
@@ -11650,13 +11644,14 @@ def _normalize_film_summary_row(row: Dict[str, Any], *, include_content: bool = 
         item["validation_report"] = row.get("validation_report") or {}
         item["manual_selection"] = row.get("manual_selection") or []
         bucket_name = os.environ.get("AWS_S3_BUCKET", "my-clips-bucket")
-        # The manual clip-picker editor needs the original source video
-        # (not just the preview/final render) to let the user see each
-        # scene in full -- source_s3_key is always populated by the time
-        # analysis finishes (even for a youtube source, see
-        # _run_film_summary_analysis_pipeline) and only cleared once the
-        # final render completes (_finalize_film_summary_render), so it's
-        # reliably available throughout the awaiting_review window.
+        # The review panel's video preview and clip-swap picker need the
+        # original source video (not just the preview/final render) to let
+        # the user see and seek through the whole film -- source_s3_key is
+        # always populated by the time analysis finishes (even for a
+        # youtube source, see _run_film_summary_analysis_pipeline) and only
+        # cleared once the final render completes
+        # (_finalize_film_summary_render), so it's reliably available
+        # throughout the awaiting_review window.
         if row.get("source_s3_key"):
             item["source_url"] = generate_presigned_url(bucket_name, row["source_s3_key"], expiration=3600)
         if row.get("preview_s3_key"):
@@ -12425,8 +12420,8 @@ async def update_film_summary_audio_settings_endpoint(
     audio plays during original_dialogue segments, see
     FilmSummaryAudioSettingsUpdateRequest's dialogue_volume docstring) and
     subtitle toggle/style -- applied at render time (see render_edit_plan /
-    _run_film_summary_render_pipeline_stages, phase 3 of the manual-editor
-    work). Editable up to the same point as the plan itself."""
+    _run_film_summary_render_pipeline_stages). Editable up to the same
+    point as the plan itself."""
     row = await supabase_get_film_summary(film_summary_id, user_id)
     if not row:
         raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
@@ -12443,89 +12438,6 @@ async def update_film_summary_audio_settings_endpoint(
         return _normalize_film_summary_row(row, include_content=True)
 
     updated = await supabase_update_film_summary(film_summary_id, user_id, updates)
-    return _normalize_film_summary_row(updated, include_content=True)
-
-
-@app.put("/api/film-summaries/{film_summary_id}/manual-selection", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
-async def update_film_summary_manual_selection_endpoint(
-    film_summary_id: str, payload: FilmSummaryManualSelectionUpdateRequest, user_id: Annotated[str, Depends(get_user_id_header)],
-):
-    """Persists the user's manually chosen plans (shots, each possibly
-    trimmed from their auto-detected scene_index boundaries) and switches
-    this film summary into manual edit mode. Phase 2 of the manual-editor
-    work (the AI-narration-from-selection step) reads this back via
-    generate_narration_for_selected_clips."""
-    row = await supabase_get_film_summary(film_summary_id, user_id)
-    if not row:
-        raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
-    if row.get("status") != film_summary.FilmSummaryStatus.AWAITING_REVIEW:
-        raise HTTPException(status_code=409, detail="Clip selection can only be edited while awaiting review")
-
-    known_scene_ids = {s.get("scene_id") for s in (row.get("scene_index") or [])}
-    source_duration_ms = int((row.get("source_duration_seconds") or 0) * 1000)
-    for clip in payload.manual_selection:
-        scene_id, start_ms, end_ms = clip.get("scene_id"), clip.get("start_ms"), clip.get("end_ms")
-        if scene_id not in known_scene_ids:
-            raise HTTPException(status_code=400, detail=f"Unknown scene_id {scene_id}")
-        if not isinstance(start_ms, int) or not isinstance(end_ms, int) or start_ms < 0 or end_ms <= start_ms or end_ms > source_duration_ms:
-            raise HTTPException(status_code=400, detail=f"Invalid timecode for scene_id {scene_id}")
-
-    updated = await supabase_update_film_summary(film_summary_id, user_id, {
-        "manual_selection": payload.manual_selection, "edit_mode": "manual",
-    })
-    return _normalize_film_summary_row(updated, include_content=True)
-
-
-@app.post("/api/film-summaries/{film_summary_id}/generate-narration", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}})
-async def generate_film_summary_narration_endpoint(
-    film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)],
-):
-    """Manual-editor phase 2 (see FilmSummaryManualSelectionUpdateRequest's
-    docstring and film_summary.generate_narration_for_selected_clips):
-    turns the user's already-persisted manual_selection into narrated
-    voice_over segments and persists the result into edit_plan/
-    validation_report, same way the automatic pipeline's planning stage
-    does. Re-callable as many times as the user likes while still awaiting
-    review (e.g. after tweaking their clip selection) -- regeneration is
-    deliberately covered by the original analysis credits, so this adds no
-    new credit/usage-limit logic of its own."""
-    row = await supabase_get_film_summary(film_summary_id, user_id)
-    if not row:
-        raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
-    if row.get("status") != film_summary.FilmSummaryStatus.AWAITING_REVIEW:
-        raise HTTPException(status_code=409, detail="Narration can only be generated while awaiting review")
-
-    manual_selection = row.get("manual_selection") or []
-    if not manual_selection:
-        raise HTTPException(status_code=400, detail="manual_selection is empty -- submit it via PUT manual-selection first")
-
-    movie_metadata = {
-        "title": row.get("title") or "",
-        "source_duration_ms": int((row.get("source_duration_seconds") or 0) * 1000),
-        "source_language": row.get("source_language") or "",
-        "narration_language": row.get("narration_language") or row.get("source_language") or "",
-    }
-    try:
-        result = await film_summary.generate_narration_for_selected_clips(
-            movie_metadata=movie_metadata, narration_language=movie_metadata["narration_language"],
-            narration_style=row.get("narration_style") or "", scene_index=row.get("scene_index") or [],
-            manual_selection=manual_selection, duration_tolerance_ratio=FILM_SUMMARY_DURATION_TOLERANCE_RATIO,
-        )
-    except Exception as exc:
-        # Any failure here (OpenAI transport/config error, malformed JSON
-        # after exhausting the retry, or the model breaking the exact-
-        # partition invariant) is a planning failure, never the user's
-        # fault -- same 502 convention as get_film_summary_voice_preview_
-        # endpoint's own OpenAI call, kept deliberately simple (no new
-        # retry/orchestration beyond what generate_narration_for_selected_
-        # clips itself already does).
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    plan, validation_report = result["plan"], result["validation_report"]
-    updated = await supabase_update_film_summary(film_summary_id, user_id, {
-        "edit_plan": plan, "validation_report": validation_report,
-        "target_duration_seconds": _plan_target_duration_seconds(plan),
-    })
     return _normalize_film_summary_row(updated, include_content=True)
 
 

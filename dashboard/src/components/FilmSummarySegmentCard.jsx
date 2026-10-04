@@ -77,7 +77,7 @@ export default function FilmSummarySegmentCard({ segment, onNarrationChange, onE
                                     <span className="shrink-0 font-mono text-slate-500 dark:text-zinc-500">
                                         {formatMsClock(clip.start_ms)}-{formatMsClock(clip.end_ms)}
                                     </span>
-                                    <span className="truncate">{clip.description || clip.scene_id}</span>
+                                    <span className="min-w-0 flex-1 truncate">{clip.description || clip.scene_id}</span>
                                 </button>
                             ))
                         ) : (

@@ -5,16 +5,15 @@ import FilmSummaryShotTimeline from "./FilmSummaryShotTimeline";
 
 const MAX_SUGGESTIONS = 12;
 
-// The new primary editing surface (see the Film Summary feature's "Remplacer
+// The film-summary feature's only clip-editing surface (see the "Remplacer
 // l'experience de selection manuelle" redesign): instead of forcing the
 // creator to rebuild the whole cut from a flat scene browser, this picker is
 // scoped to ONE narrative block (segment) at a time. It opens with ranked
 // suggestions (rankSceneSuggestionsForSegment, pure/client-side -- no new
 // backend call) and keeps "Explorer toutes les scenes" as a secondary,
 // explicit tab inside the same picker rather than a separate full-page mode.
-// Reuses FilmSummaryShotTimeline unchanged (same toggle/trim mechanics
-// FilmSummaryClipPickerEditor already uses) for the segment's own clips,
-// just scoped to this one segment instead of the whole plan.
+// Reuses FilmSummaryShotTimeline for the segment's own clips, just scoped
+// to this one segment instead of the whole plan.
 function SceneSuggestionRow({ scene, onAdd, onSeek, t }) {
     return (
         <div

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, CheckCircle2, Languages, Loader2, RefreshCw, RotateCcw, Save, Sparkles } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Languages, Loader2, RefreshCw, RotateCcw, Save } from "lucide-react";
 import { getApiUrl } from "../config";
 import { getAuthHeaders } from "../lib/apiAuth";
 import { useTranslation } from "../state/LanguageContext";
@@ -15,11 +15,10 @@ import FilmSummaryClipSwapPicker from "./FilmSummaryClipSwapPicker";
 // AnonymousStoryProjectDetailPage) since FilmSummaryProjectDetailPage
 // already carries the whole status state machine on top of this.
 //
-// This is now the feature's *primary* editing surface regardless of how the
-// plan was produced (automatic planning or the advanced free-selection mode,
-// see onOpenFreeSelectionMode below) -- editing a narrative block's clips
-// happens here, per-segment, via FilmSummaryClipSwapPicker, instead of
-// forcing a trip through a separate full-film scene browser.
+// This is the feature's only editing surface: editing a narrative block's
+// clips happens here, per-segment, via FilmSummaryClipSwapPicker (ranked
+// suggestions plus an "explore all scenes" tab), instead of a separate
+// full-film scene browser.
 export default function FilmSummaryReviewPanel({
     filmSummary,
     projectId,
@@ -29,7 +28,6 @@ export default function FilmSummaryReviewPanel({
     onRefresh,
     onRegenerateAll,
     regenerating,
-    onOpenFreeSelectionMode,
 }) {
     const { t } = useTranslation();
     const [draftPlan, setDraftPlan] = useState(filmSummary.edit_plan || {});
@@ -211,7 +209,7 @@ export default function FilmSummaryReviewPanel({
 
             {error ? <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div> : null}
 
-            <div className="grid gap-6 lg:grid-cols-[1fr_360px]">
+            <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
                 <section className="space-y-4">
                     <div className="space-y-2 rounded-2xl border border-slate-300 dark:border-white/10 bg-white/5 p-4 md:p-5">
                         <label className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-400 dark:text-zinc-500">
@@ -322,25 +320,6 @@ export default function FilmSummaryReviewPanel({
                                 "Relance toute la generation depuis la video source -- a utiliser si le plan actuel ne te convient pas ou si la video generee a un probleme."
                             )}
                         </p>
-
-                        {onOpenFreeSelectionMode ? (
-                            <>
-                                <button
-                                    type="button"
-                                    onClick={onOpenFreeSelectionMode}
-                                    className="flex w-full items-center justify-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-700 dark:text-zinc-300 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
-                                >
-                                    <Sparkles size={14} />
-                                    {t("filmSummary.openFreeSelectionButton", "Mode avance : reconstruire depuis une selection libre")}
-                                </button>
-                                <p className="text-xs text-slate-500 dark:text-zinc-400">
-                                    {t(
-                                        "filmSummary.openFreeSelectionHint",
-                                        "Repart de zero : tu choisis librement tous les plans a la main, puis l'IA reecrit entierement la narration autour de ta selection."
-                                    )}
-                                </p>
-                            </>
-                        ) : null}
                     </div>
 
                     <div className="space-y-3 rounded-2xl border border-slate-300 dark:border-white/10 bg-white/5 p-4 md:p-5">
