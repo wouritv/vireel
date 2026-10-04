@@ -340,14 +340,28 @@ export default function FilmSummaryProjectDetailPage() {
                 <div className="min-w-0">
                     <h1 className="truncate text-3xl font-black tracking-tight">{filmSummary?.title || t("filmSummary.untitled", "Resume de film sans titre")}</h1>
                 </div>
-                <button
-                    type="button"
-                    onClick={() => navigate("/dashboard/film-summaries")}
-                    className="inline-flex shrink-0 items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
-                >
-                    <ArrowLeft size={14} />
-                    {t("filmSummary.backToList", "Retour aux resumes de film")}
-                </button>
+                <div className="flex shrink-0 flex-wrap items-center gap-2">
+                    {status === "awaiting_review" && !manualEditorOpen && Array.isArray(filmSummary?.scene_index) && filmSummary.scene_index.length > 0 ? (
+                        <button
+                            type="button"
+                            onClick={() => setManualEditorOpen(true)}
+                            className="inline-flex items-center gap-2 rounded-xl border border-primary/40 bg-primary/10 px-4 py-2.5 text-sm font-medium text-primary hover:bg-primary/20"
+                        >
+                            <Wand2 size={14} />
+                            {t("filmSummary.manual.openButton", "Mode manuel : choisir mes plans")}
+                        </button>
+                    ) : null}
+                    <button
+                        type="button"
+                        onClick={manualEditorOpen ? () => setManualEditorOpen(false) : () => navigate("/dashboard/film-summaries")}
+                        className="inline-flex items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
+                    >
+                        <ArrowLeft size={14} />
+                        {manualEditorOpen
+                            ? t("filmSummary.manual.backToAutomatic", "Retour au mode automatique")
+                            : t("filmSummary.backToList", "Retour aux resumes de film")}
+                    </button>
+                </div>
             </div>
 
             {error ? (
@@ -444,18 +458,6 @@ export default function FilmSummaryProjectDetailPage() {
                             />
                         ) : (
                             <div className="space-y-4">
-                                {Array.isArray(filmSummary.scene_index) && filmSummary.scene_index.length > 0 ? (
-                                    <div className="flex items-center justify-end">
-                                        <button
-                                            type="button"
-                                            onClick={() => setManualEditorOpen(true)}
-                                            className="inline-flex items-center gap-2 rounded-xl border border-primary/40 bg-primary/10 px-4 py-2.5 text-sm font-medium text-primary hover:bg-primary/20"
-                                        >
-                                            <Wand2 size={14} />
-                                            {t("filmSummary.manual.openButton", "Mode manuel : choisir mes plans")}
-                                        </button>
-                                    </div>
-                                ) : null}
                                 <FilmSummaryReviewPanel
                                     filmSummary={filmSummary}
                                     projectId={projectId}
