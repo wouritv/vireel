@@ -12672,6 +12672,157 @@ async def render_film_summary_endpoint(
     return {"job_id": render_job_id, "film_summary_id": film_summary_id, "status": "rendering"}
 
 
+async def _require_completed_film_summary_row(film_summary_id: str, user_id: str) -> Dict[str, Any]:
+    """Shared 404/409 gating for apply_film_summary_subtitles_endpoint and
+    remove_film_summary_subtitles_endpoint -- both only act on a finished
+    render, unlike the awaiting_review-gated editor endpoints above."""
+    row = await supabase_get_film_summary(film_summary_id, user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
+    if row.get("status") != film_summary.FilmSummaryStatus.COMPLETED:
+        raise HTTPException(status_code=409, detail="Subtitles can only be changed on a completed film summary")
+    return row
+
+
+def _download_and_reupload_s3_object(bucket_name: str, source_key: str, dest_key: str, local_path: str) -> None:
+    """Copies an S3 object by downloading it locally then re-uploading it
+    under a different key -- s3_uploader.py has no native "copy object"
+    helper. Used in both directions by the two endpoints below: to back up
+    the pristine final video the first time subtitles are applied post-
+    completion (final_s3_key -> final_clean_s3_key), and to restore it when
+    the user removes subtitles (final_clean_s3_key -> final_s3_key). Film
+    summary final videos are capped at ~5 minutes
+    (FILM_SUMMARY_MAX_PLAN_DURATION_MS) so this is cheap."""
+    if not download_s3_object(bucket_name, source_key, local_path):
+        raise HTTPException(status_code=502, detail=f"Failed to download {source_key} from storage")
+    if not upload_file_to_s3(local_path, bucket_name, dest_key):
+        raise HTTPException(status_code=502, detail=f"Failed to upload {dest_key} to storage")
+
+
+async def _ensure_film_summary_final_clean_backup(
+    row: Dict[str, Any], user_id: str, film_summary_id: str, bucket_name: str, local_path: str,
+) -> Dict[str, Any]:
+    """Lazily backs up the current final_s3_key object as final_clean_s3_key
+    the first time apply_film_summary_subtitles_endpoint is called for this
+    film summary, so a later remove-subtitles call has a pristine copy to
+    restore. Returns the row unchanged if that backup already exists.
+
+    Known limitation: if this film summary's ORIGINAL render already had
+    subtitles_enabled=True (the user chose subtitles up front, during
+    generation), this backup captures that already-captioned video as the
+    "clean" master -- no truly caption-free copy was ever kept in that case.
+    Accepted as-is; only a render-time change could fix it."""
+    if row.get("final_clean_s3_key"):
+        return row
+    final_clean_s3_key = f"{_FILM_SUMMARIES_PREFIX}{user_id}/{film_summary_id}/final_clean.mp4"
+    _download_and_reupload_s3_object(bucket_name, row["final_s3_key"], final_clean_s3_key, local_path)
+    return await supabase_update_film_summary(film_summary_id, user_id, {"final_clean_s3_key": final_clean_s3_key})
+
+
+async def _render_film_summary_subtitled_video(
+    output_dir: str, clean_local_path: str, subtitle_style: Optional[Dict[str, Any]],
+) -> Tuple[str, str]:
+    """Burns subtitles into the pristine clean video and regenerates the
+    preview from the result, wrapping failures the same way
+    _run_film_summary_render_pipeline_stages does for the same call --
+    except as a 502 here, since this is a synchronous request/response
+    endpoint rather than a background job with its own failure/refund
+    path."""
+    try:
+        captioned_path = await _apply_film_summary_subtitle_burn_in(output_dir, clean_local_path, True, subtitle_style)
+        preview_path = os.path.join(output_dir, "preview_with_subtitles.mp4")
+        await asyncio.to_thread(film_summary_render.encode_preview, captioned_path, preview_path)
+    except film_summary.FilmSummaryValidationError as exc:
+        raise HTTPException(status_code=502, detail=f"Subtitle burn-in failed: {exc}") from exc
+    return captioned_path, preview_path
+
+
+@app.post("/api/film-summaries/{film_summary_id}/apply-subtitles", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}})
+async def apply_film_summary_subtitles_endpoint(
+    film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Lets a user who skipped subtitles during the original render add them
+    after the fact ("si une personne n'a pas pu ajouter des sous titres
+    pendant la generation, a la fin il dois pouvoir le faire"). Reads the
+    row's current subtitle_style/transcribes+burns it onto the real final
+    video in place -- the frontend PATCHes the chosen style via the
+    existing update_film_summary_audio_settings_endpoint right before
+    calling this, same reuse as elsewhere in this feature. The very first
+    time this runs for a given film summary it also lazily backs up the
+    then-current final video as final_clean_s3_key (see
+    _ensure_film_summary_final_clean_backup), so remove_film_summary_
+    subtitles_endpoint has something to restore later.
+
+    Free: adds no new credit/billing charge, the same decision already made
+    for translate_film_summary_narration_endpoint's retranslation earlier in
+    this feature."""
+    row = await _require_completed_film_summary_row(film_summary_id, user_id)
+    if not row.get("final_s3_key"):
+        raise HTTPException(status_code=400, detail="This film summary has no final video to add subtitles to")
+
+    bucket_name = os.environ.get("AWS_S3_BUCKET", "my-clips-bucket")
+    output_dir = os.path.join(OUTPUT_DIR, f"subtitle_apply_{film_summary_id}_{uuid.uuid4().hex[:8]}")
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        backup_local_path = os.path.join(output_dir, "final_before_backup.mp4")
+        row = await _ensure_film_summary_final_clean_backup(row, user_id, film_summary_id, bucket_name, backup_local_path)
+
+        clean_local_path = os.path.join(output_dir, "final_clean.mp4")
+        if not download_s3_object(bucket_name, row["final_clean_s3_key"], clean_local_path):
+            raise HTTPException(status_code=502, detail="Failed to download the subtitle-free final video")
+
+        captioned_path, preview_path = await _render_film_summary_subtitled_video(
+            output_dir, clean_local_path, row.get("subtitle_style"),
+        )
+
+        if not upload_file_to_s3(captioned_path, bucket_name, row["final_s3_key"]):
+            raise HTTPException(status_code=502, detail="Failed to upload the captioned final video")
+        if not upload_file_to_s3(preview_path, bucket_name, row.get("preview_s3_key")):
+            raise HTTPException(status_code=502, detail="Failed to upload the regenerated preview")
+
+        updated = await supabase_update_film_summary(film_summary_id, user_id, {"subtitles_enabled": True})
+    finally:
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+    return _normalize_film_summary_row(updated, include_content=True)
+
+
+@app.post("/api/film-summaries/{film_summary_id}/remove-subtitles", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
+async def remove_film_summary_subtitles_endpoint(
+    film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Lets the user revert a completed film summary back to its original,
+    subtitle-free video ("s'il ne veut plus de sous titres il dois avoir un
+    bouton pour revenir a la video initiale sans sous-titres"), restoring
+    final_s3_key/preview_s3_key from the pristine backup final_clean_s3_key
+    (see _ensure_film_summary_final_clean_backup, written the first time
+    apply_film_summary_subtitles_endpoint ran for this row). subtitle_style
+    is left untouched so a later re-apply remembers the user's last chosen
+    style."""
+    row = await _require_completed_film_summary_row(film_summary_id, user_id)
+    final_clean_s3_key = row.get("final_clean_s3_key")
+    if not final_clean_s3_key:
+        raise HTTPException(status_code=400, detail="No subtitle-free version of this video is available")
+
+    bucket_name = os.environ.get("AWS_S3_BUCKET", "my-clips-bucket")
+    output_dir = os.path.join(OUTPUT_DIR, f"subtitle_remove_{film_summary_id}_{uuid.uuid4().hex[:8]}")
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        clean_local_path = os.path.join(output_dir, "final_clean.mp4")
+        _download_and_reupload_s3_object(bucket_name, final_clean_s3_key, row["final_s3_key"], clean_local_path)
+
+        preview_path = os.path.join(output_dir, "preview_clean.mp4")
+        await asyncio.to_thread(film_summary_render.encode_preview, clean_local_path, preview_path)
+        if not upload_file_to_s3(preview_path, bucket_name, row.get("preview_s3_key")):
+            raise HTTPException(status_code=502, detail="Failed to upload the regenerated preview")
+
+        updated = await supabase_update_film_summary(film_summary_id, user_id, {"subtitles_enabled": False})
+    finally:
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+    return _normalize_film_summary_row(updated, include_content=True)
+
+
 async def _run_film_summary_render_job(
     job_id: str, user_id: str, film_summary_id: str, project_id: Optional[str], source_s3_key: Optional[str],
     output_dir: str, plan: Dict[str, Any], voice_id: str, render_required_credits: float, narration_language: str,

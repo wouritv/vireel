@@ -4264,6 +4264,221 @@ def test_run_film_summary_render_pipeline_defaults_dialogue_volume_when_none_giv
     assert render_calls == [0.2]
 
 
+def _completed_film_summary_row(**overrides):
+    row = {
+        "id": "fs_1", "status": "completed", "stage": "completed",
+        "final_s3_key": "film_summaries/u1/fs_1/final.mp4",
+        "preview_s3_key": "film_summaries/u1/fs_1/preview.mp4",
+        "subtitle_style": {"fontColor": "#ffffff"},
+        "classification": {},
+    }
+    row.update(overrides)
+    return row
+
+
+def _stub_apply_subtitles_s3_calls(app, monkeypatch, tmp_path):
+    """Shared plumbing for apply/remove-subtitles tests: fakes download_s3_
+    object/upload_file_to_s3 (recording every call) and film_summary_
+    render.encode_preview, so each test only needs to assert on the call
+    lists it cares about."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+
+    download_calls = []
+
+    def _fake_download(bucket, key, local_path):
+        download_calls.append((bucket, key, local_path))
+        Path(local_path).write_bytes(b"source-bytes")
+        return True
+
+    monkeypatch.setattr(app, "download_s3_object", _fake_download)
+
+    upload_calls = []
+
+    def _fake_upload(local_path, bucket, key):
+        upload_calls.append((local_path, bucket, key))
+        return True
+
+    monkeypatch.setattr(app, "upload_file_to_s3", _fake_upload)
+
+    def _fake_encode_preview(input_path, output_path, **kwargs):
+        Path(output_path).write_bytes(b"preview-bytes")
+
+    monkeypatch.setattr(app.film_summary_render, "encode_preview", _fake_encode_preview)
+
+    return download_calls, upload_calls
+
+
+def test_apply_film_summary_subtitles_404_when_missing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=None))
+
+    coro = app.apply_film_summary_subtitles_endpoint(film_summary_id="fs_1", user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 404
+
+
+def test_apply_film_summary_subtitles_409_when_not_completed(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_completed_film_summary_row(status="rendering")))
+
+    coro = app.apply_film_summary_subtitles_endpoint(film_summary_id="fs_1", user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+
+
+def test_apply_film_summary_subtitles_400_without_final_video(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_completed_film_summary_row(final_s3_key=None)))
+
+    coro = app.apply_film_summary_subtitles_endpoint(film_summary_id="fs_1", user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 400
+
+
+def test_apply_film_summary_subtitles_backs_up_clean_video_on_first_use(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    row = _completed_film_summary_row()
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=row))
+    download_calls, upload_calls = _stub_apply_subtitles_s3_calls(app, monkeypatch, tmp_path)
+
+    burn_calls = []
+
+    async def _fake_burn_in(output_dir, final_path, subtitles_enabled, subtitle_style):
+        burn_calls.append((output_dir, final_path, subtitles_enabled, subtitle_style))
+        captioned_path = os.path.join(output_dir, "captioned.mp4")
+        Path(captioned_path).write_bytes(b"captioned-bytes")
+        return captioned_path
+
+    monkeypatch.setattr(app, "_apply_film_summary_subtitle_burn_in", _fake_burn_in)
+
+    update_calls = []
+
+    async def _fake_update(film_summary_id, user_id, updates):
+        update_calls.append(updates)
+        merged = dict(row)
+        merged.update(updates)
+        return merged
+
+    monkeypatch.setattr(app, "supabase_update_film_summary", _fake_update)
+
+    result = asyncio.run(app.apply_film_summary_subtitles_endpoint(film_summary_id="fs_1", user_id="u1"))
+
+    expected_clean_key = "film_summaries/u1/fs_1/final_clean.mp4"
+    # First backs up the pristine final video under final_clean_s3_key...
+    assert download_calls[0][1] == row["final_s3_key"]
+    assert upload_calls[0][2] == expected_clean_key
+    assert update_calls[0] == {"final_clean_s3_key": expected_clean_key}
+    # ...then downloads from that (now-persisted) clean key to burn subtitles into.
+    assert download_calls[1][1] == expected_clean_key
+    assert burn_calls[0][2] is True
+    assert burn_calls[0][3] == row["subtitle_style"]
+    # Captioned video and regenerated preview overwrite the existing keys.
+    assert upload_calls[1][2] == row["final_s3_key"]
+    assert upload_calls[2][2] == row["preview_s3_key"]
+    assert update_calls[1] == {"subtitles_enabled": True}
+    assert result["subtitles_enabled"] is True
+
+
+def test_apply_film_summary_subtitles_skips_backup_when_already_present(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    row = _completed_film_summary_row(final_clean_s3_key="film_summaries/u1/fs_1/final_clean.mp4")
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=row))
+    download_calls, upload_calls = _stub_apply_subtitles_s3_calls(app, monkeypatch, tmp_path)
+
+    async def _fake_burn_in(output_dir, final_path, subtitles_enabled, subtitle_style):
+        captioned_path = os.path.join(output_dir, "captioned.mp4")
+        Path(captioned_path).write_bytes(b"captioned-bytes")
+        return captioned_path
+
+    monkeypatch.setattr(app, "_apply_film_summary_subtitle_burn_in", _fake_burn_in)
+    update_mock = AsyncMock(return_value=dict(row, subtitles_enabled=True))
+    monkeypatch.setattr(app, "supabase_update_film_summary", update_mock)
+
+    asyncio.run(app.apply_film_summary_subtitles_endpoint(film_summary_id="fs_1", user_id="u1"))
+
+    # No backup step -- the only download is straight from the existing clean key.
+    assert len(download_calls) == 1
+    assert download_calls[0][1] == row["final_clean_s3_key"]
+    # Only one supabase_update_film_summary call (subtitles_enabled), no backup-key persist.
+    update_mock.assert_awaited_once_with("fs_1", "u1", {"subtitles_enabled": True})
+
+
+def test_apply_film_summary_subtitles_burn_in_failure_is_502(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    row = _completed_film_summary_row(final_clean_s3_key="film_summaries/u1/fs_1/final_clean.mp4")
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=row))
+    _stub_apply_subtitles_s3_calls(app, monkeypatch, tmp_path)
+
+    async def _failing_burn_in(output_dir, final_path, subtitles_enabled, subtitle_style):
+        raise film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.RENDER_FAILED, "boom")
+
+    monkeypatch.setattr(app, "_apply_film_summary_subtitle_burn_in", _failing_burn_in)
+    monkeypatch.setattr(app, "supabase_update_film_summary", AsyncMock())
+
+    coro = app.apply_film_summary_subtitles_endpoint(film_summary_id="fs_1", user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 502
+
+
+def test_remove_film_summary_subtitles_404_when_missing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=None))
+
+    coro = app.remove_film_summary_subtitles_endpoint(film_summary_id="fs_1", user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 404
+
+
+def test_remove_film_summary_subtitles_409_when_not_completed(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_completed_film_summary_row(status="rendering")))
+
+    coro = app.remove_film_summary_subtitles_endpoint(film_summary_id="fs_1", user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+
+
+def test_remove_film_summary_subtitles_400_without_clean_backup(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_completed_film_summary_row(final_clean_s3_key=None)))
+
+    coro = app.remove_film_summary_subtitles_endpoint(film_summary_id="fs_1", user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 400
+
+
+def test_remove_film_summary_subtitles_restores_clean_video(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    row = _completed_film_summary_row(final_clean_s3_key="film_summaries/u1/fs_1/final_clean.mp4", subtitles_enabled=True)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=row))
+    download_calls, upload_calls = _stub_apply_subtitles_s3_calls(app, monkeypatch, tmp_path)
+
+    update_calls = []
+
+    async def _fake_update(film_summary_id, user_id, updates):
+        update_calls.append(updates)
+        merged = dict(row)
+        merged.update(updates)
+        return merged
+
+    monkeypatch.setattr(app, "supabase_update_film_summary", _fake_update)
+
+    result = asyncio.run(app.remove_film_summary_subtitles_endpoint(film_summary_id="fs_1", user_id="u1"))
+
+    assert download_calls[0][1] == row["final_clean_s3_key"]
+    assert upload_calls[0][2] == row["final_s3_key"]
+    assert upload_calls[1][2] == row["preview_s3_key"]
+    assert update_calls[0] == {"subtitles_enabled": False}
+    assert result["subtitles_enabled"] is False
+
+
 def test_share_film_summary_rejects_when_not_completed(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
