@@ -87,6 +87,7 @@ from supabase_request import (
 	set_user_data_balance as supabase_set_user_data_balance,
 	deduct_user_credits as supabase_deduct_user_credits,
 	insert_user_data_history as supabase_insert_user_data_history,
+	upsert_user_data_history_entry as supabase_upsert_user_data_history_entry,
 	get_user_data_history as supabase_get_user_data_history,
 	get_latest_user_paid_subscription as supabase_get_latest_user_paid_subscription,
 	update_souscription_row as supabase_update_souscription_row,
@@ -2873,10 +2874,17 @@ def _enrich_clips_with_saved_rows(clips: List[Dict[str, Any]], saved_rows: List[
 async def _debit_auto_caption_credits_for_completed_job(job_id: str, user_id: Optional[str], saved_rows: List[Dict[str, Any]]) -> None:
     """Bills the per-clip auto-caption credit cost recorded on each saved
     reel row (see _burn_default_captions_for_clip) -- additive to the reel
-    generation charge in _finalize_completed_reel_billing, never folded
-    into it, since its storage side is already counted in that charge's
-    total_reel_size_bytes (reel_size_bytes is the post-burn, captioned
-    file size)."""
+    generation charge in _finalize_completed_reel_billing, but merged into
+    that same job_id's user_data_history row (same operation_id, via
+    upsert_user_data_history_entry) rather than its own separate line: to
+    the user this is one reel generation, so it should show up as one
+    history entry whose amount includes this cost and whose nature stays
+    "generation_reel" (the primary charge for this job_id is always billed
+    first -- see job_manager.debit_credits_for_job, called from
+    _finalize_completed_reel_billing before this function is). The storage
+    side is already counted in that charge's total_reel_size_bytes
+    (reel_size_bytes is the post-burn, captioned file size), so only credit
+    is added here."""
     auto_caption_credit_total = sum(
         float(((row.get("billing_details") or {}).get("auto_caption") or {}).get("credit_cost") or 0.0)
         for row in saved_rows
@@ -2886,13 +2894,13 @@ async def _debit_auto_caption_credits_for_completed_job(job_id: str, user_id: Op
     try:
         caption_debited = await supabase_deduct_user_credits(user_id, auto_caption_credit_total, 0.0)
         if caption_debited:
-            await supabase_insert_user_data_history(
+            await supabase_upsert_user_data_history_entry(
                 user_id=user_id,
                 credit=auto_caption_credit_total,
                 storage=0.0,
                 operation="output",
                 operation_type="sous_titre",
-                operation_id=f"{job_id}:auto_captions",
+                operation_id=job_id,
             )
     except Exception as caption_billing_error:
         logger.exception("Auto-caption billing update failed for job %s", job_id)
@@ -3038,9 +3046,17 @@ async def _upload_and_bill_preserved_source_video(job_id: str, user_id: Optional
     """Backs up the locally preserved source video to S3 and debits the
     storage it consumes from the user's quota, the same way every other
     reel artifact's storage is billed (see _build_reel_row_for_clip's
-    original_s3_key). Best-effort: the local copy is what actually powers
-    manual clipping (_resolve_preserved_source_video), so a failure here
-    never affects that -- it only means the backup/billing didn't happen."""
+    original_s3_key). Merged into this job_id's own user_data_history row
+    (same operation_id, via upsert_user_data_history_entry) instead of its
+    own separate line, same reasoning as
+    _debit_auto_caption_credits_for_completed_job -- this call can run
+    before or after that job's primary charge is billed (this function
+    runs earlier in the reel pipeline), but both already share
+    operation_type "generation_reel" so which one creates the row first
+    doesn't matter here. Best-effort: the local copy is what actually
+    powers manual clipping (_resolve_preserved_source_video), so a failure
+    here never affects that -- it only means the backup/billing didn't
+    happen."""
     if not user_id or not is_supabase_configured():
         return
     bucket = os.environ.get("AWS_S3_BUCKET", "")
@@ -3056,13 +3072,13 @@ async def _upload_and_bill_preserved_source_video(job_id: str, user_id: Optional
             return
         debited = await supabase_deduct_user_credits(user_id, 0.0, -storage_gb)
         if debited:
-            await supabase_insert_user_data_history(
+            await supabase_upsert_user_data_history_entry(
                 user_id=user_id,
                 credit=0.0,
                 storage=round(storage_gb, 6),
                 operation="output",
                 operation_type="generation_reel",
-                operation_id=f"{job_id}:source_video",
+                operation_id=job_id,
             )
     except Exception as exc:
         logger.warning("Failed to upload/bill preserved source video for job %s: %s", job_id, exc)

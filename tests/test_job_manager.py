@@ -19,6 +19,7 @@ def _import_job_manager_with_supabase_stub(monkeypatch):
     supabase_request_stub.deduct_user_credits = _noop
     supabase_request_stub.refund_user_credits = _noop
     supabase_request_stub.insert_user_data_history = _noop
+    supabase_request_stub.upsert_user_data_history_entry = _noop
     supabase_request_stub.get_user_data = _noop
 
     monkeypatch.setitem(sys.modules, "supabase_request", supabase_request_stub)
@@ -41,7 +42,7 @@ def test_debit_credits_for_job_success_path_updates_log_and_record(monkeypatch):
     manager = job_manager.JobManager()
 
     job_manager.supabase_deduct_user_credits = AsyncMock(return_value=True)
-    job_manager.supabase_insert_user_data_history = AsyncMock()
+    job_manager.supabase_upsert_user_data_history_entry = AsyncMock()
     job_manager.update_job_record = AsyncMock()
     job_manager.append_job_log = AsyncMock()
 
@@ -61,12 +62,46 @@ def test_debit_credits_for_job_success_path_updates_log_and_record(monkeypatch):
     job_manager.append_job_log.assert_awaited()
 
 
+def test_debit_credits_for_job_upserts_history_keyed_by_job_id(monkeypatch):
+    # Billing a job's primary charge through the merge-aware upsert (rather
+    # than a plain insert) is what lets a per-job sub-charge billed
+    # afterward under the same operation_id (e.g. a reel's auto-caption
+    # cost, see app.py's _debit_auto_caption_credits_for_completed_job)
+    # merge into this one row instead of becoming its own history line.
+    job_manager = _import_job_manager_with_supabase_stub(monkeypatch)
+    manager = job_manager.JobManager()
+
+    job_manager.supabase_deduct_user_credits = AsyncMock(return_value=True)
+    job_manager.supabase_upsert_user_data_history_entry = AsyncMock()
+    job_manager.update_job_record = AsyncMock()
+    job_manager.append_job_log = AsyncMock()
+
+    asyncio.run(
+        manager.debit_credits_for_job(
+            job_id="job-primary",
+            user_id="user-1",
+            credits=2.2,
+            storage_delta=0.0,
+            operation_type="generation_reel",
+        )
+    )
+
+    job_manager.supabase_upsert_user_data_history_entry.assert_awaited_once_with(
+        user_id="user-1",
+        credit=3,
+        storage=0.0,
+        operation="output",
+        operation_type="generation_reel",
+        operation_id="job-primary",
+    )
+
+
 def test_debit_credits_for_job_insufficient_balance_logs_warning(monkeypatch):
     job_manager = _import_job_manager_with_supabase_stub(monkeypatch)
     manager = job_manager.JobManager()
 
     job_manager.supabase_deduct_user_credits = AsyncMock(return_value=False)
-    job_manager.supabase_insert_user_data_history = AsyncMock()
+    job_manager.supabase_upsert_user_data_history_entry = AsyncMock()
     job_manager.update_job_record = AsyncMock()
     job_manager.append_job_log = AsyncMock()
 
@@ -81,7 +116,7 @@ def test_debit_credits_for_job_insufficient_balance_logs_warning(monkeypatch):
     )
 
     assert result is False
-    job_manager.supabase_insert_user_data_history.assert_not_awaited()
+    job_manager.supabase_upsert_user_data_history_entry.assert_not_awaited()
     job_manager.update_job_record.assert_not_awaited()
     job_manager.append_job_log.assert_awaited_once()
     assert job_manager.append_job_log.await_args.args[1] == "WARN"
@@ -93,7 +128,7 @@ def test_debit_credits_for_job_settles_extra_debit_above_reservation(monkeypatch
 
     job_manager.supabase_deduct_user_credits = AsyncMock(return_value=True)
     job_manager.supabase_refund_user_credits = AsyncMock(return_value=True)
-    job_manager.supabase_insert_user_data_history = AsyncMock()
+    job_manager.supabase_upsert_user_data_history_entry = AsyncMock()
     job_manager.update_job_record = AsyncMock()
     job_manager.append_job_log = AsyncMock()
 
@@ -121,7 +156,7 @@ def test_debit_credits_for_job_refunds_surplus_below_reservation(monkeypatch):
 
     job_manager.supabase_deduct_user_credits = AsyncMock(return_value=True)
     job_manager.supabase_refund_user_credits = AsyncMock(return_value=True)
-    job_manager.supabase_insert_user_data_history = AsyncMock()
+    job_manager.supabase_upsert_user_data_history_entry = AsyncMock()
     job_manager.update_job_record = AsyncMock()
     job_manager.append_job_log = AsyncMock()
 

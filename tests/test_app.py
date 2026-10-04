@@ -3898,7 +3898,7 @@ def test_finalize_completed_reel_billing_debits_auto_caption_credits(monkeypatch
     deduct_mock = AsyncMock(return_value=True)
     monkeypatch.setattr(app, "supabase_deduct_user_credits", deduct_mock)
     history_mock = AsyncMock()
-    monkeypatch.setattr(app, "supabase_insert_user_data_history", history_mock)
+    monkeypatch.setattr(app, "supabase_upsert_user_data_history_entry", history_mock)
 
     saved_rows = [
         {"reel_size_bytes": 100, "billing_details": {"auto_caption": {"applied": True, "credit_cost": 1.5}}},
@@ -3911,7 +3911,12 @@ def test_finalize_completed_reel_billing_debits_auto_caption_credits(monkeypatch
 
     deduct_mock.assert_awaited_once_with("u1", pytest.approx(1.5), 0.0)
     history_mock.assert_awaited_once()
+    # operation_type stays "sous_titre" when creating a fresh row (no merge
+    # target yet in this test's stubbed world); operation_id is the bare
+    # job_id (not suffixed) so a real upsert_user_data_history_entry call
+    # would merge this into the job's own primary "generation_reel" row.
     assert history_mock.await_args.kwargs["operation_type"] == "sous_titre"
+    assert history_mock.await_args.kwargs["operation_id"] == "job-reel-2"
     assert history_mock.await_args.kwargs["credit"] == pytest.approx(1.5)
 
 
@@ -5112,7 +5117,7 @@ def test_preserve_source_video_uploads_to_s3_and_bills_storage(monkeypatch, tmp_
     deduct_mock = AsyncMock(return_value=True)
     monkeypatch.setattr(app, "supabase_deduct_user_credits", deduct_mock)
     history_mock = AsyncMock(return_value={})
-    monkeypatch.setattr(app, "supabase_insert_user_data_history", history_mock)
+    monkeypatch.setattr(app, "supabase_upsert_user_data_history_entry", history_mock)
 
     asyncio.run(app._preserve_source_video_for_manual_clipping(
         "job-1", {"input_path": str(src)}, str(tmp_path), "user-1",
@@ -5123,13 +5128,16 @@ def test_preserve_source_video_uploads_to_s3_and_bills_storage(monkeypatch, tmp_
 
     expected_storage_gb = app._bytes_to_gb(len(b"video-bytes"))
     deduct_mock.assert_awaited_once_with("user-1", 0.0, -expected_storage_gb)
+    # operation_id is the bare job_id (not suffixed) so this storage charge
+    # merges into the job's own primary "generation_reel" history row
+    # instead of becoming its own line.
     history_mock.assert_awaited_once_with(
         user_id="user-1",
         credit=0.0,
         storage=round(expected_storage_gb, 6),
         operation="output",
         operation_type="generation_reel",
-        operation_id="job-1:source_video",
+        operation_id="job-1",
     )
 
 
