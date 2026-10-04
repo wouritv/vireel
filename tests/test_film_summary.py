@@ -252,23 +252,6 @@ def test_validate_edit_plan_schema_rejects_empty_segments():
         fs.validate_edit_plan_schema({"segments": []}, movie_metadata={}, target_duration_ms=600000)
 
 
-def test_validate_edit_plan_schema_keeps_valid_music_mood():
-    raw = _valid_raw_plan()
-    raw["music_mood"] = "Tense"  # case-insensitive
-    plan = fs.validate_edit_plan_schema(raw, movie_metadata={}, target_duration_ms=600000)
-    assert plan["music_mood"] == "tense"
-
-
-def test_validate_edit_plan_schema_defaults_music_mood_when_missing_or_unknown():
-    plan = fs.validate_edit_plan_schema(_valid_raw_plan(), movie_metadata={}, target_duration_ms=600000)
-    assert plan["music_mood"] == fs.DEFAULT_MUSIC_MOOD
-
-    raw = _valid_raw_plan()
-    raw["music_mood"] = "epic orchestral battle theme"  # not one of MUSIC_MOODS
-    plan = fs.validate_edit_plan_schema(raw, movie_metadata={}, target_duration_ms=600000)
-    assert plan["music_mood"] == fs.DEFAULT_MUSIC_MOOD
-
-
 def test_validate_edit_plan_schema_rejects_unknown_segment_type():
     raw = _valid_raw_plan()
     raw["segments"][0]["type"] = "not_a_real_type"
@@ -1224,7 +1207,6 @@ def _translated_raw_plan(original_plan, narration_text="Il etait une fois."):
         "characters": original_plan.get("characters") or [],
         "segments": segments,
         "total_estimated_duration_ms": original_plan.get("total_estimated_duration_ms"),
-        "music_mood": original_plan.get("music_mood"),
         "unresolved_ambiguities": [],
     }
 

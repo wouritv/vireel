@@ -108,14 +108,6 @@ SEGMENT_TYPE_ORIGINAL_DIALOGUE = "original_dialogue"
 SEGMENT_TYPE_BREATHING = "breathing"
 SEGMENT_TYPES = (SEGMENT_TYPE_VOICE_OVER, SEGMENT_TYPE_ORIGINAL_DIALOGUE, SEGMENT_TYPE_BREATHING)
 
-# Dominant mood for the whole film, used only to pick an optional
-# instrumental background bed mixed under narration (voice_over) segments --
-# see PLANNING_SYSTEM_PROMPT's BACKGROUND MUSIC MOOD section and
-# film_summary_render.resolve_background_music_track. Never affects
-# original_dialogue/breathing segments, where the film's own audio plays.
-MUSIC_MOODS = ("tense", "dark", "hopeful", "romantic", "melancholic", "triumphant", "comedic", "neutral")
-DEFAULT_MUSIC_MOOD = "neutral"
-
 # Hard cap on a film summary's total runtime (automatic or manual plans
 # alike): "il est preferable que les resumes de films ne depassent pas
 # 5mn" -- kept as a changeable env-configurable constant, same convention
@@ -443,8 +435,6 @@ def validate_edit_plan_schema(
         "role": str(c.get("role") or "").strip(),
     } for i, c in enumerate(characters)]
 
-    requested_mood = str(raw.get("music_mood") or "").strip().lower()
-
     plan = {
         "schema_version": EDIT_PLAN_SCHEMA_VERSION,
         "movie": dict(movie_metadata),
@@ -453,9 +443,6 @@ def validate_edit_plan_schema(
         "segments": segments,
         "total_estimated_duration_ms": compute_total_estimated_duration_ms(segments),
         "unresolved_ambiguities": [str(a) for a in (raw.get("unresolved_ambiguities") or [])],
-        # Non-blocking: an unknown/missing mood just means no music, never a
-        # plan failure -- see MUSIC_MOODS.
-        "music_mood": requested_mood if requested_mood in MUSIC_MOODS else DEFAULT_MUSIC_MOOD,
     }
     return plan
 
@@ -936,9 +923,6 @@ The total duration includes voice-over, original dialogue and breathing segments
 EVIDENCE AND UNCERTAINTY
 Every narrated segment must include source_event_ids. Every clip must reference a valid scene_id. When names are uncertain, use the canonical identity from character_bible or neutral wording. Add unresolved issues to unresolved_ambiguities. If the evidence cannot support a coherent summary, return status="insufficient_evidence" and explain the blocking evidence gaps without generating fake content.
 
-BACKGROUND MUSIC MOOD
-An optional, low-volume instrumental music bed (no lyrics) may be mixed under voice-over narration -- never under original_dialogue or breathing segments, where the film's own audio must remain the only thing heard. Pick exactly one dominant mood for the whole film from: tense, dark, hopeful, romantic, melancholic, triumphant, comedic, neutral. Base it on the film's actual confirmed tone, not a guess -- a thriller with a betrayal at its core is "tense" or "dark," a story ending in reconciliation is "hopeful," and so on. Use "neutral" only when no other mood clearly fits. This choice only selects which instrumental track (if any is available) may play under narration; it has no effect on the narration text or segment selection.
-
 OUTPUT SCHEMA
 Return exactly this JSON shape -- every field below is required unless marked optional, and no other top-level or segment field names are read:
 {
@@ -947,7 +931,6 @@ Return exactly this JSON shape -- every field below is required unless marked op
   "characters": [ { "id": string, "canonical_name": string, "aliases": [string], "role": string } ],
   "segments": [ <segment, see below> ],
   "total_estimated_duration_ms": integer   (your own best-effort sum, backend recomputes the authoritative value),
-  "music_mood": "tense" | "dark" | "hopeful" | "romantic" | "melancholic" | "triumphant" | "comedic" | "neutral"   (optional, default "neutral", see BACKGROUND MUSIC MOOD),
   "unresolved_ambiguities": [string]
 }
 Every segment is a JSON object with these fields:
@@ -981,7 +964,6 @@ Before returning the JSON, silently verify:
 - the hook, main progression, climax, resolution and conclusion are present when supported by the movie;
 - the setup, inciting incident, rising complications, midpoint turn, climax and resolution are each identifiable in at least one segment;
 - every segment names its characters, places and objects specifically rather than generically, and no segment is a generic sentence that could describe almost any movie;
-- music_mood is one of the listed moods and genuinely reflects the film's confirmed tone;
 - the result can be executed by an automated FFmpeg pipeline."""
 
 
@@ -1030,7 +1012,6 @@ Return exactly this JSON shape -- every field required unless marked optional:
   "characters": [],
   "segments": [ <segment, see below> ],
   "total_estimated_duration_ms": integer   (your own best-effort sum, backend recomputes the authoritative value),
-  "music_mood": "tense" | "dark" | "hopeful" | "romantic" | "melancholic" | "triumphant" | "comedic" | "neutral"   (optional, default "neutral"),
   "unresolved_ambiguities": [string]
 }
 Every segment's "type" MUST be exactly "voice_over" -- never "original_dialogue" or "breathing": the user's manual selection already is the final cut, so there is nothing left for either of those segment types to add in this mode. Each segment object has:
@@ -1054,12 +1035,12 @@ Before returning the JSON, silently verify: concatenating every segment's clips,
 # debut"). The model's only job is to translate text, never to re-edit.
 NARRATION_TRANSLATION_SYSTEM_PROMPT = """You are Vireel's Film Summary Narration Translation Engine. An edit plan for a film summary already exists -- its footage, timing and segment structure are final and approved. The only problem is that its narration was written in the wrong language. Your ONLY job is to translate the spoken narration text of each voice_over segment into the requested target_language. You do not edit, re-cut, re-order, re-group, add, remove or re-time anything else.
 
-You have no permission to change any field other than a voice_over segment's "narration". Every other field -- "id", "type", "sequence", "clips" (and every clip's "scene_id", "start_ms", "end_ms"), "start_ms"/"end_ms" on non-voice_over segments, "estimated_duration_ms", "source_event_ids", "characters" and "music_mood" -- must be copied byte-for-byte identical to the input, in the same order, same count. A segment whose "type" is "original_dialogue" or "breathing" has no "narration" field at all (its "transcript_excerpt" is the original movie's own verbatim dialogue, not voice-over, and must never be translated or altered) -- copy that segment through completely unchanged.
+You have no permission to change any field other than a voice_over segment's "narration". Every other field -- "id", "type", "sequence", "clips" (and every clip's "scene_id", "start_ms", "end_ms"), "start_ms"/"end_ms" on non-voice_over segments, "estimated_duration_ms", "source_event_ids" and "characters" -- must be copied byte-for-byte identical to the input, in the same order, same count. A segment whose "type" is "original_dialogue" or "breathing" has no "narration" field at all (its "transcript_excerpt" is the original movie's own verbatim dialogue, not voice-over, and must never be translated or altered) -- copy that segment through completely unchanged.
 
 INPUTS
 - movie_metadata: title, source duration, source language and technical metadata
 - target_language: the language to translate every voice_over segment's narration into
-- characters, segments, music_mood: the existing plan's own fields, to copy through (segments' narration aside) exactly as given
+- characters, segments: the existing plan's own fields, to copy through (segments' narration aside) exactly as given
 
 TRANSLATION RULES
 1. Translate only the "narration" string of each voice_over segment into target_language. Preserve its meaning, tone and register -- a natural, cinematic, emotionally precise translation suitable for AI speech, not a literal word-for-word rendering.
@@ -1074,7 +1055,6 @@ Return exactly this JSON shape -- every field required unless marked optional:
   "characters": [ <copied through unchanged> ],
   "segments": [ <segment, see below -- same count and order as the input> ],
   "total_estimated_duration_ms": integer   (your own best-effort sum, backend recomputes the authoritative value),
-  "music_mood": <copied through unchanged>,
   "unresolved_ambiguities": [string]   (may be empty)
 }
 Each segment object must have exactly the same shape and field values as the corresponding input segment, with this single exception: a "voice_over" segment's "narration" field holds the translated text instead of the original. Concretely:
@@ -1083,7 +1063,7 @@ Each segment object must have exactly the same shape and field values as the cor
 
 OUTPUT CONTRACT
 Return JSON only. Do not use Markdown. Do not include commentary before or after the JSON.
-Before returning the JSON, silently verify: the segment count, order, types, sequence numbers, clips, timecodes, estimated_duration_ms, source_event_ids, characters and music_mood are all byte-for-byte identical to the input; only each voice_over segment's narration text has changed, and it is a faithful translation into target_language."""
+Before returning the JSON, silently verify: the segment count, order, types, sequence numbers, clips, timecodes, estimated_duration_ms, source_event_ids and characters are all byte-for-byte identical to the input; only each voice_over segment's narration text has changed, and it is a faithful translation into target_language."""
 
 
 TTS_INSTRUCTIONS_TEMPLATE = (
@@ -1509,15 +1489,14 @@ def _build_narration_translation_payload(
     *, plan: Dict[str, Any], target_language: str, movie_metadata: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Only the fields the translation model actually needs: the existing
-    plan's own characters/segments/music_mood (to copy through verbatim,
-    translating only each voice_over segment's narration) plus the
-    requested target_language and movie_metadata for context."""
+    plan's own characters/segments (to copy through verbatim, translating
+    only each voice_over segment's narration) plus the requested
+    target_language and movie_metadata for context."""
     return {
         "movie_metadata": movie_metadata,
         "target_language": target_language,
         "characters": plan.get("characters") or [],
         "segments": plan.get("segments") or [],
-        "music_mood": plan.get("music_mood") or DEFAULT_MUSIC_MOOD,
     }
 
 
