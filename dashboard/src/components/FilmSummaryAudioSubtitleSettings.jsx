@@ -1,6 +1,5 @@
 import { useState } from "react";
 import { updateFilmSummaryAudioSettings } from "../lib/filmSummary";
-import FilmSummaryDialogueVolumeSettings from "./FilmSummaryDialogueVolumeSettings";
 import FilmSummarySubtitleSettings from "./FilmSummarySubtitleSettings";
 
 // Same shape CaptionsModal's DEFAULT_STYLE uses for Reels/Captions
@@ -30,14 +29,12 @@ const DEFAULT_SUBTITLE_STYLE = {
     animation: "word-highlight",
 };
 
-// Audio/subtitles panel for a film summary while awaiting_review: dialogue
-// volume (a single slider controlling how audible the film's own original
-// audio stays under the AI-generated narration -- see
-// FilmSummaryDialogueVolumeSettings) and subtitles (enable toggle + the
-// Reels/Captions theme system), each its own small sub-component, each
-// saved independently via PATCH /api/film-summaries/{id}/audio-settings.
-// Available for both the automatic and manual edit modes -- it's unrelated
-// to clip picking.
+// Subtitles panel for a film summary while awaiting_review: enable toggle +
+// the Reels/Captions theme system, saved via PATCH
+// /api/film-summaries/{id}/audio-settings. There is no dialogue-volume
+// control -- the film's own audio is never audible in the final video
+// ("il ne dois y avoir aucune parole du film originale"), only the AI
+// narration.
 export default function FilmSummaryAudioSubtitleSettings({ filmSummary, user, totalDurationMs, onUpdated, t }) {
     const [subtitlesEnabled, setSubtitlesEnabled] = useState(Boolean(filmSummary.subtitles_enabled));
     const [subtitleStyle, setSubtitleStyle] = useState({ ...DEFAULT_SUBTITLE_STYLE, ...(filmSummary.subtitle_style || {}) });
@@ -70,12 +67,6 @@ export default function FilmSummaryAudioSubtitleSettings({ filmSummary, user, to
 
     return (
         <div className="space-y-4">
-            <FilmSummaryDialogueVolumeSettings
-                filmSummary={filmSummary}
-                user={user}
-                onUpdated={onUpdated}
-                t={t}
-            />
             <FilmSummarySubtitleSettings
                 enabled={subtitlesEnabled}
                 style={subtitleStyle}

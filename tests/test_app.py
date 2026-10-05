@@ -3143,79 +3143,6 @@ def _awaiting_review_film_summary_row(**overrides):
     return row
 
 
-def test_normalize_film_summary_row_defaults_dialogue_volume_to_20(monkeypatch):
-    app = _import_app_with_stubs(monkeypatch)
-    row = {"id": "fs_1", "status": "awaiting_review", "stage": "awaiting_user_review"}
-    item = app._normalize_film_summary_row(row)
-    assert item["dialogue_volume"] == 20
-
-
-def test_normalize_film_summary_row_keeps_explicit_dialogue_volume(monkeypatch):
-    app = _import_app_with_stubs(monkeypatch)
-    row = {"id": "fs_1", "status": "awaiting_review", "stage": "awaiting_user_review", "dialogue_volume": 65}
-    item = app._normalize_film_summary_row(row)
-    assert item["dialogue_volume"] == 65
-
-
-def test_normalize_film_summary_row_keeps_zero_dialogue_volume(monkeypatch):
-    # 0 is falsy but a legitimate, explicitly-chosen value -- must not be
-    # replaced by the 20 default.
-    app = _import_app_with_stubs(monkeypatch)
-    row = {"id": "fs_1", "status": "awaiting_review", "stage": "awaiting_user_review", "dialogue_volume": 0}
-    item = app._normalize_film_summary_row(row)
-    assert item["dialogue_volume"] == 0
-
-
-def test_update_film_summary_audio_settings_persists_dialogue_volume(monkeypatch):
-    app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row()))
-    update_mock = AsyncMock(return_value=_awaiting_review_film_summary_row(dialogue_volume=65, subtitles_enabled=True))
-    monkeypatch.setattr(app, "supabase_update_film_summary", update_mock)
-
-    result = asyncio.run(app.update_film_summary_audio_settings_endpoint(
-        film_summary_id="fs_1",
-        payload=app.FilmSummaryAudioSettingsUpdateRequest(dialogue_volume=65, subtitles_enabled=True),
-        user_id="u1",
-    ))
-
-    update_mock.assert_awaited_once_with("fs_1", "u1", {"dialogue_volume": 65, "subtitles_enabled": True})
-    assert result["dialogue_volume"] == 65
-    assert result["subtitles_enabled"] is True
-
-
-@pytest.mark.parametrize("boundary_value", [0, 100])
-def test_update_film_summary_audio_settings_accepts_dialogue_volume_boundaries(monkeypatch, boundary_value):
-    app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row()))
-    update_mock = AsyncMock(return_value=_awaiting_review_film_summary_row(dialogue_volume=boundary_value))
-    monkeypatch.setattr(app, "supabase_update_film_summary", update_mock)
-
-    result = asyncio.run(app.update_film_summary_audio_settings_endpoint(
-        film_summary_id="fs_1",
-        payload=app.FilmSummaryAudioSettingsUpdateRequest(dialogue_volume=boundary_value),
-        user_id="u1",
-    ))
-
-    update_mock.assert_awaited_once_with("fs_1", "u1", {"dialogue_volume": boundary_value})
-    assert result["dialogue_volume"] == boundary_value
-
-
-@pytest.mark.parametrize("bad_value", [-1, 101])
-def test_update_film_summary_audio_settings_rejects_dialogue_volume_outside_range(monkeypatch, bad_value):
-    app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row()))
-
-    coro = app.update_film_summary_audio_settings_endpoint(
-        film_summary_id="fs_1",
-        payload=app.FilmSummaryAudioSettingsUpdateRequest(dialogue_volume=bad_value),
-        user_id="u1",
-    )
-    with pytest.raises(app.HTTPException) as exc_info:
-        asyncio.run(coro)
-    assert exc_info.value.status_code == 400
-    assert "dialogue_volume must be between 0 and 100" in str(exc_info.value.detail)
-
-
 def test_update_film_summary_audio_settings_blocks_outside_awaiting_review(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row(status="rendering")))
@@ -3348,7 +3275,7 @@ def test_retry_film_summary_succeeds_from_awaiting_review_and_resets_manual_stat
     app = _import_app_with_stubs(monkeypatch)
     row = _awaiting_review_film_summary_row(
         manual_selection=[{"scene_id": "scene_001", "start_ms": 0, "end_ms": 1000}], edit_mode="manual",
-        dialogue_volume=65, subtitles_enabled=True, subtitle_style={"font": "Arial"},
+        subtitles_enabled=True, subtitle_style={"font": "Arial"},
     )
     update_mock = _setup_retry_film_summary_mocks(app, monkeypatch, row, tmp_path)
 
@@ -3364,7 +3291,7 @@ def test_retry_film_summary_succeeds_from_awaiting_review_and_resets_manual_stat
     assert updates["edit_mode"] == "automatic"
     # Independent user preferences must survive a regenerate untouched --
     # i.e. never even mentioned in the update payload.
-    for untouched_key in ("dialogue_volume", "subtitles_enabled", "subtitle_style"):
+    for untouched_key in ("subtitles_enabled", "subtitle_style"):
         assert untouched_key not in updates
 
 
@@ -3963,7 +3890,7 @@ def test_render_pipeline_reports_incremental_progress_per_segment(monkeypatch, t
 
     monkeypatch.setattr(app.film_summary_render, "render_edit_plan", _fake_render_edit_plan)
 
-    plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "original_dialogue", "start_ms": 0, "end_ms": 1000}]}
+    plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "voice_over", "narration": "", "estimated_duration_ms": 1000, "clips": []}]}
     asyncio.run(app._run_film_summary_render_pipeline_stages(
         "job-1", "u1", "fs-1", "proj-1", "source-key", str(tmp_path), plan, "cedar", "fr",
     ))
@@ -4089,7 +4016,7 @@ def test_run_film_summary_render_pipeline_applies_subtitles_and_reencodes_previe
     render_calls = []
 
     def _fake_render_edit_plan(*, on_segment_done, **kwargs):
-        render_calls.append(kwargs.get("original_dialogue_volume"))
+        render_calls.append(True)
         return {"segment_count": 1, "final_duration_seconds": 10.0}
 
     monkeypatch.setattr(app.film_summary_render, "render_edit_plan", _fake_render_edit_plan)
@@ -4116,14 +4043,13 @@ def test_run_film_summary_render_pipeline_applies_subtitles_and_reencodes_previe
         lambda inp, out, **k: preview_reencode_calls.append((inp, out)),
     )
 
-    plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "original_dialogue", "start_ms": 0, "end_ms": 1000}]}
+    plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "voice_over", "narration": "", "estimated_duration_ms": 1000, "clips": []}]}
     asyncio.run(app._run_film_summary_render_pipeline_stages(
         "job-1", "u1", "fs-1", "proj-1", "source-key", str(tmp_path), plan, "cedar", "fr",
-        dialogue_volume=65, subtitles_enabled=True, subtitle_style={"fontSize": 18},
+        subtitles_enabled=True, subtitle_style={"fontSize": 18},
     ))
 
-    # dialogue_volume=65 -> original_dialogue_volume=0.65 passed to render_edit_plan.
-    assert render_calls == [0.65]
+    assert render_calls == [True]
     assert len(subtitle_calls) == 1
     assert subtitle_calls[0][0] == str(tmp_path / "final.mp4")
     # Preview re-encoded once at the end, from the fully post-processed path.
@@ -4146,7 +4072,7 @@ def test_run_film_summary_render_pipeline_leaves_preview_untouched_without_new_s
     preview_reencode_calls = []
     monkeypatch.setattr(app.film_summary_render, "encode_preview", lambda *a, **k: preview_reencode_calls.append(a))
 
-    plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "original_dialogue", "start_ms": 0, "end_ms": 1000}]}
+    plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "voice_over", "narration": "", "estimated_duration_ms": 1000, "clips": []}]}
     asyncio.run(app._run_film_summary_render_pipeline_stages(
         "job-1", "u1", "fs-1", "proj-1", "source-key", str(tmp_path), plan, "cedar", "fr",
     ))
@@ -4158,30 +4084,6 @@ def test_run_film_summary_render_pipeline_leaves_preview_untouched_without_new_s
     # happens in that step when subtitles aren't enabled.
     stage_calls = [call.args[2] for call in app.reel_job_manager.update_progress.await_args_list]
     assert film_summary.FilmSummaryStage.ADDING_SUBTITLES not in stage_calls
-
-
-def test_run_film_summary_render_pipeline_defaults_dialogue_volume_when_none_given(monkeypatch, tmp_path):
-    # dialogue_volume=None (e.g. a row predating the migration's column
-    # default) must fall back to the product default of 20/100 = 0.2.
-    app = _import_app_with_stubs(monkeypatch)
-    monkeypatch.setattr(app, "download_s3_object", lambda bucket, key, path: True)
-    monkeypatch.setattr(app, "upload_file_to_s3", lambda *a, **k: True)
-    app._finalize_film_summary_render = AsyncMock()
-    app.reel_job_manager.update_progress = AsyncMock()
-
-    render_calls = []
-    monkeypatch.setattr(
-        app.film_summary_render, "render_edit_plan",
-        lambda *a, on_segment_done, **k: render_calls.append(k.get("original_dialogue_volume")) or {"segment_count": 1, "final_duration_seconds": 10.0},
-    )
-
-    plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "original_dialogue", "start_ms": 0, "end_ms": 1000}]}
-    asyncio.run(app._run_film_summary_render_pipeline_stages(
-        "job-1", "u1", "fs-1", "proj-1", "source-key", str(tmp_path), plan, "cedar", "fr",
-        dialogue_volume=None,
-    ))
-
-    assert render_calls == [0.2]
 
 
 def test_share_film_summary_rejects_when_not_completed(monkeypatch):

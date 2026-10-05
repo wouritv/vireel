@@ -215,8 +215,11 @@ def _valid_raw_plan():
                 "source_event_ids": ["event_1"],
             },
             {
-                "id": "seg_002", "sequence": 2, "type": "original_dialogue",
-                "start_ms": 9000, "end_ms": 12000, "transcript_excerpt": "I know.", "speaker_ids": ["char_1"],
+                "id": "seg_002", "sequence": 2, "type": "voice_over", "narration": "And then it happened.",
+                "estimated_duration_ms": 3000, "clips": [
+                    {"scene_id": "scene_002", "start_ms": 9000, "end_ms": 12000, "description": "reveal", "match_score": 0.8},
+                ],
+                "source_event_ids": ["event_2"],
             },
         ],
         "unresolved_ambiguities": [],
@@ -280,10 +283,10 @@ def test_validate_edited_plan_patch_recomputes_estimate_from_edited_narration():
     # must recompute it from the new text so the total actually moves.
     raw = _valid_raw_plan()
     raw["segments"][0]["narration"] = " ".join(["word"] * 270)  # -> 120000ms at 135 wpm
+    second_segment_estimate = fs.estimate_narration_duration_ms(raw["segments"][1]["narration"])
     plan = fs.validate_edited_plan_patch(raw, movie_metadata={}, target_duration_ms=600000)
-    voice_over = next(s for s in plan["segments"] if s["type"] == "voice_over")
-    assert voice_over["estimated_duration_ms"] == 120000
-    assert plan["total_estimated_duration_ms"] == 120000 + 3000
+    assert plan["segments"][0]["estimated_duration_ms"] == 120000
+    assert plan["total_estimated_duration_ms"] == 120000 + second_segment_estimate
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +301,7 @@ def _built_plan(target_duration_ms=29000):
 def test_validate_edit_plan_content_valid_plan_passes():
     plan = _built_plan()
     report = fs.validate_edit_plan_content(
-        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001"], duration_tolerance_ratio=0.5,
+        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001", "scene_002"], duration_tolerance_ratio=0.5,
     )
     assert report["valid"] is True
     assert report["errors"] == []
@@ -323,20 +326,36 @@ def test_validate_edit_plan_content_flags_out_of_bounds_clip():
     assert any("hors limites" in e for e in report["errors"])
 
 
-def test_validate_edit_plan_content_flags_overlapping_dialogue_segments():
+def test_validate_edit_plan_content_flags_unsupported_segment_type():
+    # original_dialogue/breathing no longer exist as segment types -- "il
+    # ne dois y avoir aucune parole du film originale, uniquement les
+    # sequences videos + voix off de narration". A segment of either type
+    # (e.g. from a pre-existing plan) is rejected as unknown, never
+    # silently accepted.
     plan = _built_plan()
     plan["segments"].append({
         "id": "seg_003", "sequence": 3, "type": "breathing",
         "start_ms": 10000, "end_ms": 11000, "transcript_excerpt": "", "speaker_ids": [],
     })
     report = fs.validate_edit_plan_content(
-        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001"], duration_tolerance_ratio=0.5,
+        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001", "scene_002"], duration_tolerance_ratio=0.5,
     )
     assert report["valid"] is False
-    # Names both segment ids and their exact timecodes -- fed back verbatim
-    # to the planning model as corrective context on a retry, a bare
-    # generic message gives it nothing to act on.
-    assert any("seg_002" in e and "seg_003" in e and "9000-12000ms" in e and "10000-11000ms" in e for e in report["errors"])
+    assert any("seg_003" in e and "type inconnu" in e for e in report["errors"])
+
+
+def test_validate_edit_plan_content_flags_empty_narration():
+    # An empty narration never gets a TTS pass, so that segment's clip
+    # would silently keep the source clip's own raw audio instead of the
+    # narrator's voice -- "il arrive des moments ... ou le son de
+    # narration ne s'ecoute plus". Blocking, not a warning.
+    plan = _built_plan()
+    plan["segments"][0]["narration"] = ""
+    report = fs.validate_edit_plan_content(
+        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001", "scene_002"], duration_tolerance_ratio=0.5,
+    )
+    assert report["valid"] is False
+    assert any("seg_001" in e and "aucune narration" in e for e in report["errors"])
 
 
 def test_validate_edit_plan_content_flags_duration_outside_tolerance():
@@ -366,7 +385,7 @@ def test_validate_edit_plan_content_never_flags_repeated_clip():
     plan = _built_plan(target_duration_ms=32000)
     plan["segments"][0]["clips"].append(dict(plan["segments"][0]["clips"][0]))
     report = fs.validate_edit_plan_content(
-        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001"], duration_tolerance_ratio=0.5,
+        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001", "scene_002"], duration_tolerance_ratio=0.5,
     )
     assert report["valid"] is True
     assert report["errors"] == []
@@ -382,8 +401,8 @@ def test_validate_edit_plan_content_never_flags_repeated_clip():
 def _plan_with_total_duration_ms(total_ms):
     raw = _valid_raw_plan()
     # Fold the whole total into the single voice_over segment's estimated
-    # duration and drop the original_dialogue segment, so total_estimated_
-    # duration_ms is exactly total_ms with nothing else to account for.
+    # duration and drop the second segment, so total_estimated_duration_ms
+    # is exactly total_ms with nothing else to account for.
     raw["segments"] = [raw["segments"][0]]
     raw["segments"][0]["sequence"] = 1
     raw["segments"][0]["estimated_duration_ms"] = total_ms
@@ -444,7 +463,7 @@ def test_realign_plan_target_duration_snaps_target_to_actual_total_when_outside_
     # leaving the plan permanently invalid.
     plan = _built_plan(target_duration_ms=1)
     realigned, report = fs.realign_plan_target_duration(
-        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001"], duration_tolerance_ratio=0.15,
+        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001", "scene_002"], duration_tolerance_ratio=0.15,
     )
     assert realigned["target_duration_ms"] == 29000
     assert report["valid"] is True
@@ -454,7 +473,7 @@ def test_realign_plan_target_duration_snaps_target_to_actual_total_when_outside_
 def test_realign_plan_target_duration_leaves_plan_untouched_within_tolerance():
     plan = _built_plan(target_duration_ms=29000)
     realigned, report = fs.realign_plan_target_duration(
-        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001"], duration_tolerance_ratio=0.15,
+        plan, source_duration_ms=3600000, valid_scene_ids=["scene_001", "scene_002"], duration_tolerance_ratio=0.15,
     )
     assert realigned is plan
     assert realigned["target_duration_ms"] == 29000
@@ -487,12 +506,12 @@ def test_clamp_legacy_duration_truncation_overage_clamps_voice_over_clip_within_
     assert plan["segments"][0]["clips"][0]["end_ms"] == 3_600_500  # input left untouched
 
 
-def test_clamp_legacy_duration_truncation_overage_clamps_timed_segment_within_bound():
+def test_clamp_legacy_duration_truncation_overage_clamps_second_segment_within_bound():
     plan = _built_plan()
-    plan["segments"][1]["end_ms"] = 3_600_800  # 800ms over
+    plan["segments"][1]["clips"][0]["end_ms"] = 3_600_800  # 800ms over
     fixed, changed = fs._clamp_legacy_duration_truncation_overage(plan["segments"], 3_600_000)
     assert changed is True
-    assert fixed[1]["end_ms"] == 3_600_000
+    assert fixed[1]["clips"][0]["end_ms"] == 3_600_000
 
 
 def test_clamp_legacy_duration_truncation_overage_leaves_larger_overage_alone():
@@ -509,7 +528,7 @@ def test_realign_plan_target_duration_self_heals_legacy_truncation_overage():
     plan = _built_plan()
     plan["segments"][0]["clips"][0]["end_ms"] = 3_600_500
     realigned, report = fs.realign_plan_target_duration(
-        plan, source_duration_ms=3_600_000, valid_scene_ids=["scene_001"], duration_tolerance_ratio=0.5,
+        plan, source_duration_ms=3_600_000, valid_scene_ids=["scene_001", "scene_002"], duration_tolerance_ratio=0.5,
     )
     assert report["valid"] is True
     assert report["errors"] == []
@@ -858,19 +877,19 @@ def test_generate_edit_plan_retries_once_and_converges_on_correction(monkeypatch
 
 
 def test_generate_edit_plan_retries_on_warning_only_even_when_already_valid(monkeypatch):
-    # An unknown-character warning never makes validation fail, so this
-    # plan is "valid": True on the first attempt. The retry must still fire
-    # to give the model a chance to fix it, and must not block the final
-    # result either way.
+    # A plan over the ideal duration ceiling never makes validation fail,
+    # so this plan is "valid": True on the first attempt. The retry must
+    # still fire to give the model a chance to shorten it, and must not
+    # block the final result either way.
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    unknown_character_plan = _valid_raw_plan()
-    unknown_character_plan["segments"][1]["speaker_ids"] = ["char_missing"]
-
-    corrected_plan = _valid_raw_plan()  # seg_002.speaker_ids back to the known ["char_1"]
+    monkeypatch.setattr(fs, "FILM_SUMMARY_MAX_PLAN_DURATION_MS", 10000)  # total (29000ms) now over ceiling
+    over_ceiling_plan = _valid_raw_plan()
+    corrected_plan = _valid_raw_plan()
+    corrected_plan["segments"][0]["narration"] = "Corrected narration."
 
     fake_client = MagicMock()
     fake_client.chat.completions.create.side_effect = [
-        _fake_openai_response(json.dumps(unknown_character_plan)),
+        _fake_openai_response(json.dumps(over_ceiling_plan)),
         _fake_openai_response(json.dumps(corrected_plan)),
     ]
     monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
@@ -883,20 +902,20 @@ def test_generate_edit_plan_retries_on_warning_only_even_when_already_valid(monk
 
     assert fake_client.chat.completions.create.call_count == 2
     sent_messages = fake_client.chat.completions.create.call_args_list[1].kwargs["messages"]
-    assert "personnage inconnu" in sent_messages[-1]["content"]
+    assert "duree ideale" in sent_messages[-1]["content"]
     assert "did not block validation" in sent_messages[-1]["content"]
-    # The corrected plan no longer references the unknown character.
-    assert result["plan"]["segments"][1]["speaker_ids"] == ["char_1"]
+    # The second (corrected) response is the one actually returned.
+    assert result["plan"]["segments"][0]["narration"] == "Corrected narration."
 
 
 def test_generate_edit_plan_does_not_retry_forever_on_persistent_warning(monkeypatch):
     # The warning-driven retry must still respect max_attempts and return
     # the last plan rather than looping -- the warning is never blocking.
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    unknown_character_plan = _valid_raw_plan()
-    unknown_character_plan["segments"][1]["speaker_ids"] = ["char_missing"]
+    monkeypatch.setattr(fs, "FILM_SUMMARY_MAX_PLAN_DURATION_MS", 10000)  # total (29000ms) always over ceiling
+    over_ceiling_plan = _valid_raw_plan()
     fake_client = MagicMock()
-    fake_client.chat.completions.create.return_value = _fake_openai_response(json.dumps(unknown_character_plan))
+    fake_client.chat.completions.create.return_value = _fake_openai_response(json.dumps(over_ceiling_plan))
     monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)
 
     movie_metadata = {"title": "M", "source_duration_ms": 3600000, "source_language": "en", "narration_language": "en"}
@@ -906,7 +925,7 @@ def test_generate_edit_plan_does_not_retry_forever_on_persistent_warning(monkeyp
     ))
 
     assert fake_client.chat.completions.create.call_count == 2
-    assert result["plan"]["segments"][1]["speaker_ids"] == ["char_missing"]
+    assert result["plan"]["total_estimated_duration_ms"] == 29000
 
 
 def _raw_plan_with_repeated_clip():
@@ -1123,14 +1142,10 @@ def test_translate_edit_plan_narration_translates_and_preserves_structure(monkey
 
     fake_client.chat.completions.create.assert_called_once()
     translated_plan = result["plan"]
-    voice_over = next(s for s in translated_plan["segments"] if s["type"] == "voice_over")
-    dialogue = next(s for s in translated_plan["segments"] if s["type"] == "original_dialogue")
-    assert voice_over["narration"] == "Il etait une fois."
-    # Everything else -- clips, timing, the original (untranslated) quoted
-    # dialogue -- must come through unchanged.
-    assert voice_over["clips"] == original_plan["segments"][0]["clips"]
-    assert dialogue["transcript_excerpt"] == "I know."
-    assert dialogue["start_ms"] == 9000 and dialogue["end_ms"] == 12000
+    assert all(s["narration"] == "Il etait une fois." for s in translated_plan["segments"])
+    # Everything else -- clips, timing -- must come through unchanged.
+    assert translated_plan["segments"][0]["clips"] == original_plan["segments"][0]["clips"]
+    assert translated_plan["segments"][1]["clips"] == original_plan["segments"][1]["clips"]
     assert result["validation_report"]["valid"] is True
     assert result["usage"]["prompt_tokens"] == 10
 
@@ -1163,7 +1178,7 @@ def test_translate_edit_plan_narration_rejects_dropped_segment(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     original_plan = _built_plan()
     raw = _translated_raw_plan(original_plan, "Traduction.")
-    raw["segments"] = raw["segments"][:1]  # the original_dialogue segment silently dropped
+    raw["segments"] = raw["segments"][:1]  # the second segment silently dropped
     fake_client = MagicMock()
     fake_client.chat.completions.create.return_value = _fake_openai_response(json.dumps(raw))
     monkeypatch.setattr(fs, "_get_openai_client", lambda: fake_client)

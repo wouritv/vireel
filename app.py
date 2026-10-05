@@ -11596,13 +11596,6 @@ class FilmSummaryRenderRequest(BaseModel):
 
 
 class FilmSummaryAudioSettingsUpdateRequest(BaseModel):
-    # How loud the film's own original audio plays during original_dialogue
-    # segments in the montage, 0-100 (default 20) -- see
-    # film_summary_render._build_original_segment_clip's dialogue_volume.
-    # Never applies to voice_over segments: the film's own voice must never
-    # be present while the AI narrator speaks, so that audio is always
-    # fully replaced by the narration, unconditionally.
-    dialogue_volume: Optional[int] = None
     subtitles_enabled: Optional[bool] = None
     subtitle_style: Optional[Dict[str, Any]] = None
 
@@ -11633,7 +11626,6 @@ def _normalize_film_summary_row(row: Dict[str, Any], *, include_content: bool = 
         "updated_at": row.get("updated_at"),
         "completed_at": row.get("completed_at"),
         "edit_mode": row.get("edit_mode") or "automatic",
-        "dialogue_volume": row.get("dialogue_volume") if row.get("dialogue_volume") is not None else 20,
         "subtitles_enabled": bool(row.get("subtitles_enabled") or False),
         "subtitle_style": row.get("subtitle_style") or None,
     }
@@ -12416,12 +12408,9 @@ async def update_film_summary_plan_endpoint(
 async def update_film_summary_audio_settings_endpoint(
     film_summary_id: str, payload: FilmSummaryAudioSettingsUpdateRequest, user_id: Annotated[str, Depends(get_user_id_header)],
 ):
-    """Persists the user's dialogue-volume choice (how loud the film's own
-    audio plays during original_dialogue segments, see
-    FilmSummaryAudioSettingsUpdateRequest's dialogue_volume docstring) and
-    subtitle toggle/style -- applied at render time (see render_edit_plan /
-    _run_film_summary_render_pipeline_stages). Editable up to the same
-    point as the plan itself."""
+    """Persists the user's subtitle toggle/style -- applied at render time
+    (see render_edit_plan / _run_film_summary_render_pipeline_stages).
+    Editable up to the same point as the plan itself."""
     row = await supabase_get_film_summary(film_summary_id, user_id)
     if not row:
         raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
@@ -12429,10 +12418,6 @@ async def update_film_summary_audio_settings_endpoint(
         raise HTTPException(status_code=409, detail="Audio/subtitle settings can only be edited while awaiting review")
 
     updates = payload.model_dump(exclude_unset=True)
-
-    dialogue_volume = updates.get("dialogue_volume")
-    if dialogue_volume is not None and not (0 <= dialogue_volume <= 100):
-        raise HTTPException(status_code=400, detail="dialogue_volume must be between 0 and 100")
 
     if not updates:
         return _normalize_film_summary_row(row, include_content=True)
@@ -12584,7 +12569,6 @@ async def render_film_summary_endpoint(
         voice_id=voice_id,
         render_required_credits=render_required_credits,
         narration_language=row.get("narration_language") or "",
-        dialogue_volume=row.get("dialogue_volume"),
         subtitles_enabled=bool(row.get("subtitles_enabled")),
         subtitle_style=row.get("subtitle_style"),
     ))
@@ -12595,14 +12579,12 @@ async def render_film_summary_endpoint(
 async def _run_film_summary_render_job(
     job_id: str, user_id: str, film_summary_id: str, project_id: Optional[str], source_s3_key: Optional[str],
     output_dir: str, plan: Dict[str, Any], voice_id: str, render_required_credits: float, narration_language: str,
-    dialogue_volume: Optional[int] = None,
     subtitles_enabled: bool = False, subtitle_style: Optional[Dict[str, Any]] = None,
 ) -> None:
     try:
         await reel_job_manager.start_job(job_id)
         await _run_film_summary_render_pipeline_stages(
             job_id, user_id, film_summary_id, project_id, source_s3_key, output_dir, plan, voice_id, narration_language,
-            dialogue_volume=dialogue_volume,
             subtitles_enabled=subtitles_enabled, subtitle_style=subtitle_style,
         )
     except film_summary.FilmSummaryValidationError as exc:
@@ -12736,7 +12718,6 @@ async def _apply_film_summary_subtitle_burn_in(
 async def _run_film_summary_render_pipeline_stages(
     job_id: str, user_id: str, film_summary_id: str, project_id: Optional[str], source_s3_key: Optional[str],
     output_dir: str, plan: Dict[str, Any], voice_id: str, narration_language: str,
-    dialogue_volume: Optional[int] = None,
     subtitles_enabled: bool = False, subtitle_style: Optional[Dict[str, Any]] = None,
 ) -> None:
     bucket_name = os.environ.get("AWS_S3_BUCKET", "my-clips-bucket")
@@ -12793,7 +12774,6 @@ async def _run_film_summary_render_pipeline_stages(
 
     final_path = os.path.join(output_dir, "final.mp4")
     preview_path = os.path.join(output_dir, "preview.mp4")
-    original_dialogue_volume = (dialogue_volume if dialogue_volume is not None else 20) / 100.0
     try:
         render_result = await asyncio.to_thread(
             film_summary_render.render_edit_plan,
@@ -12801,7 +12781,6 @@ async def _run_film_summary_render_pipeline_stages(
             voiceover_paths_by_segment_id=voiceover_paths, work_dir=os.path.join(output_dir, "work"),
             final_output_path=final_path, preview_output_path=preview_path,
             on_segment_done=_on_segment_done,
-            original_dialogue_volume=original_dialogue_volume,
         )
     except film_summary.FilmSummaryValidationError:
         raise
@@ -12941,8 +12920,8 @@ def _retry_film_summary_status_updates(previous_status: str, retry_job_id: str) 
     retry (automatic or failed/failed resubmission), plus -- only when
     retriggered from awaiting_review -- clearing any stale manual-editor
     state, since a full automatic regenerate makes it meaningless against
-    the brand-new plan about to replace it. dialogue_volume/subtitles_
-    enabled/subtitle_style are independent user preferences and are left
+    the brand-new plan about to replace it. subtitles_enabled/
+    subtitle_style are independent user preferences and are left
     untouched here."""
     updates: Dict[str, Any] = {
         "status": film_summary.FilmSummaryStatus.QUEUED,

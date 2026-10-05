@@ -53,10 +53,10 @@ export function isFilmSummaryRejectionErrorCode(code) {
     return FILM_SUMMARY_REJECTION_ERROR_CODES.includes(String(code || ""));
 }
 
-// Segment types (film_summary.SEGMENT_TYPES).
+// The only segment type (film_summary.SEGMENT_TYPES) -- "il ne dois y
+// avoir aucune parole du film originale, uniquement les sequences videos
+// + voix off de narration".
 export const SEGMENT_TYPE_VOICE_OVER = "voice_over";
-export const SEGMENT_TYPE_ORIGINAL_DIALOGUE = "original_dialogue";
-export const SEGMENT_TYPE_BREATHING = "breathing";
 
 /**
  * Shared response reader for the fetch() wrappers below: parses the JSON
@@ -75,11 +75,8 @@ async function readJsonOrThrow(response, fallbackMessage) {
 
 /**
  * PATCH /api/film-summaries/{id}/audio-settings -- `patch` is any subset of
- * {dialogue_volume, subtitles_enabled, subtitle_style}; callers send only
- * the fields they changed. `dialogue_volume` (when sent) is an integer
- * 0-100 (default 20) controlling how audible the film's own original audio
- * stays under the AI-generated narration -- 0 mutes it entirely, 100 keeps
- * it at full volume. Returns the normalized full-content film summary row.
+ * {subtitles_enabled, subtitle_style}; callers send only the fields they
+ * changed. Returns the normalized full-content film summary row.
  */
 export async function updateFilmSummaryAudioSettings(filmSummaryId, userId, patch) {
     const response = await fetch(getApiUrl(`/api/film-summaries/${filmSummaryId}/audio-settings`), {

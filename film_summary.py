@@ -105,9 +105,12 @@ class FilmSummaryErrorCode:
 CREDIT_OPERATION_TYPE = "resume_film"
 
 SEGMENT_TYPE_VOICE_OVER = "voice_over"
-SEGMENT_TYPE_ORIGINAL_DIALOGUE = "original_dialogue"
-SEGMENT_TYPE_BREATHING = "breathing"
-SEGMENT_TYPES = (SEGMENT_TYPE_VOICE_OVER, SEGMENT_TYPE_ORIGINAL_DIALOGUE, SEGMENT_TYPE_BREATHING)
+# "il ne dois y avoir aucune parole du film originale, uniquement les
+# sequences videos + voix off de narration" -- voice_over is the only
+# segment type a plan may ever contain; every clip's own audio is always
+# fully replaced by the narration (see film_summary_render.duck_and_mix_
+# narration), so no original film dialogue or audio is ever heard.
+SEGMENT_TYPES = (SEGMENT_TYPE_VOICE_OVER,)
 
 # Ideal ceiling on a film summary's total runtime: "dans l'ideal le resume
 # dois etre de moins de 5mn, mais jamais cela deborde il ne dois pas y
@@ -321,8 +324,6 @@ def build_generation_constraints(
         "hook_max_seconds": 35,
         "conclusion_min_seconds": 25,
         "conclusion_max_seconds": 45,
-        "min_original_dialogue_segments": 3,
-        "max_original_dialogue_segments": 6,
         "words_per_minute_low": 125,
         "words_per_minute_high": 150,
         # A concrete sizing anchor for the model: tracking a running total
@@ -379,26 +380,18 @@ def _normalize_segment(raw: Any, *, recompute_narration_estimates: bool = False)
     if seg_type not in SEGMENT_TYPES:
         raise FilmSummaryValidationError(FilmSummaryErrorCode.PLAN_INVALID, f"Unknown segment type: {seg_type}")
 
-    segment: Dict[str, Any] = {
+    narration = str(raw.get("narration") or "").strip()
+    return {
         "id": str(raw.get("id") or f"seg_{uuid.uuid4().hex[:8]}"),
         "sequence": _safe_int(raw.get("sequence")),
         "type": seg_type,
         "approval_status": str(raw.get("approval_status") or "pending"),
+        "narration": narration,
+        "estimated_duration_ms": _resolve_voice_over_estimated_duration_ms(raw, narration, recompute_narration_estimates),
+        "actual_duration_ms": _safe_int(raw.get("actual_duration_ms")) or None,
+        "clips": [_normalize_clip(c) for c in (raw.get("clips") or []) if isinstance(c, dict)],
+        "source_event_ids": [str(e) for e in (raw.get("source_event_ids") or [])],
     }
-    if seg_type == SEGMENT_TYPE_VOICE_OVER:
-        segment["narration"] = str(raw.get("narration") or "").strip()
-        segment["estimated_duration_ms"] = _resolve_voice_over_estimated_duration_ms(
-            raw, segment["narration"], recompute_narration_estimates,
-        )
-        segment["actual_duration_ms"] = _safe_int(raw.get("actual_duration_ms")) or None
-        segment["clips"] = [_normalize_clip(c) for c in (raw.get("clips") or []) if isinstance(c, dict)]
-        segment["source_event_ids"] = [str(e) for e in (raw.get("source_event_ids") or [])]
-    else:
-        segment["start_ms"] = _safe_int(raw.get("start_ms"))
-        segment["end_ms"] = _safe_int(raw.get("end_ms"))
-        segment["transcript_excerpt"] = str(raw.get("transcript_excerpt") or "").strip()
-        segment["speaker_ids"] = [str(s) for s in (raw.get("speaker_ids") or [])]
-    return segment
 
 
 def validate_edit_plan_schema(
@@ -450,13 +443,7 @@ def validate_edit_plan_schema(
 
 
 def compute_total_estimated_duration_ms(segments: List[Dict[str, Any]]) -> int:
-    total = 0
-    for seg in segments:
-        if seg.get("type") == SEGMENT_TYPE_VOICE_OVER:
-            total += _safe_int(seg.get("actual_duration_ms") or seg.get("estimated_duration_ms"))
-        else:
-            total += max(0, _safe_int(seg.get("end_ms")) - _safe_int(seg.get("start_ms")))
-    return total
+    return sum(_safe_int(seg.get("actual_duration_ms") or seg.get("estimated_duration_ms")) for seg in segments)
 
 
 def _validate_segment_sequence_numbers(segments: List[Dict[str, Any]]) -> List[str]:
@@ -470,6 +457,15 @@ def _validate_voice_over_segment(
     seg: Dict[str, Any], source_duration_ms: int, known_scene_ids: set,
 ) -> List[str]:
     errors = []
+    if not str(seg.get("narration") or "").strip():
+        # app.py's render pipeline skips the TTS call outright for blank
+        # text (nothing to synthesize), so an empty narration never
+        # becomes an audio file -- the segment's clip then keeps the
+        # source video's own raw audio instead of the narrator's voice,
+        # a stretch of the final video where "le son de narration ne
+        # s'ecoute plus". Blocking (not a warning): every voice_over
+        # segment must carry real narration before it can reach render.
+        errors.append(f"Le segment {seg.get('id')} n'a aucune narration -- la voix off ne serait pas audible a cet endroit de la video")
     for clip in seg.get("clips") or []:
         start_ms, end_ms = clip.get("start_ms"), clip.get("end_ms")
         if start_ms is None or end_ms is None or start_ms < 0 or end_ms <= start_ms or end_ms > source_duration_ms:
@@ -480,68 +476,24 @@ def _validate_voice_over_segment(
     return errors
 
 
-def _validate_timed_segment(
-    seg: Dict[str, Any], source_duration_ms: int, known_character_ids: set,
-) -> Tuple[List[str], List[str], Optional[Tuple[int, int, str]]]:
-    errors: List[str] = []
-    warnings: List[str] = []
-    start_ms, end_ms = seg.get("start_ms"), seg.get("end_ms")
-    valid_range = None
-    if start_ms is None or end_ms is None or start_ms < 0 or end_ms <= start_ms or end_ms > source_duration_ms:
-        errors.append(f"Le segment {seg.get('id')} a un timecode hors limites")
-    else:
-        valid_range = (start_ms, end_ms, str(seg.get("id")))
-    for speaker_id in seg.get("speaker_ids") or []:
-        if known_character_ids and speaker_id not in known_character_ids:
-            warnings.append(f"Le segment {seg.get('id')} reference un personnage inconnu {speaker_id}")
-    return errors, warnings, valid_range
-
-
 def _validate_segments(
-    segments: List[Dict[str, Any]], source_duration_ms: int, known_scene_ids: set, known_character_ids: set,
-) -> Tuple[List[str], List[str], List[Tuple[int, int, str]]]:
-    """Per-segment checks (type, clip/timecode bounds, scene/character
-    references), collecting the shared state (dialogue ranges) the overlap
-    check needs afterwards. Split out of validate_edit_plan_content -- a
-    single loop mixing every one of these concerns was the bulk of that
-    function's cognitive complexity."""
+    segments: List[Dict[str, Any]], source_duration_ms: int, known_scene_ids: set,
+) -> List[str]:
+    """Per-segment checks (type, narration presence, clip/timecode bounds,
+    scene references). Split out of validate_edit_plan_content to keep
+    that function's own cognitive complexity low. A segment whose type
+    isn't voice_over (e.g. a pre-existing plan's original_dialogue/
+    breathing segment, from before those types were retired -- "il ne
+    dois y avoir aucune parole du film originale") is flagged as an
+    unknown type rather than silently accepted."""
     errors: List[str] = []
-    warnings: List[str] = []
-    dialogue_ranges: List[Tuple[int, int, str]] = []
-
     for seg in segments:
         seg_type = seg.get("type")
         if seg_type not in SEGMENT_TYPES:
             errors.append(f"Le segment {seg.get('id')} a un type inconnu {seg_type}")
-        elif seg_type == SEGMENT_TYPE_VOICE_OVER:
-            errors.extend(_validate_voice_over_segment(seg, source_duration_ms, known_scene_ids))
         else:
-            seg_errors, seg_warnings, valid_range = _validate_timed_segment(seg, source_duration_ms, known_character_ids)
-            errors.extend(seg_errors)
-            warnings.extend(seg_warnings)
-            if valid_range:
-                dialogue_ranges.append(valid_range)
-
-    return errors, warnings, dialogue_ranges
-
-
-def _validate_dialogue_overlap(dialogue_ranges: List[Tuple[int, int, str]]) -> List[str]:
-    """Named after the pair of segment ids and their exact timecodes,
-    instead of a bare generic message -- this is fed back verbatim to the
-    planning model as corrective context on a retry (see generate_edit_
-    plan), and a model can only fix the specific pair it's told about."""
-    ranges = sorted(dialogue_ranges)
-    for i in range(1, len(ranges)):
-        prev_start, prev_end, prev_id = ranges[i - 1]
-        cur_start, cur_end, cur_id = ranges[i]
-        if cur_start < prev_end:
-            return [
-                f"Les segments {prev_id} ({prev_start}-{prev_end}ms) et {cur_id} ({cur_start}-{cur_end}ms) "
-                "sont tous les deux de type original_dialogue/breathing et se chevauchent dans le temps source "
-                "-- chaque plage temporelle source ne peut etre utilisee que par un seul segment de ce type ; "
-                "conservez un seul des deux, ou deplacez le plus tardif vers une plage non chevauchante"
-            ]
-    return []
+            errors.extend(_validate_voice_over_segment(seg, source_duration_ms, known_scene_ids))
+    return errors
 
 
 def _validate_duration_tolerance(total_ms: int, target_ms: int, duration_tolerance_ratio: float) -> List[str]:
@@ -584,23 +536,16 @@ def validate_edit_plan_content(
     above; this function only orchestrates and merges their results, to
     keep its own cognitive complexity low."""
     known_scene_ids = set(valid_scene_ids or [])
-    known_character_ids = {c.get("id") for c in (plan.get("characters") or [])}
     segments = plan.get("segments") or []
 
     errors: List[str] = [] if segments else ["Le plan ne contient aucun segment"]
     errors.extend(_validate_segment_sequence_numbers(segments))
-
-    segment_errors, warnings, dialogue_ranges = _validate_segments(
-        segments, source_duration_ms, known_scene_ids, known_character_ids,
-    )
-    errors.extend(segment_errors)
-
-    errors.extend(_validate_dialogue_overlap(dialogue_ranges))
+    errors.extend(_validate_segments(segments, source_duration_ms, known_scene_ids))
 
     total_ms = compute_total_estimated_duration_ms(segments)
     target_ms = int(plan.get("target_duration_ms") or 0)
     errors.extend(_validate_duration_tolerance(total_ms, target_ms, duration_tolerance_ratio))
-    warnings.extend(_validate_max_plan_duration(total_ms))
+    warnings: List[str] = list(_validate_max_plan_duration(total_ms))
 
     return {
         "valid": not errors,
@@ -652,16 +597,10 @@ def _clamp_legacy_duration_truncation_overage(
     fixed_segments = []
     for seg in segments:
         seg = dict(seg)
-        if seg.get("type") == SEGMENT_TYPE_VOICE_OVER:
-            seg["clips"], clips_changed = _clamp_voice_over_clips_overage(
-                seg.get("clips") or [], source_duration_ms, max_overage_ms,
-            )
-            changed = changed or clips_changed
-        else:
-            clamped = _clamped_legacy_end_ms(seg.get("end_ms"), source_duration_ms, max_overage_ms)
-            if clamped is not None:
-                seg["end_ms"] = clamped
-                changed = True
+        seg["clips"], clips_changed = _clamp_voice_over_clips_overage(
+            seg.get("clips") or [], source_duration_ms, max_overage_ms,
+        )
+        changed = changed or clips_changed
         fixed_segments.append(seg)
     return fixed_segments, changed
 
@@ -723,24 +662,20 @@ _NARRATION_TRANSLATION_INVARIANT_SEGMENT_FIELDS = ("id", "type", "sequence", "es
 def _narration_translation_segment_signature(seg: Dict[str, Any]) -> Dict[str, Any]:
     """The subset of a segment's fields a narration translation must never
     touch (see validate_narration_translation_structure) -- everything
-    except `narration` itself (and, for voice_over, `actual_duration_ms`,
-    which the translation call never sets)."""
+    except `narration` itself (`actual_duration_ms`, which the translation
+    call never sets, is excluded too)."""
     signature = {field: seg.get(field) for field in _NARRATION_TRANSLATION_INVARIANT_SEGMENT_FIELDS}
-    if seg.get("type") == SEGMENT_TYPE_VOICE_OVER:
-        signature["clips"] = [_clip_signature(c) for c in (seg.get("clips") or [])]
-    else:
-        signature["start_ms"] = seg.get("start_ms")
-        signature["end_ms"] = seg.get("end_ms")
+    signature["clips"] = [_clip_signature(c) for c in (seg.get("clips") or [])]
     return signature
 
 
 def validate_narration_translation_structure(original_plan: Dict[str, Any], translated_plan: Dict[str, Any]) -> None:
     """The one invariant translate_edit_plan_narration's model must never
     violate: the translated plan has exactly the same segments, in the
-    same order -- same id/type/sequence/clips/start_ms/end_ms/estimated_
-    duration_ms/source_event_ids as the original plan -- only each
-    voice_over segment's `narration` text may differ (total_estimated_
-    duration_ms/unresolved_ambiguities may be recomputed from it).
+    same order -- same id/type/sequence/clips/estimated_duration_ms/
+    source_event_ids as the original plan -- only each segment's
+    `narration` text may differ (total_estimated_duration_ms/unresolved_
+    ambiguities may be recomputed from it).
 
     Raises FilmSummaryValidationError(PLAN_INVALID, ...) on any violation;
     returns None when the invariant holds."""
@@ -830,19 +765,19 @@ INPUTS
 - narration_style: requested storytelling style
 - scene_index: every usable scene with scene_id, start_ms, end_ms, keyframe descriptions, visible characters, actions, locations, emotions, transcript overlap and quality flags
 - transcript_segments: exact transcript text with start_ms, end_ms and speaker identifiers where available
-- generation_constraints: segment, clip, dialogue, duration and safety limits
+- generation_constraints: segment, clip, duration and safety limits
 
 PRIMARY GOAL
 Create a condensed version of the movie that plays like a real editor's recap cut, not a flat synopsis or a plot-point checklist. The audience must understand the plot, relationships, motivations, conflicts, major reversals, climax, resolution and meaningful character evolution -- through specific, named, evidence-backed particulars (who, where, what exact stakes), never through generic or interchangeable phrasing that could describe almost any movie. If a sentence you drafted could be pasted into a summary of a completely different film without anyone noticing, rewrite it with the actual confirmed detail that makes it true of THIS movie and no other. Respect the original movie and never mock its characters.
 
 NARRATIVE RULES
-1. Start with a compelling 20-to-35-second hook based on a confirmed paradox, conflict, transformation, impossible relationship, betrayal, dramatic consequence or extraordinary situation. Intrigue the viewer without needlessly exposing the ending.
+1. Always open with a brief narrative introduction (roughly 10-to-20 seconds) that orients the viewer before any plot action is narrated: state the film's setting (time period, place, world or milieu) and introduce its central character(s) by canonical name and role, in plain scene-setting narration -- the way a storyteller frames "this is the story of NAME, a ROLE in PLACE" before diving in. Only after this orientation, continue into a compelling 20-to-35-second hook based on a confirmed paradox, conflict, transformation, impossible relationship, betrayal, dramatic consequence or extraordinary situation, intriguing the viewer without needlessly exposing the ending. The introduction and the hook may be written as one combined opening voice-over block or as two consecutive blocks, whichever reads more naturally -- but the setting/character orientation must always come first, never the hook or plot action alone.
 2. Be concrete, never generic. Anchor every segment in specific, evidence-backed particulars: characters by their canonical name (never "the man," "someone," "a woman"), specific places, specific objects, specific numbers (ages, amounts of money, elapsed time, counts) and the specific stakes of that moment. A line that only asserts a generic escalation ("things get complicated," "the situation gets worse," "everything changes") is incomplete on its own -- it must be paired, in the same or the very next sentence, with the specific confirmed fact that makes it true. Write like an editor who actually watched this movie and is telling a friend exactly what happens in it, not like someone paraphrasing a synopsis they skimmed.
 3. Select only events required to understand the story, preserve its main emotional progression and reach the resolution naturally.
 4. Remove repetition, inconsequential conversations, unnecessary travel, redundant explanations and secondary plots that do not affect the main story.
 5. Never remove an event required to understand a later event.
 6. Write natural, cinematic, emotionally precise narration suitable for AI speech. Never say “in this scene,” “we can see,” “the transcript says,” or similar analytical phrases.
-7. Map the summary onto a real story structure, not a flat chronological list of things that happen: an opening status quo, the inciting incident that sets the real story in motion, two to four rising complications that escalate in stakes (not just in number), a midpoint turn where the situation changes in kind rather than merely in degree, the climax, and the resolution. Every segment should serve one identifiable beat in this structure -- if you cannot say which beat a segment serves, cut it or fold it into an adjacent one.
+7. Map the summary onto a real story structure, not a flat chronological list of things that happen: the opening setting/character introduction and hook (NARRATIVE RULE 1), an opening status quo, the inciting incident that sets the real story in motion, two to four rising complications that escalate in stakes (not just in number), a midpoint turn where the situation changes in kind rather than merely in degree, the climax, and the resolution. Every segment should serve one identifiable beat in this structure -- if you cannot say which beat a segment serves, cut it or fold it into an adjacent one.
 8. Voice-over blocks average around 27 seconds, but do not force every block to the same length -- vary it with the story's own rhythm the way an editor would: a fast run of escalating complications can use a few shorter ~12-to-20-second blocks back to back, while a pivotal emotional beat can justify a longer ~30-to-40-second block. Contain enough words for the declared duration; estimate speech at 125 to 150 words per minute, while recognizing that the backend will replace estimates with actual TTS durations.
 9. Each voice-over block must advance the story and should end with a useful transition, question, tension point or new information when this arises naturally.
 10. End with a 25-to-45-second reflection grounded in the movie's confirmed character evolution and theme. Do not impose an unsupported moral.
@@ -857,14 +792,11 @@ VISUAL MATCHING RULES
 7. The cumulative clip duration for a voice-over block must be compatible with that block's estimated narration duration. Small backend-adjustable differences are acceptable.
 8. Never fabricate visual information based only on transcript dialogue. Use keyframe and scene evidence to confirm visual claims.
 
-ORIGINAL DIALOGUE RULES
-Use original movie dialogue selectively for declarations, revelations, breakups, confrontations, confessions, memorable comic lines, reunions, highly emotional moments and essential resolution lines. Voice-over must stop during original dialogue. Prefer approximately 3 to 6 original-dialogue moments in an 8-to-12-minute summary, but choose fewer or more when the evidence justifies it. The quoted transcript excerpt must match the supplied transcript. Each source time range (start_ms-end_ms) may be used by at most one original_dialogue or breathing segment in the whole plan -- never select the same or an overlapping source range twice, even to preview it early in the hook. If a later event must be foreshadowed in the hook, narrate it instead (a voice_over segment referencing the confirmed event) rather than replaying its exact original_dialogue/breathing range twice.
-
-CINEMATIC BREATHING RULES
-You may select short original-audio or silent visual moments for meaningful looks, crying, embraces, arrivals, departures, reactions, musical passages or silence after a revelation. Voice-over must stop during these segments. Use them sparingly, and never reuse or overlap a source time range already used by another original_dialogue or breathing segment (see ORIGINAL DIALOGUE RULES).
+NO ORIGINAL AUDIO RULE
+The final video must never play any of the original film's own dialogue, speech or audio -- only the narrated footage (video + voice-over). There is no "original dialogue" or "breathing" segment type: every segment is "voice_over", and its clips' own audio is always fully replaced by the narration. Never write narration that merely describes a line of dialogue happening off-screen as a substitute for quoting it -- paraphrase the confirmed content and meaning of the moment instead, in your own narration.
 
 DURATION RULES
-The total duration includes voice-over, original dialogue and breathing segments. Keep total_estimated_duration_ms within the tolerance supplied in generation_constraints. Do not pretend that a short sentence lasts 30 seconds. Never solve a duration deficit by selecting irrelevant footage or repeating information. Before writing segments, use generation_constraints.approximate_total_segment_count_hint as your sizing anchor: it is roughly target_duration_ms divided by a typical ~27-second voice-over block, so plan for approximately that many segments in total (voice-over blocks plus however many original-dialogue/breathing moments you add on top). Individual blocks may run shorter or longer than that average per NARRATIVE RULE 8, but producing far fewer segments than the hint, or making most voice-over blocks much shorter than average to compensate, is the most common way plans miss the duration tolerance -- if your draft segment count is well below the hint, add more voice-over blocks covering additional confirmed plot points rather than inflating estimated_duration_ms on existing ones.
+The total duration is the sum of every voice-over block's estimated_duration_ms. Keep total_estimated_duration_ms within the tolerance supplied in generation_constraints. Do not pretend that a short sentence lasts 30 seconds. Never solve a duration deficit by selecting irrelevant footage or repeating information. Before writing segments, use generation_constraints.approximate_total_segment_count_hint as your sizing anchor: it is roughly target_duration_ms divided by a typical ~27-second voice-over block, so plan for approximately that many segments. Individual blocks may run shorter or longer than that average per NARRATIVE RULE 8, but producing far fewer segments than the hint, or making most voice-over blocks much shorter than average to compensate, is the most common way plans miss the duration tolerance -- if your draft segment count is well below the hint, add more voice-over blocks covering additional confirmed plot points rather than inflating estimated_duration_ms on existing ones.
 
 EVIDENCE AND UNCERTAINTY
 Every narrated segment must include source_event_ids. Every clip must reference a valid scene_id. When names are uncertain, use the canonical identity from character_bible or neutral wording. Add unresolved issues to unresolved_ambiguities. If the evidence cannot support a coherent summary, return status="insufficient_evidence" and explain the blocking evidence gaps without generating fake content.
@@ -882,31 +814,27 @@ Return exactly this JSON shape -- every field below is required unless marked op
 Every segment is a JSON object with these fields:
 - "id": a stable unique string you invent (e.g. "seg_01").
 - "sequence": REQUIRED integer. Segments MUST be numbered 1, 2, 3, ... with no gaps and no repeats, strictly in playback order -- segment N's sequence is always exactly N. This is validated mechanically; a missing, duplicated, non-integer or out-of-order sequence value fails the plan outright.
-- "type": exactly one of "voice_over", "original_dialogue", "breathing".
-When "type" is "voice_over", also include:
+- "type": always "voice_over" -- this is the only segment type (see NO ORIGINAL AUDIO RULE).
 - "narration": string, the spoken voice-over text.
 - "estimated_duration_ms": integer, your best estimate of this block's spoken duration.
 - "source_event_ids": [string], the story events/evidence this narration is based on.
 - "clips": [ { "scene_id": string (must exist in scene_index), "start_ms": integer, "end_ms": integer, "description": string, "match_score": number 0-1 } ].
-When "type" is "original_dialogue" or "breathing", instead include:
-- "start_ms": integer, "end_ms": integer -- the exact source timecodes played verbatim (must exist within scene_index/transcript_segments bounds).
-- "transcript_excerpt": string, the verbatim quoted transcript for this range (empty string for a silent "breathing" moment).
-- "speaker_ids": [string], referencing characters[].id.
 
 OUTPUT CONTRACT
-Return JSON only. Do not use Markdown. Do not include commentary before or after the JSON. The output must validate against the OUTPUT SCHEMA above exactly -- do not add, rename or omit fields. Use integer milliseconds for all durations and timecodes. Segment types are exactly: voice_over, original_dialogue, or breathing. Keep segments in playback order with contiguous 1-based sequence numbers and stable unique IDs.
+Return JSON only. Do not use Markdown. Do not include commentary before or after the JSON. The output must validate against the OUTPUT SCHEMA above exactly -- do not add, rename or omit fields. Use integer milliseconds for all durations and timecodes. Every segment's type is exactly "voice_over". Keep segments in playback order with contiguous 1-based sequence numbers and stable unique IDs.
 
 Before returning the JSON, silently verify:
 - every segment has an integer "sequence" field, and the full list is exactly 1, 2, 3, ... with no gaps, duplicates or reordering;
+- every segment's "type" is "voice_over" -- the final video must never play any of the original film's own dialogue or audio, only narrated footage;
 - all important story claims are supported;
 - every scene_id and timecode exists and remains within bounds;
 - chronology is coherent;
-- no two original_dialogue/breathing segments reuse or overlap the same source time range;
 - no clips overlap incompatibly;
 - narration length agrees with estimated duration;
-- original dialogue and breathing contain no simultaneous voice-over;
 - no clip (same scene_id and start_ms/end_ms) is used in more than one segment unless genuinely unavoidable, and repeated facts are minimized;
 - the target duration tolerance is respected;
+- every voice_over segment's "narration" is non-empty -- an empty one never reaches the audience as speech, leaving that stretch of the video with no narration audible at all;
+- the opening introduces the film's setting and principal characters by name before any hook or plot action is narrated (NARRATIVE RULE 1);
 - the hook, main progression, climax, resolution and conclusion are present when supported by the movie;
 - the setup, inciting incident, rising complications, midpoint turn, climax and resolution are each identifiable in at least one segment;
 - every segment names its characters, places and objects specifically rather than generically, and no segment is a generic sentence that could describe almost any movie;
@@ -933,7 +861,7 @@ PLANNING_CONSOLIDATION_NOTE = (
 # job is to translate text, never to re-edit.
 NARRATION_TRANSLATION_SYSTEM_PROMPT = """You are Vireel's Film Summary Narration Translation Engine. An edit plan for a film summary already exists -- its footage, timing and segment structure are final and approved. The only problem is that its narration was written in the wrong language. Your ONLY job is to translate the spoken narration text of each voice_over segment into the requested target_language. You do not edit, re-cut, re-order, re-group, add, remove or re-time anything else.
 
-You have no permission to change any field other than a voice_over segment's "narration". Every other field -- "id", "type", "sequence", "clips" (and every clip's "scene_id", "start_ms", "end_ms"), "start_ms"/"end_ms" on non-voice_over segments, "estimated_duration_ms", "source_event_ids" and "characters" -- must be copied byte-for-byte identical to the input, in the same order, same count. A segment whose "type" is "original_dialogue" or "breathing" has no "narration" field at all (its "transcript_excerpt" is the original movie's own verbatim dialogue, not voice-over, and must never be translated or altered) -- copy that segment through completely unchanged.
+You have no permission to change any field other than a voice_over segment's "narration". Every other field -- "id", "type", "sequence", "clips" (and every clip's "scene_id", "start_ms", "end_ms"), "estimated_duration_ms", "source_event_ids" and "characters" -- must be copied byte-for-byte identical to the input, in the same order, same count.
 
 INPUTS
 - movie_metadata: title, source duration, source language and technical metadata
@@ -944,7 +872,6 @@ TRANSLATION RULES
 1. Translate only the "narration" string of each voice_over segment into target_language. Preserve its meaning, tone and register -- a natural, cinematic, emotionally precise translation suitable for AI speech, not a literal word-for-word rendering.
 2. Never shorten, lengthen, embellish, summarize or otherwise rewrite the narration's content beyond what translation requires. Keep roughly the same information density and pacing.
 3. Leave "estimated_duration_ms" exactly as given, even though the translated text's natural spoken length may differ slightly -- the backend recomputes real durations from actual TTS output, not from this estimate.
-4. Do not translate, alter or re-quote any "transcript_excerpt" (original_dialogue/breathing segments play the movie's own original-language audio verbatim).
 
 OUTPUT SCHEMA
 Return exactly this JSON shape -- every field required unless marked optional:
@@ -955,9 +882,7 @@ Return exactly this JSON shape -- every field required unless marked optional:
   "total_estimated_duration_ms": integer   (your own best-effort sum, backend recomputes the authoritative value),
   "unresolved_ambiguities": [string]   (may be empty)
 }
-Each segment object must have exactly the same shape and field values as the corresponding input segment, with this single exception: a "voice_over" segment's "narration" field holds the translated text instead of the original. Concretely:
-- When "type" is "voice_over": "id", "sequence", "type", "estimated_duration_ms", "source_event_ids", "clips" copied through unchanged; "narration" is the translation.
-- When "type" is "original_dialogue" or "breathing": "id", "sequence", "type", "start_ms", "end_ms", "transcript_excerpt", "speaker_ids" all copied through unchanged -- there is no "narration" field to translate.
+Each segment object must have exactly the same shape and field values as the corresponding input segment, with this single exception: "narration" holds the translated text instead of the original. "id", "sequence", "type", "estimated_duration_ms", "source_event_ids" and "clips" are all copied through unchanged.
 
 OUTPUT CONTRACT
 Return JSON only. Do not use Markdown. Do not include commentary before or after the JSON.

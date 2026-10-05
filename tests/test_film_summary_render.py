@@ -94,13 +94,6 @@ def test_extract_source_subclip_builds_scale_and_pad_filter(monkeypatch):
     assert "-af" not in cmd
 
 
-def test_extract_source_subclip_applies_audio_volume_filter_when_not_default(monkeypatch):
-    calls = _capture_ffmpeg_calls(monkeypatch)
-    render.extract_source_subclip("/tmp/source.mp4", 1000, 4000, "/tmp/out.mp4", canvas=CANVAS, audio_volume=0.35)
-    cmd = calls[0]
-    assert cmd[cmd.index("-af") + 1] == "volume=0.35"
-
-
 def test_build_blank_segment_uses_lavfi_color_source(monkeypatch):
     calls = _capture_ffmpeg_calls(monkeypatch)
     render.build_blank_segment(5.0, "/tmp/out.mp4", canvas=CANVAS)
@@ -195,10 +188,11 @@ def test_pad_or_trim_pads_when_too_short(monkeypatch, tmp_path):
 # duck_and_mix_narration / normalize_audio_loudness / encode_preview
 # ---------------------------------------------------------------------------
 
-def test_duck_and_mix_narration_mutes_original_audio_by_default(monkeypatch):
-    # The film's own dialogue must not remain audible under the narration:
-    # by default (original_volume=0), the segment's audio is fully replaced
-    # by the narration track instead of being mixed/ducked underneath it.
+def test_duck_and_mix_narration_always_fully_replaces_original_audio(monkeypatch):
+    # The film's own dialogue must never remain audible under the
+    # narration ("il ne dois y avoir aucune parole du film originale"):
+    # the segment's audio is unconditionally replaced by the narration
+    # track, never mixed/ducked underneath it.
     calls = _capture_ffmpeg_calls(monkeypatch)
     render.duck_and_mix_narration("/tmp/visual.mp4", "/tmp/narration.mp3", "/tmp/out.mp4")
     cmd = calls[0]
@@ -206,16 +200,6 @@ def test_duck_and_mix_narration_mutes_original_audio_by_default(monkeypatch):
     assert cmd[cmd.index("-map") + 1] == "0:v"
     assert cmd[cmd.index("-map", cmd.index("-map") + 1) + 1] == "1:a"
     assert "-shortest" in cmd
-
-
-def test_duck_and_mix_narration_builds_amix_filter_when_volume_above_zero(monkeypatch):
-    calls = _capture_ffmpeg_calls(monkeypatch)
-    render.duck_and_mix_narration("/tmp/visual.mp4", "/tmp/narration.mp3", "/tmp/out.mp4", original_volume=0.15)
-    cmd = calls[0]
-    filter_complex = cmd[cmd.index("-filter_complex") + 1]
-    assert "amix=inputs=2" in filter_complex
-    assert "volume=0.15" in filter_complex
-    assert "normalize=0" in filter_complex
 
 
 def test_normalize_audio_loudness_uses_loudnorm_filter(monkeypatch):
@@ -233,7 +217,7 @@ def test_encode_preview_rounds_odd_height_up(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _build_voice_over_segment_clip / _build_original_segment_clip
+# _build_voice_over_segment_clip
 # ---------------------------------------------------------------------------
 
 def test_build_voice_over_segment_clip_uses_blank_segment_when_no_clips(monkeypatch, tmp_path):
@@ -312,30 +296,6 @@ def test_build_voice_over_segment_clip_never_passes_a_volume_to_duck_and_mix(mon
     assert result.endswith("seg_6_final.mp4")
 
 
-def test_build_original_segment_clip_applies_dialogue_volume_to_original_dialogue(monkeypatch, tmp_path):
-    calls = []
-    monkeypatch.setattr(render, "extract_source_subclip", lambda *a, **k: calls.append((a, k)))
-    segment = {"id": "seg_5", "type": "original_dialogue", "start_ms": 1000, "end_ms": 3000}
-
-    result = render._build_original_segment_clip(segment, "/tmp/source.mp4", str(tmp_path), CANVAS, dialogue_volume=0.35)
-
-    assert result.endswith("seg_5_final.mp4")
-    assert len(calls) == 1
-    assert calls[0][1]["audio_volume"] == 0.35
-
-
-def test_build_original_segment_clip_ignores_dialogue_volume_for_breathing(monkeypatch, tmp_path):
-    # Breathing segments always keep their own full, untouched volume --
-    # dialogue_volume only ever scales original_dialogue segments.
-    calls = []
-    monkeypatch.setattr(render, "extract_source_subclip", lambda *a, **k: calls.append((a, k)))
-    segment = {"id": "seg_7", "type": "breathing", "start_ms": 1000, "end_ms": 3000}
-
-    render._build_original_segment_clip(segment, "/tmp/source.mp4", str(tmp_path), CANVAS, dialogue_volume=0.35)
-
-    assert calls[0][1]["audio_volume"] == 1.0
-
-
 # ---------------------------------------------------------------------------
 # render_edit_plan (full orchestration)
 # ---------------------------------------------------------------------------
@@ -344,62 +304,9 @@ def _sample_plan():
     return {
         "segments": [
             {"id": "seg_1", "sequence": 1, "type": "voice_over", "estimated_duration_ms": 5000, "clips": [{"start_ms": 0, "end_ms": 5000}]},
-            {"id": "seg_2", "sequence": 2, "type": "original_dialogue", "start_ms": 6000, "end_ms": 8000},
+            {"id": "seg_2", "sequence": 2, "type": "voice_over", "estimated_duration_ms": 2000, "clips": [{"start_ms": 6000, "end_ms": 8000}]},
         ],
     }
-
-
-def test_render_edit_plan_passes_original_dialogue_volume_to_original_segments_only(monkeypatch, tmp_path):
-    monkeypatch.setattr(render, "_target_canvas", lambda path: CANVAS)
-    voice_over_calls = []
-    monkeypatch.setattr(
-        render, "_build_voice_over_segment_clip",
-        lambda segment, source, narration, work_dir, canvas: voice_over_calls.append(True) or str(tmp_path / "seg_1_final.mp4"),
-    )
-    original_calls = []
-    monkeypatch.setattr(
-        render, "_build_original_segment_clip",
-        lambda segment, source, work_dir, canvas, dialogue_volume=1.0: original_calls.append(dialogue_volume) or str(tmp_path / "seg_2_final.mp4"),
-    )
-    monkeypatch.setattr(render, "concat_video_clips", lambda paths, out, work_dir: None)
-    monkeypatch.setattr(render, "normalize_audio_loudness", lambda inp, out: None)
-    monkeypatch.setattr(render, "encode_preview", lambda inp, out, **k: None)
-    monkeypatch.setattr(render, "probe_media_duration_seconds", lambda path: 13.0)
-
-    render.render_edit_plan(
-        plan=_sample_plan(), source_video_path="/tmp/source.mp4", voiceover_paths_by_segment_id={},
-        work_dir=str(tmp_path), final_output_path=str(tmp_path / "final.mp4"), preview_output_path=str(tmp_path / "preview.mp4"),
-        original_dialogue_volume=0.65,
-    )
-
-    # _build_voice_over_segment_clip's signature never takes a volume
-    # argument at all -- the film's voice must never be present while the
-    # narrator speaks, so that path never receives a configurable volume...
-    assert len(voice_over_calls) == 1
-    # ...while the given volume is threaded into the original_dialogue
-    # segment instead.
-    assert original_calls == [0.65]
-
-
-def test_render_edit_plan_defaults_original_dialogue_volume_to_full(monkeypatch, tmp_path):
-    monkeypatch.setattr(render, "_target_canvas", lambda path: CANVAS)
-    monkeypatch.setattr(render, "_build_voice_over_segment_clip", lambda *a, **k: str(tmp_path / "seg_1_final.mp4"))
-    original_calls = []
-    monkeypatch.setattr(
-        render, "_build_original_segment_clip",
-        lambda segment, source, work_dir, canvas, dialogue_volume=1.0: original_calls.append(dialogue_volume) or str(tmp_path / "seg_2_final.mp4"),
-    )
-    monkeypatch.setattr(render, "concat_video_clips", lambda paths, out, work_dir: None)
-    monkeypatch.setattr(render, "normalize_audio_loudness", lambda inp, out: None)
-    monkeypatch.setattr(render, "encode_preview", lambda inp, out, **k: None)
-    monkeypatch.setattr(render, "probe_media_duration_seconds", lambda path: 13.0)
-
-    render.render_edit_plan(
-        plan=_sample_plan(), source_video_path="/tmp/source.mp4", voiceover_paths_by_segment_id={},
-        work_dir=str(tmp_path), final_output_path=str(tmp_path / "final.mp4"), preview_output_path=str(tmp_path / "preview.mp4"),
-    )
-
-    assert original_calls == [1.0]
 
 
 def test_render_edit_plan_raises_when_no_segments(monkeypatch, tmp_path):
@@ -412,10 +319,30 @@ def test_render_edit_plan_raises_when_no_segments(monkeypatch, tmp_path):
     assert exc_info.value.code == film_summary.FilmSummaryErrorCode.RENDER_FAILED
 
 
+def test_render_edit_plan_raises_on_unsupported_segment_type(monkeypatch, tmp_path):
+    # original_dialogue/breathing no longer exist as segment types -- "il
+    # ne dois y avoir aucune parole du film originale, uniquement les
+    # sequences videos + voix off de narration". A plan containing one
+    # (e.g. a pre-existing plan from before those types were retired)
+    # fails the render outright rather than silently playing the film's
+    # own audio.
+    monkeypatch.setattr(render, "_target_canvas", lambda path: CANVAS)
+    plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "original_dialogue", "start_ms": 0, "end_ms": 1000}]}
+    with pytest.raises(film_summary.FilmSummaryValidationError) as exc_info:
+        render.render_edit_plan(
+            plan=plan, source_video_path="/tmp/source.mp4", voiceover_paths_by_segment_id={},
+            work_dir=str(tmp_path), final_output_path=str(tmp_path / "final.mp4"), preview_output_path=str(tmp_path / "preview.mp4"),
+        )
+    assert exc_info.value.code == film_summary.FilmSummaryErrorCode.RENDER_FAILED
+
+
 def test_render_edit_plan_orchestrates_all_segments(monkeypatch, tmp_path):
     monkeypatch.setattr(render, "_target_canvas", lambda path: CANVAS)
-    monkeypatch.setattr(render, "_build_voice_over_segment_clip", lambda *a, **k: str(tmp_path / "seg_1_final.mp4"))
-    monkeypatch.setattr(render, "_build_original_segment_clip", lambda *a, **k: str(tmp_path / "seg_2_final.mp4"))
+    build_calls = []
+    monkeypatch.setattr(
+        render, "_build_voice_over_segment_clip",
+        lambda segment, source, narration, work_dir, canvas: build_calls.append(segment["id"]) or str(tmp_path / f"{segment['id']}_final.mp4"),
+    )
     concat_calls = []
     monkeypatch.setattr(render, "concat_video_clips", lambda paths, out, work_dir: concat_calls.append(paths))
     monkeypatch.setattr(render, "normalize_audio_loudness", lambda inp, out: None)
@@ -428,13 +355,13 @@ def test_render_edit_plan_orchestrates_all_segments(monkeypatch, tmp_path):
     )
 
     assert result == {"segment_count": 2, "final_duration_seconds": 13.0}
+    assert build_calls == ["seg_1", "seg_2"]
     assert concat_calls[0] == [str(tmp_path / "seg_1_final.mp4"), str(tmp_path / "seg_2_final.mp4")]
 
 
 def test_render_edit_plan_reports_progress_after_each_segment(monkeypatch, tmp_path):
     monkeypatch.setattr(render, "_target_canvas", lambda path: CANVAS)
-    monkeypatch.setattr(render, "_build_voice_over_segment_clip", lambda *a, **k: str(tmp_path / "seg_1_final.mp4"))
-    monkeypatch.setattr(render, "_build_original_segment_clip", lambda *a, **k: str(tmp_path / "seg_2_final.mp4"))
+    monkeypatch.setattr(render, "_build_voice_over_segment_clip", lambda *a, **k: str(tmp_path / "seg_final.mp4"))
     monkeypatch.setattr(render, "concat_video_clips", lambda paths, out, work_dir: None)
     monkeypatch.setattr(render, "normalize_audio_loudness", lambda inp, out: None)
     monkeypatch.setattr(render, "encode_preview", lambda inp, out, **k: None)
