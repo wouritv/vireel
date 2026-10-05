@@ -91,7 +91,6 @@ export default function FilmSummaryProjectDetailPage() {
 
     useEffect(() => {
         loadFilmSummary();
-        setManualEditorOpen(false);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [projectId, user?.id]);
 
