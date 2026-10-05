@@ -213,6 +213,48 @@ def test_probe_video_resolution_returns_none_on_failure(monkeypatch):
     assert subtitles._probe_video_resolution("in.mp4") == (None, None)
 
 
+def test_probe_video_duration_seconds_parses_ffprobe_output(monkeypatch):
+    monkeypatch.setattr(subtitles.subprocess, "check_output", lambda *_a, **_k: b"12.345000\n")
+    assert subtitles._probe_video_duration_seconds("in.mp4") == 12.345
+
+
+def test_probe_video_duration_seconds_returns_zero_on_failure(monkeypatch):
+    def _boom(*_a, **_k):
+        raise OSError("ffprobe not found")
+    monkeypatch.setattr(subtitles.subprocess, "check_output", _boom)
+    assert subtitles._probe_video_duration_seconds("in.mp4") == 0.0
+
+
+def test_generate_srt_from_video_uses_ffprobe_duration_not_cv2(monkeypatch, tmp_path):
+    # Regression guard: this must never import/use cv2.VideoCapture's
+    # frame_count/fps (unreliable -- reads back 0 for some ffmpeg-produced
+    # containers, which silently collapsed the transcription range to
+    # [0, 0) and made every subtitle disappear with no error at all).
+    monkeypatch.setattr(
+        subtitles, "transcribe_audio",
+        lambda video_path: {"segments": [{"words": [{"word": "hello", "start": 1.0, "end": 1.5}]}]},
+    )
+    monkeypatch.setattr(subtitles, "_probe_video_duration_seconds", lambda video_path: 5.0)
+    out = tmp_path / "out.srt"
+
+    ok = subtitles.generate_srt_from_video("in.mp4", str(out))
+
+    assert ok is True
+    assert out.exists()
+    assert "hello" in out.read_text()
+
+
+def test_generate_srt_from_video_returns_false_when_no_speech_detected(monkeypatch, tmp_path):
+    monkeypatch.setattr(subtitles, "transcribe_audio", lambda video_path: {"segments": []})
+    monkeypatch.setattr(subtitles, "_probe_video_duration_seconds", lambda video_path: 5.0)
+    out = tmp_path / "out.srt"
+
+    ok = subtitles.generate_srt_from_video("in.mp4", str(out))
+
+    assert ok is False
+    assert not out.exists()
+
+
 def test_burn_subtitles_raises_on_ffmpeg_error(monkeypatch, tmp_path):
     srt_path = _write_sample_srt(tmp_path)
 

@@ -51,20 +51,36 @@ def transcribe_audio(video_path):
     return transcript
 
 
+def _probe_video_duration_seconds(video_path):
+    """Returns video_path's duration in seconds via ffprobe, or 0.0 if it
+    can't be determined (missing binary, unreadable file, ...). Used
+    instead of deriving duration from cv2.VideoCapture's frame_count/fps
+    (CAP_PROP_FRAME_COUNT is well known to read back 0 or wrong for many
+    ffmpeg-produced H.264/mp4 containers), which silently collapsed the
+    word-timestamp range generate_srt_from_video transcribes against to
+    [0, 0) and made every subtitle disappear without any error at all."""
+    try:
+        probe_cmd = [
+            'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1', video_path,
+        ]
+        output = subprocess.check_output(probe_cmd, timeout=30).decode().strip()
+        return max(0.0, float(output))
+    except Exception:
+        return 0.0
+
+
 def generate_srt_from_video(video_path, output_path, max_chars=20, max_duration=2.0, max_words_per_line=4, highlight=False):
     """
     Transcribe a video and generate SRT directly.
     Used for dubbed videos that don't have a pre-existing transcript.
+    Returns False (and writes no file) when the video has no detectable
+    speech, or no duration at all -- callers must check this and treat it
+    as subtitle generation failing, not silently ship a video with no
+    subtitles burned in.
     """
     transcript = transcribe_audio(video_path)
-
-    # Get video duration to use as clip_end
-    import cv2
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = frame_count / fps if fps else 0
-    cap.release()
+    duration = _probe_video_duration_seconds(video_path)
 
     generator = generate_highlighted_srt if highlight else generate_srt
     return generator(

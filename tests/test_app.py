@@ -4006,6 +4006,28 @@ def test_apply_film_summary_subtitle_burn_in_burns_and_cleans_up_temp_files(monk
     assert not os.path.exists(ass_path)
 
 
+def test_apply_film_summary_subtitle_burn_in_raises_when_no_transcript_produced(monkeypatch, tmp_path):
+    # "s'assurer qu'une transcription existe pour la video finale" --
+    # generate_srt_from_video returning False (no speech detected, or no
+    # duration to transcribe against) must be treated as subtitle
+    # generation failing, never silently shipping a final video with no
+    # subtitles burned in.
+    app = _import_app_with_stubs(monkeypatch)
+    burn_calls = []
+    monkeypatch.setattr(app, "generate_srt_from_video", lambda *a, **k: False)
+    monkeypatch.setattr(app, "burn_subtitles", lambda *a, **k: burn_calls.append(a) or True)
+
+    final_path = str(tmp_path / "final.mp4")
+    coro = app._apply_film_summary_subtitle_burn_in(str(tmp_path), final_path, True, None)
+    with pytest.raises(film_summary.FilmSummaryValidationError) as exc_info:
+        asyncio.run(coro)
+
+    assert exc_info.value.code == film_summary.FilmSummaryErrorCode.TRANSCRIPTION_FAILED
+    # burn_subtitles must never be called against a .srt file that was
+    # never written.
+    assert burn_calls == []
+
+
 def test_run_film_summary_render_pipeline_applies_subtitles_and_reencodes_preview(monkeypatch, tmp_path):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "download_s3_object", lambda bucket, key, path: True)

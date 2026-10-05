@@ -12686,16 +12686,31 @@ async def _apply_film_summary_subtitle_burn_in(
     Returns final_path unchanged when subtitles_enabled is false, so the
     pipeline behaves exactly as today for any film summary without this
     setting. Temporary .srt/.ass files are cleaned up before returning,
-    mirroring _burn_default_captions_for_clip's own cleanup."""
+    mirroring _burn_default_captions_for_clip's own cleanup.
+
+    "s'assurer qu'une transcription existe pour la video finale et baser
+    les sous titres sur cela": generate_srt_from_video's own return value
+    (previously discarded here) is checked explicitly -- when it comes
+    back False (no transcript/no speech detected), this raises
+    TRANSCRIPTION_FAILED instead of calling burn_subtitles against a
+    .srt file that was never written, which otherwise either crashed on
+    a confusing "no such file" or, if the video genuinely had no
+    duration to transcribe against, silently shipped the final video
+    with no subtitles burned in at all."""
     if not subtitles_enabled:
         return final_path
     style_kwargs = _map_film_summary_subtitle_style(subtitle_style)
     srt_path = os.path.join(output_dir, "film_summary_subtitles.srt")
     new_path = os.path.join(output_dir, "final_with_subtitles.mp4")
     try:
-        await asyncio.to_thread(
+        transcribed = await asyncio.to_thread(
             generate_srt_from_video, final_path, srt_path, max_words_per_line=style_kwargs["words_per_line"],
         )
+        if not transcribed:
+            raise film_summary.FilmSummaryValidationError(
+                film_summary.FilmSummaryErrorCode.TRANSCRIPTION_FAILED,
+                "La transcription de la video finale n'a produit aucun sous-titre",
+            )
         style_options = _build_film_summary_subtitle_style(subtitle_style)
         await asyncio.to_thread(
             burn_subtitles, final_path, srt_path, new_path,
