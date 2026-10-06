@@ -99,7 +99,10 @@ const iconMap = {
 export default function AbonnementPage() {
     const { t } = useTranslation();
     const { user } = useAuth();
-    const { credits, creditMax, refresh: refreshCredits, promotionalCredit, promotionalCreditExpirations } = useUserCredits();
+    const {
+        credits, creditMax, refresh: refreshCredits,
+        promotionalCredit, promotionalCreditExpirations, purchasedCredit, purchasedCreditExpirations,
+    } = useUserCredits();
     const [items, setItems] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState("");
@@ -464,23 +467,37 @@ export default function AbonnementPage() {
                             1 EUR = {CREDIT_RATE} {t("abonnement.creditRate","crédits · solde actuel ")} :{" "}
                             <span className="text-slate-900 dark:text-white font-semibold">{credits.toLocaleString()} / {Number(creditMax || 0).toLocaleString()} cr</span>
                         </p>
-                        {promotionalCredit > 0 && (
+                        {(promotionalCredit > 0 || purchasedCredit > 0) && (
                             <p className="text-xs text-slate-500 dark:text-zinc-400 mt-1">
-                                {t("abonnement.creditsBreakdown", "{{standard}} crédits standards · {{promo}} crédits promotionnels", {
+                                {t("abonnement.creditsBreakdown3", "{{standard}} crédits abonnement · {{purchased}} crédits achetés · {{promo}} crédits promotionnels", {
                                     standard: credits.toLocaleString(),
+                                    purchased: purchasedCredit.toLocaleString(),
                                     promo: promotionalCredit.toLocaleString(),
                                 })}
                             </p>
                         )}
-                        {promotionalCreditExpirations.length > 0 && (
+                        {(promotionalCreditExpirations.length > 0 || purchasedCreditExpirations.length > 0) && (
                             <ul className="mt-1 space-y-0.5">
                                 {promotionalCreditExpirations.map((batch, index) => {
                                     const days = daysUntilDate(batch.expires_at);
                                     if (days === null) return null;
                                     return (
-                                        <li key={`${batch.expires_at}-${index}`} className="flex items-center gap-1.5 text-[0.7rem] text-amber-600 dark:text-amber-400">
+                                        <li key={`promo-${batch.expires_at}-${index}`} className="flex items-center gap-1.5 text-[0.7rem] text-amber-600 dark:text-amber-400">
                                             <Clock size={11} />
-                                            {t("abonnement.expiringBatch", "{{amount}} crédits expirent dans {{days}} jour(s)", {
+                                            {t("abonnement.expiringBatch", "{{amount}} crédits promotionnels expirent dans {{days}} jour(s)", {
+                                                amount: Number(batch.amount).toLocaleString(),
+                                                days,
+                                            })}
+                                        </li>
+                                    );
+                                })}
+                                {purchasedCreditExpirations.map((batch, index) => {
+                                    const days = daysUntilDate(batch.expires_at);
+                                    if (days === null) return null;
+                                    return (
+                                        <li key={`purchased-${batch.expires_at}-${index}`} className="flex items-center gap-1.5 text-[0.7rem] text-amber-600 dark:text-amber-400">
+                                            <Clock size={11} />
+                                            {t("abonnement.expiringPurchasedBatch", "{{amount}} crédits achetés expirent dans {{days}} jour(s)", {
                                                 amount: Number(batch.amount).toLocaleString(),
                                                 days,
                                             })}

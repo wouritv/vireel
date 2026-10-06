@@ -65,12 +65,16 @@ export function UserCreditsProvider({ children }) {
         storageMax:       credits?.stockage_max ?? 0,
         creditRatio:      (credits?.credit_max ?? 0) > 0 ? (credits?.credit ?? 0) / (credits?.credit_max ?? 1) : 0,
         storageRatio:     (credits?.stockage_max ?? 0) > 0 ? (credits?.stockage ?? 0) / (credits?.stockage_max ?? 1) : 0,
-        // Promotional credits are a distinct pool (own batches/expiries,
-        // spent before standard credits) -- `credits` above is standard-only.
+        // Three distinct pools, always consumed in this order: promotional,
+        // then purchased, then standard (subscription) -- `credits` above
+        // is the subscription pool only. Promotional and purchased each
+        // have their own batches/expiries (see /api/user/credits).
         promotionalCredit: credits?.promotional_credit ?? 0,
         promotionalCreditExpirations: credits?.promotional_credit_expirations ?? [],
-        // Total available always combines both pools.
-        hasCredits:       credits ? (credits.credit ?? 0) + (credits.promotional_credit ?? 0) > 0 : null,  // null = unknown
+        purchasedCredit: credits?.purchased_credit ?? 0,
+        purchasedCreditExpirations: credits?.purchased_credit_expirations ?? [],
+        // Total available always combines all three pools.
+        hasCredits:       credits ? (credits.credit ?? 0) + (credits.promotional_credit ?? 0) + (credits.purchased_credit ?? 0) > 0 : null,  // null = unknown
         hasActiveSubscription: credits ? Boolean(credits.has_active_subscription) : null,  // null = unknown
         hasAnalyticsAccess: credits ? Boolean(credits.has_analytics_access) : null,  // null = unknown
         aboCosts:         credits?.abo_costs ?? {},
@@ -78,10 +82,10 @@ export function UserCreditsProvider({ children }) {
         loading,
         error,
         refresh:          fetch_credits,
-        /** Check if user has at least `required` credits, standard + promotional combined (null when not loaded yet). */
+        /** Check if user has at least `required` credits, across all three pools combined (null when not loaded yet). */
         canAfford: (required = 1) => {
             if (credits === null) return null;
-            return (credits.credit ?? 0) + (credits.promotional_credit ?? 0) >= required;
+            return (credits.credit ?? 0) + (credits.promotional_credit ?? 0) + (credits.purchased_credit ?? 0) >= required;
         },
     }), [credits, loading, error, fetch_credits]);
 

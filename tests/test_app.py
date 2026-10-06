@@ -5545,13 +5545,13 @@ def test_stripe_webhook_dispatches_payment_failed_invoice(monkeypatch):
     invoice = types.SimpleNamespace()
     fake_event = types.SimpleNamespace(type="invoice.payment_failed", data=types.SimpleNamespace(object=invoice))
     monkeypatch.setattr(app, "_verify_and_parse_event", lambda payload, signature: fake_event)
-    failed_mock = MagicMock(return_value={"received": True})
+    failed_mock = AsyncMock(return_value={"received": True})
     monkeypatch.setattr(app, "_handle_subscription_payment_failed", failed_mock)
 
     result = asyncio.run(app.stripe_webhook(_FakeWebhookRequest()))
 
     assert result == {"received": True}
-    failed_mock.assert_called_once_with(invoice)
+    failed_mock.assert_awaited_once_with(invoice)
 
 
 def test_stripe_webhook_dispatches_setup_session_to_payment_method_handler(monkeypatch):
@@ -5889,6 +5889,74 @@ def test_get_stripe_default_payment_method_falls_back_to_first_attached_card(mon
 
 
 # ---------------------------------------------------------------------------
+# Credit top-up purchase: granted as its own tier-2 expiring batch, not a
+# plain delta into user_data.credit (see the credit-tiers migration).
+# ---------------------------------------------------------------------------
+
+def _fake_credit_purchase_ctx(**overrides):
+    ctx = {
+        "metadata": {"credits_to_add": 100.0},
+        "user_id": "u1",
+        "amount_total": 9.99,
+        "payment_reference": "cs_credits_1",
+        "payment_date": datetime.now(timezone.utc),
+        "customer_email": "user@example.com",
+    }
+    ctx.update(overrides)
+    return ctx
+
+
+def test_handle_credit_purchase_grants_tier_2_batch_not_plain_delta(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "_enforce_subscription_retention_policy", AsyncMock(return_value={"state": "active"}))
+    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-credits-1"}))
+    batch_mock = AsyncMock(return_value={"id": "batch-1"})
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+    delta_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_upsert_user_data_credits", delta_mock)
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+
+    result = asyncio.run(app._handle_credit_purchase(_fake_credit_purchase_ctx()))
+
+    assert result == {"received": True, "credits_added": 100.0}
+    batch_mock.assert_awaited_once_with(
+        "u1", 100.0, "CREDIT_PURCHASE", app.PURCHASED_CREDITS_EXPIRATION_DAYS,
+        source_reference="sous-credits-1", tier=app.CREDIT_BATCH_TIER_PURCHASED,
+    )
+    # Never a plain delta into user_data.credit -- that's what used to let
+    # a subscription renewal's reset-to-allowance silently wipe a
+    # purchased top-up.
+    delta_mock.assert_not_awaited()
+
+
+def test_handle_credit_purchase_duplicate_payment_reference_is_noop(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value={"id": "existing"}))
+    batch_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+
+    result = asyncio.run(app._handle_credit_purchase(_fake_credit_purchase_ctx()))
+
+    assert result == {"received": True, "duplicate": True}
+    batch_mock.assert_not_awaited()
+
+
+def test_handle_credit_purchase_requires_active_subscription(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "_enforce_subscription_retention_policy", AsyncMock(return_value={"state": "no_subscription"}))
+    batch_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+
+    result = asyncio.run(app._handle_credit_purchase(_fake_credit_purchase_ctx()))
+
+    assert result == {"received": True, "ignored": "no_active_subscription", "policy_state": "no_subscription"}
+    batch_mock.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # Payment method preview/revoke/replace: card on file shown in Settings.
 # ---------------------------------------------------------------------------
 
@@ -6050,6 +6118,8 @@ def test_send_transactional_email_swallows_bad_template_context(monkeypatch):
 
 
 def test_handle_subscription_payment_failed_sends_email_with_retry_date(monkeypatch):
+    # Not the final attempt (next_payment_attempt is set) -- Stripe will
+    # retry on its own, so subscription credit must NOT be zeroed yet.
     app = _import_app_with_stubs(monkeypatch)
     fake_subscription = types.SimpleNamespace(metadata=_FakeStripeMetadata({"userid": "u1", "plan_name": "Pro"}))
     fake_stripe = MagicMock()
@@ -6057,12 +6127,15 @@ def test_handle_subscription_payment_failed_sends_email_with_retry_date(monkeypa
     monkeypatch.setattr(app, "stripe", fake_stripe)
     email_mock = MagicMock()
     monkeypatch.setattr(app, "_send_transactional_email", email_mock)
+    zero_credit_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_zero_subscription_credit", zero_credit_mock)
 
     invoice = types.SimpleNamespace(
         subscription="sub_123", customer_email="user@example.com",
         amount_due=2999, next_payment_attempt=1700000000, hosted_invoice_url="https://billing.stripe.com/x",
+        id="in_123",
     )
-    result = app._handle_subscription_payment_failed(invoice)
+    result = asyncio.run(app._handle_subscription_payment_failed(invoice))
 
     assert result == {"received": True}
     email_mock.assert_called_once()
@@ -6073,32 +6146,61 @@ def test_handle_subscription_payment_failed_sends_email_with_retry_date(monkeypa
     assert kwargs["amount"] == pytest.approx(29.99)
     assert "aura lieu automatiquement" in kwargs["retry_message"]
     assert kwargs["update_payment_url"] == "https://billing.stripe.com/x"
+    zero_credit_mock.assert_not_awaited()
 
 
-def test_handle_subscription_payment_failed_no_retry_scheduled(monkeypatch):
+def test_handle_subscription_payment_failed_zeroes_credit_on_final_attempt(monkeypatch):
+    # next_payment_attempt is null/None -- Stripe has given up retrying,
+    # so this is the signal to actually zero the subscription's credit.
     app = _import_app_with_stubs(monkeypatch)
-    fake_subscription = types.SimpleNamespace(metadata=_FakeStripeMetadata({"plan_name": "Pro"}))
+    fake_subscription = types.SimpleNamespace(metadata=_FakeStripeMetadata({"userid": "u1", "plan_name": "Pro"}))
     fake_stripe = MagicMock()
     fake_stripe.Subscription.retrieve.return_value = fake_subscription
     monkeypatch.setattr(app, "stripe", fake_stripe)
     email_mock = MagicMock()
     monkeypatch.setattr(app, "_send_transactional_email", email_mock)
+    zero_credit_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_zero_subscription_credit", zero_credit_mock)
 
     invoice = types.SimpleNamespace(
         subscription="sub_123", customer_email="user@example.com",
         amount_due=2999, next_payment_attempt=None, hosted_invoice_url="https://billing.stripe.com/x",
+        id="in_123",
     )
-    app._handle_subscription_payment_failed(invoice)
+    asyncio.run(app._handle_subscription_payment_failed(invoice))
 
     kwargs = email_mock.call_args.kwargs
     assert "Aucune nouvelle tentative" in kwargs["retry_message"]
+    zero_credit_mock.assert_awaited_once_with("u1", operation_id="in_123")
+
+
+def test_handle_subscription_payment_failed_no_userid_skips_credit_zeroing(monkeypatch):
+    # Defensive: missing userid metadata must never crash this handler --
+    # it just can't zero anyone's credit.
+    app = _import_app_with_stubs(monkeypatch)
+    fake_subscription = types.SimpleNamespace(metadata=_FakeStripeMetadata({"plan_name": "Pro"}))
+    fake_stripe = MagicMock()
+    fake_stripe.Subscription.retrieve.return_value = fake_subscription
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+    zero_credit_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_zero_subscription_credit", zero_credit_mock)
+
+    invoice = types.SimpleNamespace(
+        subscription="sub_123", customer_email="user@example.com",
+        amount_due=2999, next_payment_attempt=None, hosted_invoice_url="https://billing.stripe.com/x",
+        id="in_123",
+    )
+    asyncio.run(app._handle_subscription_payment_failed(invoice))
+
+    zero_credit_mock.assert_not_awaited()
 
 
 def test_handle_subscription_payment_failed_ignores_invoice_without_subscription(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     invoice = types.SimpleNamespace(subscription=None)
 
-    result = app._handle_subscription_payment_failed(invoice)
+    result = asyncio.run(app._handle_subscription_payment_failed(invoice))
 
     assert result == {"received": True, "ignored": "no_subscription_on_invoice"}
 
@@ -7538,6 +7640,37 @@ def test_assert_user_has_active_subscription_for_publish_blocks_without_subscrip
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_list_active_promotional_credit_batches", AsyncMock(return_value=[]))
+
+    coro = app._assert_user_has_active_subscription_for_publish("u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+
+    assert exc_info.value.status_code == 402
+
+
+def test_assert_user_has_active_subscription_for_publish_allows_with_bonus_credit_and_no_subscription(monkeypatch):
+    # A referred user with only a promotional bonus (or anyone whose
+    # subscription lapsed but still has unused promotional/purchased
+    # credit) keeps publish access until that bonus credit runs out --
+    # the subscription requirement is bypassed, not the other way around.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_list_active_promotional_credit_batches", AsyncMock(
+        return_value=[{"amount_remaining": 25.0, "tier": 1}],
+    ))
+
+    asyncio.run(app._assert_user_has_active_subscription_for_publish("u1"))
+
+
+def test_assert_user_has_active_subscription_for_publish_blocks_when_bonus_credit_exhausted(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_list_active_promotional_credit_batches", AsyncMock(
+        return_value=[{"amount_remaining": 0.0, "tier": 2}],
+    ))
 
     coro = app._assert_user_has_active_subscription_for_publish("u1")
     with pytest.raises(app.HTTPException) as exc_info:
@@ -8890,6 +9023,29 @@ def test_get_user_credits_reports_has_analytics_access(monkeypatch):
 
     assert resp.status_code == 200
     assert resp.json()["has_analytics_access"] is False
+
+
+def test_get_user_credits_splits_promotional_and_purchased_batches(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 10, "stockage": 1}))
+    monkeypatch.setattr(app, "supabase_list_active_promotional_credit_batches", AsyncMock(return_value=[
+        {"amount_remaining": 50.0, "expires_at": "2026-12-01T00:00:00+00:00", "tier": 1},
+        {"amount_remaining": 200.0, "expires_at": "2027-01-01T00:00:00+00:00", "tier": 2},
+    ]))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/user/credits", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["promotional_credit"] == 50.0
+    assert body["purchased_credit"] == 200.0
+    assert len(body["promotional_credit_expirations"]) == 1
+    assert len(body["purchased_credit_expirations"]) == 1
+    assert body["has_credits"] is True  # 10 (subscription) + 50 (promo) + 200 (purchased)
 
 
 # ---------------------------------------------------------------------------

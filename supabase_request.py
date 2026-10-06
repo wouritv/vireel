@@ -1743,6 +1743,35 @@ async def set_user_data_balance(
 	return rows[0] if rows else payload
 
 
+async def zero_subscription_credit(user_id: str, operation_id: str = "") -> None:
+	"""Zeroes out ONLY the pure-subscription credit balance (credit/
+	credit_max) -- used when Stripe definitively gives up retrying a
+	subscription's renewal charge (see _handle_subscription_payment_failed
+	in app.py). Storage, and the promotional/purchased credit batches
+	(a separate table -- see promotional_credit_batches), are never
+	touched: this account may still have usable bonus credit left even
+	though its subscription itself is now unpaid. A subsequent successful
+	renewal resets this back to the plan's full allowance as usual (see
+	_reset_user_plan_balance), same as every other renewal."""
+	if not user_id:
+		return
+	existing = await get_user_data(user_id)
+	if not existing:
+		return
+	credit_removed = max(0.0, float(existing.get("credit", 0) or 0.0))
+	current_storage = float(existing.get("stockage", 0) or 0.0)
+	storage_max = float(existing.get("stockage_max", max(current_storage, 0.0)) or 0.0)
+	await set_user_data_balance(
+		user_id=user_id, credit=0.0, storage=current_storage,
+		credit_max=0.0, storage_max=storage_max,
+		operation_type="subscription_payment_failed", operation_id=operation_id,
+	)
+	await insert_user_data_history(
+		user_id=user_id, credit=credit_removed, storage=0.0, operation="output",
+		operation_type="subscription_payment_failed", operation_id=operation_id,
+	)
+
+
 MAX_CREDIT_DEBT = max(0.0, float(os.environ.get("MAX_CREDIT_DEBT", "0") or "0"))
 
 
@@ -2336,22 +2365,30 @@ async def get_auth_user_created_at(user_id: str) -> Optional[datetime]:
 # --------------------------------------------------------------------------
 PROMOTIONAL_CREDIT_BATCH_COLUMNS = (
 	"id, created_at, user_id, amount_initial, amount_remaining, source, "
-	"source_reference, expires_at, revoked_at, revoked_reason"
+	"source_reference, expires_at, revoked_at, revoked_reason, tier"
 )
+
+# tier 1 (promotional) is always drained before tier 2 (purchased) --
+# see consume_promotional_credits in the credit-tiers migration.
+CREDIT_BATCH_TIER_PROMOTIONAL = 1
+CREDIT_BATCH_TIER_PURCHASED = 2
 
 
 async def insert_promotional_credit_batch(
 	user_id: str, amount: float, source: str, expiration_days: int, source_reference: Optional[str] = None,
+	tier: int = CREDIT_BATCH_TIER_PROMOTIONAL,
 ) -> Dict[str, Any]:
-	"""Grants one independent promotional-credit batch, expiring
-	``expiration_days`` from now (fixed at grant time -- a later change to
-	PROMOTIONAL_CREDITS_EXPIRATION_DAYS never touches this batch's own
-	expires_at). Also makes sure a user_data row exists for this user
-	(harmless 0-delta "touch" -- see upsert_user_data_credits): without
-	this, a brand-new referred user who has ONLY promotional credits and
-	no plan yet would have no user_data row at all, and
-	deduct_user_credits would reject spending their promo credits purely
-	because that row doesn't exist yet."""
+	"""Grants one independent credit batch, expiring ``expiration_days``
+	from now (fixed at grant time -- a later change to the expiration env
+	var never touches this batch's own expires_at). ``tier`` distinguishes
+	promotional credit (default, consumed first) from a standalone
+	purchased top-up (consumed second, before subscription credit -- see
+	_handle_credit_purchase in app.py). Also makes sure a user_data row
+	exists for this user (harmless 0-delta "touch" -- see
+	upsert_user_data_credits): without this, a brand-new referred user who
+	has ONLY promotional credits and no plan yet would have no user_data
+	row at all, and deduct_user_credits would reject spending their promo
+	credits purely because that row doesn't exist yet."""
 	await upsert_user_data_credits(user_id, credit_delta=0.0, operation_type="promotional_credit_touch")
 
 	client = await get_client()
@@ -2364,6 +2401,7 @@ async def insert_promotional_credit_batch(
 		"source": source,
 		"source_reference": source_reference,
 		"expires_at": expires_at.isoformat(),
+		"tier": int(tier),
 	}
 	response = await client.table(SUPABASE_PROMOTIONAL_CREDIT_BATCHES_TABLE).insert(payload).execute()
 	rows = response.data or []

@@ -91,6 +91,7 @@ from supabase_request import (
 	get_user_data as supabase_get_user_data,
 	upsert_user_data_credits as supabase_upsert_user_data_credits,
 	set_user_data_balance as supabase_set_user_data_balance,
+	zero_subscription_credit as supabase_zero_subscription_credit,
 	deduct_user_credits as supabase_deduct_user_credits,
 	insert_user_data_history as supabase_insert_user_data_history,
 	upsert_user_data_history_entry as supabase_upsert_user_data_history_entry,
@@ -143,6 +144,8 @@ from supabase_request import (
 	get_auth_user_created_at as supabase_get_auth_user_created_at,
 	insert_promotional_credit_batch as supabase_insert_promotional_credit_batch,
 	list_active_promotional_credit_batches as supabase_list_active_promotional_credit_batches,
+	CREDIT_BATCH_TIER_PROMOTIONAL,
+	CREDIT_BATCH_TIER_PURCHASED,
 	revoke_promotional_credit_batches_by_source_reference as supabase_revoke_promotional_credit_batches_by_source_reference,
 	insert_notification as supabase_insert_notification,
 	list_notifications as supabase_list_notifications,
@@ -343,6 +346,11 @@ REFERRAL_SIGNUP_BONUS_CREDITS = float(os.environ.get("REFERRAL_SIGNUP_BONUS_CRED
 REFERRAL_MONTHLY_BONUS_CREDITS = float(os.environ.get("REFERRAL_MONTHLY_BONUS_CREDITS", "100") or "100")
 REFERRAL_ANNUAL_BONUS_CREDITS = float(os.environ.get("REFERRAL_ANNUAL_BONUS_CREDITS", "300") or "300")
 PROMOTIONAL_CREDITS_EXPIRATION_DAYS = int(os.environ.get("PROMOTIONAL_CREDITS_EXPIRATION_DAYS", "60") or "60")
+# A directly-purchased credit top-up (_handle_credit_purchase) -- unlike
+# subscription credit, which resets every billing cycle, a paid top-up
+# keeps its own validity window, independent of and typically much longer
+# than the promotional one above.
+PURCHASED_CREDITS_EXPIRATION_DAYS = int(os.environ.get("PURCHASED_CREDITS_EXPIRATION_DAYS", "365") or "365")
 # This codebase has no signup webhook/trigger on auth.users (accounts are
 # created directly by the frontend's Supabase Auth SDK call, never via a
 # backend endpoint) -- the referral-association endpoint instead verifies
@@ -4077,17 +4085,29 @@ async def _assert_user_has_required_credits(user_id: str, required_credits: floa
 
 async def _assert_user_has_active_subscription_for_publish(user_id: str) -> None:
     """Publishing to social networks is free of credit cost, but still
-    requires an active paid subscription: an account at 0 credits can still
-    publish as long as its subscription is active, while one with no active
-    subscription is blocked regardless of its credit balance."""
+    normally requires an active paid subscription: an account at 0
+    credits can still publish as long as its subscription is active,
+    while one with no active subscription is blocked regardless of its
+    credit balance -- UNLESS it still has bonus credit available
+    (promotional or purchased, see promotional_credit_batches/the
+    credit-tiers migration): a referred user with only a promotional
+    bonus and no paid plan yet, or anyone whose subscription has lapsed
+    while they still have unused bonus credit, keeps full feature access
+    until that credit actually runs out, exactly like every other
+    credit-metered feature already does (see deduct_user_credits)."""
     if not is_supabase_configured():
         return
     subscription = await get_user_abonnement(user_id)
-    if not subscription:
-        raise HTTPException(
-            status_code=402,
-            detail="Un abonnement actif est requis pour publier sur les reseaux sociaux.",
-        )
+    if subscription:
+        return
+    bonus_batches = await supabase_list_active_promotional_credit_batches(user_id)
+    bonus_credit = sum(float(batch.get("amount_remaining") or 0.0) for batch in bonus_batches)
+    if bonus_credit > 0:
+        return
+    raise HTTPException(
+        status_code=402,
+        detail="Un abonnement actif est requis pour publier sur les reseaux sociaux.",
+    )
 
 
 async def _assert_user_can_access_analytics(user_id: str) -> None:
@@ -9272,7 +9292,20 @@ def _send_transactional_email(to_email: str, template_key: str, **context: Any) 
 
 
 async def _handle_credit_purchase(ctx: dict) -> dict:
-    """Handle a one-off credit purchase (payment_mode == 'stripe_credits')."""
+    """Handle a one-off credit purchase (payment_mode == 'stripe_credits').
+    Granted as its own expiring tier-2 batch (CREDIT_BATCH_TIER_PURCHASED,
+    in promotional_credit_batches -- see the credit-tiers migration)
+    rather than a plain delta into user_data.credit: that used to leave a
+    purchased top-up indistinguishable from subscription credit, with no
+    expiration of its own, and silently WIPED by the next subscription
+    renewal's reset-to-allowance (_reset_user_plan_balance always
+    overwrites user_data.credit wholesale rather than adding to it). As
+    its own batch it gets a configurable validity window
+    (PURCHASED_CREDITS_EXPIRATION_DAYS) and is consumed after promotional
+    credit but before subscription credit (see consume_promotional_credits'
+    tier ordering), and is revocable on refund/chargeback the same way a
+    referral reward batch already is (source_reference = this souscription
+    row's id -- see _handle_charge_refund_or_dispute)."""
     if await supabase_get_souscription_by_reference(ctx["payment_reference"]):
         return {"received": True, "duplicate": True}
 
@@ -9288,7 +9321,7 @@ async def _handle_credit_purchase(ctx: dict) -> dict:
     if credits_to_add <= 0:
         credits_to_add = usd_to_credits(ctx["amount_total"])
 
-    await supabase_insert_souscription(
+    new_souscription = await supabase_insert_souscription(
         user_id=ctx["user_id"],
         abonnement=None,
         payment_mode="stripe_credits",
@@ -9298,12 +9331,11 @@ async def _handle_credit_purchase(ctx: dict) -> dict:
         payment_comment=f"Credit purchase {credits_to_add} credits",
         payment_date=ctx["payment_date"],
     )
-    await supabase_upsert_user_data_credits(
-        user_id=ctx["user_id"],
-        credit_delta=credits_to_add,
-        update_credit_max=True,
-        operation_type="credit_purchase",
-        operation_id=ctx["payment_reference"],
+    souscription_id = str(new_souscription.get("id") or ctx["payment_reference"])
+
+    await supabase_insert_promotional_credit_batch(
+        ctx["user_id"], credits_to_add, "CREDIT_PURCHASE", PURCHASED_CREDITS_EXPIRATION_DAYS,
+        source_reference=souscription_id, tier=CREDIT_BATCH_TIER_PURCHASED,
     )
     await supabase_insert_user_data_history(
         user_id=ctx["user_id"],
@@ -9638,15 +9670,19 @@ async def _handle_subscription_renewal_invoice(invoice: "stripe.Invoice") -> dic
     return {"received": True}
 
 
-def _handle_subscription_payment_failed(invoice: "stripe.Invoice") -> dict:
-    """Notify the customer when Stripe's automatic monthly renewal charge
-    fails (expired/declined card, insufficient funds, ...). Stripe keeps
-    retrying the charge on its own schedule (Smart Retries) independently
-    of this handler -- it only sends the heads-up email; it never touches
-    local credit/storage/subscription state, since nothing actually
-    changes here until Stripe gives up retrying (customer.subscription.
-    deleted or .updated to past_due/canceled, not handled by this webhook
-    today)."""
+async def _handle_subscription_payment_failed(invoice: "stripe.Invoice") -> dict:
+    """Notify the customer when Stripe's automatic monthly/annual renewal
+    charge fails (expired/declined card, insufficient funds, ...). Stripe
+    keeps retrying the charge on its own schedule (Smart Retries)
+    independently of this handler -- invoice.payment_failed fires again
+    on each attempt, with invoice.next_payment_attempt set to the next
+    scheduled retry. Only once Stripe gives up for good (this is the
+    LAST attempt, next_payment_attempt is now null/None) does this zero
+    the account's pure subscription credit (supabase_zero_subscription_credit
+    -- never the promotional/purchased credit batches, which stay usable
+    on their own terms regardless of the subscription's payment state).
+    A subsequent successful renewal resets it back to the plan's full
+    allowance as usual."""
     subscription_id = invoice.subscription
     if not subscription_id:
         return {"received": True, "ignored": "no_subscription_on_invoice"}
@@ -9654,15 +9690,19 @@ def _handle_subscription_payment_failed(invoice: "stripe.Invoice") -> dict:
     subscription = stripe.Subscription.retrieve(subscription_id)
     metadata = subscription.metadata.to_dict() if subscription.metadata else {}
     plan_name = metadata.get("plan_name") or metadata.get("abonnement") or "Vireel"
+    user_id = metadata.get("userid")
 
-    if invoice.next_payment_attempt:
-        retry_date = datetime.fromtimestamp(invoice.next_payment_attempt, tz=timezone.utc).strftime("%d/%m/%Y")
-        retry_message = f"Une nouvelle tentative de prélèvement aura lieu automatiquement le {retry_date}."
-    else:
+    is_final_attempt = not invoice.next_payment_attempt
+    if is_final_attempt:
         retry_message = (
             "Aucune nouvelle tentative automatique n'est prévue -- merci de mettre à jour votre "
             "moyen de paiement dès que possible pour conserver l'accès à votre abonnement."
         )
+        if user_id:
+            await supabase_zero_subscription_credit(user_id, operation_id=str(invoice.id or subscription_id))
+    else:
+        retry_date = datetime.fromtimestamp(invoice.next_payment_attempt, tz=timezone.utc).strftime("%d/%m/%Y")
+        retry_message = f"Une nouvelle tentative de prélèvement aura lieu automatiquement le {retry_date}."
 
     _send_transactional_email(
         invoice.customer_email, "payment_failed",
@@ -9732,7 +9772,7 @@ async def stripe_webhook(request: Request):
         return await _handle_subscription_renewal_invoice(invoice)
 
     if event.type == "invoice.payment_failed":
-        return _handle_subscription_payment_failed(event.data.object)
+        return await _handle_subscription_payment_failed(event.data.object)
 
     if event.type == "charge.refunded":
         return await _handle_charge_refund_or_dispute(event.data.object, "refund")
@@ -11025,14 +11065,26 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
     has_active_subscription = bool(abonnement)
 
     data = await supabase_get_user_data(user_id)
-    promotional_batches = await supabase_list_active_promotional_credit_batches(user_id)
+    bonus_batches = await supabase_list_active_promotional_credit_batches(user_id)
+    # Two distinct, independently-expiring bonus pools sharing the same
+    # table (see the credit-tiers migration) -- always consumed in order
+    # promotional, then purchased, then (last) the plain subscription
+    # `credit` field below. Keeping them split here (never summed into
+    # one "bonus_credit") lets the wallet UI label each one correctly.
+    promotional_batches = [b for b in bonus_batches if int(b.get("tier") or CREDIT_BATCH_TIER_PROMOTIONAL) == CREDIT_BATCH_TIER_PROMOTIONAL]
+    purchased_batches = [b for b in bonus_batches if int(b.get("tier") or CREDIT_BATCH_TIER_PROMOTIONAL) == CREDIT_BATCH_TIER_PURCHASED]
     promotional_credit = sum(float(batch.get("amount_remaining") or 0.0) for batch in promotional_batches)
+    purchased_credit = sum(float(batch.get("amount_remaining") or 0.0) for batch in purchased_batches)
     # Soonest-expiry-first, matching the batches' own FEFO consumption
     # order -- the wallet UI (section 15) shows this so a user understands
     # why Vireel is about to consume certain credits before others.
     promotional_credit_expirations = [
         {"amount": float(batch.get("amount_remaining") or 0.0), "expires_at": batch.get("expires_at")}
         for batch in promotional_batches
+    ]
+    purchased_credit_expirations = [
+        {"amount": float(batch.get("amount_remaining") or 0.0), "expires_at": batch.get("expires_at")}
+        for batch in purchased_batches
     ]
 
     if not data:
@@ -11043,8 +11095,10 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
             "stockage_max": 0.0,
             "promotional_credit": promotional_credit,
             "promotional_credit_expirations": promotional_credit_expirations,
+            "purchased_credit": purchased_credit,
+            "purchased_credit_expirations": purchased_credit_expirations,
             "storage_overage_tolerance_percent": STORAGE_OVERAGE_TOLERANCE_PERCENT,
-            "has_credits": promotional_credit > 0,
+            "has_credits": (promotional_credit + purchased_credit) > 0,
             "has_active_subscription": has_active_subscription,
             "has_analytics_access": bool(abonnement) and int(abonnement.get("priorite") or 1) >= 2,
             "abo_costs": {
@@ -11081,8 +11135,10 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
         "stockage_max": storage_max,
         "promotional_credit": promotional_credit,
         "promotional_credit_expirations": promotional_credit_expirations,
+        "purchased_credit": purchased_credit,
+        "purchased_credit_expirations": purchased_credit_expirations,
         "storage_overage_tolerance_percent": STORAGE_OVERAGE_TOLERANCE_PERCENT,
-        "has_credits": (credit + promotional_credit) > 0,
+        "has_credits": (credit + promotional_credit + purchased_credit) > 0,
         "has_active_subscription": has_active_subscription,
         "has_analytics_access": bool(abonnement) and int(abonnement.get("priorite") or 1) >= 2,
         "abo_costs": abo_costs,

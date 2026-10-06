@@ -684,12 +684,16 @@
     "statsExcluded": "Pas de statistiques sociales sur la page d'accueil",
     "aiFeaturesHeading": "Fonctionnalités IA incluses dans les crédits",
     "creditsBreakdown": "{{standard}} crédits standards · {{promo}} crédits promotionnels",
-    "expiringBatch": "{{amount}} crédits expirent dans {{days}} jour(s)"
+    "expiringBatch": "{{amount}} crédits promotionnels expirent dans {{days}} jour(s)",
+    "creditsBreakdown3": "{{standard}} crédits abonnement · {{purchased}} crédits achetés · {{promo}} crédits promotionnels",
+    "expiringPurchasedBatch": "{{amount}} crédits achetés expirent dans {{days}} jour(s)"
   },
   "serviceUsage": {
     "totalAvailable": "{{total}} crédits disponibles",
     "creditsBreakdown": "{{standard}} crédits standards · {{promo}} crédits promotionnels",
-    "expiringBatch": "{{amount}} crédits expirent dans {{days}} jour(s)"
+    "expiringBatch": "{{amount}} crédits promotionnels expirent dans {{days}} jour(s)",
+    "creditsBreakdown3": "{{standard}} crédits abonnement · {{purchased}} crédits achetés · {{promo}} crédits promotionnels",
+    "expiringPurchasedBatch": "{{amount}} crédits achetés expirent dans {{days}} jour(s)"
   },
   "parrainage": {
     "title": "Parrainage",

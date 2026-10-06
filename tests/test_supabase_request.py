@@ -3,6 +3,7 @@ import importlib
 import sys
 import types
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock
 
 
 class _FakeResponse:
@@ -2124,6 +2125,64 @@ def test_insert_promotional_credit_batch_sets_expiry_and_touches_user_data(monke
     assert payload["source_reference"] == "ref-1"
     expires_at = datetime.fromisoformat(payload["expires_at"])
     assert (expires_at - before).days in (59, 60)  # ~60 days out, defensive against test timing
+    assert payload["tier"] == supabase_request.CREDIT_BATCH_TIER_PROMOTIONAL  # default
+
+
+def test_insert_promotional_credit_batch_accepts_purchased_tier(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient({
+        supabase_request.SUPABASE_USER_DATA_TABLE: [_FakeResponse(data=[{"user_id": "u1", "credit": 0.0}])],
+        supabase_request.SUPABASE_PROMOTIONAL_CREDIT_BATCHES_TABLE: [_FakeResponse(data=[{"id": "batch-2"}])],
+    })
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    asyncio.run(
+        supabase_request.insert_promotional_credit_batch(
+            "u1", 200.0, "CREDIT_PURCHASE", expiration_days=365, source_reference="sous-1",
+            tier=supabase_request.CREDIT_BATCH_TIER_PURCHASED,
+        )
+    )
+    payload = _event_args(fake_client.events, supabase_request.SUPABASE_PROMOTIONAL_CREDIT_BATCHES_TABLE, "insert")[0]
+    assert payload["tier"] == supabase_request.CREDIT_BATCH_TIER_PURCHASED
+
+
+def test_zero_subscription_credit_zeroes_credit_keeps_storage(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+
+    async def _existing(_uid):
+        return {"user_id": "u1", "credit": 150.0, "stockage": 5.0, "stockage_max": 20.0}
+
+    monkeypatch.setattr(supabase_request, "get_user_data", _existing)
+    balance_mock = AsyncMock(return_value={"user_id": "u1"})
+    monkeypatch.setattr(supabase_request, "set_user_data_balance", balance_mock)
+    history_mock = AsyncMock()
+    monkeypatch.setattr(supabase_request, "insert_user_data_history", history_mock)
+
+    asyncio.run(supabase_request.zero_subscription_credit("u1", operation_id="in_123"))
+
+    balance_mock.assert_awaited_once_with(
+        user_id="u1", credit=0.0, storage=5.0, credit_max=0.0, storage_max=20.0,
+        operation_type="subscription_payment_failed", operation_id="in_123",
+    )
+    history_mock.assert_awaited_once_with(
+        user_id="u1", credit=150.0, storage=0.0, operation="output",
+        operation_type="subscription_payment_failed", operation_id="in_123",
+    )
+
+
+def test_zero_subscription_credit_noop_without_existing_user_data(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+
+    async def _missing(_uid):
+        return None
+
+    monkeypatch.setattr(supabase_request, "get_user_data", _missing)
+    balance_mock = AsyncMock()
+    monkeypatch.setattr(supabase_request, "set_user_data_balance", balance_mock)
+
+    asyncio.run(supabase_request.zero_subscription_credit("u1"))
+
+    balance_mock.assert_not_awaited()
 
 
 def test_list_active_promotional_credit_batches_filters_and_orders(monkeypatch):

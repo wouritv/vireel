@@ -683,12 +683,16 @@
     "statsExcluded": "No social stats on the home page",
     "aiFeaturesHeading": "AI features included in the credits",
     "creditsBreakdown": "{{standard}} standard credits · {{promo}} promotional credits",
-    "expiringBatch": "{{amount}} credits expire in {{days}} day(s)"
+    "expiringBatch": "{{amount}} promotional credits expire in {{days}} day(s)",
+    "creditsBreakdown3": "{{standard}} subscription credits · {{purchased}} purchased credits · {{promo}} promotional credits",
+    "expiringPurchasedBatch": "{{amount}} purchased credits expire in {{days}} day(s)"
   },
   "serviceUsage": {
     "totalAvailable": "{{total}} credits available",
     "creditsBreakdown": "{{standard}} standard credits · {{promo}} promotional credits",
-    "expiringBatch": "{{amount}} credits expire in {{days}} day(s)"
+    "expiringBatch": "{{amount}} promotional credits expire in {{days}} day(s)",
+    "creditsBreakdown3": "{{standard}} subscription credits · {{purchased}} purchased credits · {{promo}} promotional credits",
+    "expiringPurchasedBatch": "{{amount}} purchased credits expire in {{days}} day(s)"
   },
   "parrainage": {
     "title": "Referrals",

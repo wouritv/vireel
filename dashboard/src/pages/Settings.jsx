@@ -1220,11 +1220,11 @@ export default function SettingsPage() {
                   {t('settings.nextBillingDate', 'Prochaine facturation')}: {new Date(subscription.next_billing_date).toLocaleDateString('fr-FR')}
                 </p>
               ) : null}
-              {subscription?.next_credit_allocation_date
-              && subscription?.next_billing_date
-              && subscription.next_credit_allocation_date !== subscription.next_billing_date ? (
+              {subscription?.next_credit_allocation_date ? (
                 <p className="text-slate-600 dark:text-zinc-400 mt-1">
-                  {t('settings.nextCreditAllocationDate', 'Prochaine attribution de crédits')}: {new Date(subscription.next_credit_allocation_date).toLocaleDateString('fr-FR')}
+                  {t('settings.nextCreditAllocationDate', 'Prochaine attribution de crédits')}: {new Date(subscription.next_credit_allocation_date).toLocaleString('fr-FR', {
+                    day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit',
+                  })}
                 </p>
               ) : null}
               {subscription?.retention_deadline_at ? (
