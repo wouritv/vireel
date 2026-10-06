@@ -1772,6 +1772,78 @@ async def zero_subscription_credit(user_id: str, operation_id: str = "") -> None
 	)
 
 
+async def set_user_max_daily_publications(user_id: str, max_daily_publications: float) -> None:
+	"""Snapshots the active plan's daily-publication cap (0 = unlimited)
+	onto user_data at the moment it's allocated (purchase, renewal, plan
+	change -- see _allocate_plan_resources/_finalize_immediate_upgrade in
+	app.py), so the quota check (consume_publish_quota) always reads it
+	off the user's own row rather than re-deriving it live from
+	abonnement -- it depends on the user, not a fresh plan lookup, exactly
+	as asked. A harmless 0-delta credit "touch" first (see
+	upsert_user_data_credits) makes sure the row exists at all for a
+	brand-new user_id with no prior credit grant."""
+	if not user_id:
+		return
+	await upsert_user_data_credits(user_id, credit_delta=0.0, operation_type="max_daily_publications_touch")
+	client = await get_client()
+	await (
+		client.table(SUPABASE_USER_DATA_TABLE)
+		.update({"max_daily_publications": int(max(0, max_daily_publications))})
+		.eq("user_id", user_id)
+		.execute()
+	)
+
+
+async def consume_publish_quota(user_id: str, count: int = 1) -> Dict[str, Any]:
+	"""Checks this user's own snapshotted daily-publication cap
+	(user_data.max_daily_publications, 0 = unlimited) against today's
+	count (user_data.publications_today), and if there's room, consumes
+	``count`` of it. The daily reset is lazy, not a scheduled job: if the
+	stored publications_count_date isn't today (UTC), today's count is
+	simply treated as starting from 0 -- correct without a cron sweep.
+
+	This is a plain read-then-write, not the optimistic-CAS retry loop
+	deduct_user_credits uses for money -- a rate limit tolerates the rare
+	benign race (two simultaneous requests both reading the same stale
+	count) that a credit ledger never could; losing a request's increment
+	here only ever means one extra publication slips through, not a
+	financial loss.
+
+	Returns {"allowed": True, "max_daily", "used_today"} when it fits
+	(max_daily/used_today are the post-consumption state), or
+	{"allowed": False, "max_daily", "used_today", "resets_at"} when it
+	doesn't -- resets_at is the next UTC midnight, exactly when the daily
+	counter lazily starts over, so the caller can tell the user precisely
+	when they'll be able to publish again."""
+	if count <= 0:
+		return {"allowed": True, "max_daily": 0, "used_today": 0}
+	existing = await get_user_data(user_id)
+	if not existing:
+		return {"allowed": True, "max_daily": 0, "used_today": 0}
+
+	max_daily = int(existing.get("max_daily_publications") or 0)
+	today = datetime.now(timezone.utc).date()
+	stored_date = existing.get("publications_count_date")
+	current_count = int(existing.get("publications_today") or 0) if stored_date == today.isoformat() else 0
+
+	if max_daily > 0 and current_count + count > max_daily:
+		resets_at = datetime.combine(today + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+		return {
+			"allowed": False, "max_daily": max_daily, "used_today": current_count,
+			"resets_at": resets_at.isoformat(),
+		}
+
+	new_count = current_count + count
+	client = await get_client()
+	await (
+		client.table(SUPABASE_USER_DATA_TABLE)
+		.update({"publications_today": new_count, "publications_count_date": today.isoformat()})
+		.eq("user_id", user_id)
+		.execute()
+	)
+	return {"allowed": True, "max_daily": max_daily, "used_today": new_count}
+
+
 MAX_CREDIT_DEBT = max(0.0, float(os.environ.get("MAX_CREDIT_DEBT", "0") or "0"))
 
 

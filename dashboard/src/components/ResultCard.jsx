@@ -11,6 +11,7 @@ import { useAuth } from '../state/AuthContext';
 import { getAuthHeaders } from '../lib/apiAuth';
 import { useUserCredits } from '../state/UserCreditsContext';
 import { useTranslation } from "../state/LanguageContext";
+import { describePublishError } from '../lib/publishErrors';
 
 const parseApiErrorText = (rawText) => {
     try {
@@ -19,6 +20,21 @@ const parseApiErrorText = (rawText) => {
     } catch {
         return rawText || 'Request failed';
     }
+};
+
+// Same JSON parsing as parseApiErrorText, but only for the /api/social/post
+// publish call below: that endpoint can also raise the structured
+// publish_quota_exceeded object (see lib/publishErrors), so its `detail`
+// is routed through describePublishError instead of being interpolated
+// directly, which would render the literal text "[object Object]".
+const parsePublishApiErrorText = (rawText, t) => {
+    let detail;
+    try {
+        detail = JSON.parse(rawText || '{}')?.detail;
+    } catch {
+        detail = undefined;
+    }
+    return describePublishError(t, detail, rawText || 'Request failed');
 };
 
 const isLikelyVideoAsset = (value) => {
@@ -736,7 +752,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
 
             if (!res.ok) {
                 const errText = await res.text();
-                setPostResult({ success: false, msg: `Failed: ${parseApiErrorText(errText)}` });
+                setPostResult({ success: false, msg: `Failed: ${parsePublishApiErrorText(errText, t)}` });
                 return;
             }
 

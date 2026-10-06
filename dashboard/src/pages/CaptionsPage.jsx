@@ -10,6 +10,7 @@ import MobileFilterDropdown from "../components/MobileFilterDropdown";
 import { useTranslation } from "../state/LanguageContext";
 import { statusClass, statusLabel } from "../lib/status";
 import { getAuthHeaders } from "../lib/apiAuth";
+import { describePublishError } from "../lib/publishErrors";
 
 const CAPTION_STATUS_FALLBACK = "termine";
 
@@ -329,7 +330,7 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
                 let msg = t("reels.shareFailed", "Share failed");
                 try {
                     const parsed = JSON.parse(errText);
-                    msg = parsed?.detail || errText || msg;
+                    msg = describePublishError(t, parsed?.detail, errText || msg);
                 } catch {
                     msg = errText || msg;
                 }

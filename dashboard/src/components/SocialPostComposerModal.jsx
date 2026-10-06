@@ -3,6 +3,7 @@ import { X, Loader2, Share2, Calendar, Clock, Facebook, Linkedin, CheckCircle, A
 import { getApiUrl } from "../config";
 import { getAuthHeaders } from "../lib/apiAuth";
 import { describePlatformPublishError } from "../lib/anonymousStories";
+import { describePublishError } from "../lib/publishErrors";
 import { useAuth } from "../state/AuthContext";
 import { useTranslation } from "../state/LanguageContext";
 
@@ -361,7 +362,7 @@ export default function SocialPostComposerModal({ isOpen, onClose, onCreated }) 
             });
             const data = await response.json().catch(() => ({}));
             if (!response.ok) {
-                setResult({ success: false, msg: data?.detail || t("social.postComposerFailed", "La publication a echoue.") });
+                setResult({ success: false, msg: describePublishError(t, data?.detail, t("social.postComposerFailed", "La publication a echoue.")) });
                 return;
             }
 

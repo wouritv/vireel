@@ -92,6 +92,8 @@ from supabase_request import (
 	upsert_user_data_credits as supabase_upsert_user_data_credits,
 	set_user_data_balance as supabase_set_user_data_balance,
 	zero_subscription_credit as supabase_zero_subscription_credit,
+	set_user_max_daily_publications as supabase_set_user_max_daily_publications,
+	consume_publish_quota as supabase_consume_publish_quota,
 	deduct_user_credits as supabase_deduct_user_credits,
 	insert_user_data_history as supabase_insert_user_data_history,
 	upsert_user_data_history_entry as supabase_upsert_user_data_history_entry,
@@ -4084,30 +4086,51 @@ async def _assert_user_has_required_credits(user_id: str, required_credits: floa
 
 
 async def _assert_user_has_active_subscription_for_publish(user_id: str) -> None:
-    """Publishing to social networks is free of credit cost, but still
-    normally requires an active paid subscription: an account at 0
-    credits can still publish as long as its subscription is active,
-    while one with no active subscription is blocked regardless of its
-    credit balance -- UNLESS it still has bonus credit available
-    (promotional or purchased, see promotional_credit_batches/the
-    credit-tiers migration): a referred user with only a promotional
-    bonus and no paid plan yet, or anyone whose subscription has lapsed
-    while they still have unused bonus credit, keeps full feature access
-    until that credit actually runs out, exactly like every other
-    credit-metered feature already does (see deduct_user_credits)."""
+    """Publishing to social networks never spends a credit, but still
+    requires EITHER an active paid subscription OR at least some valid
+    credit -- whatever its nature (subscription, promotional, or
+    purchased, all counted together): an active subscription alone is
+    always enough (even at 0 credit), and otherwise any positive total
+    across the three pools is enough on its own, with no subscription at
+    all. Only an account with neither is blocked."""
     if not is_supabase_configured():
         return
     subscription = await get_user_abonnement(user_id)
     if subscription:
         return
+    user_data = await supabase_get_user_data(user_id)
+    standard_credit = float((user_data or {}).get("credit") or 0.0)
     bonus_batches = await supabase_list_active_promotional_credit_batches(user_id)
     bonus_credit = sum(float(batch.get("amount_remaining") or 0.0) for batch in bonus_batches)
-    if bonus_credit > 0:
+    if standard_credit + bonus_credit > 0:
         return
     raise HTTPException(
         status_code=402,
-        detail="Un abonnement actif est requis pour publier sur les reseaux sociaux.",
+        detail="Un abonnement actif ou des credits valides sont requis pour publier sur les reseaux sociaux.",
     )
+
+
+async def _assert_user_can_publish(user_id: str, count: int = 1) -> None:
+    """Enforces the per-user daily publication quota: how many
+    publications (one per account/platform target, counted at request
+    time whether the publish is immediate or scheduled for later) this
+    account may make today. The cap itself (abonnement.max_daily_
+    publications, 0 = unlimited) is snapshotted onto user_data.
+    max_daily_publications at allocation time (see _allocate_plan_
+    resources/_finalize_immediate_upgrade) -- this reads only that
+    snapshot, never a live plan lookup. Raises a coded 429 carrying
+    max_daily/used_today/resets_at so the frontend can tell the user
+    exactly when they'll be able to publish again."""
+    if not is_supabase_configured():
+        return
+    result = await supabase_consume_publish_quota(user_id, count)
+    if not result.get("allowed", True):
+        raise _coded_error(
+            429, "publish_quota_exceeded",
+            f"Quota de publications quotidien atteint ({result.get('max_daily')} par jour).",
+            max_daily=result.get("max_daily"), used_today=result.get("used_today"),
+            resets_at=result.get("resets_at"),
+        )
 
 
 async def _assert_user_can_access_analytics(user_id: str) -> None:
@@ -8555,6 +8578,7 @@ async def post_to_socials(req: SocialPostRequest, request: Request, user_id_head
     user_id = _resolve_request_user_id(req.user_id, user_id_header)
     await _assert_user_has_active_subscription_for_publish(user_id)
     accounts = await _resolve_accounts_for_publish(user_id, req.account_ids, _SHARE_PLATFORMS)
+    await _assert_user_can_publish(user_id, len(accounts))
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(req.scheduled_date, req.timezone)
     if req.scheduled_date and not scheduled_for:
@@ -9402,6 +9426,10 @@ async def _allocate_plan_resources(
 
     # A new/changed plan resets monthly allowances and their maxima to the plan limits.
     await _reset_user_plan_balance(user_id, plan_credit, plan_storage, souscription_id or payment_reference)
+    # The daily publish-quota cap is snapshotted onto user_data itself
+    # (depends on the user, never re-derived live from abonnement -- see
+    # consume_publish_quota) rather than onto this souscription row.
+    await supabase_set_user_max_daily_publications(user_id, plan.get("max_daily_publications") or 0)
 
     if souscription_id:
         snapshot_updates: Dict[str, Any] = {"plan_credit": plan_credit, "plan_stockage": plan_storage}
@@ -10817,6 +10845,7 @@ async def _finalize_immediate_upgrade(
         operation_type=PLAN_CHANGE_UPGRADE_OPERATION_TYPE,
         operation_id=new_souscription_id,
     )
+    await supabase_set_user_max_daily_publications(user_id, new_plan.get("max_daily_publications") or 0)
 
     _send_transactional_email(
         _user_email_from_request(request), "subscription_plan_changed",
@@ -12502,6 +12531,7 @@ async def publish_anonymous_story_endpoint(
         raise HTTPException(status_code=400, detail="Story has no generated text to publish yet")
 
     accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SOCIAL_POST_PLATFORMS)
+    await _assert_user_can_publish(user_id, len(accounts))
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for, is_scheduled = _resolve_anonymous_story_schedule(payload)
     background_id = payload.background_id or anonymous_stories.BACKGROUND_PRESETS[0]["id"]
@@ -12862,6 +12892,7 @@ async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotate
         raise HTTPException(status_code=400, detail="text is required when no media is attached")
 
     accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SOCIAL_POST_PLATFORMS)
+    await _assert_user_can_publish(user_id, len(accounts))
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
     if payload.scheduled_date and not scheduled_for:
@@ -13117,6 +13148,7 @@ async def share_caption(caption_id: str, payload: ReelShareRequest, user_id: Ann
     final_title = payload.title or row.get("caption_title") or "Sous-titres"
     final_description = payload.description or row.get("caption_description") or ""
     accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SHARE_PLATFORMS)
+    await _assert_user_can_publish(user_id, len(accounts))
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
     if payload.scheduled_date and not scheduled_for:
@@ -14767,6 +14799,7 @@ async def share_film_summary(film_summary_id: str, payload: ReelShareRequest, us
     final_title = payload.title or row.get("title") or "Resume de film"
     final_description = payload.description or ""
     accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SHARE_PLATFORMS)
+    await _assert_user_can_publish(user_id, len(accounts))
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
     if payload.scheduled_date and not scheduled_for:
@@ -15233,6 +15266,7 @@ async def share_reel(reel_id: str, payload: ReelShareRequest, user_id: Annotated
     final_title = payload.title or row.get("reel_title") or "Vireel"
     final_description = payload.description or row.get("reel_description") or ""
     accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SHARE_PLATFORMS)
+    await _assert_user_can_publish(user_id, len(accounts))
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
     if payload.scheduled_date and not scheduled_for:

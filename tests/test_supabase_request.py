@@ -2185,6 +2185,95 @@ def test_zero_subscription_credit_noop_without_existing_user_data(monkeypatch):
     balance_mock.assert_not_awaited()
 
 
+def test_set_user_max_daily_publications_updates_row(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_USER_DATA_TABLE: [_FakeResponse(data=[{"user_id": "u1", "credit": 0.0}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    asyncio.run(supabase_request.set_user_max_daily_publications("u1", 5))
+
+    update_payloads = [
+        args[0] for table, method, args, _kwargs in fake_client.events
+        if table == supabase_request.SUPABASE_USER_DATA_TABLE and method == "update"
+    ]
+    assert any(p.get("max_daily_publications") == 5 for p in update_payloads)
+
+
+def test_consume_publish_quota_allows_unlimited_when_max_is_zero(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+
+    async def _existing(_uid):
+        return {"user_id": "u1", "max_daily_publications": 0, "publications_today": 999}
+
+    monkeypatch.setattr(supabase_request, "get_user_data", _existing)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_USER_DATA_TABLE: [_FakeResponse(data=[{"user_id": "u1"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.consume_publish_quota("u1", 3))
+
+    assert result["allowed"] is True
+    assert result["max_daily"] == 0
+
+
+def test_consume_publish_quota_blocks_once_daily_cap_reached(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    async def _existing(_uid):
+        return {"user_id": "u1", "max_daily_publications": 3, "publications_today": 3, "publications_count_date": today}
+
+    monkeypatch.setattr(supabase_request, "get_user_data", _existing)
+
+    result = asyncio.run(supabase_request.consume_publish_quota("u1", 1))
+
+    assert result["allowed"] is False
+    assert result["max_daily"] == 3
+    assert result["used_today"] == 3
+    assert result["resets_at"] is not None
+    # resets at the next UTC midnight -- strictly in the future.
+    resets_at = datetime.fromisoformat(result["resets_at"])
+    assert resets_at > datetime.now(timezone.utc)
+
+
+def test_consume_publish_quota_lazily_resets_on_new_day(monkeypatch):
+    # A stale publications_count_date (yesterday or earlier) must be
+    # treated as a fresh day -- no scheduled reset job exists.
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+
+    async def _existing(_uid):
+        return {"user_id": "u1", "max_daily_publications": 2, "publications_today": 2, "publications_count_date": "2000-01-01"}
+
+    monkeypatch.setattr(supabase_request, "get_user_data", _existing)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_USER_DATA_TABLE: [_FakeResponse(data=[{"user_id": "u1"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.consume_publish_quota("u1", 1))
+
+    assert result["allowed"] is True
+    assert result["used_today"] == 1
+    payload = _event_args(fake_client.events, supabase_request.SUPABASE_USER_DATA_TABLE, "update")[0]
+    assert payload["publications_today"] == 1
+
+
+def test_consume_publish_quota_allows_when_no_existing_user_data(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+
+    async def _missing(_uid):
+        return None
+
+    monkeypatch.setattr(supabase_request, "get_user_data", _missing)
+
+    result = asyncio.run(supabase_request.consume_publish_quota("u1", 5))
+
+    assert result["allowed"] is True
+
+
 def test_list_active_promotional_credit_batches_filters_and_orders(monkeypatch):
     supabase_request = _import_supabase_request_with_stubs(monkeypatch)
     rows = [{"id": "b1", "expires_at": "2026-02-01T00:00:00+00:00"}]

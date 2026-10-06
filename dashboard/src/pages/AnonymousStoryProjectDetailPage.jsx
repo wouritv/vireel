@@ -6,6 +6,7 @@ import { getAuthHeaders } from "../lib/apiAuth";
 import { useAuth } from "../state/AuthContext";
 import { useTranslation } from "../state/LanguageContext";
 import { buildFullText, errorMessageForCode, describePlatformPublishError } from "../lib/anonymousStories";
+import { describePublishError } from "../lib/publishErrors";
 import AnonymousStoryPublishModal from "../components/AnonymousStoryPublishModal";
 
 // Same "project detail" role as ReelProjectDetailPage / CaptionProjectDetailPage:
@@ -230,9 +231,19 @@ export default function AnonymousStoryProjectDetailPage() {
             });
             const data = await response.json().catch(() => ({}));
             if (!response.ok) {
+                // The publish quota's 429 raises an OBJECT detail
+                // ({ code: "publish_quota_exceeded", ... }); errorMessageForCode
+                // below assumes a short string code (the shape every other
+                // error from this same call -- and from the other endpoints
+                // in this file -- still uses), so the quota object is
+                // special-cased first and everything else keeps its
+                // existing string-code handling untouched.
+                const quotaMsg = data?.detail && typeof data.detail === "object" && data.detail.code === "publish_quota_exceeded"
+                    ? describePublishError(t, data.detail)
+                    : null;
                 setPublishResult({
                     success: false,
-                    msg: errorMessageForCode(t, data?.detail, data?.detail || t("anonymousStories.genericError", "Une erreur est survenue.")),
+                    msg: quotaMsg ?? errorMessageForCode(t, data?.detail, data?.detail || t("anonymousStories.genericError", "Une erreur est survenue.")),
                 });
                 return;
             }

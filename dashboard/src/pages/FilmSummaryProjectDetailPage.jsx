@@ -6,6 +6,7 @@ import { getAuthHeaders } from "../lib/apiAuth";
 import { useAuth } from "../state/AuthContext";
 import { useTranslation } from "../state/LanguageContext";
 import { errorMessageForCode } from "../lib/filmSummary";
+import { describePublishError } from "../lib/publishErrors";
 import FilmSummaryProcessingPanel from "../components/FilmSummaryProcessingPanel";
 import FilmSummaryReviewPanel from "../components/FilmSummaryReviewPanel";
 import SharePostModal from "../components/SharePostModal";
@@ -274,7 +275,10 @@ export default function FilmSummaryProjectDetailPage() {
             });
             const data = await response.json().catch(() => ({}));
             if (!response.ok) {
-                setShareResult({ success: false, msg: typeof data?.detail === "string" ? data.detail : t("filmSummary.genericError", "Une erreur est survenue.") });
+                setShareResult({
+                    success: false,
+                    msg: describePublishError(t, data?.detail, t("filmSummary.genericError", "Une erreur est survenue.")),
+                });
                 return;
             }
             setShareResult({

@@ -1,4 +1,8 @@
 {
+  "publishQuota": {
+    "exceeded": "Quota quotidien de {{max}} publications atteint. Vous pourrez publier à nouveau à {{time}}.",
+    "genericError": "Une erreur est survenue."
+  },
   "app": {
     "loading": "Chargement...",
     "reelGenerator": "Génération de réels",

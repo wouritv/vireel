@@ -4111,6 +4111,7 @@ def test_run_film_summary_render_pipeline_leaves_preview_untouched_without_new_s
 def test_share_film_summary_rejects_when_not_completed(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     app.supabase_get_film_summary = AsyncMock(return_value={"id": "fs-1", "status": "awaiting_review"})
 
     with TestClient(app.app) as client:
@@ -4125,6 +4126,7 @@ def test_share_film_summary_rejects_when_not_completed(monkeypatch):
 def test_share_film_summary_publishes_immediately(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     app.supabase_get_film_summary = AsyncMock(return_value={
         "id": "fs-1", "status": "completed", "title": "Mon film", "final_s3_key": "final/fs-1.mp4",
     })
@@ -4159,6 +4161,7 @@ def test_share_film_summary_publishes_immediately(monkeypatch):
 def test_share_film_summary_schedules_future_post(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     app.supabase_get_film_summary = AsyncMock(return_value={
         "id": "fs-1", "status": "completed", "title": "Mon film", "final_s3_key": "final/fs-1.mp4",
     })
@@ -4185,6 +4188,7 @@ def test_share_film_summary_schedules_future_post(monkeypatch):
 def test_share_reel_publishes_to_each_selected_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     app.supabase_get_reel = AsyncMock(return_value={"reel_title": "Mon reel"})
     monkeypatch.setattr(app, "_normalize_reel_row", lambda row: {**row, "media_url": "https://s3.example/reel.mp4"})
     accounts_by_id = {
@@ -4211,6 +4215,7 @@ def test_share_reel_publishes_to_each_selected_account(monkeypatch):
 def test_share_reel_rejects_when_no_media_url(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     app.supabase_get_reel = AsyncMock(return_value={"reel_title": "Mon reel"})
     monkeypatch.setattr(app, "_normalize_reel_row", lambda row: {**row, "media_url": ""})
 
@@ -4226,6 +4231,7 @@ def test_share_reel_rejects_when_no_media_url(monkeypatch):
 def test_share_caption_publishes_to_each_selected_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     app.supabase_get_caption = AsyncMock(return_value={"caption_title": "Mes sous-titres"})
     monkeypatch.setattr(app, "_normalize_caption_row", lambda row: {**row, "media_url": "https://s3.example/caption.mp4"})
     monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "fb-acct", "platform": "facebook"}))
@@ -4249,6 +4255,7 @@ def test_share_caption_publishes_to_each_selected_account(monkeypatch):
 def test_post_to_socials_publishes_reel_clip_to_selected_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "fb-acct", "platform": "facebook"}))
     monkeypatch.setattr(
@@ -4277,6 +4284,7 @@ def test_create_social_post_blocks_when_over_comment_limit(monkeypatch):
     # rejected before any account is touched or anything is published.
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_active_plan_for_user", AsyncMock(return_value={"commentaire": 1}))
     resolve_accounts_mock = AsyncMock()
     monkeypatch.setattr(app, "_resolve_accounts_for_publish", resolve_accounts_mock)
@@ -4297,6 +4305,7 @@ def test_create_social_post_blocks_when_over_comment_limit(monkeypatch):
 def test_create_social_post_allows_comments_within_limit(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_active_plan_for_user", AsyncMock(return_value={"commentaire": 2}))
     monkeypatch.setattr(app, "_resolve_accounts_for_publish", AsyncMock(return_value=[{"id": "acct-1", "platform": "facebook"}]))
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
@@ -5694,6 +5703,7 @@ def test_allocate_plan_resources_snapshots_values_onto_souscription_row(monkeypa
     monkeypatch.setattr(app, "supabase_insert_user_data_history", history_mock)
     update_mock = AsyncMock()
     monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
+    monkeypatch.setattr(app, "supabase_set_user_max_daily_publications", AsyncMock())
 
     asyncio.run(app._allocate_plan_resources(
         user_id="u1", abonnement="plan-1", payment_reference="ref-1", souscription_id="sous-1",
@@ -5715,6 +5725,7 @@ def test_allocate_plan_resources_schedules_next_allocation_for_annual_plan(monke
     monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
     update_mock = AsyncMock()
     monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
+    monkeypatch.setattr(app, "supabase_set_user_max_daily_publications", AsyncMock())
 
     period_start = datetime(2026, 1, 15, tzinfo=timezone.utc)
     asyncio.run(app._allocate_plan_resources(
@@ -6955,6 +6966,7 @@ def _stub_plan_change_prereqs(monkeypatch, app, subscription=None, plans=None):
     monkeypatch.setattr(app, "supabase_upsert_user_data_credits", credits_mock)
     history_mock = AsyncMock()
     monkeypatch.setattr(app, "supabase_insert_user_data_history", history_mock)
+    monkeypatch.setattr(app, "supabase_set_user_max_daily_publications", AsyncMock())
     monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
     return fake_stripe, update_mock, insert_mock, credits_mock, history_mock
 
@@ -7636,10 +7648,11 @@ def test_upsert_social_account_rejects_new_account_over_plan_limit(monkeypatch):
     assert table.inserted == []
 
 
-def test_assert_user_has_active_subscription_for_publish_blocks_without_subscription(monkeypatch):
+def test_assert_user_has_active_subscription_for_publish_blocks_without_subscription_or_credit(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 0}))
     monkeypatch.setattr(app, "supabase_list_active_promotional_credit_batches", AsyncMock(return_value=[]))
 
     coro = app._assert_user_has_active_subscription_for_publish("u1")
@@ -7657,9 +7670,23 @@ def test_assert_user_has_active_subscription_for_publish_allows_with_bonus_credi
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 0}))
     monkeypatch.setattr(app, "supabase_list_active_promotional_credit_batches", AsyncMock(
         return_value=[{"amount_remaining": 25.0, "tier": 1}],
     ))
+
+    asyncio.run(app._assert_user_has_active_subscription_for_publish("u1"))
+
+
+def test_assert_user_has_active_subscription_for_publish_allows_with_standard_credit_and_no_subscription(monkeypatch):
+    # "peu importe la nature des credits" -- plain subscription credit
+    # left over after the subscription itself lapsed counts just as much
+    # as a promotional/purchased batch.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 10}))
+    monkeypatch.setattr(app, "supabase_list_active_promotional_credit_batches", AsyncMock(return_value=[]))
 
     asyncio.run(app._assert_user_has_active_subscription_for_publish("u1"))
 
@@ -7668,6 +7695,7 @@ def test_assert_user_has_active_subscription_for_publish_blocks_when_bonus_credi
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 0}))
     monkeypatch.setattr(app, "supabase_list_active_promotional_credit_batches", AsyncMock(
         return_value=[{"amount_remaining": 0.0, "tier": 2}],
     ))
@@ -7688,6 +7716,62 @@ def test_assert_user_has_active_subscription_for_publish_allows_with_zero_credit
     monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 0}))
 
     asyncio.run(app._assert_user_has_active_subscription_for_publish("u1"))
+
+
+def test_assert_user_can_publish_allows_under_quota(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_consume_publish_quota", AsyncMock(
+        return_value={"allowed": True, "max_daily": 5, "used_today": 3},
+    ))
+
+    asyncio.run(app._assert_user_can_publish("u1", 1))
+
+
+def test_assert_user_can_publish_blocks_with_quota_details(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_consume_publish_quota", AsyncMock(
+        return_value={"allowed": False, "max_daily": 5, "used_today": 5, "resets_at": "2026-01-02T00:00:00+00:00"},
+    ))
+
+    coro = app._assert_user_can_publish("u1", 1)
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+
+    assert exc_info.value.status_code == 429
+    detail = exc_info.value.detail
+    assert detail["code"] == "publish_quota_exceeded"
+    assert detail["max_daily"] == 5
+    assert detail["used_today"] == 5
+    assert detail["resets_at"] == "2026-01-02T00:00:00+00:00"
+
+
+def test_post_to_socials_consumes_quota_for_every_account(monkeypatch):
+    # The quota is consumed once per account/platform target in the
+    # request, not once per API call.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    quota_mock = AsyncMock()
+    monkeypatch.setattr(app, "_assert_user_can_publish", quota_mock)
+    monkeypatch.setattr(app, "_resolve_accounts_for_publish", AsyncMock(return_value=[
+        {"id": "acct-1", "platform": "facebook"}, {"id": "acct-2", "platform": "instagram"},
+    ]))
+    monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
+    monkeypatch.setattr(app, "_resolve_clip_for_social_post", AsyncMock(return_value={"video_url": "https://x/video.mp4"}))
+    monkeypatch.setattr(app, "_resolve_local_video_path", lambda *a, **k: "/tmp/video.mp4")
+    monkeypatch.setattr(app, "_resolve_public_video_url", lambda *a, **k: "https://x/video.mp4")
+    monkeypatch.setattr(app, "_publish_reel_social_post_now", AsyncMock(return_value={"success": True}))
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/social/post",
+            json={"job_id": "job-1", "clip_index": 0, "account_ids": ["acct-1", "acct-2"]},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    quota_mock.assert_awaited_once_with("u1", 2)
 
 
 def test_get_user_max_social_accounts_defaults_to_one_without_active_plan(monkeypatch):
@@ -8490,6 +8574,7 @@ def _social_post_account(platform="facebook"):
 def test_create_social_post_rejects_empty_text(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
 
     with TestClient(app.app) as client:
@@ -8504,6 +8589,7 @@ def test_create_social_post_rejects_empty_text(monkeypatch):
 def test_create_social_post_rejects_unsupported_platform_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "acct-1", "platform": "tiktok"}))
 
@@ -8519,6 +8605,7 @@ def test_create_social_post_rejects_unsupported_platform_account(monkeypatch):
 def test_create_social_post_publishes_now_and_posts_comments(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
@@ -8569,6 +8656,7 @@ def test_create_social_post_publishes_attached_photo(monkeypatch):
     # background can't be combined with media.
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
@@ -8616,6 +8704,7 @@ def test_create_social_post_allows_empty_text_with_attached_media(monkeypatch):
     # once media is attached.
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
@@ -8644,6 +8733,7 @@ def test_create_social_post_allows_empty_text_with_attached_media(monkeypatch):
 def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
@@ -8680,6 +8770,7 @@ def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
 def test_create_social_post_schedules_job_without_publishing(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     accounts_by_id = {

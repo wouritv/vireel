@@ -11,6 +11,7 @@ import { toResultCardClip } from "../lib/clips";
 import { statusLabel, statusClass } from "../lib/status";
 import { getAuthHeaders } from "../lib/apiAuth";
 import { useTranslation } from "../state/LanguageContext";
+import { describePublishError } from "../lib/publishErrors";
 
 export default function ReelsPage({ projectId = "" }) {
     const { user } = useAuth();
@@ -317,7 +318,7 @@ export default function ReelsPage({ projectId = "" }) {
                 let msg = t("reels.shareFailed", "Share failed");
                 try {
                     const parsed = JSON.parse(errText);
-                    msg = parsed?.detail || errText || msg;
+                    msg = describePublishError(t, parsed?.detail, errText || msg);
                 } catch {
                     msg = errText || msg;
                 }

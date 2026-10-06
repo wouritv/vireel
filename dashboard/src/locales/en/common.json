@@ -1,4 +1,8 @@
 {
+  "publishQuota": {
+    "exceeded": "Daily limit of {{max}} publications reached. You can publish again at {{time}}.",
+    "genericError": "Something went wrong."
+  },
   "app": {
     "loading": "Loading...",
     "reelGenerator": "Reels Generator",
