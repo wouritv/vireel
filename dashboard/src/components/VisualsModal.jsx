@@ -517,31 +517,49 @@ export default function VisualsModal({
                                     </div>
                                 </div>
 
-                                <div className="grid grid-cols-2 gap-2">
-                                    <label className="text-[11px] text-slate-500 dark:text-zinc-400">
-                                        {t('visualsModal.startTime', 'Début (s)')}
+                                <div className="space-y-3">
+                                    <div>
+                                        <label className="text-[11px] text-slate-500 dark:text-zinc-400 mb-1 block">
+                                            {t('visualsModal.startTime', 'Apparition')}: {toTwoDecimals(selectedDraft.start_time)}s
+                                        </label>
                                         <input
-                                            type="number"
+                                            type="range"
                                             min="0"
+                                            max={Math.max(0, reelDuration - selectedDraft.duration)}
                                             step="0.1"
                                             value={selectedDraft.start_time}
                                             onChange={(e) => setSelectedDraft((prev) => ({ ...prev, start_time: Number(e.target.value) || 0 }))}
+                                            onMouseUp={() => commitSelectedTiming(selectedDraft)}
+                                            onTouchEnd={() => commitSelectedTiming(selectedDraft)}
                                             onBlur={() => commitSelectedTiming(selectedDraft)}
-                                            className="mt-1 w-full bg-white dark:bg-black/40 border border-slate-300 dark:border-white/10 rounded-md px-2 py-1.5 text-xs text-slate-900 dark:text-zinc-100"
+                                            className="w-full accent-cyan-500"
                                         />
-                                    </label>
-                                    <label className="text-[11px] text-slate-500 dark:text-zinc-400">
-                                        {t('visualsModal.duration', 'Durée (s)')}
+                                        <div className="flex justify-between text-[10px] text-slate-400 dark:text-zinc-500">
+                                            <span>0s</span>
+                                            <span>{toTwoDecimals(Math.max(0, reelDuration - selectedDraft.duration))}s</span>
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <label className="text-[11px] text-slate-500 dark:text-zinc-400 mb-1 block">
+                                            {t('visualsModal.duration', 'Durée')}: {toTwoDecimals(selectedDraft.duration)}s
+                                        </label>
                                         <input
-                                            type="number"
-                                            min="0.1"
+                                            type="range"
+                                            min={MIN_VISUAL_DURATION}
+                                            max={Math.max(MIN_VISUAL_DURATION, reelDuration - selectedDraft.start_time)}
                                             step="0.1"
                                             value={selectedDraft.duration}
                                             onChange={(e) => setSelectedDraft((prev) => ({ ...prev, duration: Number(e.target.value) || 0 }))}
+                                            onMouseUp={() => commitSelectedTiming(selectedDraft)}
+                                            onTouchEnd={() => commitSelectedTiming(selectedDraft)}
                                             onBlur={() => commitSelectedTiming(selectedDraft)}
-                                            className="mt-1 w-full bg-white dark:bg-black/40 border border-slate-300 dark:border-white/10 rounded-md px-2 py-1.5 text-xs text-slate-900 dark:text-zinc-100"
+                                            className="w-full accent-cyan-500"
                                         />
-                                    </label>
+                                        <div className="flex justify-between text-[10px] text-slate-400 dark:text-zinc-500">
+                                            <span>{MIN_VISUAL_DURATION}s</span>
+                                            <span>{toTwoDecimals(Math.max(MIN_VISUAL_DURATION, reelDuration - selectedDraft.start_time))}s</span>
+                                        </div>
+                                    </div>
                                 </div>
 
                                 {editError ? <p className="text-[11px] text-red-400">{editError}</p> : null}
@@ -591,29 +609,43 @@ export default function VisualsModal({
                                     </div>
                                 </div>
 
-                                <div className="grid grid-cols-2 gap-2">
-                                    <label className="text-[11px] text-slate-500 dark:text-zinc-400">
-                                        {t('visualsModal.startTime', 'Début (s)')}
+                                <div className="space-y-3">
+                                    <div>
+                                        <label className="text-[11px] text-slate-500 dark:text-zinc-400 mb-1 block">
+                                            {t('visualsModal.startTime', 'Apparition')}: {toTwoDecimals(newVisualDraft.start_time)}s
+                                        </label>
                                         <input
-                                            type="number"
+                                            type="range"
                                             min="0"
+                                            max={Math.max(0, reelDuration - newVisualDraft.duration)}
                                             step="0.1"
                                             value={newVisualDraft.start_time}
                                             onChange={(e) => setNewVisualDraft((prev) => ({ ...prev, start_time: Number(e.target.value) || 0 }))}
-                                            className="mt-1 w-full bg-white dark:bg-black/40 border border-slate-300 dark:border-white/10 rounded-md px-2 py-1.5 text-xs text-slate-900 dark:text-zinc-100"
+                                            className="w-full accent-cyan-500"
                                         />
-                                    </label>
-                                    <label className="text-[11px] text-slate-500 dark:text-zinc-400">
-                                        {t('visualsModal.duration', 'Durée (s)')}
+                                        <div className="flex justify-between text-[10px] text-slate-400 dark:text-zinc-500">
+                                            <span>0s</span>
+                                            <span>{toTwoDecimals(Math.max(0, reelDuration - newVisualDraft.duration))}s</span>
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <label className="text-[11px] text-slate-500 dark:text-zinc-400 mb-1 block">
+                                            {t('visualsModal.duration', 'Durée')}: {toTwoDecimals(newVisualDraft.duration)}s
+                                        </label>
                                         <input
-                                            type="number"
-                                            min="0.1"
+                                            type="range"
+                                            min={MIN_VISUAL_DURATION}
+                                            max={Math.max(MIN_VISUAL_DURATION, reelDuration - newVisualDraft.start_time)}
                                             step="0.1"
                                             value={newVisualDraft.duration}
                                             onChange={(e) => setNewVisualDraft((prev) => ({ ...prev, duration: Number(e.target.value) || 0 }))}
-                                            className="mt-1 w-full bg-white dark:bg-black/40 border border-slate-300 dark:border-white/10 rounded-md px-2 py-1.5 text-xs text-slate-900 dark:text-zinc-100"
+                                            className="w-full accent-cyan-500"
                                         />
-                                    </label>
+                                        <div className="flex justify-between text-[10px] text-slate-400 dark:text-zinc-500">
+                                            <span>{MIN_VISUAL_DURATION}s</span>
+                                            <span>{toTwoDecimals(Math.max(MIN_VISUAL_DURATION, reelDuration - newVisualDraft.start_time))}s</span>
+                                        </div>
+                                    </div>
                                 </div>
 
                                 {newError ? <p className="text-[11px] text-red-400">{newError}</p> : null}
