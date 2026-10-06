@@ -256,6 +256,97 @@ async def soft_delete_reel(reel_id: str, user_id: str) -> bool:
 
 
 # --------------------------------------------------------------------------
+# Reel visuals (manual image split-screen overlays -- see
+# supabase/migrations/20261008_create_reel_visuals.sql)
+# --------------------------------------------------------------------------
+SUPABASE_REEL_VISUALS_TABLE = os.environ.get("SUPABASE_REEL_VISUALS_TABLE", "reel_visuals")
+
+
+async def insert_reel_visual(
+	reel_id: str,
+	user_id: str,
+	position: str,
+	start_time: float,
+	duration: float,
+	image_s3_key: str,
+) -> Dict[str, Any]:
+	client = await get_client()
+	payload = {
+		"reel_id": reel_id,
+		"user_id": user_id,
+		"position": position,
+		"start_time": float(start_time),
+		"duration": float(duration),
+		"image_s3_key": image_s3_key,
+	}
+	response = await client.table(SUPABASE_REEL_VISUALS_TABLE).insert(payload).execute()
+	rows = response.data or []
+	return rows[0] if rows else payload
+
+
+async def list_reel_visuals(reel_id: str) -> List[Dict[str, Any]]:
+	if not reel_id:
+		return []
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_REEL_VISUALS_TABLE)
+		.select("*")
+		.eq("reel_id", reel_id)
+		.order("start_time", desc=False)
+		.execute()
+	)
+	return response.data or []
+
+
+async def get_reel_visual(visual_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+	if not visual_id:
+		return None
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_REEL_VISUALS_TABLE)
+		.select("*")
+		.eq("id", visual_id)
+		.eq("user_id", user_id)
+		.limit(1)
+		.execute()
+	)
+	rows = response.data or []
+	return rows[0] if rows else None
+
+
+async def update_reel_visual(visual_id: str, user_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+	if not visual_id or not updates:
+		return None
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_REEL_VISUALS_TABLE)
+		.update(dict(updates))
+		.eq("id", visual_id)
+		.eq("user_id", user_id)
+		.execute()
+	)
+	rows = response.data or []
+	return rows[0] if rows else None
+
+
+async def delete_reel_visual(visual_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+	"""Deletes the row and returns it (so the caller can clean up its
+	S3 image) -- or None if it didn't exist / wasn't owned by user_id."""
+	if not visual_id:
+		return None
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_REEL_VISUALS_TABLE)
+		.delete()
+		.eq("id", visual_id)
+		.eq("user_id", user_id)
+		.execute()
+	)
+	rows = response.data or []
+	return rows[0] if rows else None
+
+
+# --------------------------------------------------------------------------
 # Projects
 # --------------------------------------------------------------------------
 async def create_project(

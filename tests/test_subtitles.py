@@ -183,6 +183,94 @@ def test_burn_subtitles_falls_back_to_vertical_resolution_when_probe_fails(monke
     assert "PlayResY: 1920" in captured["ass_content"]
 
 
+def test_burn_subtitles_repositions_dialogue_overlapping_bottom_visual(monkeypatch, tmp_path):
+    # "Hello world" (1.0-2.0s) overlaps a BOTTOM visual's window
+    # (0.5-2.5s) and must get the \an2\pos override so it stays over the
+    # video instead of the image; "Again" (2.5-3.0s) starts exactly when
+    # the window ends and must be untouched.
+    srt_path = _write_sample_srt(tmp_path)
+    captured = {}
+
+    def fake_run(cmd, stdout=None, stderr=None, **kwargs):
+        ass_path = cmd[5].split("subtitles='")[1].split("'")[0]
+        captured["ass_content"] = Path(ass_path).read_text(encoding="utf-8")
+        class _Result:
+            returncode = 0
+            stderr = b""
+        return _Result()
+
+    monkeypatch.setattr(subtitles, "_normalize_subtitle_text_case", lambda *args, **kwargs: None)
+    monkeypatch.setattr(subtitles.subprocess, "run", fake_run)
+    monkeypatch.setattr(subtitles, "_probe_video_resolution", lambda _path: (1080, 1920))
+
+    subtitles.burn_subtitles(
+        "in.mp4", srt_path, "out.mp4",
+        visual_windows=[{"position": "BOTTOM", "start": 0.5, "end": 2.5}],
+    )
+
+    ass_content = captured["ass_content"]
+    hello_line = next(line for line in ass_content.splitlines() if "Hello world" in line)
+    again_line = next(line for line in ass_content.splitlines() if "Again" in line)
+    assert "\\an2\\pos(540,1223)" in hello_line  # 1920*0.65 - 25 = 1223
+    assert "\\pos" not in again_line
+
+
+def test_burn_subtitles_does_not_reposition_for_top_visual(monkeypatch, tmp_path):
+    srt_path = _write_sample_srt(tmp_path)
+    captured = {}
+
+    def fake_run(cmd, stdout=None, stderr=None, **kwargs):
+        ass_path = cmd[5].split("subtitles='")[1].split("'")[0]
+        captured["ass_content"] = Path(ass_path).read_text(encoding="utf-8")
+        class _Result:
+            returncode = 0
+            stderr = b""
+        return _Result()
+
+    monkeypatch.setattr(subtitles, "_normalize_subtitle_text_case", lambda *args, **kwargs: None)
+    monkeypatch.setattr(subtitles.subprocess, "run", fake_run)
+    monkeypatch.setattr(subtitles, "_probe_video_resolution", lambda _path: (1080, 1920))
+
+    subtitles.burn_subtitles(
+        "in.mp4", srt_path, "out.mp4",
+        visual_windows=[{"position": "TOP", "start": 0.5, "end": 2.5}],
+    )
+
+    assert "\\pos" not in captured["ass_content"]
+
+
+def test_burn_subtitles_with_no_visual_windows_is_unaffected(monkeypatch, tmp_path):
+    srt_path = _write_sample_srt(tmp_path)
+    captured = {}
+
+    def fake_run(cmd, stdout=None, stderr=None, **kwargs):
+        ass_path = cmd[5].split("subtitles='")[1].split("'")[0]
+        captured["ass_content"] = Path(ass_path).read_text(encoding="utf-8")
+        class _Result:
+            returncode = 0
+            stderr = b""
+        return _Result()
+
+    monkeypatch.setattr(subtitles, "_normalize_subtitle_text_case", lambda *args, **kwargs: None)
+    monkeypatch.setattr(subtitles.subprocess, "run", fake_run)
+    monkeypatch.setattr(subtitles, "_probe_video_resolution", lambda _path: (1080, 1920))
+
+    subtitles.burn_subtitles("in.mp4", srt_path, "out.mp4")
+
+    assert "\\pos" not in captured["ass_content"]
+
+
+def test_dialogue_overlaps_bottom_split_visual_edge_cases():
+    # Exactly touching boundaries (no overlap) must not trigger.
+    assert subtitles._dialogue_overlaps_bottom_split_visual(2.5, 3.0, [{"position": "BOTTOM", "start": 0.5, "end": 2.5}]) is False
+    # Genuine overlap.
+    assert subtitles._dialogue_overlaps_bottom_split_visual(1.0, 2.0, [{"position": "BOTTOM", "start": 0.5, "end": 2.5}]) is True
+    # TOP visuals never trigger the override.
+    assert subtitles._dialogue_overlaps_bottom_split_visual(1.0, 2.0, [{"position": "TOP", "start": 0.5, "end": 2.5}]) is False
+    # No windows at all.
+    assert subtitles._dialogue_overlaps_bottom_split_visual(1.0, 2.0, None) is False
+
+
 def test_parse_srt_blocks_extracts_times_and_text(tmp_path):
     srt_path = _write_sample_srt(tmp_path)
     blocks = subtitles._parse_srt_blocks(srt_path)

@@ -515,6 +515,103 @@ def test_soft_delete_reel_returns_bool(monkeypatch):
     assert result is True
 
 
+# --------------------------------------------------------------------------
+# Reel visuals
+# --------------------------------------------------------------------------
+
+def test_insert_reel_visual_builds_payload(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_REEL_VISUALS_TABLE: [_FakeResponse(data=[{"id": "v1"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(
+        supabase_request.insert_reel_visual("reel-1", "u1", "TOP", 12.5, 5.0, "reels/u1/job1/visual_0_v1.jpg")
+    )
+    assert result["id"] == "v1"
+    insert_args = _event_args(fake_client.events, supabase_request.SUPABASE_REEL_VISUALS_TABLE, "insert")
+    payload = insert_args[0]
+    assert payload["reel_id"] == "reel-1"
+    assert payload["position"] == "TOP"
+    assert payload["start_time"] == 12.5
+    assert payload["duration"] == 5.0
+
+
+def test_list_reel_visuals_orders_by_start_time(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    rows = [{"id": "v1", "start_time": 1.0}, {"id": "v2", "start_time": 5.0}]
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_REEL_VISUALS_TABLE: [_FakeResponse(data=rows)]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.list_reel_visuals("reel-1"))
+    assert result == rows
+    assert _event_args(fake_client.events, supabase_request.SUPABASE_REEL_VISUALS_TABLE, "order") == ("start_time",)
+
+
+def test_list_reel_visuals_empty_reel_id(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    assert asyncio.run(supabase_request.list_reel_visuals("")) == []
+
+
+def test_get_reel_visual_scoped_to_owner(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_REEL_VISUALS_TABLE: [_FakeResponse(data=[{"id": "v1"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.get_reel_visual("v1", "u1"))
+    assert result["id"] == "v1"
+
+
+def test_get_reel_visual_returns_none_when_missing(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_REEL_VISUALS_TABLE: [_FakeResponse(data=[])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+    assert asyncio.run(supabase_request.get_reel_visual("v1", "u1")) is None
+
+
+def test_update_reel_visual_builds_payload(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_REEL_VISUALS_TABLE: [_FakeResponse(data=[{"id": "v1", "start_time": 20.0}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.update_reel_visual("v1", "u1", {"start_time": 20.0}))
+    assert result["start_time"] == 20.0
+
+
+def test_update_reel_visual_noop_for_empty_updates(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    assert asyncio.run(supabase_request.update_reel_visual("v1", "u1", {})) is None
+
+
+def test_delete_reel_visual_returns_deleted_row(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_REEL_VISUALS_TABLE: [_FakeResponse(data=[{"id": "v1", "image_s3_key": "k1"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.delete_reel_visual("v1", "u1"))
+    assert result["image_s3_key"] == "k1"
+
+
+def test_delete_reel_visual_returns_none_when_not_found(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_REEL_VISUALS_TABLE: [_FakeResponse(data=[])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+    assert asyncio.run(supabase_request.delete_reel_visual("v1", "u1")) is None
+
+
 def test_get_reel_by_job_clip_returns_none_when_not_found(monkeypatch):
     supabase_request = _import_supabase_request_with_stubs(monkeypatch)
     fake_client = _FakeClient(

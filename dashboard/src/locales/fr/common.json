@@ -287,6 +287,7 @@
     "captions": "Captions",
     "subtitles": "Génération des sous-titres",
     "viralhook": "Hooks viraux",
+    "visuals": "Visuels",
     "post": "Publier",
     "titleYoutube": "Titre YouTube",
     "caption": "Caption",
@@ -443,6 +444,45 @@
     "tipText": "Reste court et percutant. Utiliser \"POV:\" ou une question precise fonctionne bien pour la retention.",
     "generating": "Generation...",
     "addHook": "Ajouter le hook"
+  },
+  "visualsModal": {
+    "title": "Visuels (split-screen)",
+    "noPreview": "Aucun aperçu disponible.",
+    "timeline": "Chronologie",
+    "resizeHandle": "Redimensionner",
+    "newVisualDraft": "Nouveau visuel (brouillon)",
+    "editVisual": "Visuel sélectionné",
+    "deselect": "Nouveau visuel",
+    "position": {
+      "label": "Position",
+      "top": "Haut",
+      "bottom": "Bas"
+    },
+    "startTime": "Début (s)",
+    "duration": "Durée (s)",
+    "saving": "Enregistrement...",
+    "delete": "Supprimer",
+    "addVisual": "Ajouter un visuel",
+    "chooseImage": "Choisir une image (JPG, PNG, WebP)",
+    "uploading": "Envoi...",
+    "add": "Ajouter",
+    "hint": "Chaque visuel occupe environ 35% de l'écran (image) pendant sa fenêtre de temps, la vidéo gardant le reste. Les visuels ne peuvent jamais se chevaucher.",
+    "insufficientCredits": "Crédits insuffisants.",
+    "applying": "Application...",
+    "apply": "Appliquer les visuels",
+    "loadFailed": "Impossible de charger les visuels de ce reel.",
+    "genericError": "Une erreur est survenue.",
+    "errors": {
+      "invalid_visual_timing": "Horodatage invalide : le début doit être >= 0 et la durée > 0.",
+      "visual_exceeds_reel_duration": "Ce visuel dépasserait la durée du reel.",
+      "visual_overlap": "Ce visuel chevauche un autre visuel déjà configuré -- les visuels ne peuvent jamais se chevaucher.",
+      "invalid_visual_position": "La position doit être Haut ou Bas.",
+      "invalid_image_format": "Format d'image non supporté (JPG, PNG ou WebP uniquement).",
+      "image_too_large": "Image trop volumineuse.",
+      "visual_not_found": "Ce visuel n'existe plus.",
+      "no_visuals_configured": "Aucun visuel configuré pour ce reel.",
+      "missing_file": "Choisissez une image."
+    }
   },
   "subtitleModal": {
     "title": "Sous-titres auto",

@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { Share2, Camera, Clapperboard, Video, AlertCircle, Loader2, Wand2, Type, SlidersHorizontal, X, RotateCcw, Play } from 'lucide-react';
+import { Share2, Camera, Clapperboard, Video, AlertCircle, Loader2, Wand2, Type, SlidersHorizontal, X, RotateCcw, Play, ImagePlus } from 'lucide-react';
 import { fetchAppConfig, getApiUrl, getDefaultHideSocialPlatforms } from '../config';
 import CaptionsModal from './CaptionsModal';
 import HookModal from './HookModal';
+import VisualsModal from './VisualsModal';
 import SharePostModal from './SharePostModal';
 import { renderInBrowser } from '../lib/renderInBrowser';
 import { inputFilenameFromVideoUrl } from '../lib/clips';
@@ -83,6 +84,10 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
     const [captionsCreditError, setCaptionsCreditError] = useState('');
     const [isHooking, setIsHooking] = useState(false);
     const [showHookModal, setShowHookModal] = useState(false);
+    const [showVisualsModal, setShowVisualsModal] = useState(false);
+    const [isApplyingVisuals, setIsApplyingVisuals] = useState(false);
+    const [visualsCreditBlocked, setVisualsCreditBlocked] = useState(false);
+    const [visualsCreditError, setVisualsCreditError] = useState('');
     const [editError, setEditError] = useState(null);
     const [hideSocialPlatforms, setHideSocialPlatforms] = useState(getDefaultHideSocialPlatforms());
 
@@ -97,7 +102,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
 
 
     // Accumulate Remotion layers across operations
-    const [activeLayers, setActiveLayers] = useState({ subtitles: null, captions: null, hook: null, effects: null });
+    const [activeLayers, setActiveLayers] = useState({ subtitles: null, captions: null, hook: null, effects: null, visuals: null });
     const latestEditableVideoUrl = currentVideoUrl || originalVideoUrl;
     const initialPreviewImageUrl = safeClip.preview_image_url || safeClip.thumbnail_url || safeClip.reel_preview_url || safeClip.reel_thumbnail_url || safeClip.caption_preview_url || safeClip.caption_thumbnail_url || '';
     const [previewImageUrl, setPreviewImageUrl] = useState(initialPreviewImageUrl);
@@ -580,6 +585,70 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
         }
     };
 
+    // Visuals (manual split-screen image overlays) are persisted immediately
+    // by VisualsModal itself (POST/PATCH/DELETE on each add/edit/delete) --
+    // this is only the final "Générer" step, burning every configured
+    // visual into the actual video via /visuals/apply, mirroring exactly
+    // how /api/hook and /api/subtitle already work (configure, then burn).
+    const handleApplyVisuals = async () => {
+        if (!hasAnyEditingCredit) {
+            setEditError(insufficientCreditsMessage());
+            setTimeout(() => setEditError(null), 5000);
+            return;
+        }
+        if (!hasClipContext) {
+            setEditError(t("reels.noActionAvailable", "Actions indisponibles: ce reel est detache de son job original."));
+            setTimeout(() => setEditError(null), 5000);
+            return;
+        }
+        setIsApplyingVisuals(true);
+        setEditError(null);
+        setVisualsCreditBlocked(false);
+        setVisualsCreditError('');
+        try {
+            const effectiveInputUrl = currentVideoUrl?.startsWith('blob:') ? originalVideoUrl : currentVideoUrl;
+            const res = await fetch(getApiUrl(`/api/reels/${jobId}/${clipIndexForApi}/visuals/apply`), {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...getAuthHeaders(user?.id),
+                },
+                body: JSON.stringify({
+                    input_filename: inputFilenameFromVideoUrl(currentVideoUrl),
+                    input_url: effectiveInputUrl,
+                }),
+            });
+
+            if (!res.ok) {
+                const errText = await res.text();
+                if (res.status === 402) {
+                    const creditMsg = parseApiErrorText(errText) || t('visualsModal.insufficientCredits', 'Crédits insuffisants.');
+                    const creditMsgText = typeof creditMsg === 'string' ? creditMsg : (creditMsg?.message || JSON.stringify(creditMsg));
+                    setVisualsCreditBlocked(true);
+                    setVisualsCreditError(creditMsgText);
+                    setEditError(creditMsgText);
+                    setTimeout(() => setEditError(null), 5000);
+                    return;
+                }
+                const errorDetail = parseApiErrorText(errText);
+                setEditError(typeof errorDetail === 'string' ? errorDetail : (errorDetail?.message || JSON.stringify(errorDetail)));
+                setTimeout(() => setEditError(null), 5000);
+                return;
+            }
+            const data = await res.json();
+            if (data.new_video_url) {
+                setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                if (videoRef.current) videoRef.current.load();
+                setShowVisualsModal(false);
+            }
+        } catch (e) {
+            setEditError(e.message);
+            setTimeout(() => setEditError(null), 5000);
+        } finally {
+            setIsApplyingVisuals(false);
+        }
+    };
+
     const handleResetStyles = async () => {
         if (!hasClipContext || !jobId) {
             setEditError(t("reels.noActionAvailable", "Actions indisponibles: ce reel est detache de son job original."));
@@ -607,7 +676,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
                 setCurrentVideoUrl(getApiUrl(data.video_url));
                 if (videoRef.current) videoRef.current.load();
             }
-            setActiveLayers({ subtitles: null, captions: null, hook: null, effects: null });
+            setActiveLayers({ subtitles: null, captions: null, hook: null, effects: null, visuals: null });
         } catch (e) {
             setEditError(e.message);
             setTimeout(() => setEditError(null), 5000);
@@ -720,6 +789,16 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
             >
                 {isCaptioning ? <Loader2 size={14} className="animate-spin" /> : <Type size={14} />}
                 {!compactActions ? captionsLabel : null}
+            </button>
+
+            <button
+                onClick={() => setShowVisualsModal(true)}
+                disabled={isApplyingVisuals || !hasClipContext || !hasAnyEditingCredit}
+                title={t('common.visuals', 'Visuels')}
+                className={`col-span-1 py-2 bg-gradient-to-r from-cyan-600 to-sky-600 hover:from-cyan-500 hover:to-sky-500 text-white rounded-lg text-xs font-bold shadow-lg shadow-cyan-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2 mb-1 truncate px-1 ${compactActions ? 'min-h-[40px] flex-1' : ''}`}
+            >
+                {isApplyingVisuals ? <Loader2 size={14} className="animate-spin" /> : <ImagePlus size={14} />}
+                {!compactActions ? (isApplyingVisuals ? t("common.adding", "Adding...") : t('common.visuals', 'Visuels')) : null}
             </button>
 
             <button
@@ -878,7 +957,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
                 {/* Actions Footer -- in compact mode these render as a floating
                     icon overlay on the preview instead (see group/video above) */}
                 {!compactActions ? (
-                    <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mt-auto pt-4 border-t border-slate-200 dark:border-white/5">
+                    <div className="grid grid-cols-2 md:grid-cols-6 gap-3 mt-auto pt-4 border-t border-slate-200 dark:border-white/5">
                         {actionButtons}
                     </div>
                 ) : null}
@@ -983,6 +1062,23 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
                 initialText={safeClip.viral_hook_text}
                 durationInSeconds={Math.max(1, clipEnd - clipStart)}
                 existingSubtitles={resolveTextLayer(activeLayers)}
+            />
+
+            <VisualsModal
+                isOpen={showVisualsModal}
+                onClose={() => setShowVisualsModal(false)}
+                jobId={jobId}
+                clipIndex={clipIndexForApi}
+                videoUrl={latestEditableVideoUrl}
+                durationInSeconds={Math.max(1, clipEnd - clipStart)}
+                existingSubtitles={resolveTextLayer(activeLayers)}
+                existingHook={activeLayers.hook}
+                existingEffects={activeLayers.effects}
+                onVisualsChange={(visuals) => setActiveLayers((prev) => ({ ...prev, visuals }))}
+                onApply={handleApplyVisuals}
+                isApplying={isApplyingVisuals}
+                creditBlocked={visualsCreditBlocked}
+                creditError={visualsCreditError}
             />
 
             {showVideoPreviewModal && currentVideoUrl ? (

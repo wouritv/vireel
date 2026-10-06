@@ -287,6 +287,7 @@
     "captions": "Captions",
     "subtitles": "Subtitles generation",
     "viralhook": "Viral hooks",
+    "visuals": "Visuals",
     "post": "Post",
     "titleYoutube": "YouTube Title",
     "caption": "Caption",
@@ -442,6 +443,45 @@
     "tipText": "Keep it short and punchy. Using \"POV:\" or specific questions works best for retention.",
     "generating": "Generating...",
     "addHook": "Add Hook"
+  },
+  "visualsModal": {
+    "title": "Visuals (split-screen)",
+    "noPreview": "No preview available.",
+    "timeline": "Timeline",
+    "resizeHandle": "Resize",
+    "newVisualDraft": "New visual (draft)",
+    "editVisual": "Selected visual",
+    "deselect": "New visual",
+    "position": {
+      "label": "Position",
+      "top": "Top",
+      "bottom": "Bottom"
+    },
+    "startTime": "Start (s)",
+    "duration": "Duration (s)",
+    "saving": "Saving...",
+    "delete": "Delete",
+    "addVisual": "Add a visual",
+    "chooseImage": "Choose an image (JPG, PNG, WebP)",
+    "uploading": "Uploading...",
+    "add": "Add",
+    "hint": "Each visual takes up about 35% of the screen (image) during its time window, the video keeping the rest. Visuals can never overlap.",
+    "insufficientCredits": "Insufficient credits.",
+    "applying": "Applying...",
+    "apply": "Apply visuals",
+    "loadFailed": "Unable to load this clip's visuals.",
+    "genericError": "Something went wrong.",
+    "errors": {
+      "invalid_visual_timing": "Invalid timing: start time must be >= 0 and duration > 0.",
+      "visual_exceeds_reel_duration": "This visual would run past the reel's duration.",
+      "visual_overlap": "This visual's time window overlaps another one -- visuals can never overlap.",
+      "invalid_visual_position": "Position must be Top or Bottom.",
+      "invalid_image_format": "Unsupported image format (JPG, PNG or WebP only).",
+      "image_too_large": "Image is too large.",
+      "visual_not_found": "This visual no longer exists.",
+      "no_visuals_configured": "No visuals are configured for this reel.",
+      "missing_file": "Please choose an image."
+    }
   },
   "subtitleModal": {
     "title": "Auto Subtitles",

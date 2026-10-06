@@ -17,6 +17,7 @@ import re
 import ipaddress
 import socket
 import sys
+import types
 from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -59,6 +60,11 @@ from supabase_request import (
 	get_reel_by_job_clip as supabase_get_reel_by_job_clip,
 	update_reel_media_by_job_clip as supabase_update_reel_media_by_job_clip,
 	soft_delete_reel as supabase_soft_delete_reel,
+	insert_reel_visual as supabase_insert_reel_visual,
+	list_reel_visuals as supabase_list_reel_visuals,
+	get_reel_visual as supabase_get_reel_visual,
+	update_reel_visual as supabase_update_reel_visual,
+	delete_reel_visual as supabase_delete_reel_visual,
 	insert_captions as supabase_insert_captions,
 	list_captions as supabase_list_captions,
 	get_caption as supabase_get_caption,
@@ -5148,6 +5154,7 @@ async def get_status(job_id: str, user_id: Annotated[str, Depends(get_user_id_he
 from editor import VideoEditor
 from subtitles import generate_srt, generate_highlighted_srt, burn_subtitles, generate_srt_from_video, SubtitleStyleOptions
 from hooks import add_hook_to_video
+from visuals import apply_visuals_to_video
 from thumbnail import analyze_video_for_titles, refine_titles, generate_thumbnail, generate_youtube_description
 
 class EditRequest(BaseModel):
@@ -6453,7 +6460,36 @@ async def _generate_subtitle_srt(input_path: str, filename: str, transcript: Dic
     )
 
 
-def _burn_subtitles_for_request(req: SubtitleRequest, input_path: str, srt_path: str, output_path: str) -> None:
+async def _reel_visual_windows_for_job_clip(job_id: str, clip_index: int, user_id: str) -> List[Dict[str, Any]]:
+    """The reel's currently-configured manual visuals (see the "Reel
+    visuals" section above), as the [{"position","start","end"}, ...]
+    shape burn_subtitles expects -- so a subtitle burned in AFTER visuals
+    are applied repositions lines away from the image (spec section 9).
+    Best-effort: returns [] on anything short of a clean lookup, since a
+    missing reel row must never block subtitle burning."""
+    if not is_supabase_configured():
+        return []
+    try:
+        reel = await supabase_get_reel_by_job_clip(job_id, clip_index, user_id=user_id)
+        if not reel:
+            return []
+        rows = await supabase_list_reel_visuals(str(reel["id"]))
+    except Exception:
+        return []
+    return [
+        {
+            "position": row.get("position"),
+            "start": float(row.get("start_time") or 0),
+            "end": float(row.get("start_time") or 0) + float(row.get("duration") or 0),
+        }
+        for row in rows
+    ]
+
+
+def _burn_subtitles_for_request(
+    req: SubtitleRequest, input_path: str, srt_path: str, output_path: str,
+    visual_windows: Optional[List[Dict[str, Any]]] = None,
+) -> None:
     style_options = SubtitleStyleOptions(
         font_name=req.font_name,
         font_color=req.font_color,
@@ -6477,6 +6513,7 @@ def _burn_subtitles_for_request(req: SubtitleRequest, input_path: str, srt_path:
         alignment=req.position,
         fontsize=req.font_size,
         style_options=style_options,
+        visual_windows=visual_windows,
     )
 
 
@@ -6637,8 +6674,10 @@ async def add_subtitles(req: SubtitleRequest, user_id: Annotated[str, Depends(ge
         if not success:
             raise HTTPException(status_code=400, detail="No words found for this clip range.")
 
+        visual_windows = await _reel_visual_windows_for_job_clip(req.job_id, req.clip_index, user_id)
+
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _burn_subtitles_for_request, req, input_path, srt_path, output_path)
+        await loop.run_in_executor(None, _burn_subtitles_for_request, req, input_path, srt_path, output_path, visual_windows)
 
     except HTTPException:
         raise
@@ -7242,6 +7281,347 @@ async def add_hook(req: HookRequest, user_id: Annotated[str, Depends(get_user_id
         "success": True,
         "new_video_url": new_video_url,
     }
+
+
+# ---------------------------------------------------------------------------
+# Reel visuals (manual image split-screen overlays -- see visuals.py).
+# Entirely manual: no AI is ever involved in choosing the image, its
+# position, or its timing -- the user controls every one of those.
+# ---------------------------------------------------------------------------
+
+_REEL_VISUAL_ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
+_REEL_VISUAL_ALLOWED_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+REEL_VISUAL_MAX_IMAGE_BYTES = int(os.environ.get("REEL_VISUAL_MAX_IMAGE_BYTES", str(8 * 1024 * 1024)))
+_REEL_VISUAL_POSITIONS = {"TOP", "BOTTOM"}
+
+
+def _validate_reel_visual_image_upload(file: Optional[UploadFile]) -> None:
+    if not file:
+        raise HTTPException(status_code=400, detail="Missing image file")
+    content_type = str(file.content_type or "").lower()
+    if content_type and content_type not in _REEL_VISUAL_ALLOWED_CONTENT_TYPES:
+        raise _coded_error(400, "invalid_image_format", "Only JPG, PNG and WebP images are supported")
+
+
+async def _save_reel_visual_image_upload(file: UploadFile, local_path: str) -> None:
+    async with aiofiles.open(local_path, "wb") as buffer:
+        total = 0
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > REEL_VISUAL_MAX_IMAGE_BYTES:
+                raise _coded_error(
+                    400, "image_too_large",
+                    f"Image is too large (max {REEL_VISUAL_MAX_IMAGE_BYTES // (1024 * 1024)} MB)",
+                )
+            await buffer.write(chunk)
+
+
+def _validate_reel_visual_timing(
+    start_time: float, duration: float, reel_duration_seconds: float,
+    existing_visuals: List[Dict[str, Any]], exclude_visual_id: Optional[str] = None,
+) -> float:
+    """Validates one visual's timing against the spec's hard rules
+    (section 10: startTime >= 0, duration > 0, startTime+duration <=
+    reel duration, no overlap with another visual on the same reel) and
+    returns its end_time. Raises a _coded_error on any violation.
+
+    Overlap check is a plain pairwise compare against `existing_visuals`
+    (not the sort+merge idiom used elsewhere in this codebase for an
+    unsorted incoming batch -- see _merge_overlapping_bad_take_candidates)
+    because `existing_visuals` is already known non-overlapping (enforced
+    by this same function at creation time), so only the ONE new/edited
+    interval needs checking against that already-valid set."""
+    if start_time < 0:
+        raise _coded_error(400, "invalid_visual_timing", "startTime must be >= 0")
+    if duration <= 0:
+        raise _coded_error(400, "invalid_visual_timing", "duration must be > 0")
+    end_time = start_time + duration
+    if reel_duration_seconds and end_time > reel_duration_seconds + 0.01:
+        raise _coded_error(
+            400, "visual_exceeds_reel_duration",
+            f"This visual would run until {end_time:.1f}s, past the reel's {reel_duration_seconds:.1f}s duration",
+        )
+
+    for existing in existing_visuals:
+        if exclude_visual_id and str(existing.get("id")) == str(exclude_visual_id):
+            continue
+        other_start = float(existing.get("start_time") or 0)
+        other_end = other_start + float(existing.get("duration") or 0)
+        if start_time < other_end and other_start < end_time:
+            raise _coded_error(
+                409, "visual_overlap",
+                "This visual's time window overlaps an existing visual -- visuals can never overlap",
+            )
+
+    return end_time
+
+
+async def _resolve_reel_for_visuals(job_id: str, clip_index: int, user_id: str) -> Dict[str, Any]:
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+    reel = await supabase_get_reel_by_job_clip(job_id, clip_index, user_id=user_id)
+    if not reel:
+        raise HTTPException(status_code=404, detail=_CLIP_NOT_FOUND)
+    return reel
+
+
+def _reel_visual_image_url(image_s3_key: str) -> str:
+    if not image_s3_key:
+        return ""
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket:
+        return ""
+    return generate_presigned_url(bucket, image_s3_key, expiration=7200) or ""
+
+
+def _normalize_reel_visual_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        **row,
+        "image_url": _reel_visual_image_url(row.get("image_s3_key") or ""),
+        "end_time": float(row.get("start_time") or 0) + float(row.get("duration") or 0),
+    }
+
+
+@app.get("/api/reels/{job_id}/{clip_index}/visuals", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def list_reel_visuals_endpoint(job_id: str, clip_index: int, user_id: Annotated[str, Depends(get_user_id_header)]):
+    reel = await _resolve_reel_for_visuals(job_id, clip_index, user_id)
+    rows = await supabase_list_reel_visuals(str(reel["id"]))
+    return {"items": [_normalize_reel_visual_row(row) for row in rows]}
+
+
+@app.post("/api/reels/{job_id}/{clip_index}/visuals", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 503: {"description": "Service Unavailable"}})
+async def create_reel_visual(
+    job_id: str, clip_index: int, user_id: Annotated[str, Depends(get_user_id_header)],
+    file: Annotated[UploadFile, File()],
+    position: Annotated[str, Form()],
+    start_time: Annotated[float, Form()],
+    duration: Annotated[float, Form()],
+):
+    """Adds one manual visual to a reel: uploads the image to S3 (the
+    same mechanism every other upload in this app uses, see
+    s3_uploader.py) and creates its reel_visuals row. Entirely manual --
+    the caller supplies the image, position and timing; nothing here
+    infers any of it."""
+    reel = await _resolve_reel_for_visuals(job_id, clip_index, user_id)
+
+    position = str(position or "").upper()
+    if position not in _REEL_VISUAL_POSITIONS:
+        raise _coded_error(400, "invalid_visual_position", "position must be TOP or BOTTOM")
+
+    _validate_reel_visual_image_upload(file)
+
+    reel_duration = float(reel.get("reel_duration") or 0)
+    existing = await supabase_list_reel_visuals(str(reel["id"]))
+    _validate_reel_visual_timing(float(start_time), float(duration), reel_duration, existing)
+
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket:
+        raise HTTPException(status_code=503, detail="AWS_S3_BUCKET is required for image uploads")
+
+    safe_name = _sanitize_input_filename(file.filename) or "visual.jpg"
+    ext = os.path.splitext(safe_name)[1].lower()
+    if ext not in _REEL_VISUAL_ALLOWED_EXTENSIONS:
+        ext = ".jpg"
+
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    visual_id = uuid.uuid4().hex
+    local_path = os.path.join(UPLOAD_DIR, f"reel_visual_{visual_id}{ext}")
+    try:
+        await _save_reel_visual_image_upload(file, local_path)
+        s3_key = f"reels/{user_id}/{job_id}/visual_{clip_index}_{visual_id}{ext}"
+        if not upload_file_to_s3(local_path, bucket, s3_key):
+            raise HTTPException(status_code=503, detail="Failed to upload image")
+    finally:
+        try:
+            if os.path.exists(local_path):
+                os.remove(local_path)
+        except Exception:
+            pass
+
+    row = await supabase_insert_reel_visual(
+        str(reel["id"]), user_id, position, float(start_time), float(duration), s3_key,
+    )
+    return _normalize_reel_visual_row(row)
+
+
+class UpdateReelVisualRequest(BaseModel):
+    position: Optional[str] = None
+    start_time: Optional[float] = None
+    duration: Optional[float] = None
+
+
+@app.patch("/api/reels/{job_id}/{clip_index}/visuals/{visual_id}", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 503: {"description": "Service Unavailable"}})
+async def update_reel_visual_endpoint(
+    job_id: str, clip_index: int, visual_id: str, payload: UpdateReelVisualRequest,
+    user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Updates a visual's position and/or timing -- never its image (swap
+    the image by deleting and re-adding the visual instead)."""
+    reel = await _resolve_reel_for_visuals(job_id, clip_index, user_id)
+    existing_visual = await supabase_get_reel_visual(visual_id, user_id)
+    if not existing_visual or str(existing_visual.get("reel_id")) != str(reel["id"]):
+        raise _coded_error(404, "visual_not_found", "Visual not found")
+
+    updates: Dict[str, Any] = {}
+    if payload.position is not None:
+        position = str(payload.position).upper()
+        if position not in _REEL_VISUAL_POSITIONS:
+            raise _coded_error(400, "invalid_visual_position", "position must be TOP or BOTTOM")
+        updates["position"] = position
+
+    if payload.start_time is not None or payload.duration is not None:
+        start_time = payload.start_time if payload.start_time is not None else float(existing_visual.get("start_time") or 0)
+        duration = payload.duration if payload.duration is not None else float(existing_visual.get("duration") or 0)
+        reel_duration = float(reel.get("reel_duration") or 0)
+        other_visuals = await supabase_list_reel_visuals(str(reel["id"]))
+        _validate_reel_visual_timing(float(start_time), float(duration), reel_duration, other_visuals, exclude_visual_id=visual_id)
+        updates["start_time"] = float(start_time)
+        updates["duration"] = float(duration)
+
+    if not updates:
+        return _normalize_reel_visual_row(existing_visual)
+
+    row = await supabase_update_reel_visual(visual_id, user_id, updates)
+    if not row:
+        raise _coded_error(404, "visual_not_found", "Visual not found")
+    return _normalize_reel_visual_row(row)
+
+
+@app.delete("/api/reels/{job_id}/{clip_index}/visuals/{visual_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def delete_reel_visual_endpoint(
+    job_id: str, clip_index: int, visual_id: str, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    reel = await _resolve_reel_for_visuals(job_id, clip_index, user_id)
+    existing_visual = await supabase_get_reel_visual(visual_id, user_id)
+    if not existing_visual or str(existing_visual.get("reel_id")) != str(reel["id"]):
+        raise _coded_error(404, "visual_not_found", "Visual not found")
+
+    deleted = await supabase_delete_reel_visual(visual_id, user_id)
+    if not deleted:
+        raise _coded_error(404, "visual_not_found", "Visual not found")
+
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    image_s3_key = deleted.get("image_s3_key")
+    if bucket and image_s3_key:
+        try:
+            delete_s3_object(bucket, image_s3_key)
+        except Exception:
+            logger.warning("Failed to delete reel visual image %s from S3", image_s3_key, exc_info=True)
+
+    return {"deleted": True}
+
+
+class ApplyReelVisualsRequest(BaseModel):
+    input_filename: Optional[str] = None
+    input_url: Optional[str] = None
+
+
+@app.post("/api/reels/{job_id}/{clip_index}/visuals/apply", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
+async def apply_reel_visuals(
+    job_id: str, clip_index: int, payload: ApplyReelVisualsRequest,
+    user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Burns every currently-configured visual for this clip into its
+    current video (see visuals.py) -- the explicit, deliberate "Générer"
+    step after the user has finished previewing their visuals, matching
+    how /api/hook and /api/subtitle already work (configure in a modal,
+    then burn via a separate call)."""
+    await _require_job_ownership(job_id, user_id)
+    reel = await _resolve_reel_for_visuals(job_id, clip_index, user_id)
+
+    rows = await supabase_list_reel_visuals(str(reel["id"]))
+    if not rows:
+        raise _coded_error(400, "no_visuals_configured", "No visuals are configured for this reel")
+
+    job = jobs.get(job_id)
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    metadata_path, data = await _get_or_build_job_metadata(job_id, clip_index, payload.input_url)
+    if not metadata_path or not data:
+        raise HTTPException(status_code=404, detail=_METADATA_NOT_FOUND)
+
+    clips = data.get('shorts', [])
+    if clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail=_CLIP_NOT_FOUND)
+    clip_data = clips[clip_index]
+
+    # _resolve_add_subtitles_input_path only reads .job_id/.clip_index/
+    # .input_filename/.input_url off its `req` argument -- it's already
+    # the shared resolver /api/hook uses too, despite the name.
+    resolve_req = types.SimpleNamespace(
+        job_id=job_id, clip_index=clip_index,
+        input_filename=payload.input_filename, input_url=payload.input_url,
+    )
+    input_path, filename = _resolve_add_subtitles_input_path(resolve_req, output_dir, clip_data, metadata_path)
+
+    input_size_bytes = float(os.path.getsize(input_path) if os.path.exists(input_path) else 0)
+    input_duration_seconds = _probe_local_video_duration_seconds(input_path)
+    visuals_required_credits = _estimate_reel_required_credits(
+        duration_seconds=input_duration_seconds,
+        size_bytes=input_size_bytes,
+        uses_youtube_source=False,
+        uses_openai=False,
+        uses_assembly=False,
+        uses_gemini=False,
+    )
+    await _assert_user_has_required_credits(user_id, visuals_required_credits)
+
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    local_image_paths: List[str] = []
+    try:
+        burn_visuals = []
+        for row in rows:
+            image_s3_key = row.get("image_s3_key")
+            ext = os.path.splitext(image_s3_key or "")[1] or ".jpg"
+            local_image_path = os.path.join(output_dir, f"visual_src_{row['id']}{ext}")
+            if not bucket or not image_s3_key or not download_s3_object(bucket, image_s3_key, local_image_path):
+                raise HTTPException(status_code=503, detail="Failed to download a visual's image")
+            local_image_paths.append(local_image_path)
+            burn_visuals.append({
+                "image_path": local_image_path,
+                "position": row.get("position"),
+                "start_time": float(row.get("start_time") or 0),
+                "duration": float(row.get("duration") or 0),
+            })
+
+        output_filename = f"visuals_{filename}"
+        output_path = os.path.join(output_dir, output_filename)
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, apply_visuals_to_video, input_path, burn_visuals, output_path)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _generic_error("Visuals Error", e)
+    finally:
+        for path in local_image_paths:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+    new_video_url = f"/videos/{job_id}/{output_filename}"
+    _persist_new_video_url_to_clip(job, clip_index, clips, data, metadata_path, new_video_url, "visuals")
+
+    if is_supabase_configured() and visuals_required_credits > 0:
+        await supabase_deduct_user_credits(user_id, visuals_required_credits)
+        await supabase_insert_user_data_history(
+            user_id=user_id,
+            credit=visuals_required_credits,
+            storage=0.0,
+            operation="output",
+            operation_type="reel_visuals",
+            operation_id=f"{job_id}:visuals:{clip_index}",
+        )
+
+    return {
+        "success": True,
+        "new_video_url": new_video_url,
+    }
+
 
 # --- Translation (subtitles-only, keep original voice) ---
 
@@ -13781,6 +14161,19 @@ async def _delete_project_reels_s3_files(project_id: str, bucket_name: str) -> i
             reel_thumbnail_url = reel.get("reel_thumbnail_url") or reel.get("reel_thumbnail_s3_key")
             if reel_thumbnail_url and reel_thumbnail_url.startswith("reels/"):
                 freed += _delete_s3_and_get_freed_bytes(bucket_name, reel_thumbnail_url, "reel thumbnail S3 file")
+
+            # reel_visuals rows cascade-delete at the DB level (FK ON DELETE
+            # CASCADE) once the reel row itself is deleted below in the
+            # caller, but that would leave their S3 images orphaned --
+            # clean those up here too, same as every other reel asset.
+            try:
+                visuals = await supabase_list_reel_visuals(str(reel.get("id") or ""))
+                for visual in visuals:
+                    image_s3_key = visual.get("image_s3_key")
+                    if image_s3_key:
+                        freed += _delete_s3_and_get_freed_bytes(bucket_name, image_s3_key, "reel visual image S3 file")
+            except Exception as e:
+                logger.warning(f"Failed to retrieve or delete visuals for reel {reel.get('id')}: {str(e)}")
     except Exception as e:
         logger.warning(f"Failed to retrieve or delete reels for project {project_id}: {str(e)}")
     return freed

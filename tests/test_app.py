@@ -7450,6 +7450,424 @@ def test_upload_social_post_media_rejects_oversized_image(monkeypatch, tmp_path)
     assert "too large" in str(exc.value.detail).lower()
 
 
+# ---------------------------------------------------------------------------
+# Reel visuals (manual image split-screen overlays)
+# ---------------------------------------------------------------------------
+
+def test_validate_reel_visual_timing_rejects_negative_start(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    with pytest.raises(app.HTTPException) as exc:
+        app._validate_reel_visual_timing(-1.0, 5.0, 60.0, [])
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "invalid_visual_timing"
+
+
+def test_validate_reel_visual_timing_rejects_zero_or_negative_duration(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    with pytest.raises(app.HTTPException) as exc:
+        app._validate_reel_visual_timing(0.0, 0.0, 60.0, [])
+    assert exc.value.detail["code"] == "invalid_visual_timing"
+
+
+def test_validate_reel_visual_timing_rejects_exceeding_reel_duration(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    with pytest.raises(app.HTTPException) as exc:
+        app._validate_reel_visual_timing(55.0, 10.0, 60.0, [])
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "visual_exceeds_reel_duration"
+
+
+def test_validate_reel_visual_timing_allows_exactly_at_reel_duration(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    # 55 + 5 == 60, exactly at the boundary -- must be allowed.
+    end_time = app._validate_reel_visual_timing(55.0, 5.0, 60.0, [])
+    assert end_time == 60.0
+
+
+def test_validate_reel_visual_timing_rejects_overlap(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    existing = [{"id": "v1", "start_time": 10.0, "duration": 5.0}]  # [10,15)
+    with pytest.raises(app.HTTPException) as exc:
+        app._validate_reel_visual_timing(12.0, 5.0, 60.0, existing)  # [12,17) overlaps
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "visual_overlap"
+
+
+def test_validate_reel_visual_timing_allows_adjacent_non_overlapping(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    existing = [{"id": "v1", "start_time": 10.0, "duration": 5.0}]  # [10,15)
+    # [15,20) starts exactly where the other ends -- not an overlap.
+    end_time = app._validate_reel_visual_timing(15.0, 5.0, 60.0, existing)
+    assert end_time == 20.0
+
+
+def test_validate_reel_visual_timing_excludes_self_when_editing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    existing = [{"id": "v1", "start_time": 10.0, "duration": 5.0}]
+    # Editing v1's own timing must not collide with itself.
+    end_time = app._validate_reel_visual_timing(10.0, 5.0, 60.0, existing, exclude_visual_id="v1")
+    assert end_time == 15.0
+
+
+def test_create_reel_visual_happy_path(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("AWS_S3_BUCKET", "bucket")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1", "reel_duration": 60}))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[]))
+    upload_calls = []
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda path, bucket, key: upload_calls.append((path, bucket, key)) or True)
+    insert_mock = AsyncMock(return_value={"id": "v1", "position": "TOP", "start_time": 5.0, "duration": 3.0, "image_s3_key": "reels/u1/job1/visual_0_v1.jpg"})
+    monkeypatch.setattr(app, "supabase_insert_reel_visual", insert_mock)
+    monkeypatch.setattr(app, "generate_presigned_url", lambda bucket, key, expiration=3600: f"https://s3.example/{key}")
+
+    result = asyncio.run(app.create_reel_visual(
+        "job1", 0, user_id="u1", file=_FakeCommentImageUpload(b"fake-image-bytes"),
+        position="top", start_time=5.0, duration=3.0,
+    ))
+
+    assert result["id"] == "v1"
+    assert result["image_url"] == "https://s3.example/reels/u1/job1/visual_0_v1.jpg"
+    assert result["end_time"] == 8.0
+    insert_mock.assert_awaited_once()
+    insert_args = insert_mock.await_args.args
+    assert insert_args[:5] == ("reel-1", "u1", "TOP", 5.0, 3.0)
+    assert insert_args[5].startswith("reels/u1/job1/visual_0_")
+    assert len(upload_calls) == 1
+    assert upload_calls[0][2].startswith("reels/u1/job1/visual_0_")
+
+
+def test_create_reel_visual_rejects_invalid_position(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1", "reel_duration": 60}))
+
+    coro = app.create_reel_visual(
+        "job1", 0, user_id="u1", file=_FakeCommentImageUpload(b"x"),
+        position="left", start_time=0.0, duration=1.0,
+    )
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "invalid_visual_position"
+
+
+def test_create_reel_visual_rejects_non_image_content_type(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1", "reel_duration": 60}))
+
+    coro = app.create_reel_visual(
+        "job1", 0, user_id="u1", file=_FakeCommentImageUpload(b"x", content_type="text/plain"),
+        position="top", start_time=0.0, duration=1.0,
+    )
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.detail["code"] == "invalid_image_format"
+
+
+def test_create_reel_visual_rejects_overlap_with_existing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1", "reel_duration": 60}))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[
+        {"id": "v1", "start_time": 10.0, "duration": 5.0},
+    ]))
+
+    coro = app.create_reel_visual(
+        "job1", 0, user_id="u1", file=_FakeCommentImageUpload(b"x"),
+        position="top", start_time=12.0, duration=5.0,
+    )
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "visual_overlap"
+
+
+def test_create_reel_visual_requires_bucket_configured(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.delenv("AWS_S3_BUCKET", raising=False)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1", "reel_duration": 60}))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[]))
+
+    coro = app.create_reel_visual(
+        "job1", 0, user_id="u1", file=_FakeCommentImageUpload(b"x"),
+        position="top", start_time=0.0, duration=1.0,
+    )
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 503
+
+
+def test_create_reel_visual_404_when_reel_not_found(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value=None))
+
+    coro = app.create_reel_visual(
+        "job1", 0, user_id="u1", file=_FakeCommentImageUpload(b"x"),
+        position="top", start_time=0.0, duration=1.0,
+    )
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 404
+
+
+def test_list_reel_visuals_endpoint_returns_normalized_items(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setenv("AWS_S3_BUCKET", "bucket")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1"}))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[
+        {"id": "v1", "start_time": 2.0, "duration": 3.0, "image_s3_key": "k1"},
+    ]))
+    monkeypatch.setattr(app, "generate_presigned_url", lambda bucket, key, expiration=3600: f"https://s3.example/{key}")
+
+    result = asyncio.run(app.list_reel_visuals_endpoint("job1", 0, user_id="u1"))
+
+    assert result["items"][0]["end_time"] == 5.0
+    assert result["items"][0]["image_url"] == "https://s3.example/k1"
+
+
+def test_update_reel_visual_endpoint_updates_timing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1", "reel_duration": 60}))
+    monkeypatch.setattr(app, "supabase_get_reel_visual", AsyncMock(return_value={
+        "id": "v1", "reel_id": "reel-1", "position": "TOP", "start_time": 5.0, "duration": 3.0,
+    }))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[
+        {"id": "v1", "start_time": 5.0, "duration": 3.0},
+    ]))
+    update_mock = AsyncMock(return_value={"id": "v1", "position": "TOP", "start_time": 20.0, "duration": 3.0, "image_s3_key": "k1"})
+    monkeypatch.setattr(app, "supabase_update_reel_visual", update_mock)
+
+    result = asyncio.run(app.update_reel_visual_endpoint(
+        "job1", 0, "v1", app.UpdateReelVisualRequest(start_time=20.0), user_id="u1",
+    ))
+
+    assert result["start_time"] == 20.0
+    update_mock.assert_awaited_once()
+    args, kwargs = update_mock.await_args
+    assert args[0] == "v1"
+    assert args[2] == {"start_time": 20.0, "duration": 3.0}
+
+
+def test_update_reel_visual_endpoint_404_for_other_users_visual(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1", "reel_duration": 60}))
+    monkeypatch.setattr(app, "supabase_get_reel_visual", AsyncMock(return_value=None))
+
+    coro = app.update_reel_visual_endpoint("job1", 0, "v1", app.UpdateReelVisualRequest(start_time=1.0), user_id="u1")
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 404
+
+
+def test_update_reel_visual_endpoint_rejects_overlap(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1", "reel_duration": 60}))
+    monkeypatch.setattr(app, "supabase_get_reel_visual", AsyncMock(return_value={
+        "id": "v1", "reel_id": "reel-1", "position": "TOP", "start_time": 0.0, "duration": 3.0,
+    }))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[
+        {"id": "v1", "start_time": 0.0, "duration": 3.0},
+        {"id": "v2", "start_time": 10.0, "duration": 5.0},
+    ]))
+
+    coro = app.update_reel_visual_endpoint("job1", 0, "v1", app.UpdateReelVisualRequest(start_time=12.0), user_id="u1")
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 409
+
+
+def test_delete_reel_visual_endpoint_cleans_up_s3(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setenv("AWS_S3_BUCKET", "bucket")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1"}))
+    monkeypatch.setattr(app, "supabase_get_reel_visual", AsyncMock(return_value={"id": "v1", "reel_id": "reel-1"}))
+    monkeypatch.setattr(app, "supabase_delete_reel_visual", AsyncMock(return_value={"id": "v1", "image_s3_key": "k1"}))
+    delete_calls = []
+    monkeypatch.setattr(app, "delete_s3_object", lambda bucket, key: delete_calls.append((bucket, key)) or True)
+
+    result = asyncio.run(app.delete_reel_visual_endpoint("job1", 0, "v1", user_id="u1"))
+
+    assert result == {"deleted": True}
+    assert delete_calls == [("bucket", "k1")]
+
+
+def test_delete_reel_visual_endpoint_404_when_not_found(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1"}))
+    monkeypatch.setattr(app, "supabase_get_reel_visual", AsyncMock(return_value=None))
+
+    coro = app.delete_reel_visual_endpoint("job1", 0, "v1", user_id="u1")
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 404
+
+
+def test_apply_reel_visuals_rejects_when_none_configured(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_require_job_ownership", AsyncMock())
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1"}))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[]))
+
+    coro = app.apply_reel_visuals("job1", 0, app.ApplyReelVisualsRequest(), user_id="u1")
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "no_visuals_configured"
+
+
+def test_apply_reel_visuals_happy_path(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path / "output"))
+    monkeypatch.setenv("AWS_S3_BUCKET", "bucket")
+    monkeypatch.setattr(app, "_require_job_ownership", AsyncMock())
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1"}))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[
+        {"id": "v1", "position": "TOP", "start_time": 1.0, "duration": 2.0, "image_s3_key": "k1.jpg"},
+    ]))
+    monkeypatch.setattr(app, "jobs", {"job1": {"user_id": "u1"}})
+
+    output_dir = os.path.join(str(tmp_path / "output"), "job1")
+    os.makedirs(output_dir, exist_ok=True)
+    video_path = os.path.join(output_dir, "clip_1.mp4")
+    with open(video_path, "wb") as f:
+        f.write(b"fake video bytes")
+
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    clip_data = {"video_url": "clip_1.mp4", "start": 0, "end": 10}
+    data = {"shorts": [clip_data]}
+    monkeypatch.setattr(app, "_get_or_build_job_metadata", AsyncMock(return_value=(metadata_path, data)))
+    monkeypatch.setattr(app, "_probe_local_video_duration_seconds", lambda path: 10.0)
+    monkeypatch.setattr(app, "_estimate_reel_required_credits", lambda **kwargs: 5.0)
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+
+    def fake_download(bucket, key, local_path):
+        with open(local_path, "wb") as f:
+            f.write(b"fake image bytes")
+        return True
+    monkeypatch.setattr(app, "download_s3_object", fake_download)
+
+    apply_calls = []
+    def fake_apply(video_path, visuals, output_path):
+        apply_calls.append((video_path, visuals, output_path))
+        with open(output_path, "wb") as f:
+            f.write(b"fake output bytes")
+        return True
+    monkeypatch.setattr(app, "apply_visuals_to_video", fake_apply)
+
+    persist_calls = []
+    monkeypatch.setattr(app, "_persist_new_video_url_to_clip", lambda *a, **k: persist_calls.append(a))
+    monkeypatch.setattr(app, "supabase_deduct_user_credits", AsyncMock())
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
+
+    result = asyncio.run(app.apply_reel_visuals("job1", 0, app.ApplyReelVisualsRequest(), user_id="u1"))
+
+    assert result["success"] is True
+    assert result["new_video_url"] == "/videos/job1/visuals_clip_1.mp4"
+    assert len(apply_calls) == 1
+    assert apply_calls[0][1][0]["position"] == "TOP"
+    assert len(persist_calls) == 1
+    # Downloaded visual image temp file is cleaned up afterwards.
+    assert not any(p.startswith("visual_src_") for p in os.listdir(output_dir) if os.path.isfile(os.path.join(output_dir, p)))
+
+
+def test_reel_visual_windows_for_job_clip_returns_shaped_windows(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1"}))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[
+        {"position": "BOTTOM", "start_time": 2.0, "duration": 3.0},
+    ]))
+
+    result = asyncio.run(app._reel_visual_windows_for_job_clip("job1", 0, "u1"))
+
+    assert result == [{"position": "BOTTOM", "start": 2.0, "end": 5.0}]
+
+
+def test_reel_visual_windows_for_job_clip_empty_when_supabase_not_configured(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+    assert asyncio.run(app._reel_visual_windows_for_job_clip("job1", 0, "u1")) == []
+
+
+def test_reel_visual_windows_for_job_clip_empty_when_reel_not_found(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value=None))
+    assert asyncio.run(app._reel_visual_windows_for_job_clip("job1", 0, "u1")) == []
+
+
+def test_reel_visual_windows_for_job_clip_swallows_lookup_errors(monkeypatch):
+    # A lookup failure must never block subtitle burning.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(side_effect=RuntimeError("db down")))
+    assert asyncio.run(app._reel_visual_windows_for_job_clip("job1", 0, "u1")) == []
+
+
+def test_add_subtitles_passes_visual_windows_to_burn(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_require_job_ownership", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "jobs", {})
+    output_dir = str(tmp_path / "job1")
+    os.makedirs(output_dir, exist_ok=True)
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+
+    clip_data = {"video_url": "clip_1.mp4", "start": 0, "end": 10}
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    data = {"shorts": [clip_data], "transcript": {"segments": []}}
+    monkeypatch.setattr(app, "_get_or_build_job_metadata", AsyncMock(return_value=(metadata_path, data)))
+    monkeypatch.setattr(app, "_resolve_subtitle_source_video_history", AsyncMock(return_value=""))
+    monkeypatch.setattr(app, "_resolve_burn_source_input_path", AsyncMock(return_value=("in.mp4", "clip_1.mp4")))
+    monkeypatch.setattr(app, "_generate_subtitle_srt", AsyncMock(return_value=True))
+    monkeypatch.setattr(app, "_reel_visual_windows_for_job_clip", AsyncMock(return_value=[{"position": "BOTTOM", "start": 2.0, "end": 5.0}]))
+    burn_mock = MagicMock()
+    monkeypatch.setattr(app, "_burn_subtitles_for_request", burn_mock)
+    monkeypatch.setattr(app, "_upload_subtitled_video", lambda *a, **k: ("http://x/out.mp4", "k1"))
+    monkeypatch.setattr(app, "_sync_reel_after_subtitle_edit", AsyncMock())
+
+    req = app.SubtitleRequest(job_id="job1", clip_index=0)
+    asyncio.run(app.add_subtitles(req, user_id="u1"))
+
+    burn_mock.assert_called_once()
+    assert burn_mock.call_args.args[4] == [{"position": "BOTTOM", "start": 2.0, "end": 5.0}]
+
+
+def test_delete_project_reels_s3_files_also_cleans_up_visual_images(monkeypatch):
+    # reel_visuals rows cascade-delete at the DB level once the reel row
+    # is deleted, but their S3 images would be orphaned without this.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_reels_by_project", AsyncMock(return_value=[
+        {"id": "reel-1", "reel_s3_key": "reels/u1/job1/clip.mp4", "reel_thumbnail_url": "reels/u1/job1/thumbnail_0.jpg"},
+    ]))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[
+        {"id": "v1", "image_s3_key": "reels/u1/job1/visual_0_v1.jpg"},
+        {"id": "v2", "image_s3_key": "reels/u1/job1/visual_0_v2.jpg"},
+    ]))
+    deleted_keys = []
+    monkeypatch.setattr(app, "get_s3_object_size", lambda bucket, key: 100)
+    monkeypatch.setattr(app, "delete_s3_object", lambda bucket, key: deleted_keys.append(key) or True)
+
+    freed = asyncio.run(app._delete_project_reels_s3_files("proj-1", "bucket"))
+
+    assert freed == 400  # 4 files * 100 bytes each
+    assert "reels/u1/job1/visual_0_v1.jpg" in deleted_keys
+    assert "reels/u1/job1/visual_0_v2.jpg" in deleted_keys
+
+
 def test_post_facebook_comment_requires_object_id(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
 
