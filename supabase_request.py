@@ -921,7 +921,10 @@ SOUSCRIPTION_COLUMNS = (
 	"payment_start_date, payment_end_date, payment_status, payment_comment, "
 	"auto_renew, canceled_at, reactivated_at, paused_at, resumed_at, "
 	"retention_deadline_at, account_disabled_at, stripe_subscription_id, stripe_customer_id, "
-	"billing_interval, plan_credit, plan_stockage, next_credit_allocation_at"
+	"billing_interval, plan_credit, plan_stockage, next_credit_allocation_at, "
+	"credit_cycle_start_at, credit_cycle_end_at, scheduled_abonnement_id, "
+	"scheduled_billing_interval, scheduled_effective_at, scheduled_created_at, "
+	"stripe_schedule_id"
 )
 
 async def list_abonnements() -> List[Dict[str, Any]]:
@@ -991,6 +994,8 @@ async def insert_souscription(
 	plan_credit: Optional[float] = None,
 	plan_stockage: Optional[float] = None,
 	next_credit_allocation_at: Optional[datetime] = None,
+	credit_cycle_start_at: Optional[datetime] = None,
+	credit_cycle_end_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
 	"""Create a subscription row after a confirmed payment.
 
@@ -1003,7 +1008,14 @@ async def insert_souscription(
 
 	plan_credit/plan_stockage snapshot the plan's allowance at the moment
 	of this payment -- see the annual-billing migration's comment on
-	souscription for why this must never be a live lookup."""
+	souscription for why this must never be a live lookup.
+
+	credit_cycle_start_at/credit_cycle_end_at default to this row's own
+	billing period (start_date/end_date) when omitted -- correct for a
+	monthly subscription, where the credit cycle and the billing period
+	are the same thing. A caller allocating resources for an annual
+	subscription's one-month sub-cycle (not the whole paid year) passes
+	these explicitly -- see _allocate_plan_resources in app.py."""
 	client = await get_client()
 	start_date = payment_date or datetime.now(timezone.utc)
 	if start_date.tzinfo is None:
@@ -1017,6 +1029,22 @@ async def insert_souscription(
 	if end_date.tzinfo is None:
 		end_date = end_date.replace(tzinfo=timezone.utc)
 
+	cycle_start = credit_cycle_start_at if credit_cycle_start_at is not None else start_date
+	# An annual row's credit cycle is a one-month sub-window, not the
+	# whole paid year -- default it to +1 month from the cycle start
+	# rather than to end_date (the annual payment_end_date) when the
+	# caller hasn't already resolved it explicitly.
+	if credit_cycle_end_at is not None:
+		cycle_end = credit_cycle_end_at
+	elif billing_interval == "year":
+		cycle_end = add_one_month(cycle_start)
+	else:
+		cycle_end = end_date
+	if cycle_start.tzinfo is None:
+		cycle_start = cycle_start.replace(tzinfo=timezone.utc)
+	if cycle_end.tzinfo is None:
+		cycle_end = cycle_end.replace(tzinfo=timezone.utc)
+
 	payload = {
 		"userid": user_id,
 		"abonnement": abonnement,
@@ -1028,6 +1056,8 @@ async def insert_souscription(
 		"payment_status": payment_status,
 		"payment_comment": payment_comment,
 		"billing_interval": billing_interval,
+		"credit_cycle_start_at": cycle_start.isoformat(),
+		"credit_cycle_end_at": cycle_end.isoformat(),
 	}
 	if stripe_subscription_id:
 		payload["stripe_subscription_id"] = stripe_subscription_id

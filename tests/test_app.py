@@ -5512,6 +5512,30 @@ def test_stripe_webhook_dispatches_subscription_cycle_invoice_to_renewal_handler
     renewal_mock.assert_awaited_once_with(invoice)
 
 
+def test_stripe_webhook_dispatches_subscription_update_invoice_to_renewal_handler(monkeypatch):
+    # A Stripe Subscription Schedule's phase-2 transition (the mechanism
+    # driving a deferred downgrade/periodicity change, see
+    # _create_or_replace_plan_change_schedule) raises its invoice with
+    # billing_reason "subscription_update" rather than "subscription_cycle"
+    # -- this must reach the SAME existing renewal handler unmodified, or
+    # a scheduled change would silently never get applied/credited.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "STRIPE_WEBHOOK_SECRET", "whsec_test")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "stripe", MagicMock())
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    invoice = types.SimpleNamespace(billing_reason="subscription_update")
+    fake_event = types.SimpleNamespace(type="invoice.paid", data=types.SimpleNamespace(object=invoice))
+    monkeypatch.setattr(app, "_verify_and_parse_event", lambda payload, signature: fake_event)
+    renewal_mock = AsyncMock(return_value={"received": True})
+    monkeypatch.setattr(app, "_handle_subscription_renewal_invoice", renewal_mock)
+
+    result = asyncio.run(app.stripe_webhook(_FakeWebhookRequest()))
+
+    assert result == {"received": True}
+    renewal_mock.assert_awaited_once_with(invoice)
+
+
 def test_stripe_webhook_dispatches_payment_failed_invoice(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "STRIPE_WEBHOOK_SECRET", "whsec_test")
@@ -6203,28 +6227,13 @@ def test_handle_subscription_purchase_rewards_referrer_on_first_subscription(mon
 
 def test_change_souscription_plan_never_rewards_referrer(monkeypatch):
     # A plan change (upgrade/downgrade) must never trigger a referral
-    # reward -- only a genuinely first-ever paid subscription does.
+    # reward -- only a genuinely first-ever paid subscription does. Not
+    # even indirectly: change_souscription_plan never references the
+    # referral-reward function at all.
     app = _import_app_with_stubs(monkeypatch)
-    fake_stripe, _ = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
-    fake_stripe.Subscription.retrieve.return_value = _FakeStripeSubscriptionObject(
-        {"items": {"data": [{"id": "si_123"}]}},
-        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
-    )
-    fake_stripe.Subscription.modify.return_value = _FakeStripeObjectNoGet({"current_period_end": 1700000000})
-    fake_stripe.Price.create.return_value = types.SimpleNamespace(id="price_new_1")
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "new-plan", "name": "Premium", "price": 49.99, "max_social_account": 3}))
-    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
-    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
-    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-2"}))
-    monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
-    reward_mock = AsyncMock()
-    monkeypatch.setattr(app, "_maybe_reward_referrer_for_first_subscription", reward_mock)
-
-    asyncio.run(app.change_souscription_plan(
-        payload=app.ChangeSubscriptionPlanRequest(plan_id="new-plan"), user_id="u1",
-    ))
-
-    reward_mock.assert_not_awaited()
+    assert "_maybe_reward_referrer_for_first_subscription" not in app.change_souscription_plan.__code__.co_names
+    assert "_maybe_reward_referrer_for_first_subscription" not in app._apply_immediate_upgrade.__code__.co_names
+    assert "_maybe_reward_referrer_for_first_subscription" not in app._apply_scheduled_plan_change.__code__.co_names
 
 
 # ---------------------------------------------------------------------------
@@ -6757,139 +6766,531 @@ def test_extract_subscription_period_end_returns_none_when_absent_everywhere(mon
     assert app._extract_subscription_period_end(subscription) is None
 
 
-def test_change_souscription_plan_swaps_price_and_resets_resources(monkeypatch):
-    app = _import_app_with_stubs(monkeypatch)
-    fake_stripe, update_mock = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+def _FixedDatetime(fixed_now):
+    """A datetime subclass whose .now() always returns `fixed_now`,
+    while fromtimestamp/fromisoformat/etc. keep behaving normally (real
+    datetime methods, inherited) -- lets a test pin "now" for proration
+    math that calls datetime.now(timezone.utc) deep inside app.py."""
+    class _Fixed(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now
+    return _Fixed
+
+
+class _FakeStripeCardError(Exception):
+    """Stands in for stripe.error.CardError -- fake_stripe.error.CardError
+    is set to THIS class (never a bare MagicMock, which `except` can't
+    catch) so _charge_plan_change_proration's except clause actually
+    matches what a test's side_effect raises."""
+    def __init__(self, message, user_message=None):
+        super().__init__(message)
+        self.user_message = user_message
+
+
+class _FakeStripeSchedule(dict):
+    """Supports both schedule.id (attribute) and schedule["phases"]
+    (bracket) access, matching how _create_or_replace_plan_change_schedule
+    reads a real stripe.SubscriptionSchedule."""
+    def __init__(self, data, id_):
+        super().__init__(data)
+        self.id = id_
+
+
+_SILVER_PLAN = {"id": "silver", "name": "Silver", "price": 10.0, "credit": 500, "stockage": 10.0, "ordre": 1, "max_social_account": 1}
+_GOLD_PLAN = {"id": "gold", "name": "Gold", "price": 25.0, "credit": 1500, "stockage": 50.0, "ordre": 2, "max_social_account": 3}
+_ULTIMATE_PLAN = {"id": "ultimate", "name": "Ultimate", "price": 40.0, "credit": 3000, "stockage": 100.0, "ordre": 3, "max_social_account": 10}
+
+
+def _plan_change_subscription(**overrides):
+    base = {
+        "id": "sous-1", "userid": "u1", "abonnement": "silver", "billing_interval": "month",
+        "stripe_subscription_id": "sub_123", "stripe_customer_id": "cus_456",
+        "plan_credit": 500.0, "plan_stockage": 10.0,
+        "payment_start_date": "2026-01-01T00:00:00+00:00", "payment_end_date": "2026-02-01T00:00:00+00:00",
+        "credit_cycle_start_at": "2026-01-01T00:00:00+00:00", "credit_cycle_end_at": "2026-02-01T00:00:00+00:00",
+        "next_credit_allocation_at": None, "scheduled_abonnement_id": None, "stripe_schedule_id": None,
+        "auto_renew": True,
+    }
+    base.update(overrides)
+    return base
+
+
+def _stub_plan_change_prereqs(monkeypatch, app, subscription=None, plans=None):
+    subscription = subscription if subscription is not None else _plan_change_subscription()
+    plans = plans if plans is not None else {"silver": _SILVER_PLAN, "gold": _GOLD_PLAN, "ultimate": _ULTIMATE_PLAN}
+
+    fake_stripe = MagicMock()
+    fake_stripe.error = types.SimpleNamespace(CardError=_FakeStripeCardError)
     fake_stripe.Subscription.retrieve.return_value = _FakeStripeSubscriptionObject(
-        {"items": {"data": [{"id": "si_123"}]}},
-        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
+        {"current_period_end": 1700000000, "items": {"data": [{"id": "si_123", "price": {"id": "price_old_1"}}]}},
+        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": subscription.get("abonnement"), "billing_interval": subscription.get("billing_interval")}),
     )
     fake_stripe.Subscription.modify.return_value = _FakeStripeObjectNoGet({"current_period_end": 1700000000})
     fake_stripe.Price.create.return_value = types.SimpleNamespace(id="price_new_1")
+    fake_stripe.Invoice.create.return_value = types.SimpleNamespace(id="in_1")
+    fake_stripe.Invoice.finalize_invoice.return_value = types.SimpleNamespace(id="in_1")
+    fake_stripe.SubscriptionSchedule.create.return_value = _FakeStripeSchedule({"phases": [{"start_date": 1690000000}]}, id_="sched_1")
+    fake_stripe.SubscriptionSchedule.modify.return_value = types.SimpleNamespace(id="sched_1")
 
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "new-plan", "name": "Premium", "price": 49.99, "max_social_account": 3}))
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=subscription))
+
+    async def fake_get_abonnement(plan_id):
+        return plans.get(str(plan_id))
+    monkeypatch.setattr(app, "supabase_get_abonnement", fake_get_abonnement)
+
     monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
-    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"stockage": 5.0, "stockage_max": 10.0, "credit": 120.0}))
+    monkeypatch.setattr(app, "supabase_list_active_promotional_credit_batches", AsyncMock(return_value=[]))
+    update_mock = AsyncMock(return_value={"id": subscription.get("id")})
+    monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
     insert_mock = AsyncMock(return_value={"id": "sous-2"})
     monkeypatch.setattr(app, "supabase_insert_souscription", insert_mock)
-    allocate_mock = AsyncMock()
-    monkeypatch.setattr(app, "_allocate_plan_resources", allocate_mock)
+    credits_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_upsert_user_data_credits", credits_mock)
+    history_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", history_mock)
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+    return fake_stripe, update_mock, insert_mock, credits_mock, history_mock
+
+
+# -- 1. Classification by ordre, including names/prices that don't follow it --
+
+def test_classify_plan_change_upgrade_by_ordre_even_when_price_disagrees(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    cheap_but_higher_ordre = {"id": "b", "ordre": 2, "price": 1.0, "credit": 1}
+    expensive_but_lower_ordre = {"id": "a", "ordre": 1, "price": 999.0, "credit": 9999}
+    assert app._classify_plan_change(expensive_but_lower_ordre, cheap_but_higher_ordre, "month", "month") == app.PLAN_CHANGE_UPGRADE_IMMEDIATE
+
+
+def test_classify_plan_change_downgrade_by_ordre_even_when_name_disagrees(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    named_premium_but_lower_ordre = {"id": "b", "ordre": 1, "name": "Premium Plus"}
+    named_basic_but_higher_ordre = {"id": "a", "ordre": 2, "name": "Basic"}
+    assert app._classify_plan_change(named_basic_but_higher_ordre, named_premium_but_lower_ordre, "month", "month") == app.PLAN_CHANGE_DOWNGRADE_SCHEDULED
+
+
+def test_classify_plan_change_noop_same_plan_same_interval(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    plan = {"id": "a", "ordre": 1}
+    assert app._classify_plan_change(plan, plan, "month", "month") == app.PLAN_CHANGE_NOOP
+
+
+# -- 2. Equal / absent / invalid ordre --
+
+def test_classify_plan_change_lateral_unsupported_for_equal_ordre_distinct_plans(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    assert app._classify_plan_change({"id": "a", "ordre": 1}, {"id": "b", "ordre": 1}, "month", "month") == app.PLAN_CHANGE_LATERAL_UNSUPPORTED
+
+
+def test_classify_plan_change_invalid_when_ordre_absent(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    assert app._classify_plan_change({"id": "a", "ordre": None}, {"id": "b", "ordre": 2}, "month", "month") == app.PLAN_CHANGE_INVALID
+    assert app._classify_plan_change({"id": "a", "ordre": 1}, {"id": "b", "ordre": None}, "month", "month") == app.PLAN_CHANGE_INVALID
+
+
+def test_classify_plan_change_invalid_when_ordre_not_an_integer(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    assert app._classify_plan_change({"id": "a", "ordre": "not-a-number"}, {"id": "b", "ordre": 2}, "month", "month") == app.PLAN_CHANGE_INVALID
+
+
+# -- 3. Monthly upgrade with remaining balance + proration (worked example) --
+
+def test_compute_monthly_upgrade_proration_matches_spec_worked_example(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    mid = start + (end - start) / 2
+    result = app._compute_monthly_upgrade_proration(
+        current_plan_credit=500, current_plan_price=10, new_plan={"price": 25, "credit": 1500},
+        period_start=start, period_end=end, now=mid,
+    )
+    assert result["amount_due_today"] == 7.50
+    assert result["credits_to_add"] == 500
+
+
+def test_apply_immediate_upgrade_monthly_charges_exact_proration_and_adds_delta(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    mid = start + (end - start) / 2
+    monkeypatch.setattr(app, "datetime", _FixedDatetime(mid))
+    subscription = _plan_change_subscription(
+        payment_start_date=start.isoformat(), payment_end_date=end.isoformat(),
+        credit_cycle_start_at=start.isoformat(), credit_cycle_end_at=end.isoformat(),
+    )
+    fake_stripe, update_mock, insert_mock, credits_mock, history_mock = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
 
     result = asyncio.run(app.change_souscription_plan(
-        payload=app.ChangeSubscriptionPlanRequest(plan_id="new-plan"), user_id="u1",
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="gold"), user_id="u1",
     ))
 
     assert result == {"id": "sous-2"}
-    fake_stripe.Subscription.retrieve.assert_called_once_with("sub_123")
-    _, price_create_kwargs = fake_stripe.Price.create.call_args
-    assert price_create_kwargs == {
-        "currency": app.STRIPE_CURRENCY, "unit_amount": 4999, "recurring": {"interval": "month"},
-        "product_data": {"name": "Premium", "tax_code": "txcd_10103001"},
+    # Custom proration charged as its own invoice -- never Stripe's own
+    # proration engine (proration_behavior="none" below).
+    _, item_kwargs = fake_stripe.InvoiceItem.create.call_args
+    assert item_kwargs["amount"] == 750  # 7.50 EUR in cents
+    fake_stripe.Invoice.pay.assert_called_once()
+    _, modify_kwargs = fake_stripe.Subscription.modify.call_args
+    assert modify_kwargs["proration_behavior"] == "none"
+
+    insert_kwargs = insert_mock.await_args.kwargs
+    assert insert_kwargs["abonnement"] == "gold"
+    assert insert_kwargs["plan_credit"] == 1500.0  # full new quota snapshotted, not prorated
+    assert insert_kwargs["credit_cycle_start_at"] == start  # carried forward, not restarted
+    assert insert_kwargs["credit_cycle_end_at"] == end
+
+    # Delta applied on top of the existing balance -- never a reset (spec
+    # section 6: existing credits/expirations untouched).
+    credits_mock.assert_awaited_once()
+    credit_kwargs = credits_mock.await_args.kwargs
+    assert credit_kwargs["credit_delta"] == 500.0
+    assert credit_kwargs["storage_delta"] == 40.0  # 50 - 10 plan_stockage snapshot, applied in full
+    assert credit_kwargs["update_credit_max"] is True
+    assert credit_kwargs["update_stockage_max"] is True
+
+
+# -- 4. Annual upgrade: distinct annual-price and monthly-credit proration --
+
+def test_compute_annual_upgrade_proration_uses_two_distinct_ratios(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    annual_start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    annual_end = datetime(2027, 1, 1, tzinfo=timezone.utc)
+    annual_mid = annual_start + (annual_end - annual_start) / 2  # exactly 50% of the YEAR remaining
+    # A credit sub-cycle that happens to be centered on the same instant,
+    # but much shorter -- proving the two ratios are computed completely
+    # independently of each other.
+    cycle_start = annual_mid - timedelta(days=5)
+    cycle_end = annual_mid + timedelta(days=5)
+
+    result = app._compute_annual_upgrade_proration(
+        current_plan_credit=500, current_annual_price=120.0,
+        new_plan={"price": 25.0, "credit": 1500, "reduction_annuelle": 0},
+        annual_period_start=annual_start, annual_period_end=annual_end,
+        credit_cycle_start=cycle_start, credit_cycle_end=cycle_end, now=annual_mid,
+    )
+    # Annual diff: 300 (25*12) - 120 = 180, at exactly 50% of the year remaining.
+    assert result["remaining_ratio"] == 0.5
+    assert result["amount_due_today"] == 90.0
+    # Credit diff: 1500-500=1000, at exactly 50% of the 10-day sub-cycle.
+    assert result["credit_remaining_ratio"] == 0.5
+    assert result["credits_to_add"] == 500
+
+
+# -- 5. Several successive upgrades without double-granting --
+
+def test_successive_upgrades_compute_only_the_complement(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    # Silver(500) -> Gold(1500) already happened: the row's plan_credit
+    # snapshot now reads 1500, matching Gold's own full nominal quota --
+    # a second upgrade straight to Ultimate(3000) must only add the
+    # COMPLEMENT (3000-1500), never re-grant the full 3000.
+    result = app._compute_monthly_upgrade_proration(
+        current_plan_credit=1500, current_plan_price=25, new_plan={"price": 40, "credit": 3000},
+        period_start=start, period_end=end, now=start,  # ratio 1.0, full period remaining
+    )
+    assert result["credits_to_add"] == 1500
+    assert result["amount_due_today"] == 15.0
+
+
+# -- 6. Monthly and annual downgrades land on the right boundary --
+
+def test_change_souscription_plan_schedules_monthly_downgrade_to_next_renewal(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="gold")
+    fake_stripe, update_mock, insert_mock, credits_mock, history_mock = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+
+    result = asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver"), user_id="u1",
+    ))
+
+    assert result["classification"] == app.PLAN_CHANGE_DOWNGRADE_SCHEDULED
+    assert result["scheduled_effective_at"] == datetime.fromtimestamp(1700000000, tz=timezone.utc).isoformat()
+    # No charge, no credit change, no immediate price swap -- only a
+    # schedule's future phase.
+    fake_stripe.InvoiceItem.create.assert_not_called()
+    fake_stripe.Subscription.modify.assert_not_called()
+    credits_mock.assert_not_awaited()
+    fake_stripe.SubscriptionSchedule.create.assert_called_once_with(from_subscription="sub_123")
+    _, schedule_kwargs = fake_stripe.SubscriptionSchedule.modify.call_args
+    assert schedule_kwargs["phases"][1]["start_date"] == 1700000000
+    assert schedule_kwargs["phases"][1]["metadata"]["abonnement"] == "silver"
+
+    update_kwargs = update_mock.await_args.args[1]
+    assert update_kwargs["scheduled_abonnement_id"] == "silver"
+    assert update_kwargs["stripe_schedule_id"] == "sched_1"
+
+
+def test_change_souscription_plan_annual_downgrade_defers_to_annual_renewal_not_credit_anniversary(monkeypatch):
+    # The annual subscription's own Stripe current_period_end (the ANNUAL
+    # boundary) must drive the schedule -- never the separate monthly
+    # credit-allocation anniversary (next_credit_allocation_at).
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(
+        abonnement="ultimate", billing_interval="year",
+        next_credit_allocation_at="2026-01-20T00:00:00+00:00",  # much sooner than the annual boundary
+    )
+    fake_stripe, *_ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+    fake_stripe.Subscription.retrieve.return_value = _FakeStripeSubscriptionObject(
+        {"current_period_end": 1735689600, "items": {"data": [{"id": "si_123", "price": {"id": "price_old_1"}}]}},
+        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "ultimate", "billing_interval": "year"}),
+    )
+
+    result = asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="gold"), user_id="u1",
+    ))
+
+    assert result["classification"] == app.PLAN_CHANGE_DOWNGRADE_SCHEDULED
+    assert result["scheduled_effective_at"] == datetime.fromtimestamp(1735689600, tz=timezone.utc).isoformat()
+
+
+# -- 7. Periodicity changes, alone or combined with a plan change --
+
+def test_change_souscription_plan_defers_periodicity_change_alone(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="silver")
+    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+
+    result = asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver", billing_interval="year"), user_id="u1",
+    ))
+    assert result["classification"] == app.PLAN_CHANGE_PERIODICITY_SCHEDULED
+
+
+def test_change_souscription_plan_defers_periodicity_change_even_when_target_plan_is_higher(monkeypatch):
+    # Spec section 5: deferred regardless of whether ordre also increases.
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="silver")
+    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+
+    result = asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="ultimate", billing_interval="year"), user_id="u1",
+    ))
+    assert result["classification"] == app.PLAN_CHANGE_PERIODICITY_SCHEDULED
+
+
+# -- 8. Cancel, replace, and single execution of a scheduled change --
+
+def test_cancel_scheduled_plan_change_releases_schedule(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(scheduled_abonnement_id="silver", stripe_schedule_id="sched_1")
+    fake_stripe, update_mock, *_ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+
+    result = asyncio.run(app.cancel_scheduled_plan_change(user_id="u1"))
+
+    assert result == {"cancelled": True}
+    fake_stripe.SubscriptionSchedule.release.assert_called_once_with("sched_1")
+    update_kwargs = update_mock.await_args.args[1]
+    assert update_kwargs["scheduled_abonnement_id"] is None
+    assert update_kwargs["stripe_schedule_id"] is None
+
+
+def test_cancel_scheduled_plan_change_404_when_none_pending(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    _stub_plan_change_prereqs(monkeypatch, app)
+    coro = app.cancel_scheduled_plan_change(user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 404
+
+
+def test_change_souscription_plan_replaces_existing_scheduled_change(monkeypatch):
+    # Only one scheduled change at a time -- scheduling a new one releases
+    # whichever schedule was already pending first.
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="gold", scheduled_abonnement_id="silver", stripe_schedule_id="sched_old")
+    fake_stripe, *_ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+
+    asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver", billing_interval="year"), user_id="u1",
+    ))
+
+    fake_stripe.SubscriptionSchedule.release.assert_called_once_with("sched_old")
+    fake_stripe.SubscriptionSchedule.create.assert_called_once_with(from_subscription="sub_123")
+
+
+def test_apply_immediate_upgrade_requires_confirmation_to_cancel_scheduled_change(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="silver", scheduled_abonnement_id="gold", stripe_schedule_id="sched_1")
+    fake_stripe, *_ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+
+    coro = app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="gold"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "plan_change_scheduled_change_exists"
+    fake_stripe.InvoiceItem.create.assert_not_called()
+
+    # With explicit confirmation, it proceeds and cancels the pending schedule.
+    asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="gold", confirm_cancel_scheduled=True), user_id="u1",
+    ))
+    fake_stripe.SubscriptionSchedule.release.assert_called_once_with("sched_1")
+
+
+# -- 9. Failed payments and events received more than once --
+
+def test_apply_immediate_upgrade_payment_failure_leaves_plan_unchanged(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    mid = datetime(2026, 1, 15, tzinfo=timezone.utc)  # inside the fixture's Jan 1 - Feb 1 period
+    monkeypatch.setattr(app, "datetime", _FixedDatetime(mid))
+    subscription = _plan_change_subscription(abonnement="silver")
+    fake_stripe, update_mock, insert_mock, credits_mock, _ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+    fake_stripe.Invoice.pay.side_effect = _FakeStripeCardError("declined", user_message="Card declined")
+
+    coro = app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="gold"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 402
+    assert exc_info.value.detail["code"] == "plan_change_payment_failed"
+
+    # Nothing about the plan was touched -- the current offer stays active.
+    fake_stripe.Subscription.modify.assert_not_called()
+    insert_mock.assert_not_awaited()
+    credits_mock.assert_not_awaited()
+    update_mock.assert_not_awaited()
+
+
+def test_change_souscription_plan_refuses_inconsistent_upgrade_configuration(monkeypatch):
+    # ordre says "upgrade" but the catalog's actual price/credit for that
+    # plan is lower -- must refuse outright, never invert to a downgrade
+    # or charge/credit a negative amount.
+    app = _import_app_with_stubs(monkeypatch)
+    mid = datetime(2026, 1, 15, tzinfo=timezone.utc)  # inside the fixture's Jan 1 - Feb 1 period
+    monkeypatch.setattr(app, "datetime", _FixedDatetime(mid))
+    subscription = _plan_change_subscription(abonnement="gold", plan_credit=1500.0)
+    misconfigured_plans = {
+        "gold": _GOLD_PLAN,
+        "ultimate": {"id": "ultimate", "name": "Ultimate", "price": 5.0, "credit": 10, "stockage": 100.0, "ordre": 3, "max_social_account": 10},
     }
-    _, modify_kwargs = fake_stripe.Subscription.modify.call_args
-    assert modify_kwargs["items"] == [{"id": "si_123", "price": "price_new_1"}]
-    assert modify_kwargs["proration_behavior"] == "create_prorations"
-    assert modify_kwargs["metadata"]["abonnement"] == "new-plan"
-    assert modify_kwargs["metadata"]["userid"] == "u1"  # preserved from the existing subscription metadata
+    fake_stripe, update_mock, insert_mock, credits_mock, _ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription, plans=misconfigured_plans)
 
-    insert_mock.assert_awaited_once()
-    insert_kwargs = insert_mock.await_args.kwargs
-    assert insert_kwargs["abonnement"] == "new-plan"
-    assert insert_kwargs["stripe_subscription_id"] == "sub_123"
-    assert insert_kwargs["stripe_customer_id"] == "cus_456"
-    assert insert_kwargs["period_end_date"] == datetime.fromtimestamp(1700000000, tz=timezone.utc)
-
-    allocate_mock.assert_awaited_once()
-    allocate_kwargs = allocate_mock.await_args.kwargs
-    assert allocate_kwargs["abonnement"] == "new-plan"
-    assert allocate_kwargs["souscription_id"] == "sous-2"
-
-    # The old (e.g. Silver) row must be closed out immediately -- with
-    # proration, Stripe keeps the same billing-cycle end, so the new row's
-    # payment_end_date would otherwise match the old row's almost exactly,
-    # leaving both "active" per get_user_abonnement's filter and making
-    # which one it returns arbitrary (reported bug: it kept showing the
-    # old plan as active after a successful upgrade).
-    update_mock.assert_awaited_once()
-    update_args, update_kwargs = update_mock.await_args
-    assert update_args[0] == "sous-1"
-    assert "payment_end_date" in update_args[1]
-    assert update_kwargs["user_id"] == "u1"
-
-
-def test_change_souscription_plan_preserves_annual_billing_interval(monkeypatch):
-    # Changing plan tier must never silently flip an annual subscriber back
-    # to monthly billing -- the new price is re-quoted at the SAME cadence
-    # the subscription already bills on.
-    app = _import_app_with_stubs(monkeypatch)
-    fake_stripe, _ = _stub_subscription_lifecycle_prereqs(monkeypatch, app, subscription={
-        "id": "sous-1", "stripe_subscription_id": "sub_123", "stripe_customer_id": "cus_456",
-        "billing_interval": "year",
-    })
-    fake_stripe.Subscription.retrieve.return_value = _FakeStripeSubscriptionObject(
-        {"items": {"data": [{"id": "si_123"}]}},
-        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
+    coro = app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="ultimate"), user_id="u1",
     )
-    fake_stripe.Subscription.modify.return_value = _FakeStripeObjectNoGet({"current_period_end": 1700000000})
-    fake_stripe.Price.create.return_value = types.SimpleNamespace(id="price_new_1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "plan_change_inconsistent_configuration"
+    fake_stripe.InvoiceItem.create.assert_not_called()
+    insert_mock.assert_not_awaited()
 
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "new-plan", "name": "Premium", "price": 10.0, "reduction_annuelle": 0.05, "max_social_account": 3}))
-    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
-    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
-    insert_mock = AsyncMock(return_value={"id": "sous-2"})
-    monkeypatch.setattr(app, "supabase_insert_souscription", insert_mock)
-    allocate_mock = AsyncMock()
-    monkeypatch.setattr(app, "_allocate_plan_resources", allocate_mock)
+
+# -- 10. Batches and their expirations are preserved --
+
+def test_apply_immediate_upgrade_never_resets_existing_balance(monkeypatch):
+    # The existing balance/expiration must never be wiped (spec section 6)
+    # -- supabase_upsert_user_data_credits (a DELTA) is used, never
+    # supabase_set_user_data_balance / _reset_user_plan_balance (a RESET).
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="silver")
+    reset_mock = AsyncMock()
+    monkeypatch.setattr(app, "_reset_user_plan_balance", reset_mock)
+    fake_stripe, *_ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
 
     asyncio.run(app.change_souscription_plan(
-        payload=app.ChangeSubscriptionPlanRequest(plan_id="new-plan"), user_id="u1",
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="gold"), user_id="u1",
     ))
-
-    _, price_create_kwargs = fake_stripe.Price.create.call_args
-    assert price_create_kwargs["recurring"] == {"interval": "year"}
-    assert price_create_kwargs["unit_amount"] == 11400  # annual discounted price, in cents
-    _, modify_kwargs = fake_stripe.Subscription.modify.call_args
-    assert modify_kwargs["metadata"]["billing_interval"] == "year"
-
-    insert_kwargs = insert_mock.await_args.kwargs
-    assert insert_kwargs["billing_interval"] == "year"
-    assert insert_kwargs["payment_amount"] == 114.0
-
-    allocate_kwargs = allocate_mock.await_args.kwargs
-    assert allocate_kwargs["billing_interval"] == "year"
+    reset_mock.assert_not_awaited()
 
 
-def test_change_souscription_plan_sends_notification_email(monkeypatch):
+# -- 11. Month-end anniversaries and the end of an annual subscription --
+# (add_one_month/add_one_year + the credit-cycle defaulting are covered in
+# tests/test_supabase_request.py; _process_due_annual_credit_refills's own
+# "never past expiration" filter is covered by
+# test_list_souscriptions_due_for_monthly_credit_allocation_filters_correctly.)
+
+
+# -- 12. Storage overage after a downgrade --
+
+def test_change_souscription_plan_downgrade_schedules_even_when_over_new_storage_quota(monkeypatch):
+    # Spec section 7: scheduling a downgrade must NEVER be blocked by
+    # already being over the new plan's storage quota -- only new uploads
+    # are blocked, and only once the downgrade actually takes effect (via
+    # the existing generic _assert_user_has_storage_headroom).
     app = _import_app_with_stubs(monkeypatch)
-    fake_stripe, _ = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
-    fake_stripe.Subscription.retrieve.return_value = _FakeStripeSubscriptionObject(
-        {"items": {"data": [{"id": "si_123"}]}},
-        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
-    )
-    fake_stripe.Subscription.modify.return_value = _FakeStripeObjectNoGet({"current_period_end": 1700000000})
-    fake_stripe.Price.create.return_value = types.SimpleNamespace(id="price_new_1")
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "new-plan", "name": "Premium", "price": 49.99, "max_social_account": 3}))
-    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
-    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
-    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-2"}))
-    monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
-    email_mock = MagicMock()
-    monkeypatch.setattr(app, "_send_transactional_email", email_mock)
+    subscription = _plan_change_subscription(abonnement="gold")
+    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+    # 40 Go used (50 max - 10 left), silver only allows 10.
+    user_data = AsyncMock(return_value={"stockage": 10.0, "stockage_max": 50.0, "credit": 0.0})
+    monkeypatch.setattr(app, "supabase_get_user_data", user_data)
 
-    asyncio.run(app.change_souscription_plan(
-        payload=app.ChangeSubscriptionPlanRequest(plan_id="new-plan"), user_id="u1",
-        request=_FakeCheckoutRequest(headers={"X-User-Email": "user@example.com"}),
+    result = asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver"), user_id="u1",
     ))
+    assert result["classification"] == app.PLAN_CHANGE_DOWNGRADE_SCHEDULED
 
-    email_mock.assert_called_once_with(
-        "user@example.com", "subscription_plan_changed", plan_name="Premium", amount=49.99,
+
+def test_preview_plan_change_surfaces_storage_overage_warning(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="gold")
+    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"stockage": 10.0, "stockage_max": 50.0, "credit": 0.0}))
+
+    result = asyncio.run(app.preview_souscription_plan_change(user_id="u1", plan_id="silver"))
+    assert result["classification"] == app.PLAN_CHANGE_DOWNGRADE_SCHEDULED
+    assert result["storage_overage_warning"] == {"storage_used": 40.0, "storage_quota": 10.0}
+
+
+# -- 13. No new referral reward on a plan change (see above, static check) --
+# -- 14. Classification refusals: lateral and invalid/absent ordre --
+
+def test_change_souscription_plan_refuses_lateral_change(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="silver")
+    plans = {"silver": _SILVER_PLAN, "silver-annual-only": {**_SILVER_PLAN, "id": "silver-annual-only"}}
+    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription, plans=plans)
+
+    coro = app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver-annual-only"), user_id="u1",
     )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "plan_change_lateral_unsupported"
+
+
+def test_change_souscription_plan_refuses_when_ordre_missing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="silver")
+    plans = {"silver": _SILVER_PLAN, "retired": {"id": "retired", "name": "Retired", "ordre": None}}
+    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription, plans=plans)
+
+    coro = app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="retired"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "plan_change_invalid_order"
+
+
+def test_change_souscription_plan_noop_when_same_plan_and_interval(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="silver")
+    fake_stripe, update_mock, insert_mock, credits_mock, _ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+
+    result = asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver"), user_id="u1",
+    ))
+    assert result == {"classification": app.PLAN_CHANGE_NOOP, "changed": False}
+    fake_stripe.Subscription.modify.assert_not_called()
+    insert_mock.assert_not_awaited()
+    credits_mock.assert_not_awaited()
 
 
 def test_change_souscription_plan_404_for_unknown_plan(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value=None))
+    _stub_plan_change_prereqs(monkeypatch, app)
 
     coro = app.change_souscription_plan(
         payload=app.ChangeSubscriptionPlanRequest(plan_id="missing-plan"), user_id="u1",
@@ -6901,10 +7302,9 @@ def test_change_souscription_plan_404_for_unknown_plan(monkeypatch):
 
 def test_change_souscription_plan_blocks_when_over_social_account_limit(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "silver", "name": "Silver", "max_social_account": 1}))
+    subscription = _plan_change_subscription(abonnement="gold")
+    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
     monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={"facebook": 5, "instagram": 1}))
-    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
 
     coro = app.change_souscription_plan(
         payload=app.ChangeSubscriptionPlanRequest(plan_id="silver"), user_id="u1",
@@ -6917,59 +7317,36 @@ def test_change_souscription_plan_blocks_when_over_social_account_limit(monkeypa
     assert "instagram" not in exc_info.value.detail["details"]
 
 
-def test_change_souscription_plan_blocks_when_over_storage_limit(monkeypatch):
+def test_change_souscription_plan_sends_notification_email(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "silver", "name": "Silver", "max_social_account": 1, "stockage": 5.0}))
-    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
-    # stockage is the remaining balance, stockage_max the plan allowance --
-    # 20 Go used (30 max - 10 left) against a 5 Go new plan must block.
-    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"stockage": 10.0, "stockage_max": 30.0}))
+    subscription = _plan_change_subscription(abonnement="silver")
+    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+    email_mock = MagicMock()
+    monkeypatch.setattr(app, "_send_transactional_email", email_mock)
 
-    coro = app.change_souscription_plan(
-        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver"), user_id="u1",
-    )
-    with pytest.raises(app.HTTPException) as exc_info:
-        asyncio.run(coro)
-    assert exc_info.value.status_code == 409
-    assert "stockage" in exc_info.value.detail.lower() or "Go" in exc_info.value.detail
-
-
-def test_change_souscription_plan_allows_when_within_limits(monkeypatch):
-    app = _import_app_with_stubs(monkeypatch)
-    fake_stripe, _ = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
-    fake_stripe.Subscription.retrieve.return_value = _FakeStripeSubscriptionObject(
-        {"items": {"data": [{"id": "si_123"}]}},
-        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
-    )
-    fake_stripe.Subscription.modify.return_value = _FakeStripeObjectNoGet({"current_period_end": 1700000000})
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "gold", "name": "Gold", "price": 49.99, "max_social_account": 3, "stockage": 100.0}))
-    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={"facebook": 2}))
-    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"stockage": 50.0, "stockage_max": 100.0}))
-    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-2"}))
-    monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
-
-    result = asyncio.run(app.change_souscription_plan(
+    asyncio.run(app.change_souscription_plan(
         payload=app.ChangeSubscriptionPlanRequest(plan_id="gold"), user_id="u1",
+        request=_FakeCheckoutRequest(headers={"X-User-Email": "user@example.com"}),
     ))
-    assert result == {"id": "sous-2"}
+
+    email_mock.assert_called_once()
+    args, kwargs = email_mock.call_args
+    assert args[0] == "user@example.com"
+    assert args[1] == "subscription_plan_changed"
+    assert kwargs["plan_name"] == "Gold"
 
 
 def test_change_souscription_plan_starts_fresh_checkout_for_non_recurring_subscription(monkeypatch):
     # A subscription with no stripe_subscription_id (see
     # _get_active_stripe_souscription's docstring) has no Stripe
-    # Subscription to modify in place -- changing plan must instead start
-    # a brand new recurring Checkout for the chosen plan, and must never
-    # touch stripe.Subscription.retrieve/modify.
+    # Subscription to modify in place -- an immediate upgrade must instead
+    # start a brand new recurring Checkout, and must never touch
+    # stripe.Subscription.retrieve/modify.
     app = _import_app_with_stubs(monkeypatch)
-    fake_stripe, update_mock = _stub_subscription_lifecycle_prereqs(
-        monkeypatch, app, subscription={"id": "sous-legacy", "stripe_subscription_id": None},
-    )
+    subscription = _plan_change_subscription(abonnement="silver", stripe_subscription_id=None)
+    fake_stripe, update_mock, *_ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
     fake_session = MagicMock(url="https://checkout.stripe.com/pay/cs_test_plan", id="cs_test_plan")
     fake_stripe.checkout.Session.create.return_value = fake_session
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "gold", "name": "Gold", "price": 49.99, "max_social_account": 3}))
-    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
-    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
     monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value=None))
 
     result = asyncio.run(app.change_souscription_plan(
@@ -6985,7 +7362,24 @@ def test_change_souscription_plan_starts_fresh_checkout_for_non_recurring_subscr
     _, kwargs = fake_stripe.checkout.Session.create.call_args
     assert kwargs["mode"] == "subscription"
     assert kwargs["metadata"]["abonnement"] == "gold"
-    assert kwargs["metadata"]["previous_souscription_id"] == "sous-legacy"
+    assert kwargs["metadata"]["previous_souscription_id"] == "sous-1"
+
+
+def test_change_souscription_plan_legacy_subscription_refuses_scheduled_change(monkeypatch):
+    # A legacy pre-recurring-billing subscription has no Stripe
+    # Subscription to attach a schedule to -- a downgrade/periodicity
+    # change can't be deferred automatically for it.
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="gold", stripe_subscription_id=None)
+    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+
+    coro = app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "plan_change_requires_recurring_subscription"
 
 
 # ---------------------------------------------------------------------------

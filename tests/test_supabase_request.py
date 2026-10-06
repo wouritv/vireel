@@ -1033,6 +1033,80 @@ def test_insert_souscription_persists_plan_snapshot_and_next_allocation(monkeypa
     assert result["next_credit_allocation_at"] == next_allocation.isoformat()
 
 
+def test_insert_souscription_monthly_credit_cycle_matches_billing_period(monkeypatch):
+    # Plan-change rework spec section 2: for a monthly subscription the
+    # credit-allocation cycle and the paid billing period are the same
+    # thing -- credit_cycle_start_at/end_at must default to exactly the
+    # same dates as payment_start_date/payment_end_date.
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_SOUSCRIPTION_TABLE: [_FakeResponse(data=[])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    start = datetime(2026, 1, 31, tzinfo=timezone.utc)
+    result = asyncio.run(
+        supabase_request.insert_souscription(
+            user_id="u1", abonnement="plan-pro", payment_mode="stripe",
+            payment_amount=10.0, payment_reference="ref-monthly",
+            payment_status="completed", payment_date=start,
+        )
+    )
+    assert result["credit_cycle_start_at"] == result["payment_start_date"]
+    assert result["credit_cycle_end_at"] == result["payment_end_date"]
+    # Jan 31 + 1 month -> Feb 28 (2026 is not a leap year), anniversary
+    # day preserved for later months (see add_one_month).
+    assert result["payment_end_date"] == datetime(2026, 2, 28, tzinfo=timezone.utc).isoformat()
+
+
+def test_insert_souscription_annual_credit_cycle_is_one_month_subwindow(monkeypatch):
+    # For an annual subscription the credit cycle is only a one-month
+    # sub-window of the paid year, not the whole annual period -- must
+    # default to +1 month from the cycle start, never to the annual
+    # payment_end_date.
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_SOUSCRIPTION_TABLE: [_FakeResponse(data=[])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    start = datetime(2026, 1, 15, tzinfo=timezone.utc)
+    result = asyncio.run(
+        supabase_request.insert_souscription(
+            user_id="u1", abonnement="plan-pro", payment_mode="stripe",
+            payment_amount=114.0, payment_reference="ref-annual-cycle",
+            payment_status="completed", payment_date=start, billing_interval="year",
+        )
+    )
+    assert result["payment_end_date"] == datetime(2027, 1, 15, tzinfo=timezone.utc).isoformat()
+    assert result["credit_cycle_start_at"] == start.isoformat()
+    assert result["credit_cycle_end_at"] == datetime(2026, 2, 15, tzinfo=timezone.utc).isoformat()
+
+
+def test_insert_souscription_credit_cycle_explicit_override_wins(monkeypatch):
+    # An immediate upgrade carries the EXISTING credit-cycle dates forward
+    # explicitly (spec section 3: "conserve les dates... existantes") --
+    # must override both the monthly and the annual default.
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_SOUSCRIPTION_TABLE: [_FakeResponse(data=[])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    cycle_start = datetime(2026, 1, 10, tzinfo=timezone.utc)
+    cycle_end = datetime(2026, 2, 10, tzinfo=timezone.utc)
+    result = asyncio.run(
+        supabase_request.insert_souscription(
+            user_id="u1", abonnement="plan-pro", payment_mode="stripe",
+            payment_amount=7.5, payment_reference="ref-upgrade",
+            payment_status="completed", billing_interval="year",
+            credit_cycle_start_at=cycle_start, credit_cycle_end_at=cycle_end,
+        )
+    )
+    assert result["credit_cycle_start_at"] == cycle_start.isoformat()
+    assert result["credit_cycle_end_at"] == cycle_end.isoformat()
+
+
 def test_list_souscriptions_due_for_monthly_credit_allocation_filters_correctly(monkeypatch):
     supabase_request = _import_supabase_request_with_stubs(monkeypatch)
     due_rows = [{"id": "sous-1", "userid": "u1", "plan_credit": 500.0, "plan_stockage": 1.0}]

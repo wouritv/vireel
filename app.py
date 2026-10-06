@@ -9716,10 +9716,18 @@ async def stripe_webhook(request: Request):
 
     if event.type == "invoice.paid":
         invoice = event.data.object
-        if invoice.billing_reason != "subscription_cycle":
-            # "subscription_create" (the very first invoice) is handled by
-            # checkout.session.completed instead; anything else (a manual
-            # invoice, a one-off proration, ...) isn't a renewal.
+        # "subscription_create" (the very first invoice) is handled by
+        # checkout.session.completed instead. "subscription_update" is
+        # the invoice Stripe raises when a Subscription Schedule's phase
+        # 2 takes over at the scheduled boundary (see
+        # _create_or_replace_plan_change_schedule) -- it's a genuine
+        # recurring charge on the subscription, same as "subscription_cycle",
+        # just tagged differently because the price changed with it.
+        # Never matches the custom one-off proration invoice this app
+        # creates itself for an immediate upgrade (_charge_plan_change_
+        # proration): that one has no `subscription` attached at all and
+        # gets billing_reason "manual".
+        if invoice.billing_reason not in ("subscription_cycle", "subscription_update"):
             return {"received": True, "ignored": f"invoice.paid:{invoice.billing_reason}"}
         return await _handle_subscription_renewal_invoice(invoice)
 
@@ -9771,7 +9779,10 @@ async def get_current_souscription(
     request: Request,
     user_id: Annotated[str, Depends(get_user_id_header)],
 ) -> Optional[Dict[str, Any]]:
-    """Get the current active subscription for a user."""
+    """Get the current active subscription for a user -- also the data
+    source for the subscription-management view (spec section 8): active
+    plan, next billing/allocation dates, and any pending scheduled change
+    with what it would switch to."""
     await _enforce_subscription_retention_policy(user_id)
     subscription = await get_user_abonnement(user_id)
     if not subscription:
@@ -9787,6 +9798,19 @@ async def get_current_souscription(
                 "abonnement_credit": float(plan.get("credit") or 0.0),
                 "abonnement_stockage": float(plan.get("stockage") or 0.0),
             }
+
+    billing_interval = subscription.get("billing_interval") or "month"
+    subscription["next_billing_date"] = subscription.get("payment_end_date")
+    subscription["next_credit_allocation_date"] = (
+        subscription.get("next_credit_allocation_at") if billing_interval == "year"
+        else subscription.get("payment_end_date")
+    )
+
+    scheduled_abonnement_id = str(subscription.get("scheduled_abonnement_id") or "").strip()
+    if scheduled_abonnement_id:
+        scheduled_plan = await supabase_get_abonnement(scheduled_abonnement_id)
+        subscription["scheduled_abonnement_name"] = (scheduled_plan or {}).get("name") or scheduled_abonnement_id
+
     return subscription
 
 
@@ -10100,14 +10124,212 @@ async def replace_souscription_payment_method(
     return {"checkout_url": session.url}
 
 
-async def _assert_plan_change_within_limits(user_id: str, new_plan: Dict[str, Any]) -> None:
+# ---------------------------------------------------------------------------
+# Plan change classification + proration (plan-change rework spec, sections
+# 1, 2, 3 and 6)
+#
+# Required Stripe account/dashboard configuration for this section:
+#
+#  - Stripe Billing must be enabled (Subscriptions + Subscription
+#    Schedules -- both are part of the base Billing product, no separate
+#    opt-in). Nothing here uses Stripe Tax; "tax_code": "txcd_10103001"
+#    on every Price.create/product_data call is only there because
+#    Subscription.modify/SubscriptionSchedule.modify reject an item with
+#    "the product tax code is missing" once Stripe Tax or Managed
+#    Payments is active on the account -- it's a defensive no-op on an
+#    account that never turns Tax on, and the actual tax calculation (if
+#    any) is entirely Stripe's own, outside this code's control.
+#  - Managed Payments must stay OFF for mode="subscription"/"setup"
+#    Checkout Sessions the way the rest of this file already disables it
+#    (see create_recurring_subscription_checkout/replace_souscription_
+#    payment_method) -- unrelated to this rework, called out here only
+#    because a newer Stripe account may have it on by default.
+#  - Webhook endpoint: no NEW event type is required beyond what this
+#    app already subscribes to. invoice.paid is now dispatched for
+#    BOTH billing_reason "subscription_cycle" (the pre-existing ordinary
+#    monthly/annual renewal) AND "subscription_update" (the invoice
+#    Stripe raises when a Subscription Schedule's phase 2 -- a deferred
+#    downgrade/periodicity change, see _create_or_replace_plan_change_
+#    schedule -- takes over at its start_date) -- see stripe_webhook's
+#    dispatch. Make sure the webhook endpoint configured in the Stripe
+#    Dashboard is subscribed to invoice.paid (already required before
+#    this rework) with no event-type filtering narrower than that.
+#  - Nothing here needs a Stripe-side "Customer portal" configuration --
+#    every action (immediate upgrade, scheduling, cancelling a scheduled
+#    change) is driven by this app's own endpoints, never a redirect to
+#    Stripe's hosted portal.
+#  - The off-session charge for an immediate upgrade's custom proration
+#    (_charge_plan_change_proration: InvoiceItem + Invoice, collection_
+#    method="charge_automatically") requires the customer to already
+#    have a default_payment_method on file (set by a prior Checkout
+#    Session or the explicit replace-card flow) -- an account with 3D
+#    Secure (SCA) enforcement may still require the cardholder to
+#    authenticate; Invoice.pay raises in that case same as a decline,
+#    which this code already treats as a failed payment (spec section 3:
+#    the current plan is left untouched).
+# ---------------------------------------------------------------------------
+PLAN_CHANGE_NOOP = "noop"
+PLAN_CHANGE_UPGRADE_IMMEDIATE = "upgrade_immediate"
+PLAN_CHANGE_DOWNGRADE_SCHEDULED = "downgrade_scheduled"
+PLAN_CHANGE_PERIODICITY_SCHEDULED = "periodicity_scheduled"
+PLAN_CHANGE_LATERAL_UNSUPPORTED = "lateral_unsupported"
+PLAN_CHANGE_INVALID = "invalid"
+
+# operation_type for the upgrade credit/storage supplement's user_data_history
+# entry -- added to the standard credit/storage ledger via a plain delta (see
+# _apply_immediate_upgrade), never a separate expiring batch: section 6 of
+# the spec says this supplement shares "the normal lot of the current
+# monthly cycle"'s own expiration, which in this codebase is simply "wiped
+# at the next reset", exactly like the base monthly allocation already is
+# (_reset_user_plan_balance) -- no new expiration mechanism to build.
+PLAN_CHANGE_UPGRADE_OPERATION_TYPE = "plan_change_upgrade"
+
+
+def _plan_change_ordre(plan: Dict[str, Any]) -> Optional[int]:
+    """The plan's growth-order value (abonnement.ordre), used EXCLUSIVELY
+    to classify a plan change -- never name, price or credit quota (spec
+    section 1). None when absent or not a valid integer, which
+    _classify_plan_change treats as a hard refusal: ordre is nullable by
+    design (a plan retired from sale keeps its row but clears ordre --
+    see the ordre migration), so a subscriber still on such a plan, or a
+    target plan missing it, can't be safely auto-classified."""
+    raw = plan.get("ordre")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _classify_plan_change(
+    current_plan: Dict[str, Any], new_plan: Dict[str, Any],
+    current_interval: str, new_interval: str,
+) -> str:
+    """Centralizes the one piece of logic the whole plan-change rework
+    hinges on (spec section 1), reused by both the preview and the real
+    change endpoint so their classification can never disagree. Adding a
+    new plan only ever requires giving it the right abonnement.ordre --
+    nothing here is a hardcoded list of plan ids."""
+    same_plan = str(current_plan.get("id")) == str(new_plan.get("id"))
+    interval_changed = current_interval != new_interval
+
+    if same_plan and not interval_changed:
+        return PLAN_CHANGE_NOOP
+
+    current_ordre = _plan_change_ordre(current_plan)
+    new_ordre = _plan_change_ordre(new_plan)
+    if current_ordre is None or new_ordre is None:
+        return PLAN_CHANGE_INVALID
+
+    if not same_plan and current_ordre == new_ordre:
+        return PLAN_CHANGE_LATERAL_UNSUPPORTED
+
+    # A periodicity change always defers to the end of the already-paid
+    # period, whatever the ordre direction -- even when the target plan
+    # also outranks the current one (spec section 5) -- so this is
+    # checked before the upgrade/downgrade split below.
+    if interval_changed:
+        return PLAN_CHANGE_PERIODICITY_SCHEDULED
+
+    return PLAN_CHANGE_UPGRADE_IMMEDIATE if new_ordre > current_ordre else PLAN_CHANGE_DOWNGRADE_SCHEDULED
+
+
+def _remaining_ratio(period_start: Optional[datetime], period_end: Optional[datetime], now: datetime) -> float:
+    """Fraction of [period_start, period_end) still remaining at `now`,
+    clamped to [0, 1] -- the one time-based ratio every proration formula
+    below multiplies by."""
+    if not period_start or not period_end:
+        return 0.0
+    total = (period_end - period_start).total_seconds()
+    if total <= 0:
+        return 0.0
+    remaining = (period_end - now).total_seconds()
+    return max(0.0, min(1.0, remaining / total))
+
+
+def _round_credits(amount: float) -> int:
+    """Floor to a whole credit (the spec requires "crédits entiers") --
+    always rounding DOWN, never up, so a chain of successive upgrades/
+    downgrades can never accumulate extra credits purely from rounding.
+    The epsilon absorbs float representation error (e.g. 499.9999994 for
+    an exact 500) without ever rounding a genuine fraction up."""
+    return int(math.floor(float(amount) + 1e-6))
+
+
+def _round_price(amount: float) -> float:
+    """Floor to the cent, for the same determinism reason as
+    _round_credits -- the displayed preview and the amount actually
+    charged are always computed by this same function, so they can never
+    disagree (spec section 3: "le montant présenté doit correspondre au
+    montant réellement facturé")."""
+    return math.floor(float(amount) * 100 + 1e-6) / 100.0
+
+
+def _compute_monthly_upgrade_proration(
+    *, current_plan_credit: float, current_plan_price: float, new_plan: Dict[str, Any],
+    period_start: Optional[datetime], period_end: Optional[datetime], now: datetime,
+) -> Dict[str, Any]:
+    """Monthly same-periodicity upgrade (spec section 3): both the price
+    difference and the credit-quota difference are prorated by the same
+    ratio -- time remaining in the paid monthly period. Matches the
+    spec's own worked example: Silver 10€/500 credits -> Gold 25€/1500
+    credits at mid-cycle (ratio 0.5) charges 7.50€ and adds 500 credits."""
+    ratio = _remaining_ratio(period_start, period_end, now)
+    price_diff = float(new_plan.get("price") or 0) - float(current_plan_price or 0)
+    credit_diff = float(new_plan.get("credit") or 0) - float(current_plan_credit or 0)
+    return {
+        "amount_due_today": _round_price(price_diff * ratio),
+        "credits_to_add": _round_credits(credit_diff * ratio),
+        "remaining_ratio": ratio,
+    }
+
+
+def _compute_annual_upgrade_proration(
+    *, current_plan_credit: float, current_annual_price: float, new_plan: Dict[str, Any],
+    annual_period_start: Optional[datetime], annual_period_end: Optional[datetime],
+    credit_cycle_start: Optional[datetime], credit_cycle_end: Optional[datetime], now: datetime,
+) -> Dict[str, Any]:
+    """Annual same-periodicity upgrade (spec section 3): the ANNUAL price
+    difference is prorated against time remaining in the paid annual
+    period, but the credit difference is prorated against time remaining
+    in the CURRENT MONTHLY allocation sub-cycle -- two distinct ratios,
+    per the spec's explicit "deux calculs distincts" instruction."""
+    price_ratio = _remaining_ratio(annual_period_start, annual_period_end, now)
+    credit_ratio = _remaining_ratio(credit_cycle_start, credit_cycle_end, now)
+    price_diff = _annual_price_for_plan(new_plan) - float(current_annual_price or 0)
+    credit_diff = float(new_plan.get("credit") or 0) - float(current_plan_credit or 0)
+    return {
+        "amount_due_today": _round_price(price_diff * price_ratio),
+        "credits_to_add": _round_credits(credit_diff * credit_ratio),
+        "remaining_ratio": price_ratio,
+        "credit_remaining_ratio": credit_ratio,
+    }
+
+
+def _assert_upgrade_amounts_are_consistent(amount_due_today: float, credits_to_add: int) -> None:
+    """ordre says this is an upgrade -- if the resulting price or credit
+    delta computes negative anyway, the catalog is misconfigured (ordre
+    direction disagreeing with actual price/credit). Refuse outright
+    rather than silently charging/crediting a negative amount or
+    reinterpreting the request as a downgrade (spec section 3)."""
+    if amount_due_today < 0 or credits_to_add < 0:
+        raise _coded_error(
+            409, "plan_change_inconsistent_configuration",
+            "Cette offre est classee comme une montee en gamme, mais son prix ou son quota de "
+            "credits calcule est inferieur a l'offre actuelle. Contactez le support.",
+            amount_due_today=amount_due_today, credits_to_add=credits_to_add,
+        )
+
+
+async def _assert_plan_change_social_accounts_within_limits(user_id: str, new_plan: Dict[str, Any]) -> None:
     """Blocks a plan change that would leave the account over the new
-    plan's allowances. The new plan's resources aren't allocated until
-    this passes (see _allocate_plan_resources) -- without this check a
-    downgrade would silently leave, say, 5 connected Facebook accounts
-    against a plan that only allows 1, or more storage in use than the
-    new plan grants, with no way for the user to know until something
-    mysteriously stops working."""
+    plan's connected-account allowance -- there's no generic "block new
+    social account connections over limit" enforcement elsewhere (unlike
+    storage, see _assert_user_has_storage_headroom), so this is the only
+    safety net available and applies to every classification, including
+    a SCHEDULED downgrade (it would be too late to catch this once the
+    schedule fires on its own, unattended)."""
     new_max_social = max(1, int(new_plan.get("max_social_account") or 1))
     counts = await _count_social_accounts_by_platform(user_id)
     over_limit_platforms = {platform: count for platform, count in counts.items() if count > new_max_social}
@@ -10120,19 +10342,36 @@ async def _assert_plan_change_within_limits(user_id: str, new_plan: Dict[str, An
             max=new_max_social, details=details,
         )
 
+
+async def _plan_change_storage_overage(user_id: str, new_plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """None when the account's currently-used storage fits the new plan's
+    quota, otherwise {"storage_used", "storage_quota"} -- used both to
+    block an IMMEDIATE upgrade's live resource bump (which should never
+    be needed in practice, upgrades only ever raise the quota) and to
+    populate the pre-confirmation summary's overage warning for a
+    downgrade (spec section 7: never blocks scheduling the downgrade
+    itself -- only new uploads, once it actually takes effect, via the
+    existing generic _assert_user_has_storage_headroom)."""
     user_data = await supabase_get_user_data(user_id)
     if not user_data:
-        return
+        return None
     storage_max = float(user_data.get("stockage_max") or 0.0)
     storage_left = float(user_data.get("stockage") or 0.0)
     storage_used = max(0.0, storage_max - storage_left)
     new_storage_allowance = float(new_plan.get("stockage") or 0.0)
     if storage_used > new_storage_allowance:
+        return {"storage_used": storage_used, "storage_quota": new_storage_allowance}
+    return None
+
+
+async def _assert_plan_change_storage_not_exceeded(user_id: str, new_plan: Dict[str, Any]) -> None:
+    overage = await _plan_change_storage_overage(user_id, new_plan)
+    if overage:
         raise HTTPException(
             status_code=409,
             detail=(
-                f"Cette offre inclut {new_storage_allowance:.1f} Go de stockage, mais vous utilisez "
-                f"actuellement {storage_used:.1f} Go. Supprimez du contenu avant de changer d'offre."
+                f"Cette offre inclut {overage['storage_quota']:.1f} Go de stockage, mais vous utilisez "
+                f"actuellement {overage['storage_used']:.1f} Go. Supprimez du contenu avant de changer d'offre."
             ),
         )
 
@@ -10177,13 +10416,19 @@ async def _change_plan_via_fresh_checkout(
 def _apply_recurring_plan_change(
     subscription: Dict[str, Any], new_plan: Dict[str, Any],
 ) -> "stripe.Subscription":
-    """Swaps an already-recurring subscription's price in place, with
-    proration -- the counterpart of _change_plan_via_fresh_checkout for a
-    subscription that already has a real Stripe Subscription to modify.
-    Changing plan never changes billing_interval -- the new price keeps
-    whichever cadence (monthly/annual) the current subscription already
-    bills on, re-priced for new_plan at that cadence (see
-    _annual_price_for_plan)."""
+    """Swaps an already-recurring subscription's price in place for an
+    IMMEDIATE upgrade -- the counterpart of _change_plan_via_fresh_checkout
+    for a subscription that already has a real Stripe Subscription to
+    modify. proration_behavior="none": the custom-computed proration
+    (_compute_monthly_upgrade_proration/_compute_annual_upgrade_proration)
+    is charged separately as its own exact invoice
+    (_charge_plan_change_proration) -- letting Stripe ALSO auto-generate
+    its own proration invoice item here would double-charge the
+    difference and could disagree with the amount already shown to the
+    user. Changing plan never changes billing_interval here -- the new
+    price keeps whichever cadence (monthly/annual) the current
+    subscription already bills on, re-priced for new_plan at that cadence
+    (see _annual_price_for_plan)."""
     billing_interval = subscription.get("billing_interval") or "month"
     price_amount = _annual_price_for_plan(new_plan) if billing_interval == "year" else float(new_plan.get("price") or 0)
     try:
@@ -10232,59 +10477,307 @@ def _apply_recurring_plan_change(
         return stripe.Subscription.modify(
             subscription["stripe_subscription_id"],
             items=[{"id": item_id, "price": new_price.id}],
-            proration_behavior="create_prorations",
+            proration_behavior="none",
             metadata=new_metadata,
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
 
 
-async def _finalize_plan_change(
-    user_id: str, request: Optional[Request], subscription: Dict[str, Any], new_plan: Dict[str, Any],
-    updated_stripe_subscription: "stripe.Subscription",
+def _compute_plan_change_proration(
+    subscription: Dict[str, Any], current_plan: Dict[str, Any], new_plan: Dict[str, Any],
+    billing_interval: str, now: datetime,
 ) -> Dict[str, Any]:
-    """Persists an in-place Stripe plan swap: retires the old row, records
-    the new one, resets plan resources, and notifies the user -- the
-    bookkeeping half of _apply_recurring_plan_change's Stripe call."""
-    current_period_end = _extract_subscription_period_end(updated_stripe_subscription)
-    period_end = datetime.fromtimestamp(current_period_end, tz=timezone.utc) if current_period_end else None
+    """Dispatches to the monthly or annual upgrade-proration formula
+    (spec section 3) using this subscription's own stored dates --
+    payment_start_date/payment_end_date for the paid period, and (for an
+    annual subscription only) credit_cycle_start_at/credit_cycle_end_at
+    for the current monthly credit sub-cycle. current_plan is read live
+    from the catalog (its nominal price never needs its own snapshot,
+    unlike plan_credit, since _assert_upgrade_amounts_are_consistent
+    would catch a stale/misconfigured price anyway)."""
+    current_plan_credit = float(subscription.get("plan_credit") or 0.0)
+    period_start = _parse_iso_datetime(subscription.get("payment_start_date"))
+    period_end = _parse_iso_datetime(subscription.get("payment_end_date"))
+    if billing_interval == "year":
+        credit_cycle_start = _parse_iso_datetime(subscription.get("credit_cycle_start_at")) or period_start
+        credit_cycle_end = _parse_iso_datetime(subscription.get("credit_cycle_end_at")) or period_end
+        return _compute_annual_upgrade_proration(
+            current_plan_credit=current_plan_credit,
+            current_annual_price=_annual_price_for_plan(current_plan),
+            new_plan=new_plan,
+            annual_period_start=period_start, annual_period_end=period_end,
+            credit_cycle_start=credit_cycle_start, credit_cycle_end=credit_cycle_end, now=now,
+        )
+    return _compute_monthly_upgrade_proration(
+        current_plan_credit=current_plan_credit, current_plan_price=float(current_plan.get("price") or 0),
+        new_plan=new_plan, period_start=period_start, period_end=period_end, now=now,
+    )
 
-    # With proration, Stripe keeps the same billing-cycle end for the
-    # underlying subscription -- the new row below gets (essentially) the
-    # same payment_end_date as the old one, so both would otherwise match
-    # get_user_abonnement's "active" filter (payment_end_date >= now) at
-    # once, and which one it returns is unordered/arbitrary. Close the old
-    # row out now so only the new plan's row is "active" going forward.
+
+def _charge_plan_change_proration(
+    customer_id: Optional[str], amount_due_today: float, description: str, idempotency_key: Optional[str] = None,
+) -> None:
+    """Charges exactly `amount_due_today` -- the custom proration
+    computed by _compute_plan_change_proration, never Stripe's own
+    proration engine -- off-session against the customer's card on file,
+    via a one-off invoice. A no-op when there's nothing to charge (0,
+    e.g. a plan with an identical price but more credits). Raises before
+    anything else about the plan change is touched, so a declined card
+    or any other payment failure leaves the current plan fully in place
+    (spec section 3: "en cas d'echec de paiement... conserve l'offre
+    actuelle"); there is no browser redirect step here to be fooled by a
+    bare "return" from one -- this entire path is a synchronous
+    server-side call.
+
+    idempotency_key, when given, is suffixed per Stripe call (each needs
+    its own) so a retried request for the SAME upgrade (double-submit, a
+    client retry after a timeout, ...) reuses the same Stripe objects
+    instead of charging the card twice -- this only protects the Stripe
+    side; see change_souscription_plan's docstring for the remaining
+    crash window between a successful charge and the local bookkeeping
+    that follows it."""
+    if amount_due_today <= 0:
+        return
+    if not customer_id:
+        raise _coded_error(409, "plan_change_missing_payment_method", "Aucun moyen de paiement enregistre pour ce compte.")
+    unit_amount = int(round(amount_due_today * 100))
+    item_kwargs = {"idempotency_key": f"{idempotency_key}_item"} if idempotency_key else {}
+    invoice_kwargs = {"idempotency_key": f"{idempotency_key}_invoice"} if idempotency_key else {}
+    pay_kwargs = {"idempotency_key": f"{idempotency_key}_pay"} if idempotency_key else {}
+    try:
+        stripe.InvoiceItem.create(
+            customer=customer_id, amount=unit_amount, currency=STRIPE_CURRENCY, description=description, **item_kwargs,
+        )
+        invoice = stripe.Invoice.create(
+            customer=customer_id, auto_advance=True, collection_method="charge_automatically", description=description,
+            **invoice_kwargs,
+        )
+        invoice = stripe.Invoice.finalize_invoice(invoice.id)
+        stripe.Invoice.pay(invoice.id, **pay_kwargs)
+    except stripe.error.CardError as exc:
+        raise _coded_error(402, "plan_change_payment_failed", f"Paiement refuse : {getattr(exc, 'user_message', None) or exc}")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
+
+
+async def _cancel_scheduled_plan_change(user_id: str, subscription: Dict[str, Any]) -> None:
+    """Releases the Stripe Subscription Schedule driving a pending
+    downgrade/periodicity change (see _create_or_replace_plan_change_
+    schedule) and clears its local mirror columns -- the subscription
+    reverts to auto-renewing on its current (unchanged) terms, exactly as
+    if the change had never been scheduled."""
+    schedule_id = subscription.get("stripe_schedule_id")
+    if schedule_id:
+        try:
+            stripe.SubscriptionSchedule.release(schedule_id)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
     await supabase_update_souscription_row(
         str(subscription["id"]),
-        {"payment_end_date": datetime.now(timezone.utc).isoformat()},
+        {
+            "scheduled_abonnement_id": None, "scheduled_billing_interval": None,
+            "scheduled_effective_at": None, "scheduled_created_at": None,
+            "stripe_schedule_id": None,
+        },
         user_id=user_id,
     )
 
+
+def _create_or_replace_plan_change_schedule(
+    subscription: Dict[str, Any], new_plan: Dict[str, Any], new_interval: str,
+) -> Tuple[str, datetime]:
+    """Creates (replacing one already pending, if any) the Stripe
+    Subscription Schedule that defers a downgrade or periodicity change
+    to the end of the already-paid period (spec sections 4/5): phase 1 is
+    the subscription exactly as it is today, ending at its own current
+    Stripe period end; phase 2 starts there with the new plan's price and
+    metadata. Stripe raises the normal renewal invoice for phase 2 itself
+    -- the EXISTING _handle_subscription_renewal_invoice webhook applies
+    it unmodified, so there is no second, parallel billing path and the
+    underlying Subscription object (and its id) never changes. Returns
+    (schedule_id, effective_at)."""
+    stripe_subscription_id = subscription["stripe_subscription_id"]
+    try:
+        stripe_subscription = stripe.Subscription.retrieve(stripe_subscription_id)
+        current_period_end = _extract_subscription_period_end(stripe_subscription)
+        if not current_period_end:
+            raise _coded_error(502, "plan_change_schedule_failed", "Impossible de determiner la date de fin de periode en cours.")
+
+        existing_metadata = stripe_subscription.metadata.to_dict() if stripe_subscription.metadata else {}
+        current_item = stripe_subscription["items"]["data"][0]
+        current_price_id = current_item["price"]["id"]
+
+        price_amount = _annual_price_for_plan(new_plan) if new_interval == "year" else float(new_plan.get("price") or 0)
+        unit_amount = int(round(price_amount * 100))
+        if unit_amount <= 0:
+            raise _coded_error(400, "invalid_plan_price", _INVALID_PLAN_PRICE)
+        new_price = stripe.Price.create(
+            currency=STRIPE_CURRENCY, unit_amount=unit_amount, recurring={"interval": new_interval},
+            product_data={"name": str(new_plan.get("name") or "Abonnement"), "tax_code": "txcd_10103001"},
+        )
+        new_metadata = {
+            **existing_metadata,
+            "abonnement": str(new_plan.get("id")),
+            "plan_name": str(new_plan.get("name") or ""),
+            "billing_interval": new_interval,
+        }
+
+        # A subscription already governed by a schedule can't be adopted
+        # into a new one -- release whichever one this row was already
+        # pending on (replacing it) before attaching the fresh pair of
+        # phases below.
+        existing_schedule_id = subscription.get("stripe_schedule_id")
+        if existing_schedule_id:
+            try:
+                stripe.SubscriptionSchedule.release(existing_schedule_id)
+            except Exception:
+                logger.warning("Failed to release previous schedule %s before replacing it", existing_schedule_id, exc_info=True)
+
+        schedule = stripe.SubscriptionSchedule.create(from_subscription=stripe_subscription_id)
+        phase_zero_start = schedule["phases"][0]["start_date"]
+        schedule = stripe.SubscriptionSchedule.modify(
+            schedule.id,
+            end_behavior="release",
+            phases=[
+                {
+                    "items": [{"price": current_price_id, "quantity": 1}],
+                    "start_date": phase_zero_start,
+                    "end_date": current_period_end,
+                    "metadata": existing_metadata,
+                },
+                {
+                    "items": [{"price": new_price.id, "quantity": 1}],
+                    "start_date": current_period_end,
+                    "iterations": 1,
+                    "proration_behavior": "none",
+                    "metadata": new_metadata,
+                },
+            ],
+        )
+        return schedule.id, datetime.fromtimestamp(current_period_end, tz=timezone.utc)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
+
+
+async def _apply_scheduled_plan_change(
+    user_id: str, subscription: Dict[str, Any], new_plan: Dict[str, Any], new_interval: str, classification: str,
+) -> Dict[str, Any]:
+    """Schedules a downgrade or periodicity change (classifications
+    PLAN_CHANGE_DOWNGRADE_SCHEDULED / PLAN_CHANGE_PERIODICITY_SCHEDULED).
+    No charge, no credit/storage change now -- current_plan/features keep
+    running unchanged until Stripe's own renewal invoice applies the new
+    plan at the correct boundary (spec sections 4/5: next monthly renewal
+    for a monthly subscription, next ANNUAL renewal -- never the monthly
+    credit-allocation anniversary -- for an annual one)."""
+    if not subscription.get("stripe_subscription_id"):
+        raise _coded_error(
+            409, "plan_change_requires_recurring_subscription",
+            "Cet abonnement ne peut pas etre programme automatiquement. Contactez le support.",
+        )
+    if subscription.get("auto_renew") is False:
+        raise _coded_error(
+            409, "plan_change_subscription_cancelled",
+            "Cet abonnement est deja resilie en fin de periode -- reactivez-le avant de programmer un changement d'offre.",
+        )
+
+    schedule_id, effective_at = _create_or_replace_plan_change_schedule(subscription, new_plan, new_interval)
+    await supabase_update_souscription_row(
+        str(subscription["id"]),
+        {
+            "scheduled_abonnement_id": str(new_plan.get("id")),
+            "scheduled_billing_interval": new_interval,
+            "scheduled_effective_at": effective_at.isoformat(),
+            "scheduled_created_at": datetime.now(timezone.utc).isoformat(),
+            "stripe_schedule_id": schedule_id,
+        },
+        user_id=user_id,
+    )
+    return {
+        "classification": classification,
+        "scheduled_abonnement_id": str(new_plan.get("id")),
+        "scheduled_abonnement_name": str(new_plan.get("name") or ""),
+        "scheduled_billing_interval": new_interval,
+        "scheduled_effective_at": effective_at.isoformat(),
+    }
+
+
+async def _finalize_immediate_upgrade(
+    user_id: str, request: Optional[Request], subscription: Dict[str, Any], new_plan: Dict[str, Any],
+    updated_stripe_subscription: "stripe.Subscription", proration: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Persists an immediate upgrade once its custom-prorated charge has
+    already succeeded (_charge_plan_change_proration): retires the old
+    row, records the new one carrying the SAME renewal/credit-cycle
+    dates forward (spec section 3: "conserve les dates... existantes"),
+    and tops up credit/storage by a DELTA on top of the current balance
+    -- never a reset, so neither the existing balance nor its own
+    expiration is touched (spec section 6)."""
+    now = datetime.now(timezone.utc)
     billing_interval = subscription.get("billing_interval") or "month"
-    plan_amount = _annual_price_for_plan(new_plan) if billing_interval == "year" else float(new_plan.get("price") or 0)
-    plan_change_time = datetime.now(timezone.utc)
+
+    current_period_end_ts = _extract_subscription_period_end(updated_stripe_subscription)
+    period_end = (
+        datetime.fromtimestamp(current_period_end_ts, tz=timezone.utc)
+        if current_period_end_ts else _parse_iso_datetime(subscription.get("payment_end_date"))
+    )
+    credit_cycle_start = _parse_iso_datetime(subscription.get("credit_cycle_start_at")) or _parse_iso_datetime(subscription.get("payment_start_date")) or now
+    credit_cycle_end = _parse_iso_datetime(subscription.get("credit_cycle_end_at")) or period_end
+    next_allocation = _parse_iso_datetime(subscription.get("next_credit_allocation_at"))
+
+    # Same "close the superseded row out" reasoning as before: both rows
+    # would otherwise carry the same payment_end_date and both match
+    # get_user_abonnement's "active" filter at once.
+    await supabase_update_souscription_row(
+        str(subscription["id"]), {"payment_end_date": now.isoformat()}, user_id=user_id,
+    )
+
+    new_plan_credit = float(new_plan.get("credit") or 0)
+    new_plan_storage = float(new_plan.get("stockage") or 0)
+    plan_amount = proration["amount_due_today"]
+
     new_souscription = await supabase_insert_souscription(
         user_id=user_id,
         abonnement=str(new_plan.get("id")),
         payment_mode="stripe",
         payment_amount=plan_amount,
-        payment_reference=f"planchange_{subscription['stripe_subscription_id']}_{int(plan_change_time.timestamp())}",
+        payment_reference=f"planchange_{subscription['stripe_subscription_id']}_{int(now.timestamp())}",
         payment_status="completed",
-        payment_comment=f"Plan changed to {new_plan.get('name')}",
+        payment_comment=f"Plan upgraded to {new_plan.get('name')} (prorated)",
+        payment_date=now,
         period_end_date=period_end,
         stripe_subscription_id=subscription["stripe_subscription_id"],
         stripe_customer_id=subscription.get("stripe_customer_id"),
         billing_interval=billing_interval,
+        plan_credit=new_plan_credit,
+        plan_stockage=new_plan_storage,
+        next_credit_allocation_at=next_allocation,
+        credit_cycle_start_at=credit_cycle_start,
+        credit_cycle_end_at=credit_cycle_end,
     )
-    await _allocate_plan_resources(
+    new_souscription_id = str(new_souscription.get("id") or "")
+
+    storage_delta = new_plan_storage - float(subscription.get("plan_stockage") or 0.0)
+    await supabase_upsert_user_data_credits(
         user_id=user_id,
-        abonnement=str(new_plan.get("id")),
-        payment_reference=str(new_souscription.get("id") or ""),
-        souscription_id=str(new_souscription.get("id") or ""),
-        billing_interval=billing_interval,
-        period_start=plan_change_time,
+        credit_delta=float(proration["credits_to_add"]),
+        storage_delta=storage_delta,
+        update_credit_max=True,
+        update_stockage_max=True,
+        operation_type=PLAN_CHANGE_UPGRADE_OPERATION_TYPE,
+        operation_id=new_souscription_id,
     )
+    await supabase_insert_user_data_history(
+        user_id=user_id,
+        credit=float(proration["credits_to_add"]),
+        storage=storage_delta,
+        operation="input",
+        operation_type=PLAN_CHANGE_UPGRADE_OPERATION_TYPE,
+        operation_id=new_souscription_id,
+    )
+
     _send_transactional_email(
         _user_email_from_request(request), "subscription_plan_changed",
         plan_name=str(new_plan.get("name") or "Vireel"), amount=plan_amount,
@@ -10292,19 +10785,73 @@ async def _finalize_plan_change(
     return new_souscription
 
 
-@app.post("/api/souscription/change-plan", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def _apply_immediate_upgrade(
+    user_id: str, request: Optional[Request], subscription: Dict[str, Any],
+    current_plan: Dict[str, Any], new_plan: Dict[str, Any], confirm_cancel_scheduled: bool,
+) -> Dict[str, Any]:
+    """Applies classification PLAN_CHANGE_UPGRADE_IMMEDIATE (spec section
+    3): computes the custom proration, refuses an internally-inconsistent
+    catalog, requires explicit confirmation to proceed if it would cancel
+    an already-scheduled change (spec section 4's last sentence), charges
+    that exact amount, and only then mutates anything local or on Stripe."""
+    billing_interval = subscription.get("billing_interval") or "month"
+    now = datetime.now(timezone.utc)
+
+    if not subscription.get("stripe_subscription_id"):
+        raise _coded_error(
+            409, "plan_change_requires_recurring_subscription",
+            "Cet abonnement ne peut pas etre mis a niveau automatiquement. Contactez le support.",
+        )
+
+    proration = _compute_plan_change_proration(subscription, current_plan, new_plan, billing_interval, now)
+    _assert_upgrade_amounts_are_consistent(proration["amount_due_today"], proration["credits_to_add"])
+
+    has_scheduled_change = bool(subscription.get("scheduled_abonnement_id"))
+    if has_scheduled_change and not confirm_cancel_scheduled:
+        scheduled_plan = await supabase_get_abonnement(str(subscription.get("scheduled_abonnement_id")))
+        raise _coded_error(
+            409, "plan_change_scheduled_change_exists",
+            "Un changement est deja programme sur cet abonnement. Confirmez pour l'annuler et appliquer "
+            "cette montee immediatement.",
+            scheduled_abonnement_name=(scheduled_plan or {}).get("name") or subscription.get("scheduled_abonnement_id"),
+        )
+
+    description = f"Montee vers {new_plan.get('name')} (prorata)"
+    # Stable for as long as this exact upgrade (same subscription, same
+    # target plan, same already-paid period) could be retried -- a
+    # second attempt reuses the same Stripe objects instead of charging
+    # twice (see _charge_plan_change_proration's docstring).
+    idempotency_key = f"planchange_{subscription['stripe_subscription_id']}_{new_plan.get('id')}_{subscription.get('payment_end_date')}"
+    _charge_plan_change_proration(
+        subscription.get("stripe_customer_id"), proration["amount_due_today"], description, idempotency_key=idempotency_key,
+    )
+
+    if has_scheduled_change:
+        await _cancel_scheduled_plan_change(user_id, subscription)
+
+    updated_stripe_subscription = _apply_recurring_plan_change(subscription, new_plan)
+    return await _finalize_immediate_upgrade(user_id, request, subscription, new_plan, updated_stripe_subscription, proration)
+
+
+class ChangeSubscriptionPlanRequest(BaseModel):
+    plan_id: str
+    billing_interval: Optional[str] = None
+    confirm_cancel_scheduled: bool = False
+
+
+@app.post("/api/souscription/change-plan", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def change_souscription_plan(
     payload: ChangeSubscriptionPlanRequest, user_id: Annotated[str, Depends(get_user_id_header)],
     request: Request = None,
 ):
-    """Swap the subscription's price for a different plan's, effective
-    immediately (with Stripe proration), and reset credit/storage to the
-    new plan's allowance the same way a fresh purchase would -- mirrors
-    _allocate_plan_resources's existing "a changed plan resets monthly
-    allowances" behavior, just triggered synchronously here instead of via
-    a webhook. A subscription with no stripe_subscription_id goes through
-    _change_plan_via_fresh_checkout instead (see
-    _get_active_stripe_souscription's docstring for why)."""
+    """Centralized plan-change entry point (plan-change rework spec).
+    Classifies the request using ONLY abonnement.ordre (_classify_plan_change)
+    and dispatches: an upgrade at the same periodicity applies immediately
+    with custom proration (_apply_immediate_upgrade); a downgrade or a
+    periodicity change is deferred to the end of the already-paid period
+    via a Stripe Subscription Schedule (_apply_scheduled_plan_change); the
+    same plan+periodicity is a no-op; a lateral or unclassifiable (ordre
+    absent/invalid) change is refused outright, with nothing touched."""
     _require_stripe_ready()
     if not is_supabase_configured():
         raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
@@ -10313,17 +10860,153 @@ async def change_souscription_plan(
     if not subscription:
         raise _coded_error(404, "no_active_subscription", "No active subscription")
 
+    current_plan = await supabase_get_abonnement(str(subscription.get("abonnement") or ""))
+    if not current_plan:
+        raise _coded_error(409, "plan_change_invalid_order", "L'offre actuelle n'est plus disponible pour evaluer ce changement.")
+
     new_plan = await supabase_get_abonnement(payload.plan_id)
     if not new_plan:
         raise _coded_error(404, "plan_not_found", "Subscription plan not found")
 
-    await _assert_plan_change_within_limits(user_id, new_plan)
+    current_interval = subscription.get("billing_interval") or "month"
+    new_interval = payload.billing_interval or current_interval
+    if new_interval not in ("month", "year"):
+        raise _coded_error(400, "invalid_billing_interval", "billing_interval doit etre 'month' ou 'year'.")
+
+    classification = _classify_plan_change(current_plan, new_plan, current_interval, new_interval)
+
+    if classification == PLAN_CHANGE_NOOP:
+        return {"classification": PLAN_CHANGE_NOOP, "changed": False}
+    if classification == PLAN_CHANGE_INVALID:
+        raise _coded_error(409, "plan_change_invalid_order", "Cette offre ne peut pas etre evaluee (ordre manquant ou invalide).")
+    if classification == PLAN_CHANGE_LATERAL_UNSUPPORTED:
+        raise _coded_error(409, "plan_change_lateral_unsupported", "Le changement vers une offre de meme rang n'est pas pris en charge.")
+
+    await _assert_plan_change_social_accounts_within_limits(user_id, new_plan)
 
     if not subscription.get("stripe_subscription_id"):
-        return await _change_plan_via_fresh_checkout(request, user_id, subscription, new_plan)
+        # Legacy pre-recurring-billing subscription (see
+        # _get_active_stripe_souscription's docstring) -- there is no
+        # Stripe Subscription to modify or schedule. Only a same-
+        # periodicity upgrade can still go through a fresh Checkout;
+        # a deferred change has no recurring object to attach to.
+        if classification == PLAN_CHANGE_UPGRADE_IMMEDIATE:
+            await _assert_plan_change_storage_not_exceeded(user_id, new_plan)
+            return await _change_plan_via_fresh_checkout(request, user_id, subscription, new_plan)
+        raise _coded_error(
+            409, "plan_change_requires_recurring_subscription",
+            "Cet abonnement ne peut pas etre programme automatiquement. Contactez le support.",
+        )
 
-    updated_stripe_subscription = _apply_recurring_plan_change(subscription, new_plan)
-    return await _finalize_plan_change(user_id, request, subscription, new_plan, updated_stripe_subscription)
+    if classification == PLAN_CHANGE_UPGRADE_IMMEDIATE:
+        await _assert_plan_change_storage_not_exceeded(user_id, new_plan)
+        return await _apply_immediate_upgrade(user_id, request, subscription, current_plan, new_plan, payload.confirm_cancel_scheduled)
+
+    return await _apply_scheduled_plan_change(user_id, subscription, new_plan, new_interval, classification)
+
+
+@app.post("/api/souscription/change-plan/cancel-scheduled", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def cancel_scheduled_plan_change(user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Cancels this subscription's single pending scheduled change (spec
+    section 4), reverting it to auto-renew on its current, unchanged
+    terms."""
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+    subscription = await get_user_abonnement(user_id)
+    if not subscription:
+        raise _coded_error(404, "no_active_subscription", "No active subscription")
+    if not subscription.get("scheduled_abonnement_id"):
+        raise _coded_error(404, "no_scheduled_change", "Aucun changement programme sur cet abonnement.")
+    await _cancel_scheduled_plan_change(user_id, subscription)
+    return {"cancelled": True}
+
+
+@app.get("/api/souscription/change-plan/preview", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def preview_souscription_plan_change(
+    user_id: Annotated[str, Depends(get_user_id_header)],
+    plan_id: str,
+    billing_interval: Optional[str] = None,
+):
+    """Backend-computed pre-confirmation summary (spec section 8) -- uses
+    the EXACT same classification and proration functions as the real
+    change endpoint, so the amount shown here can never disagree with
+    what actually gets charged."""
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    subscription = await get_user_abonnement(user_id)
+    if not subscription:
+        raise _coded_error(404, "no_active_subscription", "No active subscription")
+
+    current_plan = await supabase_get_abonnement(str(subscription.get("abonnement") or ""))
+    if not current_plan:
+        raise _coded_error(409, "plan_change_invalid_order", "L'offre actuelle n'est plus disponible pour evaluer ce changement.")
+
+    new_plan = await supabase_get_abonnement(plan_id)
+    if not new_plan:
+        raise _coded_error(404, "plan_not_found", "Subscription plan not found")
+
+    current_interval = subscription.get("billing_interval") or "month"
+    new_interval = billing_interval or current_interval
+    if new_interval not in ("month", "year"):
+        raise _coded_error(400, "invalid_billing_interval", "billing_interval doit etre 'month' ou 'year'.")
+
+    classification = _classify_plan_change(current_plan, new_plan, current_interval, new_interval)
+    now = datetime.now(timezone.utc)
+
+    summary: Dict[str, Any] = {
+        "classification": classification,
+        "current_plan_name": current_plan.get("name"),
+        "current_billing_interval": current_interval,
+        "new_plan_name": new_plan.get("name"),
+        "new_billing_interval": new_interval,
+        "will_cancel_scheduled_change": bool(subscription.get("scheduled_abonnement_id")),
+        "annual_billing_copy_required": new_interval == "year",
+    }
+
+    if classification == PLAN_CHANGE_UPGRADE_IMMEDIATE:
+        proration = _compute_plan_change_proration(subscription, current_plan, new_plan, current_interval, now)
+        amount_due_today = proration["amount_due_today"]
+        credits_to_add = proration["credits_to_add"]
+        inconsistent = amount_due_today < 0 or credits_to_add < 0
+
+        user_data = await supabase_get_user_data(user_id)
+        current_credit = float((user_data or {}).get("credit") or 0.0)
+        promotional_batches = await supabase_list_active_promotional_credit_batches(user_id)
+        promotional_credit = sum(float(b.get("amount_remaining") or 0.0) for b in promotional_batches)
+
+        next_price = _annual_price_for_plan(new_plan) if current_interval == "year" else float(new_plan.get("price") or 0)
+        summary.update({
+            "effective_at": now.isoformat(),
+            "amount_due_today": amount_due_today,
+            "inconsistent_configuration": inconsistent,
+            "credits_added_now": credits_to_add,
+            "credits_added_expires_at": subscription.get("credit_cycle_end_at") or subscription.get("payment_end_date"),
+            "resulting_credit_balance": current_credit + promotional_credit + (credits_to_add if not inconsistent else 0),
+            "future_monthly_credit_quota": float(new_plan.get("credit") or 0),
+            "new_storage_quota": float(new_plan.get("stockage") or 0),
+            "next_amount": next_price,
+            "next_billing_date": subscription.get("payment_end_date"),
+        })
+        overage = await _plan_change_storage_overage(user_id, new_plan)
+        summary["storage_overage_warning"] = overage
+    elif classification in (PLAN_CHANGE_DOWNGRADE_SCHEDULED, PLAN_CHANGE_PERIODICITY_SCHEDULED):
+        effective_at = subscription.get("payment_end_date")
+        summary.update({
+            "effective_at": effective_at,
+            "amount_due_today": 0.0,
+            "credits_added_now": 0,
+            "future_monthly_credit_quota": float(new_plan.get("credit") or 0),
+            "new_storage_quota": float(new_plan.get("stockage") or 0),
+            "next_amount": _annual_price_for_plan(new_plan) if new_interval == "year" else float(new_plan.get("price") or 0),
+            "next_billing_date": effective_at,
+        })
+        overage = await _plan_change_storage_overage(user_id, new_plan)
+        summary["storage_overage_warning"] = overage
+    else:
+        summary.update({"effective_at": None, "amount_due_today": 0.0, "credits_added_now": 0})
+
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -15046,7 +15729,16 @@ async def _process_due_annual_credit_refills() -> None:
         # cadence stays tied to the original payment anniversary instead of
         # drifting later every time a sweep runs a bit behind schedule.
         next_due = supabase_add_one_month(previous_due)
-        await supabase_update_souscription_row(souscription_id, {"next_credit_allocation_at": next_due.isoformat()})
+        await supabase_update_souscription_row(souscription_id, {
+            "next_credit_allocation_at": next_due.isoformat(),
+            # The credit cycle (used by the upgrade-proration math in
+            # _compute_annual_upgrade_proration) is this one-month
+            # sub-window, not the whole paid year -- advance it in lockstep
+            # with next_credit_allocation_at so a mid-sub-cycle upgrade
+            # always prorates against the CURRENT window.
+            "credit_cycle_start_at": previous_due.isoformat(),
+            "credit_cycle_end_at": next_due.isoformat(),
+        })
 
 
 async def process_annual_credit_refill_jobs() -> None:
