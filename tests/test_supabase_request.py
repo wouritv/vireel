@@ -1688,7 +1688,7 @@ def test_set_user_data_balance_existing_and_insert_paths(monkeypatch):
     assert inserted["credit"] == 4
 
 
-def test_deduct_user_credits_debt_and_storage_overage_paths(monkeypatch):
+def test_deduct_user_credits_debt_path_and_storage_never_blocks(monkeypatch):
     supabase_request = _import_supabase_request_with_stubs(monkeypatch)
     fake_client = _FakeClient(
         {supabase_request.SUPABASE_USER_DATA_TABLE: [_FakeResponse(data=[{"user_id": "u1"}])]}
@@ -1720,7 +1720,17 @@ def test_deduct_user_credits_debt_and_storage_overage_paths(monkeypatch):
     assert asyncio.run(supabase_request.deduct_user_credits("u1", credits=5, storage_delta=0.0)) is True
     assert bank_calls and bank_calls[0]["direction"] == "debt_increase"
 
-    async def _existing_overage(_uid):
+    # Storage is no longer a quota that can block a deduction (see
+    # retention_config.py / the storage-quota removal) -- a large negative
+    # storage_delta must settle fine as long as the credit side is within
+    # its own debt ceiling. Fresh fake_client: the one above already
+    # consumed its single queued update response.
+    fake_client_2 = _FakeClient(
+        {supabase_request.SUPABASE_USER_DATA_TABLE: [_FakeResponse(data=[{"user_id": "u1"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client_2)
+
+    async def _existing_large_storage_delta(_uid):
         return {
             "user_id": "u1",
             "credit": 100,
@@ -1729,8 +1739,8 @@ def test_deduct_user_credits_debt_and_storage_overage_paths(monkeypatch):
             "stockage_max": 10.0,
         }
 
-    monkeypatch.setattr(supabase_request, "get_user_data", _existing_overage)
-    assert asyncio.run(supabase_request.deduct_user_credits("u1", credits=1, storage_delta=-100.0)) is False
+    monkeypatch.setattr(supabase_request, "get_user_data", _existing_large_storage_delta)
+    assert asyncio.run(supabase_request.deduct_user_credits("u1", credits=1, storage_delta=-100.0)) is True
 
 
 def test_insert_credit_bank_entry_and_user_history(monkeypatch):
@@ -2514,6 +2524,170 @@ def test_mark_all_notifications_read_returns_count(monkeypatch):
 
     count = asyncio.run(supabase_request.mark_all_notifications_read("u1"))
     assert count == 2
+
+
+def test_insert_media_asset_sends_fixed_policy_snapshot(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_MEDIA_ASSETS_TABLE: [_FakeResponse(data=[{"id": "m1"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    started = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    expires = datetime(2026, 1, 31, tzinfo=timezone.utc)
+    row = asyncio.run(supabase_request.insert_media_asset(
+        user_id="u1",
+        content_kind=supabase_request.CONTENT_KIND_REEL,
+        content_id="r1",
+        media_type="produced",
+        subscription_status_at_creation="active",
+        retention_days=30,
+        retention_started_at=started,
+        retention_expires_at=expires,
+        job_id="job-1",
+        s3_bucket="bucket",
+        s3_key="key.mp4",
+        size_bytes=4_000_000_000,
+        s3_storage_cost_per_gb_day=0.0008,
+        retention_storage_cost_usd=0.096,
+        retention_storage_credit_cost=1.5,
+    ))
+    assert row["id"] == "m1"
+    insert_payload = _event_args(fake_client.events, supabase_request.SUPABASE_MEDIA_ASSETS_TABLE, "insert")[0]
+    assert insert_payload["content_kind"] == "reel"
+    assert insert_payload["media_type"] == "produced"
+    assert insert_payload["retention_days"] == 30
+    assert insert_payload["retention_started_at"] == started.isoformat()
+    assert insert_payload["retention_expires_at"] == expires.isoformat()
+    assert insert_payload["size_bytes"] == 4_000_000_000
+
+
+def test_get_media_asset_by_content_requires_both_keys(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    assert asyncio.run(supabase_request.get_media_asset_by_content("", "r1")) is None
+    assert asyncio.run(supabase_request.get_media_asset_by_content("reel", "")) is None
+
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_MEDIA_ASSETS_TABLE: [_FakeResponse(data=[{"id": "m1"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+    row = asyncio.run(supabase_request.get_media_asset_by_content("reel", "r1"))
+    assert row["id"] == "m1"
+    eq_calls = [args for table, method, args, _ in fake_client.events if table == supabase_request.SUPABASE_MEDIA_ASSETS_TABLE and method == "eq"]
+    assert ("content_kind", "reel") in eq_calls
+    assert ("content_id", "r1") in eq_calls
+
+
+def test_list_media_assets_due_for_expiration_filters_available_and_expired(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_MEDIA_ASSETS_TABLE: [_FakeResponse(data=[{"id": "m1"}, {"id": "m2"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    rows = asyncio.run(supabase_request.list_media_assets_due_for_expiration(limit=50))
+    assert rows == [{"id": "m1"}, {"id": "m2"}]
+    eq_calls = [args for table, method, args, _ in fake_client.events if table == supabase_request.SUPABASE_MEDIA_ASSETS_TABLE and method == "eq"]
+    assert ("media_status", "AVAILABLE") in eq_calls
+    assert _event_args(fake_client.events, supabase_request.SUPABASE_MEDIA_ASSETS_TABLE, "limit") == (50,)
+
+
+def test_mark_media_asset_expired_only_targets_available_rows(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_MEDIA_ASSETS_TABLE: [_FakeResponse(data=[{"id": "m1"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    assert asyncio.run(supabase_request.mark_media_asset_expired("m1")) is True
+    update_payload = _event_args(fake_client.events, supabase_request.SUPABASE_MEDIA_ASSETS_TABLE, "update")[0]
+    assert update_payload["media_status"] == "EXPIRED"
+    assert "media_deleted_at" in update_payload
+    eq_calls = [args for table, method, args, _ in fake_client.events if table == supabase_request.SUPABASE_MEDIA_ASSETS_TABLE and method == "eq"]
+    assert ("media_status", "AVAILABLE") in eq_calls
+
+
+def test_mark_media_asset_expired_empty_id_is_noop(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    assert asyncio.run(supabase_request.mark_media_asset_expired("")) is False
+
+
+def test_mark_media_asset_missing(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_MEDIA_ASSETS_TABLE: [_FakeResponse(data=[{"id": "m1"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    assert asyncio.run(supabase_request.mark_media_asset_missing("m1")) is True
+    update_payload = _event_args(fake_client.events, supabase_request.SUPABASE_MEDIA_ASSETS_TABLE, "update")[0]
+    assert update_payload["media_status"] == "MISSING"
+
+
+def test_mark_media_asset_deleted(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_MEDIA_ASSETS_TABLE: [_FakeResponse(data=[{"id": "m1"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    assert asyncio.run(supabase_request.mark_media_asset_deleted("m1")) is True
+    update_payload = _event_args(fake_client.events, supabase_request.SUPABASE_MEDIA_ASSETS_TABLE, "update")[0]
+    assert update_payload["media_status"] == "DELETED"
+    assert "media_deleted_at" in update_payload
+
+
+def test_list_media_assets_by_content_ids_builds_map_keyed_by_content_id(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_MEDIA_ASSETS_TABLE: [_FakeResponse(data=[
+            {"content_id": "r1", "media_status": "AVAILABLE"},
+            {"content_id": "r2", "media_status": "EXPIRED"},
+        ])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.list_media_assets_by_content_ids("reel", ["r1", "r2", "r1"]))
+    assert result["r1"]["media_status"] == "AVAILABLE"
+    assert result["r2"]["media_status"] == "EXPIRED"
+    in_calls = [args for table, method, args, _ in fake_client.events if table == supabase_request.SUPABASE_MEDIA_ASSETS_TABLE and method == "in_"]
+    assert in_calls == [("content_id", ["r1", "r2"])]
+
+
+def test_list_media_assets_by_content_ids_empty_without_ids(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    assert asyncio.run(supabase_request.list_media_assets_by_content_ids("reel", [])) == {}
+    assert asyncio.run(supabase_request.list_media_assets_by_content_ids("", ["r1"])) == {}
+
+
+def test_list_produced_media_due_for_notification_excludes_source_and_notified(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_MEDIA_ASSETS_TABLE: [_FakeResponse(data=[{"id": "m1"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    rows = asyncio.run(supabase_request.list_produced_media_due_for_notification(limit=10))
+    assert rows == [{"id": "m1"}]
+    eq_calls = [args for table, method, args, _ in fake_client.events if table == supabase_request.SUPABASE_MEDIA_ASSETS_TABLE and method == "eq"]
+    assert ("media_status", "AVAILABLE") in eq_calls
+    assert ("media_type", "produced") in eq_calls
+    is_calls = [args for table, method, args, _ in fake_client.events if table == supabase_request.SUPABASE_MEDIA_ASSETS_TABLE and method == "is_"]
+    assert ("notified_before_expiry_at", "null") in is_calls
+
+
+def test_mark_media_asset_notified_is_idempotent_guarded(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_MEDIA_ASSETS_TABLE: [_FakeResponse(data=[{"id": "m1"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    assert asyncio.run(supabase_request.mark_media_asset_notified("m1")) is True
+    is_calls = [args for table, method, args, _ in fake_client.events if table == supabase_request.SUPABASE_MEDIA_ASSETS_TABLE and method == "is_"]
+    assert ("notified_before_expiry_at", "null") in is_calls
+
+    assert asyncio.run(supabase_request.mark_media_asset_notified("")) is False
 
 
 

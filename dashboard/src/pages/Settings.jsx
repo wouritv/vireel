@@ -145,20 +145,8 @@ function PlanChangePreviewCard({ preview, loading, error, classificationLabel, t
             {t('settings.futureMonthlyQuota', 'Futur quota mensuel de crédits')}: {preview.future_monthly_credit_quota}
           </p>
           <p className="text-slate-600 dark:text-zinc-400">
-            {t('settings.newStorageQuota', 'Nouveau quota de stockage')}: {preview.new_storage_quota} GB
-          </p>
-          <p className="text-slate-600 dark:text-zinc-400">
             {t('settings.nextAmountLabel', 'Prochain montant')}: {preview.next_amount} {t('settings.onDate', 'le')} {fmtDate(preview.next_billing_date)}
           </p>
-
-          {preview.storage_overage_warning ? (
-            <p className="text-amber-700 dark:text-amber-300">
-              {t('settings.storageOverageWarning', 'Stockage utilisé ({{used}} GB) dépasse le quota de la nouvelle formule ({{quota}} GB).', {
-                used: preview.storage_overage_warning.storage_used,
-                quota: preview.storage_overage_warning.storage_quota,
-              })}
-            </p>
-          ) : null}
         </>
       )}
     </div>
@@ -1577,11 +1565,10 @@ export default function SettingsPage() {
                         </span>
                       </div>
                       <p className="mt-1 text-slate-700 dark:text-zinc-300 capitalize">{(row.operation_type || '').replace('_', ' ')}</p>
-                      <div className="mt-1 flex items-center justify-between gap-2">
+                      <div className="mt-1">
                         <span className={`font-mono font-semibold ${isInput ? 'text-green-400' : 'text-red-400'}`}>
                           {isInput ? '+' : '-'}{Number(row.credit).toLocaleString()} cr
                         </span>
-                        <span className="font-mono text-slate-500 dark:text-zinc-400">{Number(row.storage).toFixed(3)} Go</span>
                       </div>
                     </article>
                   );
@@ -1595,7 +1582,6 @@ export default function SettingsPage() {
                     <th className="px-3 py-2 text-left">{t("settings.type", "Type")}</th>
                     <th className="px-3 py-2 text-left">{t("settings.operation", "Opération")}</th>
                     <th className="px-3 py-2 text-right">{t("settings.credits", "Crédits")}</th>
-                    <th className="px-3 py-2 text-right">{t("settings.storage", "Stockage (Go)")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1622,9 +1608,6 @@ export default function SettingsPage() {
                         <td className="px-3 py-2 text-slate-700 dark:text-zinc-300 capitalize">{(row.operation_type || '').replace('_', ' ')}</td>
                         <td className={`px-3 py-2 text-right font-mono font-semibold ${isInput ? 'text-green-400' : 'text-red-400'}`}>
                           {isInput ? '+' : '-'}{Number(row.credit).toLocaleString()} cr
-                        </td>
-                        <td className="px-3 py-2 text-right font-mono text-slate-500 dark:text-zinc-400">
-                          {Number(row.storage).toFixed(3)}
                         </td>
                       </tr>
                     );

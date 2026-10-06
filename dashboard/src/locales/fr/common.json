@@ -145,7 +145,6 @@
     "type": "Type",
     "operation": "Opération",
     "credits": "Crédits",
-    "storage": "Stockage (Go)",
     "historic": "Historique des opérations",
     "nextBillingDate": "Prochaine facturation",
     "nextCreditAllocationDate": "Prochaine attribution de crédits",
@@ -171,10 +170,8 @@
     "expiresOn": "expire le",
     "resultingCreditBalance": "Solde de crédits résultant",
     "futureMonthlyQuota": "Futur quota mensuel de crédits",
-    "newStorageQuota": "Nouveau quota de stockage",
     "nextAmountLabel": "Prochain montant",
     "onDate": "le",
-    "storageOverageWarning": "Stockage utilisé ({{used}} GB) dépasse le quota de la nouvelle formule ({{quota}} GB).",
     "planChangeNoop": "Vous êtes déjà sur cette formule et cette périodicité.",
     "planChangeAppliedSuccess": "Formule mise à jour avec succès.",
     "planChangeScheduledSuccess": "Changement programmé : {{plan}} ({{interval}}) à partir du {{date}}.",
@@ -755,7 +752,6 @@
     "gold": "GOLD",
     "ultimate": "ULTIMATE",
     "credits": "Crédits IA mensuels",
-    "storage": "Stockage (Go)",
     "export": "Export en format",
     "viral": "Détections des moments viraux via IA",
     "shorts": "Génération des Réels en format vertical",
@@ -1021,5 +1017,10 @@
     "errorJobCancelled": "L'opération a été annulée.",
     "sessionExpired": "Ta session a expiré. Reconnecte-toi puis reviens sur cette page pour continuer le suivi.",
     "genericError": "Une erreur est survenue. Merci de réessayer."
+  },
+  "media": {
+    "availableUntil": "Disponible jusqu'au {{date}}",
+    "expiresInDays": "Expire dans {{days}} jour(s) · Télécharger",
+    "expired": "Média expiré — Ce fichier a été supprimé automatiquement conformément à la politique de conservation."
   }
 }

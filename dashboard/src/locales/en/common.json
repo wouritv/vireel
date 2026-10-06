@@ -145,7 +145,6 @@
     "type": "Type",
     "operation": "Operation",
     "credits": "Credits",
-    "storage": "Storage (GB)",
     "historic": "Operation history",
     "nextBillingDate": "Next billing date",
     "nextCreditAllocationDate": "Next credit allocation",
@@ -171,10 +170,8 @@
     "expiresOn": "expires on",
     "resultingCreditBalance": "Resulting credit balance",
     "futureMonthlyQuota": "Future monthly credit quota",
-    "newStorageQuota": "New storage quota",
     "nextAmountLabel": "Next amount",
     "onDate": "on",
-    "storageOverageWarning": "Storage used ({{used}} GB) exceeds the new plan's quota ({{quota}} GB).",
     "planChangeNoop": "You're already on this plan and billing interval.",
     "planChangeAppliedSuccess": "Plan updated successfully.",
     "planChangeScheduledSuccess": "Scheduled change: {{plan}} ({{interval}}) starting {{date}}.",
@@ -754,7 +751,6 @@
     "gold": "GOLD",
     "ultimate": "ULTIMATE",
     "credits": "Monthly AI credits",
-    "storage": "Storage (GB)",
     "export": "Export in format",
     "viral": "Detection of viral moments via AI",
     "shorts": "Generation of vertical format reels",
@@ -1020,5 +1016,10 @@
     "errorJobCancelled": "The operation was cancelled.",
     "sessionExpired": "Your session has expired. Please sign in again and come back to this page to keep tracking progress.",
     "genericError": "Something went wrong. Please try again."
+  },
+  "media": {
+    "availableUntil": "Available until {{date}}",
+    "expiresInDays": "Expires in {{days}} day(s) · Download",
+    "expired": "Media expired — This file was automatically deleted per the retention policy."
   }
 }

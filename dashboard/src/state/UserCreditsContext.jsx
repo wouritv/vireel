@@ -60,11 +60,8 @@ export function UserCreditsProvider({ children }) {
 
     const value = useMemo(() => ({
         credits:          credits?.credit   ?? 0,
-        storage:          credits?.stockage ?? 0,
         creditMax:        credits?.credit_max ?? 0,
-        storageMax:       credits?.stockage_max ?? 0,
         creditRatio:      (credits?.credit_max ?? 0) > 0 ? (credits?.credit ?? 0) / (credits?.credit_max ?? 1) : 0,
-        storageRatio:     (credits?.stockage_max ?? 0) > 0 ? (credits?.stockage ?? 0) / (credits?.stockage_max ?? 1) : 0,
         // Three distinct pools, always consumed in this order: promotional,
         // then purchased, then standard (subscription) -- `credits` above
         // is the subscription pool only. Promotional and purchased each

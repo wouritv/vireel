@@ -11,6 +11,7 @@ import { useTranslation } from "../state/LanguageContext";
 import { statusClass, statusLabel } from "../lib/status";
 import { getAuthHeaders } from "../lib/apiAuth";
 import { describePublishError } from "../lib/publishErrors";
+import { describeMediaAvailability } from "../lib/mediaAvailability";
 
 const CAPTION_STATUS_FALLBACK = "termine";
 
@@ -461,7 +462,9 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
                         <div className="rounded-xl border border-slate-300 dark:border-white/10 bg-white/5 px-3 py-6 text-center text-slate-500 dark:text-zinc-400">{t("common.noItemsFound", "Aucun element trouve")}</div>
                     )}
 
-                    {!loading && !error && items.map((item) => (
+                    {!loading && !error && items.map((item) => {
+                        const media = describeMediaAvailability(item.media_status, item.media_expires_at);
+                        return (
                         <article key={item.id} className="rounded-xl border border-slate-300 dark:border-white/10 bg-white/5 p-3 space-y-3 overflow-hidden">
                             <div className="space-y-1">
                                 <p className="font-semibold text-slate-900 dark:text-white line-clamp-2 break-words">{item.caption_title || t("generatedMedia.untitled", "Untitled")}</p>
@@ -478,6 +481,9 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
                                 <span className={`inline-flex rounded-full border px-2 py-1 text-xs ${statusClass(item.caption_status || CAPTION_STATUS_FALLBACK)}`}>
                                     {statusLabel(item.caption_status || CAPTION_STATUS_FALLBACK)}
                                 </span>
+                                {media.translationKey ? (
+                                    <p className="mt-1 text-xs text-slate-500 dark:text-zinc-400">{t(media.translationKey, media.translationKey, media.params)}</p>
+                                ) : null}
                             </div>
 
                             <div className="flex flex-wrap gap-2">
@@ -493,7 +499,8 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
                                 <button
                                     type="button"
                                     onClick={() => handleDownload(item)}
-                                    className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-indigo-300 dark:border-white/10 bg-indigo-100 dark:bg-white/5 text-indigo-800 dark:text-zinc-200 shadow-sm hover:bg-indigo-200 dark:hover:bg-white/10"
+                                    disabled={media.disabled}
+                                    className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-indigo-300 dark:border-white/10 bg-indigo-100 dark:bg-white/5 text-indigo-800 dark:text-zinc-200 shadow-sm hover:bg-indigo-200 dark:hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed"
                                     title={t("reels.download", "Download")}
                                 >
                                     <Download size={14} />
@@ -522,7 +529,8 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
                                 </button>
                             </div>
                         </article>
-                    ))}
+                        );
+                    })}
                 </div>
 
                 <div className="hidden w-full overflow-x-auto md:block">
@@ -558,7 +566,9 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
                             </tr>
                         )}
 
-                        {!loading && !error && items.map((item) => (
+                        {!loading && !error && items.map((item) => {
+                            const media = describeMediaAvailability(item.media_status, item.media_expires_at);
+                            return (
                             <tr key={item.id} className="border-b border-slate-200 dark:border-white/5 align-top">
                                 <td className="px-2 md:px-3 py-2 md:py-3">
                                     <p className="font-semibold text-slate-900 dark:text-white line-clamp-2">{item.caption_title || t("generatedMedia.untitled", "Untitled")}</p>
@@ -571,6 +581,9 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
                                     <span className={`inline-flex rounded-full border px-2 py-1 text-xs ${statusClass(item.caption_status || CAPTION_STATUS_FALLBACK)}`}>
                                         {statusLabel(item.caption_status || CAPTION_STATUS_FALLBACK)}
                                     </span>
+                                    {media.translationKey ? (
+                                        <p className="mt-1 text-xs text-slate-500 dark:text-zinc-400">{t(media.translationKey, media.translationKey, media.params)}</p>
+                                    ) : null}
                                 </td>
                                 <td className="hidden lg:table-cell px-2 md:px-3 py-2 md:py-3 text-slate-500 dark:text-zinc-400">
                                     {item.caption_created_at ? new Date(item.caption_created_at).toLocaleString() : "-"}
@@ -589,7 +602,8 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
                                         <button
                                             type="button"
                                             onClick={() => handleDownload(item)}
-                                            className="inline-flex h-7 w-7 md:h-8 md:w-8 items-center justify-center rounded-lg border border-indigo-300 dark:border-white/10 bg-indigo-100 dark:bg-white/5 text-indigo-800 dark:text-zinc-200 shadow-sm hover:bg-indigo-200 dark:hover:bg-white/10"
+                                            disabled={media.disabled}
+                                            className="inline-flex h-7 w-7 md:h-8 md:w-8 items-center justify-center rounded-lg border border-indigo-300 dark:border-white/10 bg-indigo-100 dark:bg-white/5 text-indigo-800 dark:text-zinc-200 shadow-sm hover:bg-indigo-200 dark:hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed"
                                             title={t("reels.download", "Download")}
                                         >
                                             <Download size={14} />
@@ -619,7 +633,8 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
                                     </div>
                                 </td>
                             </tr>
-                        ))}
+                            );
+                        })}
                         </tbody>
                     </table>
                 </div>

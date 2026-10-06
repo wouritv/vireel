@@ -37,7 +37,7 @@ SUPABASE_REFERRAL_CODES_TABLE = os.environ.get("SUPABASE_REFERRAL_CODES_TABLE", 
 SUPABASE_REFERRALS_TABLE = os.environ.get("SUPABASE_REFERRALS_TABLE", "referrals")
 SUPABASE_PROMOTIONAL_CREDIT_BATCHES_TABLE = os.environ.get("SUPABASE_PROMOTIONAL_CREDIT_BATCHES_TABLE", "promotional_credit_batches")
 SUPABASE_NOTIFICATIONS_TABLE = os.environ.get("SUPABASE_NOTIFICATIONS_TABLE", "notifications")
-STORAGE_OVERAGE_TOLERANCE_PERCENT = max(0.0, float(os.environ.get("STORAGE_OVERAGE_TOLERANCE_PERCENT", "10") or "10"))
+SUPABASE_MEDIA_ASSETS_TABLE = os.environ.get("SUPABASE_MEDIA_ASSETS_TABLE", "media_assets")
 
 
 class SupabaseNotConfiguredError(RuntimeError):
@@ -1870,14 +1870,15 @@ def _calculate_credit_debit(existing: Dict[str, Any], credits: float) -> Dict[st
 
 
 def _calculate_storage_after_deduction(existing: Dict[str, Any], storage_delta: float) -> Dict[str, float]:
+	# Storage is no longer a quota that can block an operation (see
+	# retention_config.py / Vireel's credit-only billing model) -- this
+	# still tracks current_storage/new_storage for bookkeeping on the
+	# user_data row, but never rejects a deduction for it.
 	current_storage = float(existing.get("stockage", 0) or 0.0)
 	new_storage = current_storage + float(storage_delta)
-	storage_max = float(existing.get("stockage_max", max(current_storage, 0.0)) or 0.0)
-	overage_limit = (storage_max * STORAGE_OVERAGE_TOLERANCE_PERCENT) / 100.0
 	return {
 		"current_storage": current_storage,
 		"new_storage": new_storage,
-		"overage_limit": overage_limit,
 	}
 
 
@@ -1887,8 +1888,6 @@ def _build_deduction_update(existing: Dict[str, Any], credits: float, storage_de
 		return None
 
 	storage_state = _calculate_storage_after_deduction(existing, storage_delta)
-	if storage_state["new_storage"] < -storage_state["overage_limit"]:
-		return None
 
 	return {
 		**credit_state,
@@ -2874,6 +2873,227 @@ async def delete_caption_style_theme(theme_id: str, user_id: str) -> bool:
 		.delete()
 		.eq("id", theme_id)
 		.eq("user_id", user_id)
+		.execute()
+	)
+	return bool(response.data)
+
+
+# --------------------------------------------------------------------------
+# Media assets (physical-lifecycle registry -- one row per source upload or
+# produced deliverable; see the 20261012 migration's module comment and
+# retention_config.py / billing.add_retention_cost_to_breakdown for the
+# policy and cost this table's rows are snapshotted from at creation time)
+# --------------------------------------------------------------------------
+MEDIA_ASSET_COLUMNS = (
+	"id, created_at, user_id, content_kind, content_id, job_id, media_type, "
+	"s3_bucket, s3_key, size_bytes, subscription_status_at_creation, "
+	"retention_days, retention_started_at, retention_expires_at, "
+	"s3_storage_cost_per_gb_day, retention_storage_cost_usd, "
+	"retention_storage_credit_cost, billing_created_at, media_status, "
+	"media_deleted_at, notified_before_expiry_at"
+)
+
+CONTENT_KIND_PROJECT_SOURCE = "project_source"
+CONTENT_KIND_REEL = "reel"
+CONTENT_KIND_CAPTION = "caption"
+CONTENT_KIND_FILM_SUMMARY = "film_summary"
+CONTENT_KIND_ANONYMOUS_STORY = "anonymous_story"
+
+MEDIA_STATUS_AVAILABLE = "AVAILABLE"
+MEDIA_STATUS_EXPIRED = "EXPIRED"
+MEDIA_STATUS_DELETED = "DELETED"
+MEDIA_STATUS_MISSING = "MISSING"
+
+
+async def insert_media_asset(
+	user_id: str,
+	content_kind: str,
+	content_id: str,
+	media_type: str,
+	subscription_status_at_creation: str,
+	retention_days: int,
+	retention_started_at: datetime,
+	retention_expires_at: datetime,
+	job_id: Optional[str] = None,
+	s3_bucket: Optional[str] = None,
+	s3_key: Optional[str] = None,
+	size_bytes: Optional[int] = None,
+	s3_storage_cost_per_gb_day: Optional[float] = None,
+	retention_storage_cost_usd: Optional[float] = None,
+	retention_storage_credit_cost: Optional[float] = None,
+	billing_created_at: Optional[datetime] = None,
+) -> Dict[str, Any]:
+	"""Creates this media's lifecycle row, fixing its retention policy and
+	billing snapshot forever (see _finalize_media_retention_billing in
+	app.py -- this is called exactly once, at the moment the media's
+	definitive size is known, and never updated afterward to reflect a
+	later env var or subscription change)."""
+	client = await get_client()
+	payload = {
+		"user_id": user_id,
+		"content_kind": content_kind,
+		"content_id": content_id,
+		"job_id": job_id,
+		"media_type": media_type,
+		"s3_bucket": s3_bucket,
+		"s3_key": s3_key,
+		"size_bytes": int(size_bytes) if size_bytes is not None else None,
+		"subscription_status_at_creation": subscription_status_at_creation,
+		"retention_days": int(retention_days),
+		"retention_started_at": retention_started_at.isoformat(),
+		"retention_expires_at": retention_expires_at.isoformat(),
+		"s3_storage_cost_per_gb_day": s3_storage_cost_per_gb_day,
+		"retention_storage_cost_usd": retention_storage_cost_usd,
+		"retention_storage_credit_cost": retention_storage_credit_cost,
+		"billing_created_at": billing_created_at.isoformat() if billing_created_at else datetime.now(timezone.utc).isoformat(),
+	}
+	response = await client.table(SUPABASE_MEDIA_ASSETS_TABLE).insert(payload).execute()
+	rows = response.data or []
+	return rows[0] if rows else payload
+
+
+async def get_media_asset_by_content(content_kind: str, content_id: str) -> Optional[Dict[str, Any]]:
+	if not content_kind or not content_id:
+		return None
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_MEDIA_ASSETS_TABLE)
+		.select(MEDIA_ASSET_COLUMNS)
+		.eq("content_kind", content_kind)
+		.eq("content_id", content_id)
+		.limit(1)
+		.execute()
+	)
+	rows = response.data or []
+	return rows[0] if rows else None
+
+
+async def list_media_assets_by_content_ids(content_kind: str, content_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+	"""Batch lookup for list/detail endpoints that need to show expiration
+	UI (see app.py's _attach_media_asset_fields) without an N+1 query per
+	row -- returns a {content_id: row} map, one query for the whole page
+	instead of one per item."""
+	unique_ids = [cid for cid in dict.fromkeys(content_ids or []) if cid]
+	if not content_kind or not unique_ids:
+		return {}
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_MEDIA_ASSETS_TABLE)
+		.select(MEDIA_ASSET_COLUMNS)
+		.eq("content_kind", content_kind)
+		.in_("content_id", unique_ids)
+		.execute()
+	)
+	return {row["content_id"]: row for row in (response.data or []) if row.get("content_id")}
+
+
+async def list_media_assets_due_for_expiration(now: Optional[datetime] = None, limit: int = 100) -> List[Dict[str, Any]]:
+	"""AVAILABLE media whose retention_expires_at has passed, soonest-expired
+	first -- the expiration sweep's own query shape (see
+	process_media_expiration_jobs in app.py)."""
+	client = await get_client()
+	now_iso = (now or datetime.now(timezone.utc)).isoformat()
+	response = (
+		await client.table(SUPABASE_MEDIA_ASSETS_TABLE)
+		.select(MEDIA_ASSET_COLUMNS)
+		.eq("media_status", MEDIA_STATUS_AVAILABLE)
+		.lte("retention_expires_at", now_iso)
+		.order("retention_expires_at", desc=False)
+		.limit(min(max(limit, 1), 500))
+		.execute()
+	)
+	return response.data or []
+
+
+async def mark_media_asset_expired(media_id: str) -> bool:
+	"""Only ever called after a confirmed successful S3 delete (see
+	process_media_expiration_jobs) -- a failed/unconfirmed delete must never
+	reach this, so an AVAILABLE row always means the file really is still
+	there (or needs a MISSING flag instead, see mark_media_asset_missing)."""
+	if not media_id:
+		return False
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_MEDIA_ASSETS_TABLE)
+		.update({
+			"media_status": MEDIA_STATUS_EXPIRED,
+			"media_deleted_at": datetime.now(timezone.utc).isoformat(),
+		})
+		.eq("id", media_id)
+		.eq("media_status", MEDIA_STATUS_AVAILABLE)
+		.execute()
+	)
+	return bool(response.data)
+
+
+async def mark_media_asset_missing(media_id: str) -> bool:
+	"""The object should be there but S3 can't find/reach it -- distinct
+	from EXPIRED (deleted by our own retention sweep) and DELETED (deleted
+	by the user), so an operator can tell these cases apart."""
+	if not media_id:
+		return False
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_MEDIA_ASSETS_TABLE)
+		.update({"media_status": MEDIA_STATUS_MISSING})
+		.eq("id", media_id)
+		.execute()
+	)
+	return bool(response.data)
+
+
+async def mark_media_asset_deleted(media_id: str) -> bool:
+	"""For the user-initiated delete flow (see _delete_s3_and_get_freed_bytes
+	and friends in app.py) -- not yet wired into that flow, but kept
+	symmetrical with mark_media_asset_expired/missing for when it is."""
+	if not media_id:
+		return False
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_MEDIA_ASSETS_TABLE)
+		.update({
+			"media_status": MEDIA_STATUS_DELETED,
+			"media_deleted_at": datetime.now(timezone.utc).isoformat(),
+		})
+		.eq("id", media_id)
+		.execute()
+	)
+	return bool(response.data)
+
+
+async def list_produced_media_due_for_notification(notify_before_time: Optional[datetime] = None, limit: int = 100) -> List[Dict[str, Any]]:
+	"""PRODUCED, still-AVAILABLE, not-yet-notified media expiring at or
+	before ``notify_before_time`` (the caller passes now + the configured
+	RETENTION_NOTIFICATION_HOURS_BEFORE lead time) -- source media is never
+	returned here, per the spec's "don't notify for source media" rule."""
+	client = await get_client()
+	before_iso = (notify_before_time or datetime.now(timezone.utc)).isoformat()
+	response = (
+		await client.table(SUPABASE_MEDIA_ASSETS_TABLE)
+		.select(MEDIA_ASSET_COLUMNS)
+		.eq("media_status", MEDIA_STATUS_AVAILABLE)
+		.eq("media_type", "produced")
+		.is_("notified_before_expiry_at", "null")
+		.lte("retention_expires_at", before_iso)
+		.order("retention_expires_at", desc=False)
+		.limit(min(max(limit, 1), 500))
+		.execute()
+	)
+	return response.data or []
+
+
+async def mark_media_asset_notified(media_id: str, when: Optional[datetime] = None) -> bool:
+	"""Idempotency guard for the expiry-notification sweep -- once set, this
+	media's notified_before_expiry_at is never cleared, so a given expiry
+	can only ever produce one notification."""
+	if not media_id:
+		return False
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_MEDIA_ASSETS_TABLE)
+		.update({"notified_before_expiry_at": (when or datetime.now(timezone.utc)).isoformat()})
+		.eq("id", media_id)
+		.is_("notified_before_expiry_at", "null")
 		.execute()
 	)
 	return bool(response.data)

@@ -37,7 +37,7 @@ function ProgressBar({ value, max, color = "green", label, unit = "" }) {
 
 export default function ServiceUsage() {
     const {
-        credits, storage, creditMax, storageMax, hasCredits, aboCosts, loading, error, refresh,
+        credits, creditMax, hasCredits, aboCosts, loading, error, refresh,
         promotionalCredit, promotionalCreditExpirations, purchasedCredit, purchasedCreditExpirations,
     } = useUserCredits();
     const navigate = useNavigate();
@@ -46,7 +46,6 @@ export default function ServiceUsage() {
     // Estimate a "max" credit pool for display.
     // We take 10× the reel cost as the reference maximum (so users see a meaningful bar).
     const creditLimit = Math.max(0, Number(creditMax ?? aboCosts?.credit ?? 0));
-    const storageLimit = Math.max(0, Number(storageMax ?? aboCosts?.storage ?? 0));
 
     if (loading && credits === 0) {
         return (
@@ -125,15 +124,6 @@ export default function ServiceUsage() {
                     )}
                 </div>
             )}
-
-            {/* Storage bar (GB) */}
-            <ProgressBar
-                label="Stockage disponibles"
-                value={Number.parseFloat(storage.toFixed(2))}
-                max={storageLimit}
-                color="purple"
-                unit=" Go"
-            />
 
             {/* Warning if low credits */}
             {hasCredits === false && (

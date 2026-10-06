@@ -7,6 +7,7 @@ import { useAuth } from "../state/AuthContext";
 import { useTranslation } from "../state/LanguageContext";
 import { errorMessageForCode } from "../lib/filmSummary";
 import { describePublishError } from "../lib/publishErrors";
+import { describeMediaAvailability } from "../lib/mediaAvailability";
 import FilmSummaryProcessingPanel from "../components/FilmSummaryProcessingPanel";
 import FilmSummaryReviewPanel from "../components/FilmSummaryReviewPanel";
 import SharePostModal from "../components/SharePostModal";
@@ -445,20 +446,31 @@ export default function FilmSummaryProjectDetailPage() {
                         </div>
                     ) : null}
 
-                    {status === "completed" ? (
+                    {status === "completed" ? (() => {
+                        const media = describeMediaAvailability(filmSummary.media_status, filmSummary.media_expires_at);
+                        return (
                         <div className="space-y-4">
                             <h3 className="text-lg font-bold text-white">{t("filmSummary.completedTitle", "Ton resume de film est pret")}</h3>
                             {filmSummary.final_url ? (
                                 <div className="grid gap-4 md:grid-cols-[7fr_3fr]">
                                     <video src={filmSummary.final_url} controls preload="metadata" className="w-full rounded-xl bg-black" />
                                     <div className="flex flex-row flex-wrap gap-2 md:flex-col md:items-stretch">
-                                        <a
-                                            href={filmSummary.final_url}
-                                            download
-                                            className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
-                                        >
-                                            <Download size={14} /> {t("filmSummary.downloadButton", "Telecharger")}
-                                        </a>
+                                        {media.disabled ? (
+                                            <span
+                                                aria-disabled="true"
+                                                className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-400 dark:text-zinc-500 opacity-50 cursor-not-allowed"
+                                            >
+                                                <Download size={14} /> {t("filmSummary.downloadButton", "Telecharger")}
+                                            </span>
+                                        ) : (
+                                            <a
+                                                href={filmSummary.final_url}
+                                                download
+                                                className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
+                                            >
+                                                <Download size={14} /> {t("filmSummary.downloadButton", "Telecharger")}
+                                            </a>
+                                        )}
                                         <button
                                             type="button"
                                             onClick={handleOpenShare}
@@ -469,8 +481,12 @@ export default function FilmSummaryProjectDetailPage() {
                                     </div>
                                 </div>
                             ) : null}
+                            {media.translationKey ? (
+                                <p className="text-xs text-slate-500 dark:text-zinc-400">{t(media.translationKey, media.translationKey, media.params)}</p>
+                            ) : null}
                         </div>
-                    ) : null}
+                        );
+                    })() : null}
                 </>
             )}
 

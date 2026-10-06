@@ -3611,6 +3611,373 @@ def test_finalize_completed_reel_billing_skips_auto_caption_debit_when_none_appl
     deduct_mock.assert_not_awaited()
 
 
+def test_finalize_media_retention_billing_active_subscription_uses_longer_tier(monkeypatch):
+    import retention_config
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value={"id": "sub1"}))
+    insert_mock = AsyncMock(return_value={"id": "asset1"})
+    monkeypatch.setattr(app, "supabase_insert_media_asset", insert_mock)
+
+    result = asyncio.run(app._finalize_media_retention_billing(
+        job_id="job-1", user_id="u1", content_kind=app.CONTENT_KIND_REEL, content_id="reel-1",
+        media_type=app.MEDIA_TYPE_PRODUCED, size_bytes=4 * 1024 ** 3,
+        s3_bucket="bucket", s3_key="reels/reel-1.mp4",
+    ))
+
+    assert result["subscription_status_at_creation"] == "active"
+    assert result["retention_days"] == retention_config.RETENTION_SUBSCRIBER_PRODUCED_DAYS
+    assert result["retention_storage_cost_usd"] > 0
+    assert result["retention_storage_credit_cost"] > 0
+    insert_mock.assert_awaited_once()
+    assert insert_mock.await_args.kwargs["content_kind"] == app.CONTENT_KIND_REEL
+    assert insert_mock.await_args.kwargs["content_id"] == "reel-1"
+    assert insert_mock.await_args.kwargs["subscription_status_at_creation"] == "active"
+    assert insert_mock.await_args.kwargs["retention_days"] == retention_config.RETENTION_SUBSCRIBER_PRODUCED_DAYS
+
+
+def test_finalize_media_retention_billing_no_subscription_uses_free_tier(monkeypatch):
+    import retention_config
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    insert_mock = AsyncMock(return_value={"id": "asset2"})
+    monkeypatch.setattr(app, "supabase_insert_media_asset", insert_mock)
+
+    result = asyncio.run(app._finalize_media_retention_billing(
+        job_id="job-2", user_id="u2", content_kind=app.CONTENT_KIND_PROJECT_SOURCE, content_id="proj-1",
+        media_type=app.MEDIA_TYPE_SOURCE, size_bytes=1024 ** 3,
+    ))
+
+    assert result["subscription_status_at_creation"] == "free"
+    assert result["retention_days"] == retention_config.RETENTION_FREE_SOURCE_DAYS
+
+
+def test_finalize_media_retention_billing_never_raises_on_persistence_failure(monkeypatch):
+    # A media_assets insert failure must never block the job's own
+    # credit settlement -- only skip this media's own retention line item.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_media_asset", AsyncMock(side_effect=RuntimeError("boom")))
+
+    result = asyncio.run(app._finalize_media_retention_billing(
+        job_id="job-3", user_id="u3", content_kind=app.CONTENT_KIND_CAPTION, content_id="cap-1",
+        media_type=app.MEDIA_TYPE_PRODUCED, size_bytes=1024 ** 3,
+    ))
+    assert result["retention_storage_credit_cost"] > 0
+
+
+def test_finalize_media_retention_billing_subscription_lookup_failure_defaults_to_free(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(side_effect=RuntimeError("down")))
+    monkeypatch.setattr(app, "supabase_insert_media_asset", AsyncMock(return_value={"id": "asset4"}))
+
+    result = asyncio.run(app._finalize_media_retention_billing(
+        job_id="job-4", user_id="u4", content_kind=app.CONTENT_KIND_REEL, content_id="reel-4",
+        media_type=app.MEDIA_TYPE_PRODUCED, size_bytes=1024 ** 3,
+    ))
+    assert result["subscription_status_at_creation"] == "free"
+
+
+def test_finalize_retention_billing_batch_sums_across_entries_and_skips_missing_id(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_media_asset", AsyncMock(return_value={"id": "x"}))
+
+    result = asyncio.run(app._finalize_retention_billing_batch("job-5", "u5", [
+        {"content_kind": app.CONTENT_KIND_REEL, "content_id": "r1", "media_type": app.MEDIA_TYPE_PRODUCED, "size_bytes": 1024 ** 3},
+        {"content_kind": app.CONTENT_KIND_REEL, "content_id": "r2", "media_type": app.MEDIA_TYPE_PRODUCED, "size_bytes": 1024 ** 3},
+        {"content_kind": app.CONTENT_KIND_REEL, "content_id": None, "media_type": app.MEDIA_TYPE_PRODUCED, "size_bytes": 1024 ** 3},
+    ]))
+
+    assert len(result["media_assets"]) == 2
+    single = asyncio.run(app._finalize_media_retention_billing(
+        job_id="job-5", user_id="u5", content_kind=app.CONTENT_KIND_REEL, content_id="r1",
+        media_type=app.MEDIA_TYPE_PRODUCED, size_bytes=1024 ** 3,
+    ))
+    assert result["retention_storage_credit_cost"] == pytest.approx(2 * single["retention_storage_credit_cost"], rel=1e-6)
+
+
+def test_finalize_source_media_retention_skips_without_project(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    debit_mock = AsyncMock()
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+
+    asyncio.run(app._finalize_source_media_retention("job-6", "u6", None, 1024 ** 3, "bucket", "key"))
+    debit_mock.assert_not_awaited()
+
+
+def test_finalize_source_media_retention_debits_standalone_retention_charge(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_media_asset", AsyncMock(return_value={"id": "asset5"}))
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+
+    asyncio.run(app._finalize_source_media_retention(
+        "job-7", "u7", {"id": "proj-7"}, 4 * 1024 ** 3, "bucket", "key",
+    ))
+
+    debit_mock.assert_awaited_once()
+    assert debit_mock.await_args.kwargs["operation_type"] == "retention_storage_source"
+    assert debit_mock.await_args.kwargs["reserved_credits"] == 0.0
+    assert debit_mock.await_args.kwargs["credits"] > 0
+
+
+def test_attach_media_asset_fields_enriches_rows_from_batch_lookup(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_list_media_assets_by_content_ids", AsyncMock(return_value={
+        "r1": {"media_status": "AVAILABLE", "retention_expires_at": "2026-01-01T00:00:00+00:00"},
+    }))
+
+    items = [{"id": "r1"}, {"id": "r2"}]
+    result = asyncio.run(app._attach_media_asset_fields(items, app.CONTENT_KIND_REEL))
+
+    assert result[0]["media_status"] == "AVAILABLE"
+    assert result[0]["media_expires_at"] == "2026-01-01T00:00:00+00:00"
+    assert result[1]["media_status"] is None
+    assert result[1]["media_expires_at"] is None
+
+
+def test_attach_media_asset_fields_skips_without_supabase_or_rows(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+    items = [{"id": "r1"}]
+    result = asyncio.run(app._attach_media_asset_fields(items, app.CONTENT_KIND_REEL))
+    assert "media_status" not in result[0]
+
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    assert asyncio.run(app._attach_media_asset_fields([], app.CONTENT_KIND_REEL)) == []
+
+
+def test_attach_media_asset_fields_never_raises_on_lookup_failure(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_list_media_assets_by_content_ids", AsyncMock(side_effect=RuntimeError("down")))
+
+    items = [{"id": "r1"}]
+    result = asyncio.run(app._attach_media_asset_fields(items, app.CONTENT_KIND_REEL))
+    assert result == [{"id": "r1"}]
+
+
+def test_finalize_completed_reel_billing_adds_retention_cost_when_rows_have_ids(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_media_asset", AsyncMock(return_value={"id": "asset-x"}))
+    app.jobs["job-reel-ret"] = {"logs": []}
+
+    monkeypatch.setattr(app, "_estimate_reel_job_consumption", lambda **kwargs: {
+        "actual_credit": 2.0, "actual_storage_gb": 0.5, "actual_cost_usd": 0.1,
+        "processing_ratio": 1.0, "cost_breakdown": {},
+    })
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+    complete_mock = AsyncMock()
+    app.reel_job_manager.complete_job = complete_mock
+
+    saved_rows = [{"id": "reel-ret-1", "reel_size_bytes": 1024 ** 3, "reel_s3_key": "reels/r1.mp4"}]
+    asyncio.run(app._finalize_completed_reel_billing(
+        job_id="job-reel-ret", job_data={"reel_required_credits": 2.0}, user_id="u1", source_is_url=False,
+        start_ts=time.time(), enriched_clips=[{}], cost_analysis={}, saved_rows=saved_rows,
+    ))
+
+    assert debit_mock.await_args.kwargs["credits"] > 2.0
+    assert "retention_storage_credit_cost" in complete_mock.await_args.kwargs["cost_breakdown"]
+
+
+def test_process_and_complete_caption_job_bills_retention_on_top(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setenv("AWS_S3_BUCKET", "test-bucket")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_media_asset", AsyncMock(return_value={"id": "asset-y"}))
+    monkeypatch.setattr(app, "supabase_insert_captions", AsyncMock(return_value=[{"id": "cap-ret-1", "caption_s3_key": "captions/c1.mp4"}]))
+    monkeypatch.setattr(app, "_normalize_caption_row", lambda row: row)
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+    complete_mock = AsyncMock()
+    app.reel_job_manager.complete_job = complete_mock
+    monkeypatch.setattr(app, "_update_project_on_caption_completion", AsyncMock())
+    monkeypatch.setattr(app, "_persist_transcription_cache", AsyncMock())
+    monkeypatch.setattr(app, "_get_user_default_caption_style", AsyncMock(return_value={}))
+    monkeypatch.setattr(app, "_burn_default_captions_for_clip", AsyncMock(return_value=False))
+    monkeypatch.setattr(app, "_build_and_persist_caption_metadata", lambda *a, **k: None)
+    monkeypatch.setattr(app, "_upload_caption_source_and_thumbnail", lambda *a, **k: ("captions/c1.mp4", "http://x/c1.mp4", "", ""))
+    # A real multi-GB file would make this test slow/flaky to write --
+    # fake a large-enough size instead, so the computed retention credit
+    # cost isn't rounded away to 0 by a tiny test fixture file.
+    monkeypatch.setattr(app.os.path, "getsize", lambda path: 4 * 1024 ** 3)
+
+    output_dir = str(tmp_path)
+    input_path = os.path.join(output_dir, "source.mp4")
+    with open(input_path, "wb") as fh:
+        fh.write(b"x" * 1024)
+
+    job_id = "job-caption-ret"
+    app.jobs[job_id] = {"logs": [], "result": None, "status": "running"}
+
+    asyncio.run(app._process_and_complete_caption_job(
+        job_id, {"project_id": None}, "u1", pipeline=AsyncMock(persisting=AsyncMock(), rendering=AsyncMock()),
+        input_path=input_path, source_name="source.mp4", local_duration=5.0, transcript={"segments": []},
+        caption_required_credits=1.0, output_dir=output_dir,
+    ))
+
+    debit_mock.assert_awaited_once()
+    assert debit_mock.await_args.kwargs["credits"] > 1.0
+    assert "retention_storage_credit_cost" in complete_mock.await_args.kwargs["cost_breakdown"]
+    assert complete_mock.await_args.kwargs["actual_credit"] > 1.0
+
+
+def test_finalize_film_summary_render_bills_retention_and_marks_source_deleted(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_media_asset", AsyncMock(return_value={"id": "asset-z"}))
+    monkeypatch.setattr(app, "supabase_get_media_asset_by_content", AsyncMock(return_value={"id": "src-asset-1"}))
+    mark_deleted_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_mark_media_asset_deleted", mark_deleted_mock)
+    monkeypatch.setattr(app, "supabase_update_film_summary", AsyncMock())
+    monkeypatch.setattr(app, "supabase_get_job_record", AsyncMock(return_value={"reserved_quota": 1.0}))
+    monkeypatch.setattr(app, "supabase_update_project_status", AsyncMock())
+    monkeypatch.setattr(app, "supabase_update_project", AsyncMock())
+    delete_s3_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(app, "delete_s3_object", delete_s3_mock)
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+    complete_mock = AsyncMock()
+    app.reel_job_manager.complete_job = complete_mock
+
+    asyncio.run(app._finalize_film_summary_render(
+        job_id="job-fs-ret", user_id="u1", film_summary_id="fs-1", project_id="proj-1",
+        plan={"segments": []}, preview_s3_key="film_summaries/u1/fs-1/preview.mp4",
+        final_s3_key="film_summaries/u1/fs-1/final.mp4", render_result={"final_duration_seconds": 30.0},
+        output_storage_bytes=1024 ** 3, source_s3_key="film_summaries/u1/fs-1/source.mp4", bucket_name="bucket",
+    ))
+
+    delete_s3_mock.assert_called_once_with("bucket", "film_summaries/u1/fs-1/source.mp4")
+    mark_deleted_mock.assert_awaited_once_with("src-asset-1")
+    assert debit_mock.await_args.kwargs["credits"] > 0
+    assert "retention_storage_credit_cost" in complete_mock.await_args.kwargs["cost_breakdown"]
+
+
+def test_expire_one_media_asset_deletes_s3_then_marks_expired(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    delete_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(app, "delete_s3_object", delete_mock)
+    mark_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_mark_media_asset_expired", mark_mock)
+
+    asyncio.run(app._expire_one_media_asset({"id": "m1", "s3_bucket": "b", "s3_key": "k"}))
+
+    delete_mock.assert_called_once_with("b", "k")
+    mark_mock.assert_awaited_once_with("m1")
+
+
+def test_expire_one_media_asset_never_marks_expired_on_s3_failure(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "delete_s3_object", MagicMock(return_value=False))
+    mark_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_mark_media_asset_expired", mark_mock)
+
+    asyncio.run(app._expire_one_media_asset({"id": "m1", "s3_bucket": "b", "s3_key": "k"}))
+
+    mark_mock.assert_not_awaited()
+
+
+def test_expire_one_media_asset_marks_expired_directly_without_s3_key(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    delete_mock = MagicMock()
+    monkeypatch.setattr(app, "delete_s3_object", delete_mock)
+    mark_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_mark_media_asset_expired", mark_mock)
+
+    asyncio.run(app._expire_one_media_asset({"id": "m1", "s3_bucket": None, "s3_key": None}))
+
+    delete_mock.assert_not_called()
+    mark_mock.assert_awaited_once_with("m1")
+
+
+def test_expire_one_media_asset_skips_without_id(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    mark_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_mark_media_asset_expired", mark_mock)
+    asyncio.run(app._expire_one_media_asset({}))
+    mark_mock.assert_not_awaited()
+
+
+def test_run_media_expiration_sweep_continues_past_per_asset_failure(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_list_media_assets_due_for_expiration", AsyncMock(return_value=[
+        {"id": "m1", "s3_bucket": "b", "s3_key": "k1"},
+        {"id": "m2", "s3_bucket": "b", "s3_key": "k2"},
+    ]))
+    calls = []
+
+    async def _fake_expire(asset):
+        calls.append(asset["id"])
+        if asset["id"] == "m1":
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(app, "_expire_one_media_asset", _fake_expire)
+    asyncio.run(app._run_media_expiration_sweep())
+
+    assert calls == ["m1", "m2"]
+
+
+def test_notify_one_media_asset_expiring_marks_before_sending(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    mark_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_mark_media_asset_notified", mark_mock)
+    insert_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_notification", insert_mock)
+
+    asyncio.run(app._notify_one_media_asset_expiring({
+        "id": "m1", "user_id": "u1", "content_kind": "reel", "content_id": "r1",
+        "retention_expires_at": "2026-01-01T00:00:00+00:00",
+    }))
+
+    mark_mock.assert_awaited_once_with("m1")
+    insert_mock.assert_awaited_once()
+    assert insert_mock.await_args.kwargs["user_id"] == "u1"
+    assert insert_mock.await_args.kwargs["data"]["media_asset_id"] == "m1"
+
+
+def test_notify_one_media_asset_expiring_skips_send_when_already_notified(monkeypatch):
+    # supabase_mark_media_asset_notified only succeeds while the column is
+    # still null -- a second (racing or retried) attempt must send
+    # nothing, which is the idempotency guarantee the spec requires.
+    app = _import_app_with_stubs(monkeypatch)
+    mark_mock = AsyncMock(return_value=False)
+    monkeypatch.setattr(app, "supabase_mark_media_asset_notified", mark_mock)
+    insert_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_notification", insert_mock)
+
+    asyncio.run(app._notify_one_media_asset_expiring({"id": "m1", "user_id": "u1"}))
+
+    insert_mock.assert_not_awaited()
+
+
+def test_run_media_expiry_notification_sweep_uses_lead_time_window(monkeypatch):
+    import retention_config
+    app = _import_app_with_stubs(monkeypatch)
+    list_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr(app, "supabase_list_produced_media_due_for_notification", list_mock)
+
+    asyncio.run(app._run_media_expiry_notification_sweep())
+
+    list_mock.assert_awaited_once()
+    notify_before_time = list_mock.await_args.args[0]
+    delta_hours = (notify_before_time - app.datetime.now(app.timezone.utc)).total_seconds() / 3600
+    assert delta_hours == pytest.approx(retention_config.RETENTION_NOTIFICATION_HOURS_BEFORE, abs=0.1)
+
+
 def test_burn_default_captions_for_clip_returns_false_without_transcript(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     result = asyncio.run(app._burn_default_captions_for_clip(
@@ -7324,35 +7691,25 @@ def test_apply_immediate_upgrade_never_resets_existing_balance(monkeypatch):
 # test_list_souscriptions_due_for_monthly_credit_allocation_filters_correctly.)
 
 
-# -- 12. Storage overage after a downgrade --
+# -- 12. Storage is no longer a quota -- a plan change never considers it --
 
-def test_change_souscription_plan_downgrade_schedules_even_when_over_new_storage_quota(monkeypatch):
-    # Spec section 7: scheduling a downgrade must NEVER be blocked by
-    # already being over the new plan's storage quota -- only new uploads
-    # are blocked, and only once the downgrade actually takes effect (via
-    # the existing generic _assert_user_has_storage_headroom).
+def test_change_souscription_plan_never_blocks_or_warns_on_storage(monkeypatch):
+    # Storage is no longer a sellable/enforced quota at all: a plan
+    # change (immediate or scheduled) must never block on it, and the
+    # preview must never mention it.
     app = _import_app_with_stubs(monkeypatch)
     subscription = _plan_change_subscription(abonnement="gold")
     _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
-    # 40 Go used (50 max - 10 left), silver only allows 10.
-    user_data = AsyncMock(return_value={"stockage": 10.0, "stockage_max": 50.0, "credit": 0.0})
-    monkeypatch.setattr(app, "supabase_get_user_data", user_data)
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 0.0}))
 
     result = asyncio.run(app.change_souscription_plan(
         payload=app.ChangeSubscriptionPlanRequest(plan_id="silver"), user_id="u1",
     ))
     assert result["classification"] == app.PLAN_CHANGE_DOWNGRADE_SCHEDULED
 
-
-def test_preview_plan_change_surfaces_storage_overage_warning(monkeypatch):
-    app = _import_app_with_stubs(monkeypatch)
-    subscription = _plan_change_subscription(abonnement="gold")
-    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
-    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"stockage": 10.0, "stockage_max": 50.0, "credit": 0.0}))
-
-    result = asyncio.run(app.preview_souscription_plan_change(user_id="u1", plan_id="silver"))
-    assert result["classification"] == app.PLAN_CHANGE_DOWNGRADE_SCHEDULED
-    assert result["storage_overage_warning"] == {"storage_used": 40.0, "storage_quota": 10.0}
+    preview = asyncio.run(app.preview_souscription_plan_change(user_id="u1", plan_id="silver"))
+    assert "storage_overage_warning" not in preview
+    assert "new_storage_quota" not in preview
 
 
 # -- 13. No new referral reward on a plan change (see above, static check) --

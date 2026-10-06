@@ -301,7 +301,6 @@ export default function Landing({ onLaunchApp }) {
               </thead>
               <tbody>
                 <ComparisonRow feature={t("landing.prix")} Vireel={<span className="text-green-400 font-semibold">9.99€ / mois</span>} opusclip={<span className="font-semibold">24.99€ / mois</span>} kapwing={<span className="font-semibold">49.99€ / mois</span>} />
-                <ComparisonRow feature={t("landing.storage")} Vireel={<span className="text-green-400 font-semibold">10 Go</span>} opusclip={<span className="font-semibold">50 Go</span>} kapwing={<span className="font-semibold">100 Go</span>} />
                 <ComparisonRow feature={t("landing.viral")} Vireel={checkIcon} opusclip={checkIcon} kapwing={checkIcon} />
                 <ComparisonRow feature={t("landing.shorts")} Vireel={checkIcon} opusclip={checkIcon} kapwing={checkIcon} />
                 <ComparisonRow feature={t("landing.subtitles")} Vireel={checkIcon} opusclip={checkIcon} kapwing={checkIcon} />

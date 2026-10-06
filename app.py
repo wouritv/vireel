@@ -153,6 +153,19 @@ from supabase_request import (
 	list_notifications as supabase_list_notifications,
 	mark_notification_read as supabase_mark_notification_read,
 	mark_all_notifications_read as supabase_mark_all_notifications_read,
+	insert_media_asset as supabase_insert_media_asset,
+	get_media_asset_by_content as supabase_get_media_asset_by_content,
+	list_media_assets_due_for_expiration as supabase_list_media_assets_due_for_expiration,
+	mark_media_asset_expired as supabase_mark_media_asset_expired,
+	mark_media_asset_deleted as supabase_mark_media_asset_deleted,
+	list_produced_media_due_for_notification as supabase_list_produced_media_due_for_notification,
+	list_media_assets_by_content_ids as supabase_list_media_assets_by_content_ids,
+	mark_media_asset_notified as supabase_mark_media_asset_notified,
+	CONTENT_KIND_PROJECT_SOURCE,
+	CONTENT_KIND_REEL,
+	CONTENT_KIND_CAPTION,
+	CONTENT_KIND_FILM_SUMMARY,
+	CONTENT_KIND_ANONYMOUS_STORY,
 )
 import anonymous_stories
 import email_templates
@@ -170,6 +183,15 @@ from billing import (
     DEFAULT_CAPTION_CREDITS,
     CREDIT_UNIT_PRICE_BY_DOLLAR,
     estimate_llm_usage_cost_usd,
+    add_retention_cost_to_breakdown,
+)
+from retention_config import (
+    resolve_retention_days,
+    MEDIA_TYPE_SOURCE,
+    MEDIA_TYPE_PRODUCED,
+    S3_STORAGE_COST_PER_GB_DAY,
+    RETENTION_TEMP_FILES_HOURS,
+    RETENTION_NOTIFICATION_HOURS_BEFORE,
 )
 from job_manager import JobManager, JobType, calc_elapsed_seconds
 from pipelines import ReelProcessingPipeline, CaptionProcessingPipeline
@@ -334,7 +356,14 @@ FILM_SUMMARY_VOICE_PREVIEW_TEXT = os.environ.get(
 )
 
 VIREEL_VIDEO_FORMAT = os.environ.get("VIREEL_VIDEO_FORMAT", "mp4,mov,avi")
-JOB_RETENTION_SECONDS = 3600  # 1 hour retention
+# How long a job's local temp artifacts (FFmpeg intermediates, extracted
+# frames/chunks, local uploads, finished-job output dirs) stick around
+# before cleanup -- see RETENTION_TEMP_FILES_HOURS / process_temp_file_
+# cleanup_jobs. This is the ONLY category RETENTION_TEMP_FILES_HOURS
+# governs: it's unrelated to the per-media S3 retention durations
+# (RETENTION_FREE_*/RETENTION_SUBSCRIBER_*), which apply only to the
+# user-facing, S3-persisted media the retention/expiration sweep manages.
+JOB_RETENTION_SECONDS = RETENTION_TEMP_FILES_HOURS * 3600
 OUTPUT_SWEEP_INTERVAL_SECONDS = int(os.environ.get("OUTPUT_SWEEP_INTERVAL_SECONDS", str(6 * 3600)))
 OUTPUT_SWEEP_MIN_AGE_SECONDS = int(os.environ.get("OUTPUT_SWEEP_MIN_AGE_SECONDS", "1800"))
 SOCIAL_PUBLISH_SCHEDULER_INTERVAL_SECONDS = int(os.environ.get("SOCIAL_PUBLISH_SCHEDULER_INTERVAL_SECONDS", "10"))
@@ -342,6 +371,12 @@ SOCIAL_PUBLISH_SCHEDULER_INTERVAL_SECONDS = int(os.environ.get("SOCIAL_PUBLISH_S
 # this only decides how late a refill can run past its due date, not
 # whether it runs at all (see process_annual_credit_refill_jobs).
 ANNUAL_CREDIT_REFILL_INTERVAL_SECONDS = int(os.environ.get("ANNUAL_CREDIT_REFILL_INTERVAL_SECONDS", str(24 * 3600)))
+# How often the two media-retention sweeps run -- NOT how long anything is
+# kept (that's RETENTION_FREE_*/RETENTION_SUBSCRIBER_*/RETENTION_NOTIFICATION_
+# HOURS_BEFORE in retention_config.py); this only decides how promptly an
+# already-due expiration/notification is acted on.
+MEDIA_EXPIRATION_SWEEP_INTERVAL_SECONDS = int(os.environ.get("MEDIA_EXPIRATION_SWEEP_INTERVAL_SECONDS", "300"))
+MEDIA_EXPIRY_NOTIFICATION_SWEEP_INTERVAL_SECONDS = int(os.environ.get("MEDIA_EXPIRY_NOTIFICATION_SWEEP_INTERVAL_SECONDS", str(3600)))
 # Referral program -- the backend is the sole source of truth for these
 # amounts (see /api/referrals/config); the frontend never hardcodes them.
 REFERRAL_SIGNUP_BONUS_CREDITS = float(os.environ.get("REFERRAL_SIGNUP_BONUS_CREDITS", "50") or "50")
@@ -371,7 +406,6 @@ STRIPE_CURRENCY = os.environ.get("STRIPE_CURRENCY", "eur").lower()
 STRIPE_SUCCESS_URL = os.environ.get("STRIPE_SUCCESS_URL", "")
 STRIPE_CANCEL_URL = os.environ.get("STRIPE_CANCEL_URL", "")
 STORAGE_RETENTION_PERIODE_DAYS = max(0, int(os.environ.get("STORAGE_RETENTION_PERIODE", "7") or "7"))
-STORAGE_OVERAGE_TOLERANCE_PERCENT = max(0.0, float(os.environ.get("STORAGE_OVERAGE_TOLERANCE_PERCENT", "10") or "10"))
 MIN_OPERATION_START_CREDITS = float(os.environ.get("MIN_OPERATION_START_CREDITS", "1"))
 
 # Social publishing constants
@@ -2540,8 +2574,17 @@ async def _reconcile_orphaned_jobs_on_startup() -> None:
         print(f"🧹 Startup job reconciliation: closed {len(orphaned)} orphaned job(s) from a previous process.")
 
 
-async def cleanup_jobs():
-    """Background task to remove old jobs and files."""
+async def process_temp_file_cleanup_jobs():
+    """One of the 3 required retention background processes (see the
+    media lifecycle rework's module notes): cleans up local job temp
+    artifacts (FFmpeg intermediates, extracted frames/chunks, uploads,
+    finished job output dirs) -- a DIFFERENT category from the S3-persisted
+    media the other two retention sweeps manage, governed by its own
+    RETENTION_TEMP_FILES_HOURS (see JOB_RETENTION_SECONDS) rather than the
+    per-media-type RETENTION_FREE_*/RETENTION_SUBSCRIBER_* durations.
+    Idempotent: a file already gone by the time this runs is simply not
+    there to remove again (os.remove's OSError is caught per-file, see
+    _cleanup_expired_uploads), never a reason to fail the whole sweep."""
     import time
     print("🧹 Cleanup task started.")
     last_output_sweep = 0.0
@@ -2623,9 +2666,11 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(process_queue(f"worker-{idx + 1}"))
         for idx in range(max(1, QUEUE_WORKER_COUNT))
     ]
-    cleanup_task = asyncio.create_task(cleanup_jobs())
+    cleanup_task = asyncio.create_task(process_temp_file_cleanup_jobs())
     scheduler_task = asyncio.create_task(process_scheduled_social_publish_jobs())
     annual_credit_refill_task = asyncio.create_task(process_annual_credit_refill_jobs())
+    media_expiration_task = asyncio.create_task(process_media_expiration_jobs())
+    media_expiry_notification_task = asyncio.create_task(process_media_expiry_notification_jobs())
     yield
     # Cleanup (optional: cancel worker)
     for task in worker_tasks:
@@ -2633,6 +2678,8 @@ async def lifespan(app: FastAPI):
     cleanup_task.cancel()
     scheduler_task.cancel()
     annual_credit_refill_task.cancel()
+    media_expiration_task.cancel()
+    media_expiry_notification_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -2967,6 +3014,27 @@ async def _finalize_completed_reel_billing(
         expected_clips=len(enriched_clips),
         storage_bytes=total_reel_size_bytes,
     )
+    retention = await _finalize_retention_billing_batch(job_id, user_id, [
+        {
+            "content_kind": CONTENT_KIND_REEL,
+            "content_id": row.get("id"),
+            "media_type": MEDIA_TYPE_PRODUCED,
+            "size_bytes": row.get("reel_size_bytes"),
+            "s3_bucket": os.environ.get("AWS_S3_BUCKET", "my-clips-bucket"),
+            "s3_key": row.get("reel_s3_key"),
+        }
+        for row in saved_rows
+    ])
+    if retention["retention_storage_cost_usd"] or retention["retention_storage_credit_cost"]:
+        billing["actual_cost_usd"] = round(billing["actual_cost_usd"] + retention["retention_storage_cost_usd"], 6)
+        billing["actual_credit"] = round(billing["actual_credit"] + retention["retention_storage_credit_cost"], 2)
+        billing["cost_breakdown"] = {
+            **billing["cost_breakdown"],
+            "retention_storage_cost_usd": retention["retention_storage_cost_usd"],
+            "retention_storage_credit_cost": retention["retention_storage_credit_cost"],
+            "media_assets": retention["media_assets"],
+        }
+
     debit_applied = False
     logger.info(f"Billing info for job {job_id}: {billing}")
     job_reserved_credits = float(job_data.get("reel_required_credits") or 0.0)
@@ -3492,21 +3560,38 @@ def _build_caption_row_payload(
 
 async def _save_caption_row_and_debit(
     row_payload: Dict[str, Any], job_id: str, user_id: Optional[str],
-    caption_required_credits: float, caption_storage_gb: float,
-) -> Dict[str, Any]:
+    caption_required_credits: float, caption_storage_gb: float, caption_size_bytes: float = 0.0,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     normalized_item = {"id": f"local-{job_id}", **row_payload}
+    retention: Dict[str, Any] = {"retention_storage_cost_usd": 0.0, "retention_storage_credit_cost": 0.0, "media_assets": []}
     if not is_supabase_configured():
-        return normalized_item
+        return normalized_item, retention
 
     saved = await supabase_insert_captions([row_payload])
     if saved:
         normalized_item = _normalize_caption_row(saved[0])
 
-    if user_id and (caption_required_credits > 0 or caption_storage_gb > 0):
+    # Retention is only computable once the caption's own id exists (its
+    # media_assets row links back via content_id) -- hence after insert,
+    # before the single combined debit below (additive, see
+    # _finalize_media_retention_billing).
+    retention = await _finalize_retention_billing_batch(job_id, user_id, [
+        {
+            "content_kind": CONTENT_KIND_CAPTION,
+            "content_id": normalized_item.get("id"),
+            "media_type": MEDIA_TYPE_PRODUCED,
+            "size_bytes": caption_size_bytes,
+            "s3_bucket": os.environ.get("AWS_S3_BUCKET", "my-clips-bucket"),
+            "s3_key": row_payload.get("caption_s3_key"),
+        }
+    ])
+    total_credits = round(caption_required_credits + retention["retention_storage_credit_cost"], 2)
+
+    if user_id and (total_credits > 0 or caption_storage_gb > 0):
         debit_ok = await reel_job_manager.debit_credits_for_job(
             job_id=job_id,
             user_id=user_id,
-            credits=caption_required_credits,
+            credits=total_credits,
             storage_delta=-caption_storage_gb,
             operation_type="sous_titre",
             reserved_credits=caption_required_credits,
@@ -3514,7 +3599,7 @@ async def _save_caption_row_and_debit(
         if not debit_ok:
             raise RuntimeError("Insufficient credit/storage balance to finalize caption job")
 
-    return normalized_item
+    return normalized_item, retention
 
 
 async def _update_project_on_caption_completion(job_data: Dict[str, Any], user_id: Optional[str], normalized_item: Dict[str, Any], local_duration: float) -> None:
@@ -3626,7 +3711,18 @@ async def _process_and_complete_caption_job(
         caption_s3_key, caption_required_credits, caption_storage_gb, caption_cost_breakdown,
         original_s3_key=original_s3_key,
     )
-    normalized_item = await _save_caption_row_and_debit(row_payload, job_id, user_id, caption_required_credits, caption_storage_gb)
+    caption_size_bytes = float(os.path.getsize(primary_path) if os.path.exists(primary_path) else 0)
+    normalized_item, retention = await _save_caption_row_and_debit(
+        row_payload, job_id, user_id, caption_required_credits, caption_storage_gb, caption_size_bytes,
+    )
+    total_caption_credits = round(caption_required_credits + retention["retention_storage_credit_cost"], 2)
+    if retention["retention_storage_cost_usd"] or retention["retention_storage_credit_cost"]:
+        caption_cost_breakdown = {
+            **caption_cost_breakdown,
+            "retention_storage_cost_usd": retention["retention_storage_cost_usd"],
+            "retention_storage_credit_cost": retention["retention_storage_credit_cost"],
+            "media_assets": retention["media_assets"],
+        }
 
     await pipeline.rendering()
     result_payload = {
@@ -3639,7 +3735,7 @@ async def _process_and_complete_caption_job(
     await reel_job_manager.complete_job(
         job_id,
         result_payload,
-        actual_credit=caption_required_credits,
+        actual_credit=total_caption_credits,
         actual_storage_gb=caption_storage_gb,
         consumed_quota=1.0,
         cost_breakdown=caption_cost_breakdown,
@@ -4148,36 +4244,6 @@ async def _assert_user_can_access_analytics(user_id: str) -> None:
         )
 
 
-async def _assert_user_has_storage_headroom(user_id: str) -> None:
-    """Reject new uploads once the user's aggregate storage quota is already
-    exhausted (audit finding P2-10).
-
-    Storage consumption is only ever settled against ``stockage``/
-    ``stockage_max`` at job completion (see deduct_user_credits'
-    storage_delta), once the actual output size is known. Nothing upstream
-    of that stopped an account already over its storage quota from starting
-    yet more jobs -- only the credit balance gated new work. This mirrors
-    the same overage tolerance used at settlement time so an account isn't
-    blocked here by a stricter rule than the one that will actually charge it.
-    """
-    if not is_supabase_configured():
-        return
-    user_data = await supabase_get_user_data(user_id)
-    if not user_data:
-        return
-    current_storage = float(user_data.get("stockage", 0) or 0.0)
-    storage_max = float(user_data.get("stockage_max", max(current_storage, 0.0)) or 0.0)
-    overage_limit = (storage_max * STORAGE_OVERAGE_TOLERANCE_PERCENT) / 100.0
-    if current_storage < -overage_limit:
-        raise HTTPException(
-            status_code=402,
-            detail=(
-                "Quota de stockage depasse. Liberez de l'espace ou mettez a "
-                "niveau votre abonnement avant de lancer un nouveau traitement."
-            ),
-        )
-
-
 async def _reserve_job_credits(user_id: str, required_credits: float) -> float:
     """Atomically reserve ``required_credits`` for a queued job (reel/caption
     generation) instead of merely checking the balance covers it. Two
@@ -4202,6 +4268,199 @@ async def _reserve_job_credits(user_id: str, required_credits: float) -> float:
             ),
         )
     return required
+
+
+async def _finalize_media_retention_billing(
+    *,
+    job_id: Optional[str],
+    user_id: Optional[str],
+    content_kind: str,
+    content_id: str,
+    media_type: str,
+    size_bytes: float,
+    s3_bucket: Optional[str] = None,
+    s3_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Fixes this media's retention policy FOREVER at the moment its
+    definitive size is known (see retention_config.resolve_retention_days
+    and the media_assets migration's module comment -- never recomputed
+    later, even if the user's subscription or the env vars change
+    afterward), persists its media_assets row, and returns a standalone
+    retention cost line item (own USD/credit conversion, via the exact
+    same billing.calculate_credits_for_operation engine already used for
+    AI/processing/S3-operation costs -- never a parallel one) for the
+    caller to ADD to its own actual_cost_usd/actual_credit, per the
+    additive billing model (credits = existing costs + this one, never a
+    replacement). Never raises: a persistence failure here must not block
+    the job's own billing/credit settlement, only skip its own retention
+    line item (logged) -- see also add_retention_cost_to_breakdown, which
+    this re-uses for its own USD->credits conversion.
+    """
+    has_active_subscription = False
+    if is_supabase_configured() and user_id:
+        try:
+            has_active_subscription = bool(await get_user_abonnement(user_id))
+        except Exception:
+            logger.exception("Failed to resolve subscription status for retention policy (job %s)", job_id)
+
+    retention_days = resolve_retention_days(media_type, has_active_subscription)
+    media_size_gb = _bytes_to_gb(size_bytes)
+    # A standalone retention-only breakdown ({"total_usd": 0.0} + retention)
+    # -- reuses add_retention_cost_to_breakdown/calculate_credits_for_operation
+    # exactly as tested in tests/test_billing.py, just scoped to this one
+    # additive component rather than merged into a ratio-adjusted breakdown.
+    retention_breakdown = add_retention_cost_to_breakdown({"total_usd": 0.0}, media_size_gb, retention_days)
+    retention_storage_cost_usd = float(retention_breakdown.get("retention_usd") or 0.0)
+    retention_storage_credit_cost = float(retention_breakdown.get("final_credits") or 0.0)
+
+    now = datetime.now(timezone.utc)
+    retention_expires_at = now + timedelta(days=retention_days)
+    subscription_status_at_creation = "active" if has_active_subscription else "free"
+
+    if is_supabase_configured() and user_id:
+        try:
+            await supabase_insert_media_asset(
+                user_id=user_id,
+                content_kind=content_kind,
+                content_id=content_id,
+                media_type=media_type,
+                subscription_status_at_creation=subscription_status_at_creation,
+                retention_days=retention_days,
+                retention_started_at=now,
+                retention_expires_at=retention_expires_at,
+                job_id=job_id,
+                s3_bucket=s3_bucket,
+                s3_key=s3_key,
+                size_bytes=int(size_bytes or 0),
+                s3_storage_cost_per_gb_day=S3_STORAGE_COST_PER_GB_DAY,
+                retention_storage_cost_usd=retention_storage_cost_usd,
+                retention_storage_credit_cost=retention_storage_credit_cost,
+                billing_created_at=now,
+            )
+        except Exception:
+            logger.exception("Failed to persist media_assets row for job %s / %s:%s", job_id, content_kind, content_id)
+
+    return {
+        "content_kind": content_kind,
+        "content_id": content_id,
+        "media_type": media_type,
+        "media_size_bytes": int(size_bytes or 0),
+        "media_size_gb": media_size_gb,
+        "subscription_status_at_creation": subscription_status_at_creation,
+        "retention_days": retention_days,
+        # ISO strings, not datetime objects -- this dict is folded into the
+        # job's cost_breakdown log (see _finalize_retention_billing_batch),
+        # which gets JSON-serialized for persistence.
+        "retention_started_at": now.isoformat(),
+        "retention_expires_at": retention_expires_at.isoformat(),
+        "s3_storage_cost_per_gb_day": S3_STORAGE_COST_PER_GB_DAY,
+        "retention_storage_cost_usd": retention_storage_cost_usd,
+        "retention_storage_credit_cost": retention_storage_credit_cost,
+    }
+
+
+async def _finalize_retention_billing_batch(
+    job_id: Optional[str], user_id: Optional[str], media_entries: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Runs _finalize_media_retention_billing once per produced/source
+    media file this job created (one call per entry -- e.g. one per saved
+    reel row for a multi-clip job), then sums the standalone retention
+    cost across all of them for the caller to ADD to its own
+    actual_cost_usd/actual_credit, plus the full per-media snapshot list
+    for the billing log's auditable decomposition."""
+    total_cost_usd = 0.0
+    total_credit_cost = 0.0
+    snapshots: List[Dict[str, Any]] = []
+    for entry in media_entries:
+        if not entry.get("content_id"):
+            continue
+        snapshot = await _finalize_media_retention_billing(
+            job_id=job_id,
+            user_id=user_id,
+            content_kind=entry["content_kind"],
+            content_id=entry["content_id"],
+            media_type=entry["media_type"],
+            size_bytes=entry.get("size_bytes") or 0,
+            s3_bucket=entry.get("s3_bucket"),
+            s3_key=entry.get("s3_key"),
+        )
+        total_cost_usd += snapshot["retention_storage_cost_usd"]
+        total_credit_cost += snapshot["retention_storage_credit_cost"]
+        snapshots.append(snapshot)
+    return {
+        "retention_storage_cost_usd": round(total_cost_usd, 6),
+        "retention_storage_credit_cost": round(total_credit_cost, 2),
+        "media_assets": snapshots,
+    }
+
+
+async def _finalize_source_media_retention(
+    job_id: Optional[str], user_id: Optional[str], project: Optional[Dict[str, Any]],
+    size_bytes: float, s3_bucket: Optional[str], s3_key: Optional[str],
+) -> None:
+    """The shared SOURCE-media retention entry point for every pipeline's
+    project/upload creation (reel, caption, anonymous story, film summary
+    all create a `projects` row for their source upload -- see
+    _create_process_endpoint_project/_create_caption_endpoint_project/
+    _create_anonymous_story_endpoint_project/_create_film_summary_endpoint_project).
+    Unlike produced media, no credits are reserved/debited for a source
+    upload elsewhere in the existing flow, so this is its own small,
+    standalone debit (reserved_credits=0.0) for just the retention line
+    item -- never blocks the upload/job itself on failure, only logs,
+    exactly like the other best-effort debit_ok checks in this file."""
+    if not project or not project.get("id"):
+        return
+    retention = await _finalize_retention_billing_batch(job_id, user_id, [
+        {
+            "content_kind": CONTENT_KIND_PROJECT_SOURCE,
+            "content_id": project.get("id"),
+            "media_type": MEDIA_TYPE_SOURCE,
+            "size_bytes": size_bytes,
+            "s3_bucket": s3_bucket,
+            "s3_key": s3_key,
+        }
+    ])
+    retention_credits = retention["retention_storage_credit_cost"]
+    if user_id and is_supabase_configured() and retention_credits > 0:
+        try:
+            debit_ok = await reel_job_manager.debit_credits_for_job(
+                job_id=job_id,
+                user_id=user_id,
+                credits=retention_credits,
+                storage_delta=0.0,
+                operation_type="retention_storage_source",
+                reserved_credits=0.0,
+            )
+            if not debit_ok:
+                logger.warning("Insufficient balance to settle source-media retention (job %s)", job_id)
+        except Exception:
+            logger.exception("Failed to debit source-media retention cost (job %s)", job_id)
+
+
+async def _attach_media_asset_fields(
+    rows: List[Dict[str, Any]], content_kind: str, id_field: str = "id",
+) -> List[Dict[str, Any]]:
+    """Enriches each row (in place) with media_status/media_expires_at from
+    its media_assets row -- one batched query for the whole page, never
+    one per row. Purely informational for the UI (see the spec's
+    "Disponible jusqu'au...", "Expire dans N jours", "Media expire" states
+    on ReelsPage/CaptionsPage/etc.) -- never raises, and a row with no
+    media_assets row at all (historical content predating this feature)
+    just gets media_status=None, which the frontend treats as "no
+    expiration info" rather than "unavailable"."""
+    if not is_supabase_configured() or not rows:
+        return rows
+    ids = [row.get(id_field) for row in rows if row.get(id_field)]
+    try:
+        assets_by_id = await supabase_list_media_assets_by_content_ids(content_kind, ids)
+    except Exception:
+        logger.exception("Failed to batch-fetch media_assets for content_kind=%s", content_kind)
+        return rows
+    for row in rows:
+        asset = assets_by_id.get(row.get(id_field))
+        row["media_status"] = asset.get("media_status") if asset else None
+        row["media_expires_at"] = asset.get("retention_expires_at") if asset else None
+    return rows
 
 
 def _allowed_video_formats() -> List[str]:
@@ -5006,6 +5265,7 @@ async def _create_process_endpoint_project(
             source_duration=int(source_duration_seconds) if source_duration_seconds else None,
             status="processing",
         )
+        await _finalize_source_media_retention(job_id, user_id, project, source_size_bytes, bucket_name, s3_source_key)
         return project, source_duration_seconds
     except Exception as e:
         logger.warning(f"Failed to create project for job {job_id}: {str(e)}")
@@ -5085,7 +5345,6 @@ async def process_endpoint(
     _validate_process_endpoint_inputs(url, file, ack_flag)
 
     await _enforce_job_concurrency_limit(user_id)
-    await _assert_user_has_storage_headroom(user_id)
 
     attestation = _build_process_endpoint_attestation(request, url)
     job_priority = await _resolve_user_job_priority(user_id)
@@ -5558,7 +5817,7 @@ async def _create_caption_endpoint_project(user_id: str, caption_job_id: str, so
             upload_file_to_s3(input_path, bucket_name, s3_source_key)
 
         # Create project record
-        return await supabase_create_project(
+        project = await supabase_create_project(
             user_id=user_id,
             name=project_name,
             description=project_description,
@@ -5569,6 +5828,8 @@ async def _create_caption_endpoint_project(user_id: str, caption_job_id: str, so
             source_duration=int(local_duration) if local_duration else None,
             status="processing",
         )
+        await _finalize_source_media_retention(caption_job_id, user_id, project, size_bytes, bucket_name, s3_source_key)
+        return project
     except Exception as e:
         logger.warning(f"Failed to create project for caption job {caption_job_id}: {str(e)}")
         return None
@@ -5637,7 +5898,6 @@ async def process_caption_endpoint(
         raise HTTPException(status_code=400, detail="You must confirm you own the content or have rights to process it.")
 
     await _enforce_job_concurrency_limit(user_id)
-    await _assert_user_has_storage_headroom(user_id)
 
     _validate_video_extension(file.filename if file else "", context_label="sous-titres")
 
@@ -7047,6 +7307,17 @@ async def _finalize_custom_reel_clip_creation(
     billing_details = reel_row.get("billing_details") or {}
     total_credits = float(billing_details.get("final_credits") or 0.0) + float((billing_details.get("auto_caption") or {}).get("credit_cost") or 0.0)
     storage_gb = _bytes_to_gb(float(reel_row.get("reel_size_bytes") or 0))
+    retention = await _finalize_retention_billing_batch(job_id, user_id, [
+        {
+            "content_kind": CONTENT_KIND_REEL,
+            "content_id": saved_row.get("id"),
+            "media_type": MEDIA_TYPE_PRODUCED,
+            "size_bytes": reel_row.get("reel_size_bytes"),
+            "s3_bucket": os.environ.get("AWS_S3_BUCKET", "my-clips-bucket"),
+            "s3_key": reel_row.get("reel_s3_key"),
+        }
+    ])
+    total_credits = round(total_credits + retention["retention_storage_credit_cost"], 2)
     debit_ok = await reel_job_manager.debit_credits_for_job(
         job_id=job_id, user_id=user_id, credits=total_credits, storage_delta=-storage_gb,
         operation_type="generation_reel", reserved_credits=0.0,
@@ -9864,7 +10135,6 @@ async def get_current_souscription(
                 **subscription,
                 "abonnement_name": plan.get("name") or abonnement_id,
                 "abonnement_credit": float(plan.get("credit") or 0.0),
-                "abonnement_stockage": float(plan.get("stockage") or 0.0),
             }
 
     billing_interval = subscription.get("billing_interval") or "month"
@@ -10393,11 +10663,10 @@ def _assert_upgrade_amounts_are_consistent(amount_due_today: float, credits_to_a
 async def _assert_plan_change_social_accounts_within_limits(user_id: str, new_plan: Dict[str, Any]) -> None:
     """Blocks a plan change that would leave the account over the new
     plan's connected-account allowance -- there's no generic "block new
-    social account connections over limit" enforcement elsewhere (unlike
-    storage, see _assert_user_has_storage_headroom), so this is the only
-    safety net available and applies to every classification, including
-    a SCHEDULED downgrade (it would be too late to catch this once the
-    schedule fires on its own, unattended)."""
+    social account connections over limit" enforcement elsewhere, so this
+    is the only safety net available and applies to every classification,
+    including a SCHEDULED downgrade (it would be too late to catch this
+    once the schedule fires on its own, unattended)."""
     new_max_social = max(1, int(new_plan.get("max_social_account") or 1))
     counts = await _count_social_accounts_by_platform(user_id)
     over_limit_platforms = {platform: count for platform, count in counts.items() if count > new_max_social}
@@ -10408,39 +10677,6 @@ async def _assert_plan_change_social_accounts_within_limits(user_id: str, new_pl
             f"Cette offre autorise au maximum {new_max_social} compte(s) par reseau social. "
             f"Supprimez les comptes en surplus avant de changer d'offre : {details}.",
             max=new_max_social, details=details,
-        )
-
-
-async def _plan_change_storage_overage(user_id: str, new_plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """None when the account's currently-used storage fits the new plan's
-    quota, otherwise {"storage_used", "storage_quota"} -- used both to
-    block an IMMEDIATE upgrade's live resource bump (which should never
-    be needed in practice, upgrades only ever raise the quota) and to
-    populate the pre-confirmation summary's overage warning for a
-    downgrade (spec section 7: never blocks scheduling the downgrade
-    itself -- only new uploads, once it actually takes effect, via the
-    existing generic _assert_user_has_storage_headroom)."""
-    user_data = await supabase_get_user_data(user_id)
-    if not user_data:
-        return None
-    storage_max = float(user_data.get("stockage_max") or 0.0)
-    storage_left = float(user_data.get("stockage") or 0.0)
-    storage_used = max(0.0, storage_max - storage_left)
-    new_storage_allowance = float(new_plan.get("stockage") or 0.0)
-    if storage_used > new_storage_allowance:
-        return {"storage_used": storage_used, "storage_quota": new_storage_allowance}
-    return None
-
-
-async def _assert_plan_change_storage_not_exceeded(user_id: str, new_plan: Dict[str, Any]) -> None:
-    overage = await _plan_change_storage_overage(user_id, new_plan)
-    if overage:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Cette offre inclut {overage['storage_quota']:.1f} Go de stockage, mais vous utilisez "
-                f"actuellement {overage['storage_used']:.1f} Go. Supprimez du contenu avant de changer d'offre."
-            ),
         )
 
 
@@ -10960,7 +11196,6 @@ async def change_souscription_plan(
         # periodicity upgrade can still go through a fresh Checkout;
         # a deferred change has no recurring object to attach to.
         if classification == PLAN_CHANGE_UPGRADE_IMMEDIATE:
-            await _assert_plan_change_storage_not_exceeded(user_id, new_plan)
             return await _change_plan_via_fresh_checkout(request, user_id, subscription, new_plan)
         raise _coded_error(
             409, "plan_change_requires_recurring_subscription",
@@ -10968,7 +11203,6 @@ async def change_souscription_plan(
         )
 
     if classification == PLAN_CHANGE_UPGRADE_IMMEDIATE:
-        await _assert_plan_change_storage_not_exceeded(user_id, new_plan)
         return await _apply_immediate_upgrade(user_id, request, subscription, current_plan, new_plan, payload.confirm_cancel_scheduled)
 
     return await _apply_scheduled_plan_change(user_id, subscription, new_plan, new_interval, classification)
@@ -11053,12 +11287,9 @@ async def preview_souscription_plan_change(
             "credits_added_expires_at": subscription.get("credit_cycle_end_at") or subscription.get("payment_end_date"),
             "resulting_credit_balance": current_credit + promotional_credit + (credits_to_add if not inconsistent else 0),
             "future_monthly_credit_quota": float(new_plan.get("credit") or 0),
-            "new_storage_quota": float(new_plan.get("stockage") or 0),
             "next_amount": next_price,
             "next_billing_date": subscription.get("payment_end_date"),
         })
-        overage = await _plan_change_storage_overage(user_id, new_plan)
-        summary["storage_overage_warning"] = overage
     elif classification in (PLAN_CHANGE_DOWNGRADE_SCHEDULED, PLAN_CHANGE_PERIODICITY_SCHEDULED):
         effective_at = subscription.get("payment_end_date")
         summary.update({
@@ -11066,12 +11297,9 @@ async def preview_souscription_plan_change(
             "amount_due_today": 0.0,
             "credits_added_now": 0,
             "future_monthly_credit_quota": float(new_plan.get("credit") or 0),
-            "new_storage_quota": float(new_plan.get("stockage") or 0),
             "next_amount": _annual_price_for_plan(new_plan) if new_interval == "year" else float(new_plan.get("price") or 0),
             "next_billing_date": effective_at,
         })
-        overage = await _plan_change_storage_overage(user_id, new_plan)
-        summary["storage_overage_warning"] = overage
     else:
         summary.update({"effective_at": None, "amount_due_today": 0.0, "credits_added_now": 0})
 
@@ -11119,20 +11347,16 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
     if not data:
         return {
             "credit":   0.0,
-            "stockage": 0.0,
             "credit_max": 0.0,
-            "stockage_max": 0.0,
             "promotional_credit": promotional_credit,
             "promotional_credit_expirations": promotional_credit_expirations,
             "purchased_credit": purchased_credit,
             "purchased_credit_expirations": purchased_credit_expirations,
-            "storage_overage_tolerance_percent": STORAGE_OVERAGE_TOLERANCE_PERCENT,
             "has_credits": (promotional_credit + purchased_credit) > 0,
             "has_active_subscription": has_active_subscription,
             "has_analytics_access": bool(abonnement) and int(abonnement.get("priorite") or 1) >= 2,
             "abo_costs": {
                 "credit":  0.0,
-                "storage": 0.0,
             },
             "default_costs": {
                 "reel":        DEFAULT_REEL_CREDITS,
@@ -11142,31 +11366,24 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
         }
 
     credit = float(data.get("credit", 0) or 0.0)
-    storage = float(data.get("stockage", 0) or 0.0)
     credit_max = float(data.get("credit_max", credit) or 0.0)
-    storage_max = float(data.get("stockage_max", max(storage, 0.0)) or 0.0)
 
     if not abonnement:
         abo_costs = {
             "credit":  0.0,
-            "storage": 0.0,
         }
     else:
         abo_costs = {
             "credit":  float(abonnement.get("credit",   0)),
-            "storage": float(abonnement.get("stockage", 0)),
         }
 
     return {
         "credit":   credit,
-        "stockage": storage,
         "credit_max": credit_max,
-        "stockage_max": storage_max,
         "promotional_credit": promotional_credit,
         "promotional_credit_expirations": promotional_credit_expirations,
         "purchased_credit": purchased_credit,
         "purchased_credit_expirations": purchased_credit_expirations,
-        "storage_overage_tolerance_percent": STORAGE_OVERAGE_TOLERANCE_PERCENT,
         "has_credits": (credit + promotional_credit + purchased_credit) > 0,
         "has_active_subscription": has_active_subscription,
         "has_analytics_access": bool(abonnement) and int(abonnement.get("priorite") or 1) >= 2,
@@ -11724,8 +11941,10 @@ async def list_captions(
         raise HTTPException(status_code=503, detail="Supabase captions is not configured")
 
     rows, total = await supabase_list_captions(user_id=user_id, page=page, page_size=page_size, status=status, query=q)
+    items = [_normalize_caption_row(row) for row in rows]
+    await _attach_media_asset_fields(items, CONTENT_KIND_CAPTION)
     return {
-        "items": [_normalize_caption_row(row) for row in rows],
+        "items": items,
         "total": total,
         "page": max(page, 1),
         "page_size": min(max(page_size, 1), 100),
@@ -11822,7 +12041,7 @@ async def _create_anonymous_story_endpoint_project(
         if os.path.exists(input_path):
             upload_file_to_s3(input_path, bucket_name, s3_source_key)
 
-        return await supabase_create_project(
+        project = await supabase_create_project(
             user_id=user_id,
             name=story_title,
             description=project_description,
@@ -11834,6 +12053,8 @@ async def _create_anonymous_story_endpoint_project(
             source_duration=int(local_duration) if local_duration else None,
             status="processing",
         )
+        await _finalize_source_media_retention(story_job_id, user_id, project, size_bytes, bucket_name, s3_source_key)
+        return project
     except Exception as e:
         logger.warning(f"Failed to create project for anonymous story job {story_job_id}: {str(e)}")
         return None
@@ -11923,7 +12144,6 @@ async def create_anonymous_story(
     page_name, target_language = await _resolve_anonymous_story_page_context(request, page_name, target_language)
 
     await _enforce_job_concurrency_limit(user_id)
-    await _assert_user_has_storage_headroom(user_id)
 
     story_job_id = str(uuid.uuid4())
     output_dir = os.path.join(OUTPUT_DIR, story_job_id)
@@ -12228,8 +12448,10 @@ async def list_anonymous_stories_endpoint(
         raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
 
     rows, total = await supabase_list_anonymous_stories(user_id=user_id, page=page, page_size=page_size, status=status, query=q)
+    items = [_normalize_anonymous_story_row(row) for row in rows]
+    await _attach_media_asset_fields(items, CONTENT_KIND_ANONYMOUS_STORY)
     return {
-        "items": [_normalize_anonymous_story_row(row) for row in rows],
+        "items": items,
         "total": total,
         "page": max(page, 1),
         "page_size": min(max(page_size, 1), 100),
@@ -13308,7 +13530,7 @@ async def _create_film_summary_endpoint_project(
         if os.path.exists(input_path):
             upload_file_to_s3(input_path, bucket_name, s3_source_key)
 
-        return await supabase_create_project(
+        project = await supabase_create_project(
             user_id=user_id,
             name=film_title,
             description=project_description,
@@ -13320,6 +13542,8 @@ async def _create_film_summary_endpoint_project(
             source_duration=int(local_duration) if local_duration else None,
             status="processing",
         )
+        await _finalize_source_media_retention(film_job_id, user_id, project, size_bytes, bucket_name, s3_source_key)
+        return project
     except Exception as e:
         logger.warning(f"Failed to create project for film summary job {film_job_id}: {str(e)}")
         return None
@@ -13513,7 +13737,6 @@ async def create_film_summary(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     await _enforce_job_concurrency_limit(user_id)
-    await _assert_user_has_storage_headroom(user_id)
 
     film_job_id = str(uuid.uuid4())
     output_dir = os.path.join(OUTPUT_DIR, film_job_id)
@@ -13908,8 +14131,10 @@ async def list_film_summaries_endpoint(
         raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
 
     rows, total = await supabase_list_film_summaries(user_id=user_id, page=page, page_size=page_size, status=status, query=q)
+    items = [_normalize_film_summary_row(row) for row in rows]
+    await _attach_media_asset_fields(items, CONTENT_KIND_FILM_SUMMARY)
     return {
-        "items": [_normalize_film_summary_row(row) for row in rows],
+        "items": items,
         "total": total,
         "page": max(page, 1),
         "page_size": min(max(page_size, 1), 100),
@@ -14473,6 +14698,41 @@ async def _finalize_film_summary_render(
         })
         if source_s3_key and bucket_name:
             delete_s3_object(bucket_name, source_s3_key)
+            # The source's own media_assets row (created at project upload
+            # time, see _create_film_summary_endpoint_project) now points at
+            # a file we just deleted ourselves -- DELETED (volitional),
+            # never EXPIRED (that status is reserved for the retention
+            # sweep itself, see process_media_expiration_jobs).
+            if project_id:
+                try:
+                    source_media_asset = await supabase_get_media_asset_by_content(CONTENT_KIND_PROJECT_SOURCE, project_id)
+                    if source_media_asset and source_media_asset.get("id"):
+                        await supabase_mark_media_asset_deleted(source_media_asset["id"])
+                except Exception:
+                    logger.exception("Failed to mark film summary source media_asset deleted (job %s)", job_id)
+
+        # One combined media_assets row for both produced outputs (preview
+        # + final share the same film_summary_id and are always deleted/
+        # expired together) -- size_bytes is their combined total.
+        retention = await _finalize_retention_billing_batch(job_id, user_id, [
+            {
+                "content_kind": CONTENT_KIND_FILM_SUMMARY,
+                "content_id": film_summary_id,
+                "media_type": MEDIA_TYPE_PRODUCED,
+                "size_bytes": output_storage_bytes,
+                "s3_bucket": bucket_name,
+                "s3_key": final_s3_key,
+            }
+        ])
+        final_credits = round(final_credits + retention["retention_storage_credit_cost"], 2)
+        if retention["retention_storage_cost_usd"] or retention["retention_storage_credit_cost"]:
+            cost_breakdown = {
+                **cost_breakdown,
+                "retention_storage_cost_usd": retention["retention_storage_cost_usd"],
+                "retention_storage_credit_cost": retention["retention_storage_credit_cost"],
+                "media_assets": retention["media_assets"],
+            }
+
         debit_ok = await reel_job_manager.debit_credits_for_job(
             job_id=job_id, user_id=user_id, credits=final_credits,
             storage_delta=-_bytes_to_gb(float(output_storage_bytes or 0.0)),
@@ -15166,8 +15426,10 @@ async def list_reels(user_id: Annotated[str, Depends(get_user_id_header)], page:
         raise HTTPException(status_code=503, detail="Supabase reels is not configured")
 
     rows, total = await supabase_list_reels(user_id=user_id, page=page, page_size=page_size, status=status, query=q)
+    items = [_normalize_reel_row(row) for row in rows]
+    await _attach_media_asset_fields(items, CONTENT_KIND_REEL)
     return {
-        "items": [_normalize_reel_row(row) for row in rows],
+        "items": items,
         "total": total,
         "page": max(page, 1),
         "page_size": min(max(page_size, 1), 100),
@@ -15840,6 +16102,112 @@ async def process_annual_credit_refill_jobs() -> None:
             logger.warning("Annual credit refill worker error: %s", exc, exc_info=True)
 
         await asyncio.sleep(max(300, ANNUAL_CREDIT_REFILL_INTERVAL_SECONDS))
+
+
+async def _expire_one_media_asset(asset: Dict[str, Any]) -> None:
+    """Deletes the physical S3 object, then marks the row EXPIRED -- in
+    that order, and only on confirmed delete success, so an S3 failure
+    (delete_s3_object returns False) leaves the row AVAILABLE for the next
+    sweep to retry rather than ever marking EXPIRED for a file that's
+    still actually there (or whose deletion we can't confirm)."""
+    media_id = asset.get("id")
+    if not media_id:
+        return
+    bucket = asset.get("s3_bucket")
+    key = asset.get("s3_key")
+    if bucket and key:
+        deleted = delete_s3_object(bucket, key)
+        if not deleted:
+            logger.warning(
+                "Failed to delete S3 object for media_asset %s (bucket=%s key=%s); leaving AVAILABLE for retry",
+                media_id, bucket, key,
+            )
+            return
+    # No bucket/key on this row (e.g. a legacy row created without one) --
+    # nothing physical to delete, so there's nothing that can fail either.
+    await supabase_mark_media_asset_expired(media_id)
+
+
+async def _run_media_expiration_sweep() -> None:
+    due = await supabase_list_media_assets_due_for_expiration(limit=100)
+    for asset in due:
+        try:
+            await _expire_one_media_asset(asset)
+        except Exception:
+            logger.exception("Failed to expire media_asset %s", asset.get("id"))
+
+
+async def process_media_expiration_jobs() -> None:
+    """Required retention background process #1: physically deletes every
+    AVAILABLE media past its retention_expires_at (see the media_assets
+    migration and retention_config.py) -- the business row (reel/caption/
+    film_summary/anonymous_story/project) is never touched, only this
+    lifecycle row's own status/media_deleted_at."""
+    while True:
+        try:
+            if is_supabase_configured():
+                await _run_media_expiration_sweep()
+        except Exception as exc:
+            logger.warning("Media expiration worker error: %s", exc, exc_info=True)
+
+        await asyncio.sleep(max(60, MEDIA_EXPIRATION_SWEEP_INTERVAL_SECONDS))
+
+
+async def _notify_one_media_asset_expiring(asset: Dict[str, Any]) -> None:
+    """Marks notified_before_expiry_at BEFORE sending the notification
+    (not after): supabase_mark_media_asset_notified only succeeds while
+    that column is still null, so this is the idempotency guard -- a
+    second sweep (or a retry after a crash right after this one) that
+    finds the column already set simply sends nothing, rather than racing
+    on "did I already notify this?" after the fact."""
+    media_id = asset.get("id")
+    user_id = asset.get("user_id")
+    if not media_id or not user_id:
+        return
+    newly_marked = await supabase_mark_media_asset_notified(media_id)
+    if not newly_marked:
+        return
+    await supabase_insert_notification(
+        user_id=user_id,
+        type_="media_expiring_soon",
+        title="Un media va etre supprime prochainement",
+        body=(
+            "Ce media sera supprime automatiquement le "
+            f"{asset.get('retention_expires_at')}. Telechargez-le avant cette date pour le conserver."
+        ),
+        data={
+            "media_asset_id": media_id,
+            "content_kind": asset.get("content_kind"),
+            "content_id": asset.get("content_id"),
+            "retention_expires_at": asset.get("retention_expires_at"),
+        },
+    )
+
+
+async def _run_media_expiry_notification_sweep() -> None:
+    notify_before_time = datetime.now(timezone.utc) + timedelta(hours=RETENTION_NOTIFICATION_HOURS_BEFORE)
+    due = await supabase_list_produced_media_due_for_notification(notify_before_time, limit=100)
+    for asset in due:
+        try:
+            await _notify_one_media_asset_expiring(asset)
+        except Exception:
+            logger.exception("Failed to notify expiring media_asset %s", asset.get("id"))
+
+
+async def process_media_expiry_notification_jobs() -> None:
+    """Required retention background process #2: warns the user
+    RETENTION_NOTIFICATION_HOURS_BEFORE ahead of a PRODUCED media's
+    deletion (source media is never notified, per the spec's "avoid
+    notification overload" rule -- see
+    list_produced_media_due_for_notification's media_type filter)."""
+    while True:
+        try:
+            if is_supabase_configured():
+                await _run_media_expiry_notification_sweep()
+        except Exception as exc:
+            logger.warning("Media expiry notification worker error: %s", exc, exc_info=True)
+
+        await asyncio.sleep(max(60, MEDIA_EXPIRY_NOTIFICATION_SWEEP_INTERVAL_SECONDS))
 
 
 async def process_scheduled_social_publish_jobs() -> None:
