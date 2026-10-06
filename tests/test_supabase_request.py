@@ -70,6 +70,9 @@ class _FakeQuery:
     def gte(self, *args, **kwargs):
         return self._record("gte", *args, **kwargs)
 
+    def lte(self, *args, **kwargs):
+        return self._record("lte", *args, **kwargs)
+
     def in_(self, *args, **kwargs):
         return self._record("in_", *args, **kwargs)
 
@@ -436,16 +439,33 @@ def test_add_one_month_handles_december_and_month_end(monkeypatch):
 
     # Test December to January
     dec = datetime(2024, 12, 15, 10, 30)
-    result = supabase_request._add_one_month(dec)
+    result = supabase_request.add_one_month(dec)
     assert result.month == 1
     assert result.year == 2025
     assert result.day == 15
 
     # Test month-end handling (Jan 31 -> Feb 28)
     jan31 = datetime(2024, 1, 31, 10, 30)
-    result = supabase_request._add_one_month(jan31)
+    result = supabase_request.add_one_month(jan31)
     assert result.month == 2
     assert result.day == 29  # 2024 is a leap year
+
+
+def test_add_one_year_handles_leap_day(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    from datetime import datetime
+
+    leap_day = datetime(2024, 2, 29, 10, 30)
+    result = supabase_request.add_one_year(leap_day)
+    assert result.year == 2025
+    assert result.month == 2
+    assert result.day == 28
+
+    regular = datetime(2024, 6, 15, 10, 30)
+    result = supabase_request.add_one_year(regular)
+    assert result.year == 2025
+    assert result.month == 6
+    assert result.day == 15
 
 
 def test_insert_reels_returns_empty_for_empty_input(monkeypatch):
@@ -844,6 +864,63 @@ def test_insert_souscription_uses_explicit_period_end_date_and_stripe_ids(monkey
     assert result["payment_end_date"] == period_end.isoformat()
     assert result["stripe_subscription_id"] == "sub_123"
     assert result["stripe_customer_id"] == "cus_456"
+
+
+def test_insert_souscription_annual_defaults_to_plus_one_year(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_SOUSCRIPTION_TABLE: [_FakeResponse(data=[])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    start = datetime(2026, 1, 15, tzinfo=timezone.utc)
+    result = asyncio.run(
+        supabase_request.insert_souscription(
+            user_id="u1", abonnement="plan-pro", payment_mode="stripe",
+            payment_amount=114.0, payment_reference="ref-annual",
+            payment_status="completed", payment_date=start, billing_interval="year",
+        )
+    )
+    assert result["billing_interval"] == "year"
+    assert result["payment_end_date"] == datetime(2027, 1, 15, tzinfo=timezone.utc).isoformat()
+
+
+def test_insert_souscription_persists_plan_snapshot_and_next_allocation(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_SOUSCRIPTION_TABLE: [_FakeResponse(data=[])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    next_allocation = datetime(2026, 2, 15, tzinfo=timezone.utc)
+    result = asyncio.run(
+        supabase_request.insert_souscription(
+            user_id="u1", abonnement="plan-pro", payment_mode="stripe",
+            payment_amount=114.0, payment_reference="ref-annual", payment_status="completed",
+            billing_interval="year", plan_credit=500.0, plan_stockage=1.0,
+            next_credit_allocation_at=next_allocation,
+        )
+    )
+    assert result["plan_credit"] == 500.0
+    assert result["plan_stockage"] == 1.0
+    assert result["next_credit_allocation_at"] == next_allocation.isoformat()
+
+
+def test_list_souscriptions_due_for_monthly_credit_allocation_filters_correctly(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    due_rows = [{"id": "sous-1", "userid": "u1", "plan_credit": 500.0, "plan_stockage": 1.0}]
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_SOUSCRIPTION_TABLE: [_FakeResponse(data=due_rows)]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.list_souscriptions_due_for_monthly_credit_allocation())
+
+    assert result == due_rows
+    events = fake_client.events
+    assert _event_args(events, supabase_request.SUPABASE_SOUSCRIPTION_TABLE, "eq") == ("payment_status", "completed")
+    assert _event_count(events, supabase_request.SUPABASE_SOUSCRIPTION_TABLE, "lte") == 1
+    assert _event_count(events, supabase_request.SUPABASE_SOUSCRIPTION_TABLE, "gte") == 1
 
 
 def test_get_souscription_by_reference_returns_none_for_empty(monkeypatch):

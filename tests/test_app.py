@@ -5192,6 +5192,69 @@ def test_create_stripe_checkout_session_reuses_existing_stripe_customer(monkeypa
     assert "customer_email" not in kwargs
 
 
+def test_annual_price_for_plan_applies_discount_rate():
+    import app as app_module
+    assert app_module._annual_price_for_plan({"price": 10, "reduction_annuelle": 0.05}) == 114.0
+
+
+def test_annual_price_for_plan_defaults_to_no_discount():
+    import app as app_module
+    assert app_module._annual_price_for_plan({"price": 10}) == 120.0
+
+
+def test_annual_price_for_plan_clamps_out_of_range_rate():
+    import app as app_module
+    assert app_module._annual_price_for_plan({"price": 10, "reduction_annuelle": 1.5}) == 0.0
+    assert app_module._annual_price_for_plan({"price": 10, "reduction_annuelle": -1}) == 120.0
+
+
+def test_create_stripe_checkout_session_annual_interval_uses_discounted_price(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    fake_session = MagicMock(url="https://checkout.stripe.com/pay/cs_test_annual", id="cs_test_annual")
+    fake_stripe.checkout.Session.create.return_value = fake_session
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "plan-1", "name": "Pro", "price": 10.0, "reduction_annuelle": 0.05}))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value=None))
+
+    payload = app.StripeCheckoutRequest(plan_id="plan-1", billing_interval="year")
+    asyncio.run(app.create_stripe_checkout_session(
+        request=_FakeCheckoutRequest(headers={"X-User-Email": "user@example.com"}),
+        payload=payload, user_id="u1",
+    ))
+
+    _, kwargs = fake_stripe.checkout.Session.create.call_args
+    price_data = kwargs["line_items"][0]["price_data"]
+    assert price_data["recurring"] == {"interval": "year"}
+    assert price_data["unit_amount"] == 11400  # (10*12 - 5%) euros, in cents
+    assert kwargs["metadata"]["billing_interval"] == "year"
+
+
+def test_create_stripe_checkout_session_defaults_to_monthly_interval(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    fake_session = MagicMock(url="https://checkout.stripe.com/pay/cs_test_default", id="cs_test_default")
+    fake_stripe.checkout.Session.create.return_value = fake_session
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "plan-1", "name": "Pro", "price": 10.0, "reduction_annuelle": 0.05}))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value=None))
+
+    payload = app.StripeCheckoutRequest(plan_id="plan-1")
+    asyncio.run(app.create_stripe_checkout_session(
+        request=_FakeCheckoutRequest(), payload=payload, user_id="u1",
+    ))
+
+    _, kwargs = fake_stripe.checkout.Session.create.call_args
+    price_data = kwargs["line_items"][0]["price_data"]
+    assert price_data["recurring"] == {"interval": "month"}
+    assert price_data["unit_amount"] == 1000
+    assert kwargs["metadata"]["billing_interval"] == "month"
+
+
 def test_buy_credits_checkout_reuses_existing_stripe_customer(monkeypatch):
     # The card used to buy credits must be the same one on file for the
     # subscription (and vice versa) -- see _existing_stripe_customer_id --
@@ -5322,6 +5385,42 @@ def test_handle_subscription_renewal_invoice_credits_plan_and_persists_period(mo
     assert kwargs["payment_amount"] == 29.99
     allocate_mock.assert_awaited_once()
     email_mock.assert_called_once()
+
+
+def test_handle_subscription_renewal_invoice_threads_billing_interval(monkeypatch):
+    # An annual subscription's renewal invoice (fired once a year by
+    # Stripe) must carry billing_interval through to both the new
+    # souscription row and _allocate_plan_resources, which is what
+    # actually schedules the in-between monthly refills.
+    app = _import_app_with_stubs(monkeypatch)
+    fake_subscription = types.SimpleNamespace(
+        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "plan-1", "billing_interval": "year"})
+    )
+    fake_stripe = MagicMock()
+    fake_stripe.Subscription.retrieve.return_value = fake_subscription
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    insert_mock = AsyncMock(return_value={"id": "sous-1"})
+    monkeypatch.setattr(app, "supabase_insert_souscription", insert_mock)
+    allocate_mock = AsyncMock()
+    monkeypatch.setattr(app, "_allocate_plan_resources", allocate_mock)
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+
+    period = types.SimpleNamespace(start=1700000000, end=1731536000)
+    invoice = types.SimpleNamespace(
+        subscription="sub_123", payment_intent="pi_renewal_annual", id="in_renewal_annual",
+        lines=types.SimpleNamespace(data=[types.SimpleNamespace(period=period)]),
+        created=1700000000, amount_paid=11400, customer="cus_456", customer_email="user@example.com",
+    )
+
+    asyncio.run(app._handle_subscription_renewal_invoice(invoice))
+
+    insert_kwargs = insert_mock.await_args.kwargs
+    assert insert_kwargs["billing_interval"] == "year"
+    allocate_kwargs = allocate_mock.await_args.kwargs
+    assert allocate_kwargs["billing_interval"] == "year"
+    assert allocate_kwargs["period_start"] == datetime.fromtimestamp(1700000000, tz=timezone.utc)
 
 
 def test_handle_subscription_renewal_invoice_is_idempotent_on_duplicate_reference(monkeypatch):
@@ -5533,6 +5632,135 @@ def test_handle_subscription_purchase_syncs_default_payment_method(monkeypatch):
     )))
 
     sync_mock.assert_called_once_with("sub_new", "cus_new")
+
+
+def test_handle_subscription_purchase_threads_annual_billing_interval(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    insert_mock = AsyncMock(return_value={"id": "sous-new"})
+    monkeypatch.setattr(app, "supabase_insert_souscription", insert_mock)
+    allocate_mock = AsyncMock()
+    monkeypatch.setattr(app, "_allocate_plan_resources", allocate_mock)
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+    monkeypatch.setattr(app, "_sync_customer_default_payment_method", MagicMock())
+
+    payment_date = datetime.now(timezone.utc)
+    ctx = _fake_subscription_purchase_ctx(
+        metadata={"abonnement": "plan-1", "plan_name": "Pro", "billing_interval": "year"},
+        billing_interval="year", payment_date=payment_date,
+    )
+    asyncio.run(app._handle_subscription_purchase(ctx))
+
+    insert_kwargs = insert_mock.await_args.kwargs
+    assert insert_kwargs["billing_interval"] == "year"
+    allocate_kwargs = allocate_mock.await_args.kwargs
+    assert allocate_kwargs["billing_interval"] == "year"
+    assert allocate_kwargs["period_start"] == payment_date
+
+
+def test_allocate_plan_resources_snapshots_values_onto_souscription_row(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "plan-1", "credit": 500.0, "stockage": 1.0}))
+    balance_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_set_user_data_balance", balance_mock)
+    history_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", history_mock)
+    update_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
+
+    asyncio.run(app._allocate_plan_resources(
+        user_id="u1", abonnement="plan-1", payment_reference="ref-1", souscription_id="sous-1",
+    ))
+
+    balance_mock.assert_awaited_once()
+    assert balance_mock.await_args.kwargs["credit"] == 500.0
+    assert balance_mock.await_args.kwargs["storage"] == 1.0
+    update_mock.assert_awaited_once()
+    args, _ = update_mock.await_args
+    assert args[0] == "sous-1"
+    assert args[1] == {"plan_credit": 500.0, "plan_stockage": 1.0}  # no next_credit_allocation_at for a monthly plan
+
+
+def test_allocate_plan_resources_schedules_next_allocation_for_annual_plan(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "plan-1", "credit": 500.0, "stockage": 1.0}))
+    monkeypatch.setattr(app, "supabase_set_user_data_balance", AsyncMock())
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
+    update_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
+
+    period_start = datetime(2026, 1, 15, tzinfo=timezone.utc)
+    asyncio.run(app._allocate_plan_resources(
+        user_id="u1", abonnement="plan-1", payment_reference="ref-1", souscription_id="sous-1",
+        billing_interval="year", period_start=period_start,
+    ))
+
+    args, _ = update_mock.await_args
+    assert args[0] == "sous-1"
+    assert args[1]["plan_credit"] == 500.0
+    assert args[1]["plan_stockage"] == 1.0
+    assert args[1]["next_credit_allocation_at"] == datetime(2026, 2, 15, tzinfo=timezone.utc).isoformat()
+
+
+def test_allocate_plan_resources_noop_when_plan_missing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value=None))
+    balance_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_set_user_data_balance", balance_mock)
+    update_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
+
+    asyncio.run(app._allocate_plan_resources(
+        user_id="u1", abonnement="missing-plan", payment_reference="ref-1", souscription_id="sous-1",
+    ))
+
+    balance_mock.assert_not_awaited()
+    update_mock.assert_not_awaited()
+
+
+def test_process_due_annual_credit_refills_uses_snapshot_not_live_plan(monkeypatch):
+    # The whole point of the snapshot is that this sweep must never read
+    # the live plan catalog -- only the souscription row's own
+    # plan_credit/plan_stockage, so a later change to the plan never
+    # retroactively changes an in-progress annual subscription's refill.
+    app = _import_app_with_stubs(monkeypatch)
+    due_row = {
+        "id": "sous-1", "userid": "u1", "plan_credit": 500.0, "plan_stockage": 1.0,
+        "next_credit_allocation_at": datetime(2026, 1, 15, tzinfo=timezone.utc).isoformat(),
+    }
+    monkeypatch.setattr(app, "supabase_list_souscriptions_due_for_monthly_credit_allocation", AsyncMock(return_value=[due_row]))
+    balance_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_set_user_data_balance", balance_mock)
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
+    get_abonnement_mock = AsyncMock(return_value={"credit": 999999.0, "stockage": 999.0})
+    monkeypatch.setattr(app, "supabase_get_abonnement", get_abonnement_mock)
+    update_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
+
+    asyncio.run(app._process_due_annual_credit_refills())
+
+    get_abonnement_mock.assert_not_awaited()
+    balance_mock.assert_awaited_once()
+    assert balance_mock.await_args.kwargs["credit"] == 500.0
+    assert balance_mock.await_args.kwargs["storage"] == 1.0
+    update_args, _ = update_mock.await_args
+    assert update_args[0] == "sous-1"
+    assert update_args[1]["next_credit_allocation_at"] == datetime(2026, 2, 15, tzinfo=timezone.utc).isoformat()
+
+
+def test_process_due_annual_credit_refills_skips_rows_missing_ids(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_list_souscriptions_due_for_monthly_credit_allocation", AsyncMock(return_value=[
+        {"id": "sous-1", "userid": None, "plan_credit": 500.0, "plan_stockage": 1.0},
+    ]))
+    balance_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_set_user_data_balance", balance_mock)
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
+    monkeypatch.setattr(app, "supabase_update_souscription_row", AsyncMock())
+
+    asyncio.run(app._process_due_annual_credit_refills())
+
+    balance_mock.assert_not_awaited()
 
 
 def test_sync_customer_default_payment_method_sets_default_from_expanded_subscription(monkeypatch):
@@ -6118,6 +6346,48 @@ def test_change_souscription_plan_swaps_price_and_resets_resources(monkeypatch):
     assert update_args[0] == "sous-1"
     assert "payment_end_date" in update_args[1]
     assert update_kwargs["user_id"] == "u1"
+
+
+def test_change_souscription_plan_preserves_annual_billing_interval(monkeypatch):
+    # Changing plan tier must never silently flip an annual subscriber back
+    # to monthly billing -- the new price is re-quoted at the SAME cadence
+    # the subscription already bills on.
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe, _ = _stub_subscription_lifecycle_prereqs(monkeypatch, app, subscription={
+        "id": "sous-1", "stripe_subscription_id": "sub_123", "stripe_customer_id": "cus_456",
+        "billing_interval": "year",
+    })
+    fake_stripe.Subscription.retrieve.return_value = _FakeStripeSubscriptionObject(
+        {"items": {"data": [{"id": "si_123"}]}},
+        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
+    )
+    fake_stripe.Subscription.modify.return_value = _FakeStripeObjectNoGet({"current_period_end": 1700000000})
+    fake_stripe.Price.create.return_value = types.SimpleNamespace(id="price_new_1")
+
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "new-plan", "name": "Premium", "price": 10.0, "reduction_annuelle": 0.05, "max_social_account": 3}))
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
+    insert_mock = AsyncMock(return_value={"id": "sous-2"})
+    monkeypatch.setattr(app, "supabase_insert_souscription", insert_mock)
+    allocate_mock = AsyncMock()
+    monkeypatch.setattr(app, "_allocate_plan_resources", allocate_mock)
+
+    asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="new-plan"), user_id="u1",
+    ))
+
+    _, price_create_kwargs = fake_stripe.Price.create.call_args
+    assert price_create_kwargs["recurring"] == {"interval": "year"}
+    assert price_create_kwargs["unit_amount"] == 11400  # annual discounted price, in cents
+    _, modify_kwargs = fake_stripe.Subscription.modify.call_args
+    assert modify_kwargs["metadata"]["billing_interval"] == "year"
+
+    insert_kwargs = insert_mock.await_args.kwargs
+    assert insert_kwargs["billing_interval"] == "year"
+    assert insert_kwargs["payment_amount"] == 114.0
+
+    allocate_kwargs = allocate_mock.await_args.kwargs
+    assert allocate_kwargs["billing_interval"] == "year"
 
 
 def test_change_souscription_plan_sends_notification_email(monkeypatch):

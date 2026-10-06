@@ -919,6 +919,11 @@ export default function SettingsPage() {
                   {t('settings.periodEnd', 'Period end')}: {new Date(subscription.payment_end_date).toLocaleDateString('fr-FR')}
                 </p>
               ) : null}
+              {subscription ? (
+                <p className="text-slate-600 dark:text-zinc-400 mt-1">
+                  {t('settings.billingInterval', 'Facturation')}: {subscription?.billing_interval === 'year' ? t('settings.billingYearly', 'Annuelle') : t('settings.billingMonthly', 'Mensuelle')}
+                </p>
+              ) : null}
               {subscription?.retention_deadline_at ? (
                 <p className="text-amber-700 dark:text-amber-300 mt-1">
                   {t('settings.retentionUntil', 'Content retention until')}: {new Date(subscription.retention_deadline_at).toLocaleDateString('fr-FR')}

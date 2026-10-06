@@ -20,7 +20,7 @@ import sys
 from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
-from typing import Dict, Optional, List, Any, Annotated, Tuple
+from typing import Dict, Optional, List, Any, Annotated, Tuple, Literal
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse, unquote, urlencode, quote
 from urllib.request import Request as UrlRequest, urlopen, HTTPRedirectHandler, build_opener
@@ -92,6 +92,8 @@ from supabase_request import (
 	get_latest_user_paid_subscription as supabase_get_latest_user_paid_subscription,
 	update_souscription_row as supabase_update_souscription_row,
 	list_user_souscriptions as supabase_list_user_souscriptions,
+	list_souscriptions_due_for_monthly_credit_allocation as supabase_list_souscriptions_due_for_monthly_credit_allocation,
+	add_one_month as supabase_add_one_month,
 	update_job_record as supabase_update_job_record,
 	get_job_record as supabase_get_job_record,
 	count_active_jobs_for_user as supabase_count_active_jobs_for_user,
@@ -309,6 +311,10 @@ JOB_RETENTION_SECONDS = 3600  # 1 hour retention
 OUTPUT_SWEEP_INTERVAL_SECONDS = int(os.environ.get("OUTPUT_SWEEP_INTERVAL_SECONDS", str(6 * 3600)))
 OUTPUT_SWEEP_MIN_AGE_SECONDS = int(os.environ.get("OUTPUT_SWEEP_MIN_AGE_SECONDS", "1800"))
 SOCIAL_PUBLISH_SCHEDULER_INTERVAL_SECONDS = int(os.environ.get("SOCIAL_PUBLISH_SCHEDULER_INTERVAL_SECONDS", "10"))
+# Granularity is a monthly anniversary, so polling once a day is plenty --
+# this only decides how late a refill can run past its due date, not
+# whether it runs at all (see process_annual_credit_refill_jobs).
+ANNUAL_CREDIT_REFILL_INTERVAL_SECONDS = int(os.environ.get("ANNUAL_CREDIT_REFILL_INTERVAL_SECONDS", str(24 * 3600)))
 DISABLE_YOUTUBE_URL = os.environ.get("DISABLE_YOUTUBE_URL", "false").lower() in ("1", "true", "yes")
 HIDE_SOCIAL_PLATFORMS = os.environ.get("HIDE_SOCIAL_PLATFORMS", "false").lower() in ("1", "true", "yes")
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
@@ -2571,12 +2577,14 @@ async def lifespan(app: FastAPI):
     ]
     cleanup_task = asyncio.create_task(cleanup_jobs())
     scheduler_task = asyncio.create_task(process_scheduled_social_publish_jobs())
+    annual_credit_refill_task = asyncio.create_task(process_annual_credit_refill_jobs())
     yield
     # Cleanup (optional: cancel worker)
     for task in worker_tasks:
         task.cancel()
     cleanup_task.cancel()
     scheduler_task.cancel()
+    annual_credit_refill_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -8604,6 +8612,7 @@ class StripeCheckoutRequest(BaseModel):
     plan_id: str
     success_url: Optional[str] = None
     cancel_url: Optional[str] = None
+    billing_interval: Literal["month", "year"] = "month"
 
 
 def _require_stripe_ready() -> None:
@@ -8652,9 +8661,20 @@ async def _existing_stripe_customer_id(user_id: str) -> Optional[str]:
     return previous_subscription.get("stripe_customer_id") if previous_subscription else None
 
 
+def _annual_price_for_plan(plan: Dict[str, Any]) -> float:
+    """annual_price = monthly_price * 12 * (1 - reduction_annuelle) --
+    reduction_annuelle is a fraction (0..1) stored on the plan, so a plan
+    with no annual discount configured (column missing/0) simply charges
+    12 months at the monthly price."""
+    monthly_price = float(plan.get("price") or 0)
+    discount_rate = min(1.0, max(0.0, float(plan.get("reduction_annuelle") or 0)))
+    return round(monthly_price * 12 * (1 - discount_rate), 2)
+
+
 async def _create_recurring_subscription_checkout(
     request: Request, user_id: str, plan: Dict[str, Any], *,
     success_url: str, cancel_url: str, previous_souscription_id: Optional[str] = None,
+    billing_interval: str = "month",
 ) -> Dict[str, Any]:
     """Creates a mode="subscription" Checkout Session for `plan`, reusing
     the user's existing Stripe Customer when there is one (see
@@ -8665,9 +8685,15 @@ async def _create_recurring_subscription_checkout(
     a brand new Stripe subscription because the current one isn't
     Stripe-recurring (see change_souscription_plan). Never closes the old
     row itself: an abandoned Checkout must leave the current plan
-    untouched."""
+    untouched.
+
+    billing_interval selects Stripe's own recurring.interval ("month" or
+    "year") and, for "year", the discounted annual price (see
+    _annual_price_for_plan) instead of the plain monthly price."""
+    billing_interval = billing_interval if billing_interval == "year" else "month"
+    price_amount = _annual_price_for_plan(plan) if billing_interval == "year" else float(plan.get("price") or 0)
     try:
-        unit_amount = int(round(float(plan.get("price") or 0) * 100))
+        unit_amount = int(round(price_amount * 100))
     except (TypeError, ValueError):
         raise _coded_error(400, "invalid_plan_price", _INVALID_PLAN_PRICE)
 
@@ -8679,11 +8705,18 @@ async def _create_recurring_subscription_checkout(
         "abonnement": str(plan.get("id")),
         "plan_name": str(plan.get("name") or ""),
         "payment_mode": "stripe",
+        "billing_interval": billing_interval,
     }
     if previous_souscription_id:
         metadata["previous_souscription_id"] = previous_souscription_id
 
     existing_customer_id = await _existing_stripe_customer_id(user_id)
+
+    description = (
+        "Abonnement annuel, renouvele automatiquement chaque annee"
+        if billing_interval == "year"
+        else "Abonnement mensuel, renouvele automatiquement chaque mois"
+    )
 
     try:
         session = stripe.checkout.Session.create(
@@ -8701,10 +8734,10 @@ async def _create_recurring_subscription_checkout(
                     "price_data": {
                         "currency": STRIPE_CURRENCY,
                         "unit_amount": unit_amount,
-                        "recurring": {"interval": "month"},
+                        "recurring": {"interval": billing_interval},
                         "product_data": {
                             "name": str(plan.get("name") or "Abonnement"),
-                            "description": "Abonnement mensuel, renouvele automatiquement chaque mois",
+                            "description": description,
                             "tax_code": "txcd_10103001",
                         },
                     },
@@ -8745,6 +8778,7 @@ async def create_stripe_checkout_session(
 
     return await _create_recurring_subscription_checkout(
         request, user_id, plan, success_url=success_url, cancel_url=cancel_url,
+        billing_interval=payload.billing_interval,
     )
 
 
@@ -8769,6 +8803,7 @@ def _extract_session_context(session: "stripe.checkout.Session") -> dict:
         "metadata": metadata,
         "user_id": metadata.get("userid"),
         "payment_mode": metadata.get("payment_mode", "stripe"),
+        "billing_interval": metadata.get("billing_interval", "month"),
         "amount_total": (session.amount_total or 0) / 100,
         "payment_reference": session.payment_intent or session.id or "",
         "payment_date": (
@@ -8873,8 +8908,47 @@ async def _handle_credit_purchase(ctx: dict) -> dict:
     return {"received": True, "credits_added": credits_to_add}
 
 
-async def _allocate_plan_resources(user_id: str, abonnement: str, payment_reference: str, souscription_id: str) -> None:
-    """Credit the user's account with whatever the plan grants (credits + storage)."""
+async def _reset_user_plan_balance(user_id: str, credit: float, storage: float, operation_id: str) -> None:
+    """Reset a user's credit/storage balance (and their maxima) to exactly
+    `credit`/`storage` -- the actual Supabase write shared by a fresh plan
+    allocation (_allocate_plan_resources, using the live plan's values) and
+    an annual subscription's monthly refill (process_annual_credit_refill_jobs,
+    using that subscription's own snapshotted values instead)."""
+    await supabase_set_user_data_balance(
+        user_id=user_id,
+        credit=credit,
+        storage=storage,
+        credit_max=credit,
+        storage_max=storage,
+        operation_type="subscription",
+        operation_id=operation_id,
+    )
+    await supabase_insert_user_data_history(
+        user_id=user_id,
+        credit=credit,
+        storage=storage,
+        operation="input",
+        operation_type="subscription",
+        operation_id=operation_id,
+    )
+
+
+async def _allocate_plan_resources(
+    user_id: str, abonnement: str, payment_reference: str, souscription_id: str, *,
+    billing_interval: str = "month", period_start: Optional[datetime] = None,
+) -> None:
+    """Credit the user's account with whatever the plan grants (credits +
+    storage), and snapshot those exact values onto the souscription row
+    (plan_credit/plan_stockage) -- used instead of a live plan lookup
+    anywhere credits/storage need to be granted again for this same
+    subscription later, so a future change to the plan catalog never
+    retroactively changes what an already-in-progress subscription grants.
+
+    For an annual subscription (billing_interval == "year"), also schedules
+    the next monthly credit/storage refill (next_credit_allocation_at):
+    Stripe only raises this subscription's renewal invoice once a year, so
+    process_annual_credit_refill_jobs is what actually applies that
+    monthly-anniversary refill in between, straight off this snapshot."""
     plan = await supabase_get_abonnement(abonnement)
     if not plan:
         return
@@ -8883,23 +8957,14 @@ async def _allocate_plan_resources(user_id: str, abonnement: str, payment_refere
     plan_storage = float(plan.get("stockage") or 0)
 
     # A new/changed plan resets monthly allowances and their maxima to the plan limits.
-    await supabase_set_user_data_balance(
-        user_id=user_id,
-        credit=plan_credit,
-        storage=plan_storage,
-        credit_max=plan_credit,
-        storage_max=plan_storage,
-        operation_type="subscription",
-        operation_id=souscription_id or payment_reference,
-    )
-    await supabase_insert_user_data_history(
-        user_id=user_id,
-        credit=plan_credit,
-        storage=plan_storage,
-        operation="input",
-        operation_type="subscription",
-        operation_id=souscription_id or payment_reference,
-    )
+    await _reset_user_plan_balance(user_id, plan_credit, plan_storage, souscription_id or payment_reference)
+
+    if souscription_id:
+        snapshot_updates: Dict[str, Any] = {"plan_credit": plan_credit, "plan_stockage": plan_storage}
+        if billing_interval == "year":
+            anchor = period_start or datetime.now(timezone.utc)
+            snapshot_updates["next_credit_allocation_at"] = supabase_add_one_month(anchor).isoformat()
+        await supabase_update_souscription_row(souscription_id, snapshot_updates)
 
 
 def _handle_payment_method_setup(session: "stripe.checkout.Session") -> dict:
@@ -8972,6 +9037,7 @@ async def _handle_subscription_purchase(ctx: dict) -> dict:
 
     _sync_customer_default_payment_method(ctx.get("stripe_subscription_id"), ctx.get("stripe_customer_id"))
 
+    billing_interval = ctx.get("billing_interval", "month")
     new_souscription = await supabase_insert_souscription(
         user_id=ctx["user_id"],
         abonnement=abonnement,
@@ -8983,6 +9049,7 @@ async def _handle_subscription_purchase(ctx: dict) -> dict:
         payment_date=ctx["payment_date"],
         stripe_subscription_id=ctx.get("stripe_subscription_id"),
         stripe_customer_id=ctx.get("stripe_customer_id"),
+        billing_interval=billing_interval,
     )
 
     previous_souscription_id = ctx["metadata"].get("previous_souscription_id")
@@ -9006,6 +9073,8 @@ async def _handle_subscription_purchase(ctx: dict) -> dict:
         abonnement=abonnement,
         payment_reference=ctx["payment_reference"],
         souscription_id=str(new_souscription.get("id") or ctx["payment_reference"]),
+        billing_interval=billing_interval,
+        period_start=ctx["payment_date"],
     )
     _send_transactional_email(
         ctx["customer_email"], "subscription_purchase",
@@ -9030,12 +9099,14 @@ def _invoice_line_period(invoice: "stripe.Invoice") -> Tuple[Optional[datetime],
 
 
 async def _handle_subscription_renewal_invoice(invoice: "stripe.Invoice") -> dict:
-    """Credit a subscription's automatic monthly renewal. Stripe raises this
-    invoice itself on the subscription's billing anniversary -- the first
-    invoice (billing_reason "subscription_create") is instead handled by
-    checkout.session.completed, which has already run by the time it fires,
-    so only "subscription_cycle" reaches here (see the dispatch in
-    stripe_webhook)."""
+    """Credit a subscription's automatic renewal -- monthly for a monthly
+    plan, once a year for an annual one (see _allocate_plan_resources for
+    how an annual plan's credits/storage still get refilled every month in
+    between). Stripe raises this invoice itself on the subscription's
+    billing anniversary -- the first invoice (billing_reason
+    "subscription_create") is instead handled by checkout.session.completed,
+    which has already run by the time it fires, so only "subscription_cycle"
+    reaches here (see the dispatch in stripe_webhook)."""
     subscription_id = invoice.subscription
     if not subscription_id:
         return {"received": True, "ignored": "no_subscription_on_invoice"}
@@ -9055,6 +9126,7 @@ async def _handle_subscription_renewal_invoice(invoice: "stripe.Invoice") -> dic
     period_start, period_end = _invoice_line_period(invoice)
     payment_date = period_start or datetime.fromtimestamp(invoice.created, tz=timezone.utc)
     amount_total = (invoice.amount_paid or 0) / 100
+    billing_interval = metadata.get("billing_interval", "month")
 
     new_souscription = await supabase_insert_souscription(
         user_id=user_id,
@@ -9068,12 +9140,15 @@ async def _handle_subscription_renewal_invoice(invoice: "stripe.Invoice") -> dic
         period_end_date=period_end,
         stripe_subscription_id=subscription_id,
         stripe_customer_id=invoice.customer or None,
+        billing_interval=billing_interval,
     )
     await _allocate_plan_resources(
         user_id=user_id,
         abonnement=abonnement,
         payment_reference=payment_reference,
         souscription_id=str(new_souscription.get("id") or payment_reference),
+        billing_interval=billing_interval,
+        period_start=payment_date,
     )
     _send_transactional_email(
         invoice.customer_email, "subscription_renewal",
@@ -9585,6 +9660,7 @@ async def _change_plan_via_fresh_checkout(
         success_url=f"{default_base_url}/dashboard/settings?plan_change=success",
         cancel_url=f"{default_base_url}/dashboard/settings?plan_change=cancel",
         previous_souscription_id=str(subscription["id"]),
+        billing_interval=subscription.get("billing_interval") or "month",
     )
 
 
@@ -9593,9 +9669,15 @@ def _apply_recurring_plan_change(
 ) -> "stripe.Subscription":
     """Swaps an already-recurring subscription's price in place, with
     proration -- the counterpart of _change_plan_via_fresh_checkout for a
-    subscription that already has a real Stripe Subscription to modify."""
+    subscription that already has a real Stripe Subscription to modify.
+    Changing plan never changes billing_interval -- the new price keeps
+    whichever cadence (monthly/annual) the current subscription already
+    bills on, re-priced for new_plan at that cadence (see
+    _annual_price_for_plan)."""
+    billing_interval = subscription.get("billing_interval") or "month"
+    price_amount = _annual_price_for_plan(new_plan) if billing_interval == "year" else float(new_plan.get("price") or 0)
     try:
-        unit_amount = int(round(float(new_plan.get("price") or 0) * 100))
+        unit_amount = int(round(price_amount * 100))
     except (TypeError, ValueError):
         raise _coded_error(400, "invalid_plan_price", _INVALID_PLAN_PRICE)
     if unit_amount <= 0:
@@ -9613,6 +9695,7 @@ def _apply_recurring_plan_change(
             **existing_metadata,
             "abonnement": str(new_plan.get("id")),
             "plan_name": str(new_plan.get("name") or ""),
+            "billing_interval": billing_interval,
         }
         # Subscription items only accept an existing product id in
         # price_data (unlike Checkout Session line items, which allow
@@ -9623,7 +9706,7 @@ def _apply_recurring_plan_change(
         new_price = stripe.Price.create(
             currency=STRIPE_CURRENCY,
             unit_amount=unit_amount,
-            recurring={"interval": "month"},
+            recurring={"interval": billing_interval},
             product_data={
                 "name": str(new_plan.get("name") or "Abonnement"),
                 # Unlike Checkout Session's line_items[].price_data.product_data
@@ -9668,27 +9751,33 @@ async def _finalize_plan_change(
         user_id=user_id,
     )
 
+    billing_interval = subscription.get("billing_interval") or "month"
+    plan_amount = _annual_price_for_plan(new_plan) if billing_interval == "year" else float(new_plan.get("price") or 0)
+    plan_change_time = datetime.now(timezone.utc)
     new_souscription = await supabase_insert_souscription(
         user_id=user_id,
         abonnement=str(new_plan.get("id")),
         payment_mode="stripe",
-        payment_amount=float(new_plan.get("price") or 0),
-        payment_reference=f"planchange_{subscription['stripe_subscription_id']}_{int(datetime.now(timezone.utc).timestamp())}",
+        payment_amount=plan_amount,
+        payment_reference=f"planchange_{subscription['stripe_subscription_id']}_{int(plan_change_time.timestamp())}",
         payment_status="completed",
         payment_comment=f"Plan changed to {new_plan.get('name')}",
         period_end_date=period_end,
         stripe_subscription_id=subscription["stripe_subscription_id"],
         stripe_customer_id=subscription.get("stripe_customer_id"),
+        billing_interval=billing_interval,
     )
     await _allocate_plan_resources(
         user_id=user_id,
         abonnement=str(new_plan.get("id")),
         payment_reference=str(new_souscription.get("id") or ""),
         souscription_id=str(new_souscription.get("id") or ""),
+        billing_interval=billing_interval,
+        period_start=plan_change_time,
     )
     _send_transactional_email(
         _user_email_from_request(request), "subscription_plan_changed",
-        plan_name=str(new_plan.get("name") or "Vireel"), amount=float(new_plan.get("price") or 0),
+        plan_name=str(new_plan.get("name") or "Vireel"), amount=plan_amount,
     )
     return new_souscription
 
@@ -14173,6 +14262,51 @@ async def _execute_scheduled_publish_job(job_row: Dict[str, Any]) -> None:
         await _update_publish_job_status(job_id, "done", external_id=external_id, post_url=post_url, error_message=None)
     except Exception as exc:
         await _update_publish_job_status(job_id, "failed", error_message=str(exc))
+
+
+async def _process_due_annual_credit_refills() -> None:
+    """One sweep: reset credit/storage for every annual subscription whose
+    monthly anniversary is due, using each row's own snapshotted
+    plan_credit/plan_stockage (see _allocate_plan_resources) -- never a
+    live plan lookup, so a later change to the plan catalog never
+    retroactively changes an already-in-progress annual subscription's
+    monthly allowance. Resetting (not adding) to the snapshot value is
+    exactly what already enforces the storage ceiling for a monthly plan
+    (_reset_user_plan_balance), so no extra check is needed here."""
+    due_rows = await supabase_list_souscriptions_due_for_monthly_credit_allocation()
+    for row in due_rows:
+        user_id = row.get("userid")
+        souscription_id = str(row.get("id") or "")
+        if not user_id or not souscription_id:
+            continue
+
+        plan_credit = float(row.get("plan_credit") or 0.0)
+        plan_storage = float(row.get("plan_stockage") or 0.0)
+        await _reset_user_plan_balance(user_id, plan_credit, plan_storage, souscription_id)
+
+        previous_due_raw = row.get("next_credit_allocation_at")
+        try:
+            previous_due = datetime.fromisoformat(previous_due_raw) if previous_due_raw else datetime.now(timezone.utc)
+        except ValueError:
+            previous_due = datetime.now(timezone.utc)
+        if previous_due.tzinfo is None:
+            previous_due = previous_due.replace(tzinfo=timezone.utc)
+        # Anchored to the previous due date (not "now") so the monthly
+        # cadence stays tied to the original payment anniversary instead of
+        # drifting later every time a sweep runs a bit behind schedule.
+        next_due = supabase_add_one_month(previous_due)
+        await supabase_update_souscription_row(souscription_id, {"next_credit_allocation_at": next_due.isoformat()})
+
+
+async def process_annual_credit_refill_jobs() -> None:
+    while True:
+        try:
+            if is_supabase_configured():
+                await _process_due_annual_credit_refills()
+        except Exception as exc:
+            logger.warning("Annual credit refill worker error: %s", exc, exc_info=True)
+
+        await asyncio.sleep(max(300, ANNUAL_CREDIT_REFILL_INTERVAL_SECONDS))
 
 
 async def process_scheduled_social_publish_jobs() -> None:

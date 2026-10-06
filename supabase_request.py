@@ -822,7 +822,8 @@ SOUSCRIPTION_COLUMNS = (
 	"id, created_at, userid, abonnement, payment_mode, payment_amount, payment_reference, "
 	"payment_start_date, payment_end_date, payment_status, payment_comment, "
 	"auto_renew, canceled_at, reactivated_at, paused_at, resumed_at, "
-	"retention_deadline_at, account_disabled_at, stripe_subscription_id, stripe_customer_id"
+	"retention_deadline_at, account_disabled_at, stripe_subscription_id, stripe_customer_id, "
+	"billing_interval, plan_credit, plan_stockage, next_credit_allocation_at"
 )
 
 async def list_abonnements() -> List[Dict[str, Any]]:
@@ -860,12 +861,20 @@ async def get_abonnement(abonnement_uuid: str) -> Optional[Dict[str, Any]]:
 	return rows[0]
 
 
-def _add_one_month(dt: datetime) -> datetime:
+def add_one_month(dt: datetime) -> datetime:
 	"""Add one calendar month while keeping day within target month bounds."""
 	year = dt.year + (1 if dt.month == 12 else 0)
 	month = 1 if dt.month == 12 else dt.month + 1
 	day = min(dt.day, calendar.monthrange(year, month)[1])
 	return dt.replace(year=year, month=month, day=day)
+
+
+def add_one_year(dt: datetime) -> datetime:
+	"""Add one calendar year while keeping day within target month bounds
+	(handles Feb 29 on a leap-year start date)."""
+	year = dt.year + 1
+	day = min(dt.day, calendar.monthrange(year, dt.month)[1])
+	return dt.replace(year=year, day=day)
 
 
 async def insert_souscription(
@@ -880,19 +889,33 @@ async def insert_souscription(
 	period_end_date: Optional[datetime] = None,
 	stripe_subscription_id: Optional[str] = None,
 	stripe_customer_id: Optional[str] = None,
+	billing_interval: str = "month",
+	plan_credit: Optional[float] = None,
+	plan_stockage: Optional[float] = None,
+	next_credit_allocation_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
 	"""Create a subscription row after a confirmed payment.
 
-	period_end_date overrides the default +1-calendar-month end date -- a
-	Stripe subscription renewal invoice carries its own authoritative
-	billing period (see _handle_subscription_renewal_invoice in app.py),
-	which must be used as-is instead of recomputed, so the stored period
-	stays exactly in sync with what Stripe actually billed."""
+	period_end_date overrides the default end date (+1 calendar month, or
+	+1 calendar year when billing_interval == "year") -- a Stripe
+	subscription renewal invoice carries its own authoritative billing
+	period (see _handle_subscription_renewal_invoice in app.py), which
+	must be used as-is instead of recomputed, so the stored period stays
+	exactly in sync with what Stripe actually billed.
+
+	plan_credit/plan_stockage snapshot the plan's allowance at the moment
+	of this payment -- see the annual-billing migration's comment on
+	souscription for why this must never be a live lookup."""
 	client = await get_client()
 	start_date = payment_date or datetime.now(timezone.utc)
 	if start_date.tzinfo is None:
 		start_date = start_date.replace(tzinfo=timezone.utc)
-	end_date = period_end_date or _add_one_month(start_date)
+	if period_end_date is not None:
+		end_date = period_end_date
+	elif billing_interval == "year":
+		end_date = add_one_year(start_date)
+	else:
+		end_date = add_one_month(start_date)
 	if end_date.tzinfo is None:
 		end_date = end_date.replace(tzinfo=timezone.utc)
 
@@ -906,11 +929,20 @@ async def insert_souscription(
 		"payment_end_date": end_date.isoformat(),
 		"payment_status": payment_status,
 		"payment_comment": payment_comment,
+		"billing_interval": billing_interval,
 	}
 	if stripe_subscription_id:
 		payload["stripe_subscription_id"] = stripe_subscription_id
 	if stripe_customer_id:
 		payload["stripe_customer_id"] = stripe_customer_id
+	if plan_credit is not None:
+		payload["plan_credit"] = float(plan_credit)
+	if plan_stockage is not None:
+		payload["plan_stockage"] = float(plan_stockage)
+	if next_credit_allocation_at is not None:
+		if next_credit_allocation_at.tzinfo is None:
+			next_credit_allocation_at = next_credit_allocation_at.replace(tzinfo=timezone.utc)
+		payload["next_credit_allocation_at"] = next_credit_allocation_at.isoformat()
 
 	response = await client.table(SUPABASE_SOUSCRIPTION_TABLE).insert(payload).execute()
 	rows = response.data or []
@@ -1031,6 +1063,33 @@ async def list_user_souscriptions(user_id: str, limit: int = 50) -> List[Dict[st
 		.eq("userid", user_id)
 		.order("payment_start_date", desc=True)
 		.limit(min(max(limit, 1), 500))
+		.execute()
+	)
+	return response.data or []
+
+
+async def list_souscriptions_due_for_monthly_credit_allocation(
+	now: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+	"""Annual subscriptions whose next monthly credit/storage refill is due
+	-- Stripe raises an annual subscription's renewal invoice only once a
+	year, so this is what drives the monthly-anniversary reset in between
+	(see process_annual_credit_refill_jobs in app.py). Only rows with
+	billing_interval == "year" ever carry a non-null
+	next_credit_allocation_at (see insert_souscription), so filtering on
+	it being due is enough -- no need to also filter billing_interval."""
+	client = await get_client()
+	now_iso = (now or datetime.now(timezone.utc)).isoformat()
+	response = (
+		await client.table(SUPABASE_SOUSCRIPTION_TABLE)
+		.select(SOUSCRIPTION_COLUMNS)
+		.eq("payment_status", "completed")
+		.is_("account_disabled_at", "null")
+		.not_.is_("next_credit_allocation_at", "null")
+		.lte("next_credit_allocation_at", now_iso)
+		.gte("payment_end_date", now_iso)
+		.order("next_credit_allocation_at", desc=False)
+		.limit(100)
 		.execute()
 	)
 	return response.data or []
