@@ -1,8 +1,9 @@
 import React, {useEffect, useState} from "react";
-import {Check, X, CreditCardIcon, Star, Crown, Sparkles, Zap, Building2, Loader2, Coins, Plus, Minus, MessageCircle} from "lucide-react";
+import {Check, X, CreditCardIcon, Star, Crown, Sparkles, Zap, Building2, Loader2, Coins, Plus, Minus, MessageCircle, Clock} from "lucide-react";
 import {getApiUrl} from "../config.js";
 import { getAuthHeaders } from "../lib/apiAuth";
 import { annualSavingsAmount, computeAnnualPrice } from "../lib/billing";
+import { daysUntilDate } from "../lib/formatting";
 import { useAuth } from "../state/AuthContext";
 import { useUserCredits } from "../state/UserCreditsContext";
 import { useTranslation } from "../state/LanguageContext";
@@ -98,7 +99,7 @@ const iconMap = {
 export default function AbonnementPage() {
     const { t } = useTranslation();
     const { user } = useAuth();
-    const { credits, creditMax, refresh: refreshCredits } = useUserCredits();
+    const { credits, creditMax, refresh: refreshCredits, promotionalCredit, promotionalCreditExpirations } = useUserCredits();
     const [items, setItems] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState("");
@@ -463,6 +464,31 @@ export default function AbonnementPage() {
                             1 EUR = {CREDIT_RATE} {t("abonnement.creditRate","crédits · solde actuel ")} :{" "}
                             <span className="text-slate-900 dark:text-white font-semibold">{credits.toLocaleString()} / {Number(creditMax || 0).toLocaleString()} cr</span>
                         </p>
+                        {promotionalCredit > 0 && (
+                            <p className="text-xs text-slate-500 dark:text-zinc-400 mt-1">
+                                {t("abonnement.creditsBreakdown", "{{standard}} crédits standards · {{promo}} crédits promotionnels", {
+                                    standard: credits.toLocaleString(),
+                                    promo: promotionalCredit.toLocaleString(),
+                                })}
+                            </p>
+                        )}
+                        {promotionalCreditExpirations.length > 0 && (
+                            <ul className="mt-1 space-y-0.5">
+                                {promotionalCreditExpirations.map((batch, index) => {
+                                    const days = daysUntilDate(batch.expires_at);
+                                    if (days === null) return null;
+                                    return (
+                                        <li key={`${batch.expires_at}-${index}`} className="flex items-center gap-1.5 text-[0.7rem] text-amber-600 dark:text-amber-400">
+                                            <Clock size={11} />
+                                            {t("abonnement.expiringBatch", "{{amount}} crédits expirent dans {{days}} jour(s)", {
+                                                amount: Number(batch.amount).toLocaleString(),
+                                                days,
+                                            })}
+                                        </li>
+                                    );
+                                })}
+                            </ul>
+                        )}
                     </div>
                 </div>
 

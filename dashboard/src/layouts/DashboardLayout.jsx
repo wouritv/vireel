@@ -1,14 +1,23 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Bell, CreditCard, FileText, LogOut, Menu, Settings as SettingsIcon } from "lucide-react";
+import { Bell, CheckCheck, CreditCard, FileText, Gift, LogOut, Menu, Settings as SettingsIcon } from "lucide-react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { fetchAppConfig, getDefaultHideSocialPlatforms } from "../config";
 import { DASHBOARD_SIDEBAR_ITEMS } from "../lib/dashboard-nav";
 import { useAuth } from "../state/AuthContext";
+import { useNotifications } from "../state/NotificationsContext";
 import { useTranslation } from "../state/LanguageContext";
+
+function formatNotificationDate(isoDate) {
+    const date = new Date(isoDate);
+    if (Number.isNaN(date.getTime())) return "";
+    return date.toLocaleDateString(undefined, { day: "2-digit", month: "2-digit" }) +
+        " " + date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
 
 export default function DashboardLayout() {
     const { user, logout } = useAuth();
+    const { items: notificationItems, unreadCount, markRead, markAllRead } = useNotifications();
     const { t } = useTranslation();
     const location = useLocation();
     const [isSidebarOpen, setIsSidebarOpen] = useState(false);
@@ -265,23 +274,68 @@ export default function DashboardLayout() {
                                         setIsNotificationsOpen((prev) => !prev);
                                         setIsUserMenuOpen(false);
                                     }}
-                                    className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 dark:border-white/10 text-slate-600 dark:text-zinc-300 hover:bg-white/5 transition-colors"
+                                    className="relative inline-flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 dark:border-white/10 text-slate-600 dark:text-zinc-300 hover:bg-white/5 transition-colors"
                                 >
                                     <Bell size={18} />
+                                    {unreadCount > 0 && (
+                                        <span className="absolute -top-1 -right-1 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-red-500 px-1 text-[0.65rem] font-semibold text-white">
+                                            {unreadCount > 9 ? "9+" : unreadCount}
+                                        </span>
+                                    )}
                                 </button>
                                 {isNotificationsOpen && notificationsMenuPos
                                     ? createPortal(
                                           <div
                                               ref={notificationsPanelRef}
                                               style={{ top: notificationsMenuPos.top, right: notificationsMenuPos.right }}
-                                              className="fixed z-[1000] w-72 rounded-xl border border-slate-200 dark:border-white/10 bg-surface shadow-2xl"
+                                              className="fixed z-[1000] w-80 rounded-xl border border-slate-200 dark:border-white/10 bg-surface shadow-2xl overflow-hidden"
                                           >
-                                              <p className="px-4 pt-3 text-xs font-bold uppercase tracking-wider text-slate-400 dark:text-zinc-500">
-                                                  {t("header.notifications", "Notifications")}
-                                              </p>
-                                              <p className="px-4 py-6 text-center text-sm text-slate-500 dark:text-zinc-400">
-                                                  {t("header.noNotifications", "Aucune notification pour le moment.")}
-                                              </p>
+                                              <div className="flex items-center justify-between gap-2 px-4 pt-3 pb-2">
+                                                  <p className="text-xs font-bold uppercase tracking-wider text-slate-400 dark:text-zinc-500">
+                                                      {t("header.notifications", "Notifications")}
+                                                  </p>
+                                                  {unreadCount > 0 && (
+                                                      <button
+                                                          type="button"
+                                                          onClick={markAllRead}
+                                                          className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline"
+                                                      >
+                                                          <CheckCheck size={12} /> {t("header.markAllRead", "Tout marquer comme lu")}
+                                                      </button>
+                                                  )}
+                                              </div>
+
+                                              {notificationItems.length === 0 ? (
+                                                  <p className="px-4 py-6 text-center text-sm text-slate-500 dark:text-zinc-400">
+                                                      {t("header.noNotifications", "Aucune notification pour le moment.")}
+                                                  </p>
+                                              ) : (
+                                                  <ul className="max-h-80 overflow-y-auto custom-scrollbar divide-y divide-slate-200 dark:divide-white/5">
+                                                      {notificationItems.map((notification) => (
+                                                          <li key={notification.id}>
+                                                              <button
+                                                                  type="button"
+                                                                  onClick={() => !notification.read_at && markRead(notification.id)}
+                                                                  className={`w-full text-left px-4 py-3 transition-colors hover:bg-white/5 ${
+                                                                      notification.read_at ? "" : "bg-primary/5"
+                                                                  }`}
+                                                              >
+                                                                  <p className={`text-sm ${notification.read_at ? "text-slate-600 dark:text-zinc-300" : "font-semibold text-slate-900 dark:text-white"}`}>
+                                                                      {notification.title}
+                                                                  </p>
+                                                                  {notification.body && (
+                                                                      <p className="mt-0.5 text-xs text-slate-500 dark:text-zinc-400 line-clamp-2">
+                                                                          {notification.body}
+                                                                      </p>
+                                                                  )}
+                                                                  <p className="mt-1 text-[0.65rem] text-slate-400 dark:text-zinc-500">
+                                                                      {formatNotificationDate(notification.created_at)}
+                                                                  </p>
+                                                              </button>
+                                                          </li>
+                                                      ))}
+                                                  </ul>
+                                              )}
                                           </div>,
                                           document.body
                                       )
@@ -333,6 +387,13 @@ export default function DashboardLayout() {
                                                       className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-slate-700 dark:text-zinc-200 hover:bg-white/5"
                                                   >
                                                       <CreditCard size={16} /> {t("nav.abonnements", "Plan d'abonnement")}
+                                                  </NavLink>
+                                                  <NavLink
+                                                      to="/dashboard/parrainage"
+                                                      onClick={() => setIsUserMenuOpen(false)}
+                                                      className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-slate-700 dark:text-zinc-200 hover:bg-white/5"
+                                                  >
+                                                      <Gift size={16} /> {t("nav.parrainage", "Parrainage")}
                                                   </NavLink>
                                                   <a
                                                       href="https://docs.vireel.co/"

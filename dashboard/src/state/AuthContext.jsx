@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import { getSupabaseBrowserClient } from "../lib/supabase-browser";
 import { setCachedAccessToken } from "../lib/apiAuth";
+import { associateReferralCode, getStoredReferralCode, looksLikeFreshSignup } from "../lib/referral";
 
 const AuthContext = createContext(null);
 
@@ -48,6 +49,19 @@ export function AuthProvider({ children }) {
             authListener.subscription.unsubscribe();
         };
     }, []);
+
+    // OAuth signup detection: email/password signup already knows it just
+    // created an account (see Login.jsx), but Supabase fires the same
+    // SIGNED_IN event for a brand-new OAuth account and a returning one.
+    // getStoredReferralCode() is cleared inside associateReferralCode as
+    // soon as it is attempted, so this only ever fires once per code.
+    useEffect(() => {
+        if (!user) return;
+        const referralCode = getStoredReferralCode();
+        if (!referralCode) return;
+        if (!looksLikeFreshSignup(user)) return;
+        associateReferralCode(user.id, referralCode);
+    }, [user]);
 
     async function logout() {
         const supabase = getSupabaseBrowserClient();

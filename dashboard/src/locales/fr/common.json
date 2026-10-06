@@ -51,6 +51,17 @@
     "cleanAudio": "Nettoyer l'audio",
     "removeBadTakes": "Retirer les mauvaises prises"
   },
+  "nav": {
+    "abonnements": "Plan d'abonnement",
+    "parrainage": "Parrainage",
+    "documents": "Documents"
+  },
+  "header": {
+    "notifications": "Notifications",
+    "account": "Compte",
+    "noNotifications": "Aucune notification pour le moment.",
+    "markAllRead": "Tout marquer comme lu"
+  },
   "mediaInput": {
     "youtubeUrl": "URL YouTube",
     "uploadFile": "Télécharger un fichier",
@@ -589,7 +600,31 @@
     "commentsPerPost": "commentaires / publication",
     "statsIncluded": "Statistiques sociales sur la page d'accueil",
     "statsExcluded": "Pas de statistiques sociales sur la page d'accueil",
-    "aiFeaturesHeading": "Fonctionnalités IA incluses dans les crédits"
+    "aiFeaturesHeading": "Fonctionnalités IA incluses dans les crédits",
+    "creditsBreakdown": "{{standard}} crédits standards · {{promo}} crédits promotionnels",
+    "expiringBatch": "{{amount}} crédits expirent dans {{days}} jour(s)"
+  },
+  "serviceUsage": {
+    "totalAvailable": "{{total}} crédits disponibles",
+    "creditsBreakdown": "{{standard}} crédits standards · {{promo}} crédits promotionnels",
+    "expiringBatch": "{{amount}} crédits expirent dans {{days}} jour(s)"
+  },
+  "parrainage": {
+    "title": "Parrainage",
+    "subtitle": "Invite tes amis sur Vireel et gagnez tous les deux des crédits promotionnels.",
+    "loadError": "Impossible de charger tes informations de parrainage.",
+    "yourLink": "Ton lien de parrainage",
+    "copy": "Copier",
+    "copied": "Copié !",
+    "rewardsTitle": "Comment ça marche",
+    "rewardsCopy": "Ton ami reçoit {{signupBonus}} crédits promotionnels à l'inscription. Toi, tu reçois {{monthlyBonus}} crédits s'il choisit un abonnement mensuel, {{annualBonus}} crédits s'il choisit annuel. Aucune limite de parrainage.",
+    "referredCount": "Filleuls",
+    "rewardedCount": "Récompenses obtenues",
+    "referralsListTitle": "Tes filleuls",
+    "noReferrals": "Aucun filleul pour le moment. Partage ton lien pour commencer !",
+    "statusPending": "En attente d'abonnement",
+    "statusRewarded": "Récompense attribuée",
+    "statusInvalid": "Invalide"
   },
   "landing": {
     "feature": "Fonctionnalités",

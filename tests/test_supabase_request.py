@@ -73,6 +73,12 @@ class _FakeQuery:
     def lte(self, *args, **kwargs):
         return self._record("lte", *args, **kwargs)
 
+    def gt(self, *args, **kwargs):
+        return self._record("gt", *args, **kwargs)
+
+    def ilike(self, *args, **kwargs):
+        return self._record("ilike", *args, **kwargs)
+
     def in_(self, *args, **kwargs):
         return self._record("in_", *args, **kwargs)
 
@@ -88,14 +94,38 @@ class _FakeQuery:
         return _FakeResponse(data=[], count=0)
 
 
+class _FakeRPCCall:
+    def __init__(self, fn, params, events, response):
+        self.fn = fn
+        self.params = params
+        self.events = events
+        self.response = response
+
+    async def execute(self):
+        self.events.append(("rpc", self.fn, (), self.params or {}))
+        return self.response
+
+
 class _FakeClient:
-    def __init__(self, response_map):
+    def __init__(self, response_map, rpc_response_map=None):
         self.events = []
         self.response_map = {key: list(value) for key, value in (response_map or {}).items()}
+        # Defaults to a no-op promo consumption so any test exercising
+        # deduct_user_credits (the universal choke point calling
+        # consume_promotional_credits first) doesn't need its own RPC stub
+        # unless it specifically cares about promotional-credit behavior.
+        self.rpc_response_map = {
+            "consume_promotional_credits": _FakeResponse(data={"consumed": 0.0, "batches": []}),
+            "restore_promotional_credits": _FakeResponse(data=None),
+            **(rpc_response_map or {}),
+        }
 
     def table(self, table_name):
         self.events.append((table_name, "table", (), {}))
         return _FakeQuery(table_name, self.events, self.response_map.setdefault(table_name, []))
+
+    def rpc(self, fn, params=None):
+        return _FakeRPCCall(fn, params, self.events, self.rpc_response_map.get(fn, _FakeResponse(data=None)))
 
 
 def _event_args(events, table, method):
@@ -1663,6 +1693,508 @@ def test_get_user_data_history_returns_empty_for_missing_user_id(monkeypatch):
     rows, total = asyncio.run(supabase_request.get_user_data_history(""))
     assert rows == []
     assert total == 0
+
+
+# --------------------------------------------------------------------------
+# Referral program
+# --------------------------------------------------------------------------
+
+def test_generate_referral_code_has_expected_length_and_alphabet(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    code = supabase_request._generate_referral_code()
+    assert len(code) == supabase_request._REFERRAL_CODE_LENGTH
+    assert all(c in supabase_request._REFERRAL_CODE_ALPHABET for c in code)
+    # No ambiguous characters -- these must never appear in a generated code.
+    assert not any(c in code for c in "0O1IL")
+
+
+def test_get_or_create_referral_code_returns_existing_without_insert(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_REFERRAL_CODES_TABLE: [_FakeResponse(data=[{"code": "ABC1234"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    code = asyncio.run(supabase_request.get_or_create_referral_code("u1"))
+    assert code == "ABC1234"
+    assert _event_count(fake_client.events, supabase_request.SUPABASE_REFERRAL_CODES_TABLE, "insert") == 0
+
+
+def test_get_or_create_referral_code_generates_when_missing(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient({
+        supabase_request.SUPABASE_REFERRAL_CODES_TABLE: [
+            _FakeResponse(data=[]),  # the initial get_referral_code lookup: none yet
+            _FakeResponse(data=[{"code": "ZZZ9999"}]),  # the insert
+        ]
+    })
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    code = asyncio.run(supabase_request.get_or_create_referral_code("u1"))
+    assert code == "ZZZ9999"
+
+
+def test_get_or_create_referral_code_retries_on_collision(monkeypatch):
+    # A unique-constraint conflict on insert (code collision, or a
+    # concurrent request already created this exact user's code) must be
+    # retried rather than raised -- re-reading first in case it was this
+    # user's own code that just got created concurrently.
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    from postgrest.exceptions import APIError
+
+    class _RetryOnceClient:
+        def __init__(self):
+            self.insert_attempts = 0
+
+        async def _get_lookup(self):
+            return _FakeResponse(data=[])
+
+        def table(self, table_name):
+            attempts = self
+
+            class _Query:
+                def select(self, *a, **k):
+                    return self
+
+                def eq(self, *a, **k):
+                    return self
+
+                def insert(self, *a, **k):
+                    attempts.insert_attempts += 1
+                    self._is_insert = True
+                    return self
+
+                def limit(self, *a, **k):
+                    return self
+
+                async def execute(self):
+                    if getattr(self, "_is_insert", False) and attempts.insert_attempts == 1:
+                        raise APIError({"message": "duplicate key", "code": "23505", "hint": None, "details": None})
+                    if getattr(self, "_is_insert", False):
+                        return _FakeResponse(data=[{"code": "RETRY01"}])
+                    return _FakeResponse(data=[])
+
+            return _Query()
+
+    fake_client = _RetryOnceClient()
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    code = asyncio.run(supabase_request.get_or_create_referral_code("u1"))
+    assert code == "RETRY01"
+    assert fake_client.insert_attempts == 2
+
+
+def test_get_referral_code_owner_case_insensitive_lookup(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_REFERRAL_CODES_TABLE: [_FakeResponse(data=[{"user_id": "referrer-1"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    owner = asyncio.run(supabase_request.get_referral_code_owner("abc1234"))
+    assert owner == "referrer-1"
+    assert _event_args(fake_client.events, supabase_request.SUPABASE_REFERRAL_CODES_TABLE, "ilike") == ("code", "abc1234")
+
+
+def test_get_referral_code_owner_returns_none_for_empty_code(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    assert asyncio.run(supabase_request.get_referral_code_owner("")) is None
+
+
+def test_insert_referral_creates_row(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_REFERRALS_TABLE: [_FakeResponse(data=[{"id": "ref-1", "referred_user_id": "u2"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    row, created = asyncio.run(supabase_request.insert_referral("u1", "u2", "ABC1234"))
+    assert created is True
+    assert row["id"] == "ref-1"
+
+
+def test_insert_referral_is_idempotent_on_conflict(monkeypatch):
+    # A second association attempt for an already-referred user must
+    # never raise -- it returns the EXISTING row with created=False, so
+    # the caller treats it as "no-op", never granting a second bonus.
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    from postgrest.exceptions import APIError
+
+    class _ConflictThenLookupClient:
+        def table(self, table_name):
+            class _Query:
+                def insert(self, *a, **k):
+                    self._is_insert = True
+                    return self
+
+                def select(self, *a, **k):
+                    return self
+
+                def eq(self, *a, **k):
+                    return self
+
+                def limit(self, *a, **k):
+                    return self
+
+                async def execute(self):
+                    if getattr(self, "_is_insert", False):
+                        raise APIError({"message": "duplicate key", "code": "23505", "hint": None, "details": None})
+                    return _FakeResponse(data=[{"id": "existing-ref", "referred_user_id": "u2"}])
+
+            return _Query()
+
+    _patch_get_client(monkeypatch, supabase_request, _ConflictThenLookupClient())
+
+    row, created = asyncio.run(supabase_request.insert_referral("u1", "u2", "ABC1234"))
+    assert created is False
+    assert row["id"] == "existing-ref"
+
+
+def test_claim_referral_subscription_reward_succeeds_once(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_REFERRALS_TABLE: [_FakeResponse(data=[{"id": "ref-1", "status": "rewarded"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    row = asyncio.run(supabase_request.claim_referral_subscription_reward("ref-1", "month", "sous-1"))
+    assert row["status"] == "rewarded"
+    assert _event_args(fake_client.events, supabase_request.SUPABASE_REFERRALS_TABLE, "is_") == ("subscription_reward_granted_at", "null")
+
+
+def test_claim_referral_subscription_reward_idempotent_when_already_claimed(monkeypatch):
+    # The conditional UPDATE affects 0 rows once subscription_reward_granted_at
+    # is no longer null -- the fake client models that by returning no rows.
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_REFERRALS_TABLE: [_FakeResponse(data=[])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    row = asyncio.run(supabase_request.claim_referral_subscription_reward("ref-1", "month", "sous-1"))
+    assert row is None
+
+
+def test_invalidate_referral_sets_status_and_reason(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_REFERRALS_TABLE: [_FakeResponse(data=[{"id": "ref-1", "status": "invalid"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    row = asyncio.run(supabase_request.invalidate_referral("ref-1", "self_referral_suspected"))
+    assert row["status"] == "invalid"
+    update_args = _event_args(fake_client.events, supabase_request.SUPABASE_REFERRALS_TABLE, "update")
+    assert update_args[0]["status"] == "invalid"
+    assert update_args[0]["invalidated_reason"] == "self_referral_suspected"
+
+
+def test_get_auth_user_created_at_returns_parsed_datetime(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+
+    class _FakeAdmin:
+        async def get_user_by_id(self, user_id):
+            return types.SimpleNamespace(user=types.SimpleNamespace(created_at="2026-01-15T10:00:00+00:00"))
+
+    class _FakeAuth:
+        admin = _FakeAdmin()
+
+    class _FakeClientWithAuth:
+        auth = _FakeAuth()
+
+    _patch_get_client(monkeypatch, supabase_request, _FakeClientWithAuth())
+
+    result = asyncio.run(supabase_request.get_auth_user_created_at("u1"))
+    assert result == datetime(2026, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+
+
+def test_get_auth_user_created_at_returns_none_on_failure(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+
+    class _FakeAdmin:
+        async def get_user_by_id(self, user_id):
+            raise RuntimeError("not found")
+
+    class _FakeAuth:
+        admin = _FakeAdmin()
+
+    class _FakeClientWithAuth:
+        auth = _FakeAuth()
+
+    _patch_get_client(monkeypatch, supabase_request, _FakeClientWithAuth())
+
+    assert asyncio.run(supabase_request.get_auth_user_created_at("u1")) is None
+
+
+# --------------------------------------------------------------------------
+# Promotional credits
+# --------------------------------------------------------------------------
+
+def test_insert_promotional_credit_batch_sets_expiry_and_touches_user_data(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient({
+        supabase_request.SUPABASE_USER_DATA_TABLE: [_FakeResponse(data=[{"user_id": "u1", "credit": 0.0}])],
+        supabase_request.SUPABASE_PROMOTIONAL_CREDIT_BATCHES_TABLE: [_FakeResponse(data=[{"id": "batch-1"}])],
+    })
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    before = datetime.now(timezone.utc)
+    row = asyncio.run(
+        supabase_request.insert_promotional_credit_batch(
+            "u1", 50.0, "REFERRAL_SIGNUP", expiration_days=60, source_reference="ref-1",
+        )
+    )
+    assert row["id"] == "batch-1"
+    insert_args = _event_args(fake_client.events, supabase_request.SUPABASE_PROMOTIONAL_CREDIT_BATCHES_TABLE, "insert")
+    payload = insert_args[0]
+    assert payload["amount_initial"] == 50.0
+    assert payload["amount_remaining"] == 50.0
+    assert payload["source"] == "REFERRAL_SIGNUP"
+    assert payload["source_reference"] == "ref-1"
+    expires_at = datetime.fromisoformat(payload["expires_at"])
+    assert (expires_at - before).days in (59, 60)  # ~60 days out, defensive against test timing
+
+
+def test_list_active_promotional_credit_batches_filters_and_orders(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    rows = [{"id": "b1", "expires_at": "2026-02-01T00:00:00+00:00"}]
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_PROMOTIONAL_CREDIT_BATCHES_TABLE: [_FakeResponse(data=rows)]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.list_active_promotional_credit_batches("u1"))
+    assert result == rows
+    events = fake_client.events
+    assert _event_args(events, supabase_request.SUPABASE_PROMOTIONAL_CREDIT_BATCHES_TABLE, "is_") == ("revoked_at", "null")
+    assert _event_count(events, supabase_request.SUPABASE_PROMOTIONAL_CREDIT_BATCHES_TABLE, "gt") == 2
+
+
+def test_list_active_promotional_credit_batches_empty_user_id(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    assert asyncio.run(supabase_request.list_active_promotional_credit_batches("")) == []
+
+
+def test_revoke_promotional_credit_batches_by_source_reference_zeroes_remaining(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient({
+        supabase_request.SUPABASE_PROMOTIONAL_CREDIT_BATCHES_TABLE: [
+            _FakeResponse(data=[{"id": "b1", "amount_remaining": 0}])
+        ],
+    })
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    count = asyncio.run(
+        supabase_request.revoke_promotional_credit_batches_by_source_reference("sous-1", "chargeback")
+    )
+    assert count == 1
+    update_args = _event_args(fake_client.events, supabase_request.SUPABASE_PROMOTIONAL_CREDIT_BATCHES_TABLE, "update")
+    assert update_args[0]["amount_remaining"] == 0
+    assert update_args[0]["revoked_reason"] == "chargeback"
+
+
+def test_revoke_promotional_credit_batches_empty_source_reference_is_noop(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    assert asyncio.run(supabase_request.revoke_promotional_credit_batches_by_source_reference("", "x")) == 0
+
+
+# --------------------------------------------------------------------------
+# deduct_user_credits -- promotional-credits-first (FEFO) consumption
+# --------------------------------------------------------------------------
+
+def test_deduct_user_credits_consumes_promo_before_standard(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_USER_DATA_TABLE: [_FakeResponse(data=[
+            {"user_id": "u1", "credit": 1000.0, "stockage": 0.0, "stockage_max": 0.0, "credit_debt": 0.0},
+        ])]},
+        rpc_response_map={
+            "consume_promotional_credits": _FakeResponse(data={"consumed": 50.0, "batches": [{"id": "b1", "amount": 50.0}]}),
+        },
+    )
+    fake_client.response_map[supabase_request.SUPABASE_USER_DATA_TABLE].append(
+        _FakeResponse(data=[{"user_id": "u1", "credit": 950.0}])
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.deduct_user_credits("u1", credits=100.0))
+    assert result is True
+    # Only the 50 left after promo (100 - 50) should hit the standard balance.
+    update_args = _event_args(fake_client.events, supabase_request.SUPABASE_USER_DATA_TABLE, "update")
+    assert update_args[0]["credit"] == 950.0  # 1000 - 50 remaining, not 1000 - 100
+
+
+def test_deduct_user_credits_fully_covered_by_promo_skips_standard_debit(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_USER_DATA_TABLE: [
+            _FakeResponse(data=[{"user_id": "u1", "credit": 1000.0, "stockage": 0.0, "stockage_max": 0.0, "credit_debt": 0.0}]),
+            _FakeResponse(data=[{"user_id": "u1", "credit": 1000.0}]),
+        ]},
+        rpc_response_map={
+            "consume_promotional_credits": _FakeResponse(data={"consumed": 100.0, "batches": [{"id": "b1", "amount": 100.0}]}),
+        },
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.deduct_user_credits("u1", credits=100.0))
+    assert result is True
+    update_args = _event_args(fake_client.events, supabase_request.SUPABASE_USER_DATA_TABLE, "update")
+    assert update_args[0]["credit"] == 1000.0  # untouched -- promo covered the whole amount
+
+
+def test_deduct_user_credits_restores_promo_when_standard_side_infeasible(monkeypatch):
+    # Debt cap exceeded on the standard-credit remainder must restore
+    # whatever promo credits were already drawn -- the whole deduction is
+    # all-or-nothing.
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    monkeypatch.setattr(supabase_request, "MAX_CREDIT_DEBT", 0.0)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_USER_DATA_TABLE: [
+            _FakeResponse(data=[{"user_id": "u1", "credit": 10.0, "stockage": 0.0, "stockage_max": 0.0, "credit_debt": 0.0}]),
+        ]},
+        rpc_response_map={
+            "consume_promotional_credits": _FakeResponse(data={"consumed": 20.0, "batches": [{"id": "b1", "amount": 20.0}]}),
+            "restore_promotional_credits": _FakeResponse(data=None),
+        },
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    # Needs 1000 total; only 20 promo + 10 standard available, and debt is disallowed.
+    result = asyncio.run(supabase_request.deduct_user_credits("u1", credits=1000.0))
+    assert result is False
+    restore_calls = [e for e in fake_client.events if e[0] == "rpc" and e[1] == "restore_promotional_credits"]
+    assert len(restore_calls) == 1
+    assert restore_calls[0][3]["p_batches"] == [{"id": "b1", "amount": 20.0}]
+
+
+def test_deduct_user_credits_restores_promo_when_no_user_data_row(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_USER_DATA_TABLE: [_FakeResponse(data=[])]},
+        rpc_response_map={
+            "consume_promotional_credits": _FakeResponse(data={"consumed": 10.0, "batches": [{"id": "b1", "amount": 10.0}]}),
+        },
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.deduct_user_credits("u1", credits=10.0))
+    assert result is False
+    restore_calls = [e for e in fake_client.events if e[0] == "rpc" and e[1] == "restore_promotional_credits"]
+    assert len(restore_calls) == 1
+
+
+def test_deduct_user_credits_zero_or_negative_amount_skips_promo_rpc(monkeypatch):
+    # Storage-only deductions (credits=0.0) must not pay the promo-RPC
+    # cost on every single call across the whole app.
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_USER_DATA_TABLE: [
+            _FakeResponse(data=[{"user_id": "u1", "credit": 10.0, "stockage": 5.0, "stockage_max": 100.0, "credit_debt": 0.0}]),
+            _FakeResponse(data=[{"user_id": "u1", "credit": 10.0}]),
+        ]},
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.deduct_user_credits("u1", credits=0.0, storage_delta=-1.0))
+    assert result is True
+    rpc_calls = [e for e in fake_client.events if e[0] == "rpc"]
+    assert rpc_calls == []
+
+
+def test_deduct_user_credits_retries_on_concurrent_standard_balance_conflict(monkeypatch):
+    # Two concurrent deductions on the standard balance: the conditional
+    # UPDATE (WHERE credit/stockage still match what was just read) loses
+    # the race and affects 0 rows -- this must retry against the fresh
+    # balance instead of silently dropping the deduction. (True
+    # concurrency-safety for the PROMOTIONAL side comes from the
+    # Postgres consume_promotional_credits function's row-level FOR
+    # UPDATE lock, a single atomic transaction this fake-client unit test
+    # can't exercise -- only a real-Postgres integration test could.)
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_USER_DATA_TABLE: [
+            _FakeResponse(data=[{"user_id": "u1", "credit": 100.0, "stockage": 0.0, "stockage_max": 0.0, "credit_debt": 0.0}]),
+            _FakeResponse(data=[]),  # conditional update loses the race (stale read)
+            _FakeResponse(data=[{"user_id": "u1", "credit": 90.0, "stockage": 0.0, "stockage_max": 0.0, "credit_debt": 0.0}]),  # fresh read after a concurrent -10 debit
+            _FakeResponse(data=[{"user_id": "u1", "credit": 80.0}]),  # this retry's update succeeds
+        ]},
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.deduct_user_credits("u1", credits=10.0))
+    assert result is True
+    update_calls = [e for e in fake_client.events if e[0] == supabase_request.SUPABASE_USER_DATA_TABLE and e[1] == "update"]
+    assert len(update_calls) == 2
+    # The winning retry's update is against the fresh 90, not the stale 100.
+    assert update_calls[1][2][0]["credit"] == 80.0
+
+
+# --------------------------------------------------------------------------
+# Notifications
+# --------------------------------------------------------------------------
+
+def test_insert_notification_builds_payload(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_NOTIFICATIONS_TABLE: [_FakeResponse(data=[{"id": "n1"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    row = asyncio.run(
+        supabase_request.insert_notification("u1", "referral_signup_bonus", "Bienvenue !", "Tu as recu 50 credits.", {"amount": 50})
+    )
+    assert row["id"] == "n1"
+    insert_args = _event_args(fake_client.events, supabase_request.SUPABASE_NOTIFICATIONS_TABLE, "insert")
+    assert insert_args[0]["type"] == "referral_signup_bonus"
+    assert insert_args[0]["data"] == {"amount": 50}
+
+
+def test_list_notifications_returns_items_and_unread_count(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_NOTIFICATIONS_TABLE: [
+            _FakeResponse(data=[{"id": "n1"}, {"id": "n2"}]),
+            _FakeResponse(data=[{"id": "n1"}], count=1),
+        ]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    items, unread_count = asyncio.run(supabase_request.list_notifications("u1", limit=20))
+    assert items == [{"id": "n1"}, {"id": "n2"}]
+    assert unread_count == 1
+
+
+def test_list_notifications_empty_user_id(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    items, unread_count = asyncio.run(supabase_request.list_notifications(""))
+    assert items == []
+    assert unread_count == 0
+
+
+def test_mark_notification_read_scopes_to_owner(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_NOTIFICATIONS_TABLE: [_FakeResponse(data=[{"id": "n1", "read_at": "now"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    row = asyncio.run(supabase_request.mark_notification_read("n1", "u1"))
+    assert row["id"] == "n1"
+    eq_calls = [args for table, method, args, _ in fake_client.events if table == supabase_request.SUPABASE_NOTIFICATIONS_TABLE and method == "eq"]
+    assert ("id", "n1") in eq_calls
+    assert ("user_id", "u1") in eq_calls
+
+
+def test_mark_all_notifications_read_returns_count(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_NOTIFICATIONS_TABLE: [_FakeResponse(data=[{"id": "n1"}, {"id": "n2"}])]}
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    count = asyncio.run(supabase_request.mark_all_notifications_read("u1"))
+    assert count == 2
 
 
 

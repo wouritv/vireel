@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { getDayLabel, formatDate, detectTimezone, DAYS, MONTHS } from '../formatting';
+import { getDayLabel, formatDate, detectTimezone, daysUntilDate, DAYS, MONTHS } from '../formatting';
 
 // Pin "today" to a fixed date so tests are not calendar-dependent
 const FIXED_TODAY = new Date('2026-08-01T12:00:00');
@@ -44,6 +44,22 @@ describe('formatDate', () => {
             const d = new Date(2026, m, 1);
             expect(formatDate(d)).toContain(MONTHS[m]);
         }
+    });
+});
+
+describe('daysUntilDate', () => {
+    it('rounds up to the next whole day', () => {
+        expect(daysUntilDate('2026-08-02T13:00:00')).toBe(2);
+    });
+
+    it('returns 0 for a date in the past', () => {
+        expect(daysUntilDate('2026-07-01T00:00:00')).toBe(0);
+    });
+
+    it('returns null for a missing or unparseable date', () => {
+        expect(daysUntilDate(undefined)).toBeNull();
+        expect(daysUntilDate(null)).toBeNull();
+        expect(daysUntilDate('not-a-date')).toBeNull();
     });
 });
 

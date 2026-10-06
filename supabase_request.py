@@ -1,11 +1,14 @@
 import os
-from datetime import datetime, timezone
+import secrets
+import string
+from datetime import datetime, timedelta, timezone
 import calendar
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from supabase import acreate_client, AsyncClient
 from supabase.lib.client_options import AsyncClientOptions
+from postgrest.exceptions import APIError
 
 import logging
 import os
@@ -30,6 +33,10 @@ SUPABASE_STYLE_EDIT_VERSIONS_TABLE = os.environ.get("SUPABASE_STYLE_EDIT_VERSION
 SUPABASE_ANONYMOUS_STORIES_TABLE = os.environ.get("SUPABASE_ANONYMOUS_STORIES_TABLE", "anonymous_stories")
 SUPABASE_FILM_SUMMARIES_TABLE = os.environ.get("SUPABASE_FILM_SUMMARIES_TABLE", "film_summaries")
 SUPABASE_CAPTION_STYLE_THEMES_TABLE = os.environ.get("SUPABASE_CAPTION_STYLE_THEMES_TABLE", "caption_style_themes")
+SUPABASE_REFERRAL_CODES_TABLE = os.environ.get("SUPABASE_REFERRAL_CODES_TABLE", "referral_codes")
+SUPABASE_REFERRALS_TABLE = os.environ.get("SUPABASE_REFERRALS_TABLE", "referrals")
+SUPABASE_PROMOTIONAL_CREDIT_BATCHES_TABLE = os.environ.get("SUPABASE_PROMOTIONAL_CREDIT_BATCHES_TABLE", "promotional_credit_batches")
+SUPABASE_NOTIFICATIONS_TABLE = os.environ.get("SUPABASE_NOTIFICATIONS_TABLE", "notifications")
 STORAGE_OVERAGE_TOLERANCE_PERCENT = max(0.0, float(os.environ.get("STORAGE_OVERAGE_TOLERANCE_PERCENT", "10") or "10"))
 
 
@@ -1699,16 +1706,51 @@ async def _record_debt_increase_if_needed(user_id: str, update_state: Dict[str, 
 	)
 
 
+async def _consume_promotional_credits(client: AsyncClient, user_id: str, amount: float) -> Dict[str, Any]:
+	"""Atomically drain up to ``amount`` from this user's promotional
+	credit batches, oldest-expiry-first (see the consume_promotional_credits
+	Postgres function -- it row-locks each batch it touches, so this alone
+	is safe under concurrency). A no-op for amount <= 0 (e.g. the
+	storage-only deductions some callers make)."""
+	if not amount or amount <= 0:
+		return {"consumed": 0.0, "batches": []}
+	response = await client.rpc(
+		"consume_promotional_credits", {"p_user_id": user_id, "p_amount": float(amount)}
+	).execute()
+	data = response.data
+	if isinstance(data, list):
+		data = data[0] if data else None
+	return data or {"consumed": 0.0, "batches": []}
+
+
+async def _restore_promotional_credits(client: AsyncClient, batches: Optional[List[Dict[str, Any]]]) -> None:
+	"""Reverses a prior _consume_promotional_credits draw -- used when the
+	rest of a deduction (the standard-credit side) ultimately fails, so a
+	user's promotional credits are never silently spent for an operation
+	that didn't go through. Best-effort: a failure here must never mask
+	the original deduction failure the caller is already returning."""
+	if not batches:
+		return
+	try:
+		await client.rpc("restore_promotional_credits", {"p_batches": batches}).execute()
+	except Exception:
+		logger.warning("Failed to restore promotional credit batches: %s", batches, exc_info=True)
+
+
 async def deduct_user_credits(
 	user_id: str,
 	credits: float,
 	storage_delta: float = 0.0,
 	max_attempts: int = 5,
 ) -> bool:
-	"""Deduct ``credits`` from the user balance.
+	"""Deduct ``credits`` from the user balance -- promotional credits
+	first (oldest-expiry-first), the standard balance for whatever's left.
 
 	Returns ``False`` if the user does not have sufficient credits/storage
-	headroom, or if the account's debt would exceed MAX_CREDIT_DEBT.
+	headroom, or if the account's debt would exceed MAX_CREDIT_DEBT. On
+	that path, any promotional credits already drawn for this call are
+	restored first, so a rejected deduction never costs the user anything
+	(see _restore_promotional_credits).
 
 	Security: this uses optimistic concurrency (a conditional UPDATE that
 	only applies if credit/stockage still match what we just read, retried
@@ -1721,13 +1763,20 @@ async def deduct_user_credits(
 	"""
 	client = await get_client()
 
+	promo_result = await _consume_promotional_credits(client, user_id, credits)
+	promo_consumed = float(promo_result.get("consumed") or 0.0)
+	promo_batches = promo_result.get("batches") or []
+	remaining_credits = max(0.0, float(credits or 0.0) - promo_consumed)
+
 	for _ in range(max_attempts):
 		existing = await get_user_data(user_id)
 		if not existing:
+			await _restore_promotional_credits(client, promo_batches)
 			return False
 
-		update_state = _build_deduction_update(existing, credits, storage_delta)
+		update_state = _build_deduction_update(existing, remaining_credits, storage_delta)
 		if not update_state:
+			await _restore_promotional_credits(client, promo_batches)
 			return False
 
 		updated = await _try_apply_deduction_update(client, user_id, update_state)
@@ -1740,6 +1789,7 @@ async def deduct_user_credits(
 		await _record_debt_increase_if_needed(user_id, update_state)
 		return True
 
+	await _restore_promotional_credits(client, promo_batches)
 	return False
 
 
@@ -1938,6 +1988,381 @@ async def get_user_data_history(
 		.execute()
 	)
 	return response.data or [], response.count or 0
+
+
+# --------------------------------------------------------------------------
+# Referral program
+# --------------------------------------------------------------------------
+# No ambiguous-looking characters (0/O, 1/I/L) so a code stays easy to
+# read aloud or retype from a screenshot.
+_REFERRAL_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+_REFERRAL_CODE_LENGTH = 7
+
+
+def _generate_referral_code() -> str:
+	return "".join(secrets.choice(_REFERRAL_CODE_ALPHABET) for _ in range(_REFERRAL_CODE_LENGTH))
+
+
+async def get_referral_code(user_id: str) -> Optional[str]:
+	"""The user's existing referral code, if one has already been generated."""
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_REFERRAL_CODES_TABLE)
+		.select("code")
+		.eq("user_id", user_id)
+		.limit(1)
+		.execute()
+	)
+	rows = response.data or []
+	return rows[0]["code"] if rows else None
+
+
+async def get_or_create_referral_code(user_id: str, max_attempts: int = 5) -> str:
+	"""Returns the user's referral code, generating one on first use --
+	codes are never pre-created for every user up front (there is no
+	signup trigger in this codebase to do that; see user_data's own
+	lazy-creation pattern for the established precedent)."""
+	existing = await get_referral_code(user_id)
+	if existing:
+		return existing
+
+	client = await get_client()
+	for _ in range(max_attempts):
+		code = _generate_referral_code()
+		try:
+			response = (
+				await client.table(SUPABASE_REFERRAL_CODES_TABLE)
+				.insert({"user_id": user_id, "code": code})
+				.execute()
+			)
+			rows = response.data or []
+			if rows:
+				return rows[0]["code"]
+			return code
+		except APIError:
+			# Either the random code collided with someone else's (retry a
+			# fresh one) or a concurrent request already created this exact
+			# user's code (re-read and use that instead).
+			existing = await get_referral_code(user_id)
+			if existing:
+				return existing
+			continue
+
+	raise RuntimeError(f"Could not generate a unique referral code for user {user_id}")
+
+
+async def get_referral_code_owner(code: str) -> Optional[str]:
+	"""Resolve a referral code back to its owner's user_id, or None if the
+	code doesn't exist. Lookup is case-insensitive since a user might
+	retype a shared link/code by hand."""
+	if not code:
+		return None
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_REFERRAL_CODES_TABLE)
+		.select("user_id")
+		.ilike("code", code.strip())
+		.limit(1)
+		.execute()
+	)
+	rows = response.data or []
+	return rows[0]["user_id"] if rows else None
+
+
+REFERRAL_COLUMNS = (
+	"id, created_at, referrer_user_id, referred_user_id, referral_code, status, "
+	"signup_reward_granted_at, signup_reward_batch_id, first_subscription_type, "
+	"first_subscription_souscription_id, subscription_reward_granted_at, "
+	"subscription_reward_batch_id, invalidated_at, invalidated_reason"
+)
+
+
+async def get_referral_by_referred_user(referred_user_id: str) -> Optional[Dict[str, Any]]:
+	"""The (at most one) referral relationship where this user is the
+	referee -- used both to check "does this user already have a
+	referrer" and, on a first-subscription webhook, "was this user
+	referred at all"."""
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_REFERRALS_TABLE)
+		.select(REFERRAL_COLUMNS)
+		.eq("referred_user_id", referred_user_id)
+		.limit(1)
+		.execute()
+	)
+	rows = response.data or []
+	return rows[0] if rows else None
+
+
+async def insert_referral(
+	referrer_user_id: str, referred_user_id: str, referral_code: str,
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+	"""Create the referral row associating referred_user_id with
+	referrer_user_id. Returns (row, created) -- created is False when the
+	row already existed (the referred_user_id UNIQUE constraint is what
+	actually enforces "a user can never have more than one referrer",
+	this is just the application-level surface over it: a second attempt
+	returns the EXISTING row rather than erroring, so the caller can
+	treat it as an idempotent no-op instead of a failure)."""
+	client = await get_client()
+	try:
+		response = (
+			await client.table(SUPABASE_REFERRALS_TABLE)
+			.insert({
+				"referrer_user_id": referrer_user_id,
+				"referred_user_id": referred_user_id,
+				"referral_code": referral_code,
+			})
+			.execute()
+		)
+		rows = response.data or []
+		return (rows[0] if rows else None), True
+	except APIError:
+		existing = await get_referral_by_referred_user(referred_user_id)
+		return existing, False
+
+
+async def update_referral_row(referral_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_REFERRALS_TABLE)
+		.update(dict(updates or {}))
+		.eq("id", referral_id)
+		.execute()
+	)
+	rows = response.data or []
+	return rows[0] if rows else None
+
+
+async def claim_referral_subscription_reward(
+	referral_id: str, subscription_type: str, souscription_id: str,
+) -> Optional[Dict[str, Any]]:
+	"""Atomically claims the (at most once ever) subscription-reward slot
+	for this referral: the conditional UPDATE's WHERE clause is the
+	compare-and-swap that guarantees a webhook delivered twice (or
+	retried) can only ever win this race once. Returns the updated row,
+	or None if it was already claimed (nothing to do -- the caller must
+	not grant a second reward)."""
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_REFERRALS_TABLE)
+		.update({
+			"subscription_reward_granted_at": datetime.now(timezone.utc).isoformat(),
+			"first_subscription_type": subscription_type,
+			"first_subscription_souscription_id": souscription_id,
+			"status": "rewarded",
+		})
+		.eq("id", referral_id)
+		.is_("subscription_reward_granted_at", "null")
+		.execute()
+	)
+	rows = response.data or []
+	return rows[0] if rows else None
+
+
+async def list_referrals_by_referrer(referrer_user_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_REFERRALS_TABLE)
+		.select(REFERRAL_COLUMNS)
+		.eq("referrer_user_id", referrer_user_id)
+		.order("created_at", desc=True)
+		.limit(min(max(limit, 1), 500))
+		.execute()
+	)
+	return response.data or []
+
+
+async def invalidate_referral(referral_id: str, reason: str) -> Optional[Dict[str, Any]]:
+	"""Administrative kill switch for a fraudulent/abusive referral (see
+	REVIEW section 12) -- marks it invalid so no further reward can ever
+	be granted from it. Does not claw back credits already spent; use
+	revoke_promotional_credit_batches_by_source_reference for that."""
+	return await update_referral_row(referral_id, {
+		"status": "invalid",
+		"invalidated_at": datetime.now(timezone.utc).isoformat(),
+		"invalidated_reason": reason,
+	})
+
+
+async def get_auth_user_created_at(user_id: str) -> Optional[datetime]:
+	"""The Supabase Auth account's own creation timestamp, via the Admin
+	Auth API (requires the service-role client this module already uses
+	everywhere else). This codebase has no signup webhook/trigger on
+	auth.users, so this is how the referral-association endpoint verifies
+	-- server-side, never trusting the frontend's word for it -- that the
+	calling account is genuinely brand new rather than an existing user
+	retroactively attaching a referrer. Returns None on any failure
+	(unknown user, Admin API error, ...) so the caller can fail closed."""
+	try:
+		client = await get_client()
+		response = await client.auth.admin.get_user_by_id(user_id)
+		user = getattr(response, "user", None)
+		created_at = getattr(user, "created_at", None)
+		if created_at is None:
+			return None
+		if isinstance(created_at, str):
+			return datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+		return created_at
+	except Exception:
+		logger.warning("Failed to fetch auth user created_at for %s", user_id, exc_info=True)
+		return None
+
+
+# --------------------------------------------------------------------------
+# Promotional credits (generic ledger -- referrals are the first source,
+# not the only one; see the migration's comment on promotional_credit_batches)
+# --------------------------------------------------------------------------
+PROMOTIONAL_CREDIT_BATCH_COLUMNS = (
+	"id, created_at, user_id, amount_initial, amount_remaining, source, "
+	"source_reference, expires_at, revoked_at, revoked_reason"
+)
+
+
+async def insert_promotional_credit_batch(
+	user_id: str, amount: float, source: str, expiration_days: int, source_reference: Optional[str] = None,
+) -> Dict[str, Any]:
+	"""Grants one independent promotional-credit batch, expiring
+	``expiration_days`` from now (fixed at grant time -- a later change to
+	PROMOTIONAL_CREDITS_EXPIRATION_DAYS never touches this batch's own
+	expires_at). Also makes sure a user_data row exists for this user
+	(harmless 0-delta "touch" -- see upsert_user_data_credits): without
+	this, a brand-new referred user who has ONLY promotional credits and
+	no plan yet would have no user_data row at all, and
+	deduct_user_credits would reject spending their promo credits purely
+	because that row doesn't exist yet."""
+	await upsert_user_data_credits(user_id, credit_delta=0.0, operation_type="promotional_credit_touch")
+
+	client = await get_client()
+	amount = max(0.0, float(amount or 0))
+	expires_at = datetime.now(timezone.utc) + timedelta(days=max(0, int(expiration_days)))
+	payload = {
+		"user_id": user_id,
+		"amount_initial": amount,
+		"amount_remaining": amount,
+		"source": source,
+		"source_reference": source_reference,
+		"expires_at": expires_at.isoformat(),
+	}
+	response = await client.table(SUPABASE_PROMOTIONAL_CREDIT_BATCHES_TABLE).insert(payload).execute()
+	rows = response.data or []
+	return rows[0] if rows else payload
+
+
+async def list_active_promotional_credit_batches(user_id: str) -> List[Dict[str, Any]]:
+	"""Non-expired, non-revoked batches with credits left, soonest-expiry
+	first -- what the wallet UI needs for its "X credits expire in Y days"
+	breakdown (see section 15)."""
+	if not user_id:
+		return []
+	client = await get_client()
+	now_iso = datetime.now(timezone.utc).isoformat()
+	response = (
+		await client.table(SUPABASE_PROMOTIONAL_CREDIT_BATCHES_TABLE)
+		.select(PROMOTIONAL_CREDIT_BATCH_COLUMNS)
+		.eq("user_id", user_id)
+		.is_("revoked_at", "null")
+		.gt("expires_at", now_iso)
+		.gt("amount_remaining", 0)
+		.order("expires_at", desc=False)
+		.execute()
+	)
+	return response.data or []
+
+
+async def revoke_promotional_credit_batches_by_source_reference(
+	source_reference: str, reason: str,
+) -> int:
+	"""Cancels whatever's still available in every promotional batch
+	created from this source_reference (e.g. the souscription a chargeback
+	or refund landed on) -- never creates a negative balance, since this
+	only ever zeroes amount_remaining rather than subtracting from
+	anything already spent."""
+	if not source_reference:
+		return 0
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_PROMOTIONAL_CREDIT_BATCHES_TABLE)
+		.update({
+			"revoked_at": datetime.now(timezone.utc).isoformat(),
+			"revoked_reason": reason,
+			"amount_remaining": 0,
+		})
+		.eq("source_reference", source_reference)
+		.is_("revoked_at", "null")
+		.execute()
+	)
+	return len(response.data or [])
+
+
+# --------------------------------------------------------------------------
+# Notifications (generic in-app notifications, not email)
+# --------------------------------------------------------------------------
+async def insert_notification(
+	user_id: str, type_: str, title: str, body: str = "", data: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+	client = await get_client()
+	payload = {
+		"user_id": user_id,
+		"type": type_,
+		"title": title,
+		"body": body or "",
+		"data": data or {},
+	}
+	response = await client.table(SUPABASE_NOTIFICATIONS_TABLE).insert(payload).execute()
+	rows = response.data or []
+	return rows[0] if rows else payload
+
+
+async def list_notifications(
+	user_id: str, limit: int = 20, unread_only: bool = False,
+) -> Tuple[List[Dict[str, Any]], int]:
+	"""Returns (items, unread_count) -- unread_count always reflects the
+	true total regardless of ``unread_only``, so a notification bell badge
+	stays correct even while the panel is showing every notification."""
+	if not user_id:
+		return [], 0
+	client = await get_client()
+
+	query = client.table(SUPABASE_NOTIFICATIONS_TABLE).select("*").eq("user_id", user_id)
+	if unread_only:
+		query = query.is_("read_at", "null")
+	response = await query.order("created_at", desc=True).limit(min(max(limit, 1), 100)).execute()
+
+	unread_response = (
+		await client.table(SUPABASE_NOTIFICATIONS_TABLE)
+		.select("id", count="exact")
+		.eq("user_id", user_id)
+		.is_("read_at", "null")
+		.limit(1)
+		.execute()
+	)
+	return response.data or [], unread_response.count or 0
+
+
+async def mark_notification_read(notification_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_NOTIFICATIONS_TABLE)
+		.update({"read_at": datetime.now(timezone.utc).isoformat()})
+		.eq("id", notification_id)
+		.eq("user_id", user_id)
+		.execute()
+	)
+	rows = response.data or []
+	return rows[0] if rows else None
+
+
+async def mark_all_notifications_read(user_id: str) -> int:
+	client = await get_client()
+	response = (
+		await client.table(SUPABASE_NOTIFICATIONS_TABLE)
+		.update({"read_at": datetime.now(timezone.utc).isoformat()})
+		.eq("user_id", user_id)
+		.is_("read_at", "null")
+		.execute()
+	)
+	return len(response.data or [])
 
 
 # --------------------------------------------------------------------------

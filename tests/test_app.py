@@ -5599,6 +5599,7 @@ def test_handle_subscription_purchase_closes_out_previous_souscription(monkeypat
 def test_handle_subscription_purchase_without_previous_souscription_touches_nothing(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value={"id": "prior"}))
     monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-new"}))
     monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
     monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
@@ -5620,6 +5621,7 @@ def test_handle_subscription_purchase_syncs_default_payment_method(monkeypatch):
     # they actually paid with.
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value={"id": "prior"}))
     monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-new"}))
     monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
     monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
@@ -5637,6 +5639,7 @@ def test_handle_subscription_purchase_syncs_default_payment_method(monkeypatch):
 def test_handle_subscription_purchase_threads_annual_billing_interval(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value={"id": "prior"}))
     insert_mock = AsyncMock(return_value={"id": "sous-new"})
     monkeypatch.setattr(app, "supabase_insert_souscription", insert_mock)
     allocate_mock = AsyncMock()
@@ -6074,6 +6077,472 @@ def test_handle_subscription_payment_failed_ignores_invoice_without_subscription
     result = app._handle_subscription_payment_failed(invoice)
 
     assert result == {"received": True, "ignored": "no_subscription_on_invoice"}
+
+
+# ---------------------------------------------------------------------------
+# Referral program -- reward triggers
+# ---------------------------------------------------------------------------
+
+def test_maybe_reward_referrer_grants_monthly_bonus(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value={
+        "id": "ref-1", "referrer_user_id": "referrer-1", "status": "pending",
+    }))
+    claim_mock = AsyncMock(return_value={"id": "ref-1", "status": "rewarded"})
+    monkeypatch.setattr(app, "supabase_claim_referral_subscription_reward", claim_mock)
+    batch_mock = AsyncMock(return_value={"id": "batch-1"})
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+    monkeypatch.setattr(app, "supabase_update_referral_row", AsyncMock())
+    notify_mock = AsyncMock()
+    monkeypatch.setattr(app, "_create_notification", notify_mock)
+
+    asyncio.run(app._maybe_reward_referrer_for_first_subscription("referee-1", "month", "sous-1"))
+
+    claim_mock.assert_awaited_once_with("ref-1", "month", "sous-1")
+    batch_mock.assert_awaited_once_with(
+        "referrer-1", app.REFERRAL_MONTHLY_BONUS_CREDITS, "REFERRAL_MONTHLY_SUBSCRIPTION",
+        app.PROMOTIONAL_CREDITS_EXPIRATION_DAYS, source_reference="sous-1",
+    )
+    assert notify_mock.await_count == 2
+
+
+def test_maybe_reward_referrer_grants_annual_bonus(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value={
+        "id": "ref-1", "referrer_user_id": "referrer-1", "status": "pending",
+    }))
+    monkeypatch.setattr(app, "supabase_claim_referral_subscription_reward", AsyncMock(return_value={"id": "ref-1"}))
+    batch_mock = AsyncMock(return_value={"id": "batch-1"})
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+    monkeypatch.setattr(app, "supabase_update_referral_row", AsyncMock())
+    monkeypatch.setattr(app, "_create_notification", AsyncMock())
+
+    asyncio.run(app._maybe_reward_referrer_for_first_subscription("referee-1", "year", "sous-1"))
+
+    batch_mock.assert_awaited_once_with(
+        "referrer-1", app.REFERRAL_ANNUAL_BONUS_CREDITS, "REFERRAL_ANNUAL_SUBSCRIPTION",
+        app.PROMOTIONAL_CREDITS_EXPIRATION_DAYS, source_reference="sous-1",
+    )
+
+
+def test_maybe_reward_referrer_noop_when_not_referred(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value=None))
+    batch_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+
+    asyncio.run(app._maybe_reward_referrer_for_first_subscription("referee-1", "month", "sous-1"))
+
+    batch_mock.assert_not_awaited()
+
+
+def test_maybe_reward_referrer_noop_when_referral_invalidated(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value={
+        "id": "ref-1", "referrer_user_id": "referrer-1", "status": "invalid",
+    }))
+    batch_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+
+    asyncio.run(app._maybe_reward_referrer_for_first_subscription("referee-1", "month", "sous-1"))
+
+    batch_mock.assert_not_awaited()
+
+
+def test_maybe_reward_referrer_idempotent_on_duplicate_webhook(monkeypatch):
+    # claim_referral_subscription_reward returns None once the reward was
+    # already claimed (e.g. the webhook fired twice) -- no second batch.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value={
+        "id": "ref-1", "referrer_user_id": "referrer-1", "status": "rewarded",
+    }))
+    monkeypatch.setattr(app, "supabase_claim_referral_subscription_reward", AsyncMock(return_value=None))
+    batch_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+
+    asyncio.run(app._maybe_reward_referrer_for_first_subscription("referee-1", "month", "sous-1"))
+
+    batch_mock.assert_not_awaited()
+
+
+def test_handle_subscription_purchase_skips_reward_when_not_first_subscription(monkeypatch):
+    # A renewal never reaches _handle_subscription_purchase at all (see
+    # _handle_subscription_renewal_invoice's own docstring), and a plan
+    # change via fresh checkout always has a prior paid subscription --
+    # both end up here as "not first", which must never reward anyone.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value={"id": "prior"}))
+    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-new"}))
+    monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+    monkeypatch.setattr(app, "_sync_customer_default_payment_method", MagicMock())
+    reward_mock = AsyncMock()
+    monkeypatch.setattr(app, "_maybe_reward_referrer_for_first_subscription", reward_mock)
+
+    asyncio.run(app._handle_subscription_purchase(_fake_subscription_purchase_ctx()))
+
+    reward_mock.assert_not_awaited()
+
+
+def test_handle_subscription_purchase_rewards_referrer_on_first_subscription(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-new"}))
+    monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+    monkeypatch.setattr(app, "_sync_customer_default_payment_method", MagicMock())
+    reward_mock = AsyncMock()
+    monkeypatch.setattr(app, "_maybe_reward_referrer_for_first_subscription", reward_mock)
+
+    asyncio.run(app._handle_subscription_purchase(_fake_subscription_purchase_ctx(billing_interval="year")))
+
+    reward_mock.assert_awaited_once_with("u1", "year", "sous-new")
+
+
+def test_change_souscription_plan_never_rewards_referrer(monkeypatch):
+    # A plan change (upgrade/downgrade) must never trigger a referral
+    # reward -- only a genuinely first-ever paid subscription does.
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe, _ = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+    fake_stripe.Subscription.retrieve.return_value = _FakeStripeSubscriptionObject(
+        {"items": {"data": [{"id": "si_123"}]}},
+        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
+    )
+    fake_stripe.Subscription.modify.return_value = _FakeStripeObjectNoGet({"current_period_end": 1700000000})
+    fake_stripe.Price.create.return_value = types.SimpleNamespace(id="price_new_1")
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "new-plan", "name": "Premium", "price": 49.99, "max_social_account": 3}))
+    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-2"}))
+    monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
+    reward_mock = AsyncMock()
+    monkeypatch.setattr(app, "_maybe_reward_referrer_for_first_subscription", reward_mock)
+
+    asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="new-plan"), user_id="u1",
+    ))
+
+    reward_mock.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Referral program -- refunds/chargebacks revoke the reward batch
+# ---------------------------------------------------------------------------
+
+def test_handle_charge_refund_revokes_matching_batch(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value={"id": "sous-1"}))
+    revoke_mock = AsyncMock(return_value=1)
+    monkeypatch.setattr(app, "supabase_revoke_promotional_credit_batches_by_source_reference", revoke_mock)
+
+    charge = _FakeStripeObjectNoGet({"payment_intent": "pi_123"})
+    result = asyncio.run(app._handle_charge_refund_or_dispute(charge, "refund"))
+
+    assert result == {"received": True, "revoked_batches": 1}
+    revoke_mock.assert_awaited_once_with("sous-1", "refund")
+
+
+def test_handle_charge_dispute_revokes_matching_batch(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value={"id": "sous-1"}))
+    revoke_mock = AsyncMock(return_value=1)
+    monkeypatch.setattr(app, "supabase_revoke_promotional_credit_batches_by_source_reference", revoke_mock)
+
+    dispute = _FakeStripeObjectNoGet({"payment_intent": "pi_123"})
+    result = asyncio.run(app._handle_charge_refund_or_dispute(dispute, "chargeback"))
+
+    revoke_mock.assert_awaited_once_with("sous-1", "chargeback")
+
+
+def test_handle_charge_refund_ignored_when_no_matching_souscription(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    revoke_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_revoke_promotional_credit_batches_by_source_reference", revoke_mock)
+
+    charge = _FakeStripeObjectNoGet({"payment_intent": "pi_unrelated"})
+    result = asyncio.run(app._handle_charge_refund_or_dispute(charge, "refund"))
+
+    assert result == {"received": True, "ignored": "no_matching_souscription"}
+    revoke_mock.assert_not_awaited()
+
+
+def test_handle_charge_refund_ignored_without_payment_intent(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    charge = _FakeStripeObjectNoGet({})
+    result = asyncio.run(app._handle_charge_refund_or_dispute(charge, "refund"))
+    assert result == {"received": True, "ignored": "no_payment_intent"}
+
+
+def test_stripe_webhook_dispatches_charge_refunded(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    monkeypatch.setattr(app, "STRIPE_WEBHOOK_SECRET", "whsec_123")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    event = types.SimpleNamespace(type="charge.refunded", data=types.SimpleNamespace(object=types.SimpleNamespace(payment_intent="pi_123")))
+    monkeypatch.setattr(app, "_verify_and_parse_event", lambda payload, sig: event)
+    handler_mock = AsyncMock(return_value={"received": True, "revoked_batches": 1})
+    monkeypatch.setattr(app, "_handle_charge_refund_or_dispute", handler_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.post("/api/stripe/webhook", data=b"{}", headers={"stripe-signature": "sig"})
+
+    assert resp.status_code == 200
+    handler_mock.assert_awaited_once_with(event.data.object, "refund")
+
+
+def test_stripe_webhook_dispatches_charge_dispute_created(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    monkeypatch.setattr(app, "STRIPE_WEBHOOK_SECRET", "whsec_123")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    event = types.SimpleNamespace(type="charge.dispute.created", data=types.SimpleNamespace(object=types.SimpleNamespace(payment_intent="pi_123")))
+    monkeypatch.setattr(app, "_verify_and_parse_event", lambda payload, sig: event)
+    handler_mock = AsyncMock(return_value={"received": True, "revoked_batches": 1})
+    monkeypatch.setattr(app, "_handle_charge_refund_or_dispute", handler_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.post("/api/stripe/webhook", data=b"{}", headers={"stripe-signature": "sig"})
+
+    assert resp.status_code == 200
+    handler_mock.assert_awaited_once_with(event.data.object, "chargeback")
+
+
+# ---------------------------------------------------------------------------
+# Referral program -- HTTP endpoints
+# ---------------------------------------------------------------------------
+
+def test_get_referral_config_reads_from_backend_env(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "REFERRAL_SIGNUP_BONUS_CREDITS", 50.0)
+    monkeypatch.setattr(app, "REFERRAL_MONTHLY_BONUS_CREDITS", 100.0)
+    monkeypatch.setattr(app, "REFERRAL_ANNUAL_BONUS_CREDITS", 300.0)
+    monkeypatch.setattr(app, "PROMOTIONAL_CREDITS_EXPIRATION_DAYS", 60)
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/referrals/config")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "signup_bonus_credits": 50.0, "monthly_bonus_credits": 100.0,
+        "annual_bonus_credits": 300.0, "expiration_days": 60,
+    }
+
+
+def test_get_my_referrals_returns_code_link_and_summary(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_or_create_referral_code", AsyncMock(return_value="ABC1234"))
+    monkeypatch.setattr(app, "supabase_list_referrals_by_referrer", AsyncMock(return_value=[
+        {"created_at": "t1", "status": "pending", "subscription_reward_granted_at": None},
+        {"created_at": "t2", "status": "rewarded", "subscription_reward_granted_at": "t3", "first_subscription_type": "month"},
+    ]))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/referrals/me", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["code"] == "ABC1234"
+    assert data["link"].endswith("/r/ABC1234")
+    assert data["referred_count"] == 2
+    assert data["rewarded_count"] == 1
+    assert data["referrals"][0]["label"] == "Filleul #1"
+    # No PII anywhere in the per-referral summary.
+    assert "email" not in data["referrals"][0]
+    assert "referred_user_id" not in data["referrals"][0]
+
+
+def test_associate_referral_success_grants_signup_bonus(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_referral_code_owner", AsyncMock(return_value="referrer-1"))
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_auth_user_created_at", AsyncMock(return_value=datetime.now(timezone.utc)))
+    monkeypatch.setattr(app, "supabase_insert_referral", AsyncMock(return_value=({"id": "ref-1"}, True)))
+    batch_mock = AsyncMock(return_value={"id": "batch-1"})
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+    update_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_update_referral_row", update_mock)
+    notify_mock = AsyncMock()
+    monkeypatch.setattr(app, "_create_notification", notify_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/referrals/associate", json={"referral_code": "ABC1234"}, headers=_auth_headers("referee-1"),
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["associated"] is True
+    batch_mock.assert_awaited_once_with(
+        "referee-1", app.REFERRAL_SIGNUP_BONUS_CREDITS, "REFERRAL_SIGNUP",
+        app.PROMOTIONAL_CREDITS_EXPIRATION_DAYS, source_reference="ref-1",
+    )
+    update_mock.assert_awaited_once()
+    assert notify_mock.await_count == 2
+
+
+def test_associate_referral_blocks_self_referral(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_referral_code_owner", AsyncMock(return_value="u1"))
+    insert_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_referral", insert_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/referrals/associate", json={"referral_code": "ABC1234"}, headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["associated"] is False
+    insert_mock.assert_not_awaited()
+
+
+def test_associate_referral_idempotent_when_already_referred(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_referral_code_owner", AsyncMock(return_value="referrer-1"))
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value={"id": "existing-ref"}))
+    insert_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_referral", insert_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/referrals/associate", json={"referral_code": "ABC1234"}, headers=_auth_headers("referee-1"),
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["associated"] is False
+    insert_mock.assert_not_awaited()
+
+
+def test_associate_referral_rejects_unknown_code(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_referral_code_owner", AsyncMock(return_value=None))
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/referrals/associate", json={"referral_code": "NOPE000"}, headers=_auth_headers("referee-1"),
+        )
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["code"] == "referral_code_not_found"
+
+
+def test_associate_referral_rejects_account_too_old(monkeypatch):
+    # An existing user who clicks a referral link long after signing up
+    # must never retroactively get a referrer attached.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "REFERRAL_ASSOCIATION_WINDOW_MINUTES", 60)
+    monkeypatch.setattr(app, "supabase_get_referral_code_owner", AsyncMock(return_value="referrer-1"))
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_auth_user_created_at", AsyncMock(
+        return_value=datetime.now(timezone.utc) - timedelta(days=30)
+    ))
+    insert_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_referral", insert_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/referrals/associate", json={"referral_code": "ABC1234"}, headers=_auth_headers("referee-1"),
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["associated"] is False
+    insert_mock.assert_not_awaited()
+
+
+def test_associate_referral_rejects_when_account_age_unknown(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_referral_code_owner", AsyncMock(return_value="referrer-1"))
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_auth_user_created_at", AsyncMock(return_value=None))
+    insert_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_referral", insert_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/referrals/associate", json={"referral_code": "ABC1234"}, headers=_auth_headers("referee-1"),
+        )
+
+    assert resp.json()["associated"] is False
+    insert_mock.assert_not_awaited()
+
+
+def test_invalidate_referral_requires_admin_secret(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "ADMIN_API_SECRET", "top-secret")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+
+    with TestClient(app.app) as client:
+        resp = client.post("/api/admin/referrals/ref-1/invalidate", json={"reason": "fraud"})
+
+    assert resp.status_code == 403
+
+
+def test_invalidate_referral_succeeds_with_correct_secret(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "ADMIN_API_SECRET", "top-secret")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_invalidate_referral", AsyncMock(return_value={"id": "ref-1", "status": "invalid"}))
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/admin/referrals/ref-1/invalidate", json={"reason": "fraud"},
+            headers={"x-admin-secret": "top-secret"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "invalid"
+
+
+# ---------------------------------------------------------------------------
+# In-app notifications
+# ---------------------------------------------------------------------------
+
+def test_list_notifications_endpoint_returns_items_and_unread_count(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_list_notifications", AsyncMock(return_value=([{"id": "n1"}], 3)))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/notifications", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"items": [{"id": "n1"}], "unread_count": 3}
+
+
+def test_mark_notification_read_endpoint_404_when_not_found(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_mark_notification_read", AsyncMock(return_value=None))
+
+    with TestClient(app.app) as client:
+        resp = client.post("/api/notifications/n1/read", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 404
+
+
+def test_mark_all_notifications_read_endpoint_returns_count(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_mark_all_notifications_read", AsyncMock(return_value=5))
+
+    with TestClient(app.app) as client:
+        resp = client.post("/api/notifications/read-all", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"marked_read": 5}
 
 
 # ---------------------------------------------------------------------------
@@ -7594,6 +8063,7 @@ def test_get_user_credits_reports_has_analytics_access(monkeypatch):
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value={"priorite": 3, "abonnement": "ultimate-plan"}))
     monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 100, "stockage": 1}))
+    monkeypatch.setattr(app, "supabase_list_active_promotional_credit_batches", AsyncMock(return_value=[]))
 
     with TestClient(app.app) as client:
         resp = client.get("/api/user/credits", headers=_auth_headers("u1"))

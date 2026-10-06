@@ -1,17 +1,19 @@
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useEffect, useState } from "react";
 import { getSupabaseBrowserClient } from "../lib/supabase-browser";
 import { useAuth } from "../state/AuthContext";
 import AuthLayout from "../layouts/AuthLayout";
 import "../styles/auth-legacy.css";
 import { useTranslation } from "../state/LanguageContext";
+import { associateReferralCode, getStoredReferralCode } from "../lib/referral";
 
 export default function Login() {
     const { t } = useTranslation();
     const navigate = useNavigate();
     const { isAuthenticated, loading: authLoading } = useAuth();
+    const [searchParams] = useSearchParams();
 
-    const [mode, setMode] = useState("signin");
+    const [mode, setMode] = useState(() => (searchParams.get("mode") === "signup" ? "signup" : "signin"));
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
     const [loading, setLoading] = useState(false);
@@ -48,7 +50,7 @@ export default function Login() {
                 return;
             }
 
-            const { error: signUpError } = await supabase.auth.signUp({
+            const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
                 email,
                 password,
             });
@@ -56,6 +58,13 @@ export default function Login() {
             if (signUpError) {
                 setError(signUpError.message);
                 return;
+            }
+
+            const referralCode = getStoredReferralCode();
+            if (referralCode && signUpData?.user?.id) {
+                // Fire-and-forget: never block navigation on this, and the
+                // backend decides whether the reward is actually honored.
+                associateReferralCode(signUpData.user.id, referralCode);
             }
 
             setSuccess(t("app.accountCreate","Compte cree. Verifie ton email si la confirmation est activee."));

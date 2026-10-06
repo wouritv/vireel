@@ -126,6 +126,22 @@ from supabase_request import (
 	list_anonymous_story_dates_since as supabase_list_anonymous_story_dates_since,
 	list_film_summary_dates_since as supabase_list_film_summary_dates_since,
 	SUPABASE_USER_DATA_HISTORY_TABLE,
+	get_or_create_referral_code as supabase_get_or_create_referral_code,
+	get_referral_code_owner as supabase_get_referral_code_owner,
+	get_referral_by_referred_user as supabase_get_referral_by_referred_user,
+	insert_referral as supabase_insert_referral,
+	update_referral_row as supabase_update_referral_row,
+	claim_referral_subscription_reward as supabase_claim_referral_subscription_reward,
+	list_referrals_by_referrer as supabase_list_referrals_by_referrer,
+	invalidate_referral as supabase_invalidate_referral,
+	get_auth_user_created_at as supabase_get_auth_user_created_at,
+	insert_promotional_credit_batch as supabase_insert_promotional_credit_batch,
+	list_active_promotional_credit_batches as supabase_list_active_promotional_credit_batches,
+	revoke_promotional_credit_batches_by_source_reference as supabase_revoke_promotional_credit_batches_by_source_reference,
+	insert_notification as supabase_insert_notification,
+	list_notifications as supabase_list_notifications,
+	mark_notification_read as supabase_mark_notification_read,
+	mark_all_notifications_read as supabase_mark_all_notifications_read,
 )
 import anonymous_stories
 import email_templates
@@ -315,6 +331,22 @@ SOCIAL_PUBLISH_SCHEDULER_INTERVAL_SECONDS = int(os.environ.get("SOCIAL_PUBLISH_S
 # this only decides how late a refill can run past its due date, not
 # whether it runs at all (see process_annual_credit_refill_jobs).
 ANNUAL_CREDIT_REFILL_INTERVAL_SECONDS = int(os.environ.get("ANNUAL_CREDIT_REFILL_INTERVAL_SECONDS", str(24 * 3600)))
+# Referral program -- the backend is the sole source of truth for these
+# amounts (see /api/referrals/config); the frontend never hardcodes them.
+REFERRAL_SIGNUP_BONUS_CREDITS = float(os.environ.get("REFERRAL_SIGNUP_BONUS_CREDITS", "50") or "50")
+REFERRAL_MONTHLY_BONUS_CREDITS = float(os.environ.get("REFERRAL_MONTHLY_BONUS_CREDITS", "100") or "100")
+REFERRAL_ANNUAL_BONUS_CREDITS = float(os.environ.get("REFERRAL_ANNUAL_BONUS_CREDITS", "300") or "300")
+PROMOTIONAL_CREDITS_EXPIRATION_DAYS = int(os.environ.get("PROMOTIONAL_CREDITS_EXPIRATION_DAYS", "60") or "60")
+# This codebase has no signup webhook/trigger on auth.users (accounts are
+# created directly by the frontend's Supabase Auth SDK call, never via a
+# backend endpoint) -- the referral-association endpoint instead verifies
+# "is this account genuinely brand new" by checking the Auth account's own
+# created_at against this grace window (see get_auth_user_created_at),
+# generous enough to cover an OAuth provider round-trip plus any page
+# reload, while still rejecting an existing account trying to retroactively
+# attach a referrer long after signing up.
+REFERRAL_ASSOCIATION_WINDOW_MINUTES = int(os.environ.get("REFERRAL_ASSOCIATION_WINDOW_MINUTES", "60") or "60")
+ADMIN_API_SECRET = os.environ.get("ADMIN_API_SECRET", "")
 DISABLE_YOUTUBE_URL = os.environ.get("DISABLE_YOUTUBE_URL", "false").lower() in ("1", "true", "yes")
 HIDE_SOCIAL_PLATFORMS = os.environ.get("HIDE_SOCIAL_PLATFORMS", "false").lower() in ("1", "true", "yes")
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
@@ -9026,6 +9058,59 @@ def _sync_customer_default_payment_method(stripe_subscription_id: Optional[str],
         logger.warning("Failed to sync default payment method for customer %s", stripe_customer_id)
 
 
+async def _create_notification(
+    user_id: str, type_: str, title: str, body: str = "", data: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Best-effort in-app notification -- must never fail the business
+    operation that triggered it (signup association, reward grant, ...)."""
+    try:
+        await supabase_insert_notification(user_id, type_, title, body, data or {})
+    except Exception:
+        logger.warning("Failed to create notification %s for user %s", type_, user_id, exc_info=True)
+
+
+async def _maybe_reward_referrer_for_first_subscription(
+    referred_user_id: str, billing_interval: str, souscription_id: str,
+) -> None:
+    """Grants the referrer's reward the first time (and only the first
+    time -- see claim_referral_subscription_reward's conditional-update
+    idempotency guard, the same compare-and-swap pattern already used
+    elsewhere in this file for debit concurrency) their referee pays for a
+    plan. Only ever called from _handle_subscription_purchase for a
+    confirmed first-ever paid subscription -- never on a renewal or plan
+    change, and never on a failed/pending payment."""
+    referral = await supabase_get_referral_by_referred_user(referred_user_id)
+    if not referral or referral.get("status") == "invalid":
+        return
+
+    subscription_type = "year" if billing_interval == "year" else "month"
+    reward_amount = REFERRAL_ANNUAL_BONUS_CREDITS if subscription_type == "year" else REFERRAL_MONTHLY_BONUS_CREDITS
+    source = "REFERRAL_ANNUAL_SUBSCRIPTION" if subscription_type == "year" else "REFERRAL_MONTHLY_SUBSCRIPTION"
+
+    claimed = await supabase_claim_referral_subscription_reward(referral["id"], subscription_type, souscription_id)
+    if not claimed:
+        return
+
+    referrer_user_id = referral["referrer_user_id"]
+    batch = await supabase_insert_promotional_credit_batch(
+        referrer_user_id, reward_amount, source, PROMOTIONAL_CREDITS_EXPIRATION_DAYS,
+        source_reference=souscription_id,
+    )
+    await supabase_update_referral_row(referral["id"], {"subscription_reward_batch_id": batch.get("id")})
+
+    label = "annuel" if subscription_type == "year" else "mensuel"
+    await _create_notification(
+        referrer_user_id, "referral_reward_granted", "Ton ami s'est abonné !",
+        f"Tu as reçu {reward_amount:.0f} crédits promotionnels car ton ami a choisi un abonnement {label}.",
+        {"amount": reward_amount, "subscription_type": subscription_type},
+    )
+    await _create_notification(
+        referred_user_id, "referral_referrer_rewarded", "Merci pour ton abonnement !",
+        "Grâce à toi, ton parrain vient de recevoir une récompense.",
+        {},
+    )
+
+
 async def _handle_subscription_purchase(ctx: dict) -> dict:
     """Handle a standard plan subscription checkout."""
     abonnement = ctx["metadata"].get("abonnement")
@@ -9034,6 +9119,17 @@ async def _handle_subscription_purchase(ctx: dict) -> dict:
 
     if await supabase_get_souscription_by_reference(ctx["payment_reference"]):
         return {"received": True, "duplicate": True}
+
+    previous_souscription_id = ctx["metadata"].get("previous_souscription_id")
+    # Must be resolved BEFORE inserting the new souscription row below,
+    # which would otherwise make this user look like they already have a
+    # prior subscription (themselves). A plan change via a fresh Checkout
+    # (previous_souscription_id set) is never a first subscription either
+    # -- that path only exists for a user who already has one.
+    is_first_subscription = False
+    if not previous_souscription_id:
+        prior_paid_subscription = await supabase_get_latest_user_paid_subscription(ctx["user_id"])
+        is_first_subscription = not prior_paid_subscription
 
     _sync_customer_default_payment_method(ctx.get("stripe_subscription_id"), ctx.get("stripe_customer_id"))
 
@@ -9052,7 +9148,6 @@ async def _handle_subscription_purchase(ctx: dict) -> dict:
         billing_interval=billing_interval,
     )
 
-    previous_souscription_id = ctx["metadata"].get("previous_souscription_id")
     if previous_souscription_id:
         # Changing plan from a non-Stripe-recurring subscription goes
         # through a fresh Checkout (see change_souscription_plan /
@@ -9076,6 +9171,12 @@ async def _handle_subscription_purchase(ctx: dict) -> dict:
         billing_interval=billing_interval,
         period_start=ctx["payment_date"],
     )
+
+    if is_first_subscription:
+        await _maybe_reward_referrer_for_first_subscription(
+            ctx["user_id"], billing_interval, str(new_souscription.get("id") or ctx["payment_reference"]),
+        )
+
     _send_transactional_email(
         ctx["customer_email"], "subscription_purchase",
         amount=ctx["amount_total"], plan_name=ctx["metadata"].get("plan_name") or abonnement,
@@ -9191,6 +9292,28 @@ def _handle_subscription_payment_failed(invoice: "stripe.Invoice") -> dict:
     return {"received": True}
 
 
+async def _handle_charge_refund_or_dispute(stripe_object: Any, reason: str) -> dict:
+    """A refund or chargeback landing on the exact charge that funded a
+    subscription payment -- revoke whatever's still available in any
+    promotional-credit batch a referral reward created from that payment
+    (see section 11 -- never claws back credits already spent, see
+    revoke_promotional_credit_batches_by_source_reference). A charge/
+    dispute unrelated to any referral reward is a no-op here (there's
+    simply nothing in promotional_credit_batches to match it)."""
+    payment_intent_id = _stripe_field(stripe_object, "payment_intent")
+    if not payment_intent_id:
+        return {"received": True, "ignored": "no_payment_intent"}
+
+    souscription = await supabase_get_souscription_by_reference(str(payment_intent_id))
+    if not souscription:
+        return {"received": True, "ignored": "no_matching_souscription"}
+
+    revoked = await supabase_revoke_promotional_credit_batches_by_source_reference(
+        str(souscription["id"]), reason,
+    )
+    return {"received": True, "revoked_batches": revoked}
+
+
 # ---------------------------------------------------------------------------
 # Route
 # ---------------------------------------------------------------------------
@@ -9198,8 +9321,9 @@ def _handle_subscription_payment_failed(invoice: "stripe.Invoice") -> dict:
 @app.post("/api/stripe/webhook", responses={400: {"description": "Bad Request"}, 503: {"description": "Service Unavailable"}})
 async def stripe_webhook(request: Request):
     """Handle Stripe checkout.session.completed (new purchase/subscription),
-    invoice.paid (automatic subscription renewal) and invoice.payment_failed
-    (failed automatic renewal charge) events."""
+    invoice.paid (automatic subscription renewal), invoice.payment_failed
+    (failed automatic renewal charge), charge.refunded and
+    charge.dispute.created (referral-reward clawback) events."""
     _require_stripe_ready()
     if not STRIPE_WEBHOOK_SECRET:
         raise HTTPException(status_code=503, detail="Stripe webhook secret is not configured")
@@ -9221,6 +9345,12 @@ async def stripe_webhook(request: Request):
 
     if event.type == "invoice.payment_failed":
         return _handle_subscription_payment_failed(event.data.object)
+
+    if event.type == "charge.refunded":
+        return await _handle_charge_refund_or_dispute(event.data.object, "refund")
+
+    if event.type == "charge.dispute.created":
+        return await _handle_charge_refund_or_dispute(event.data.object, "chargeback")
 
     if event.type != "checkout.session.completed":
         return {"received": True, "ignored": event.type}
@@ -9832,14 +9962,26 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
     has_active_subscription = bool(abonnement)
 
     data = await supabase_get_user_data(user_id)
+    promotional_batches = await supabase_list_active_promotional_credit_batches(user_id)
+    promotional_credit = sum(float(batch.get("amount_remaining") or 0.0) for batch in promotional_batches)
+    # Soonest-expiry-first, matching the batches' own FEFO consumption
+    # order -- the wallet UI (section 15) shows this so a user understands
+    # why Vireel is about to consume certain credits before others.
+    promotional_credit_expirations = [
+        {"amount": float(batch.get("amount_remaining") or 0.0), "expires_at": batch.get("expires_at")}
+        for batch in promotional_batches
+    ]
+
     if not data:
         return {
             "credit":   0.0,
             "stockage": 0.0,
             "credit_max": 0.0,
             "stockage_max": 0.0,
+            "promotional_credit": promotional_credit,
+            "promotional_credit_expirations": promotional_credit_expirations,
             "storage_overage_tolerance_percent": STORAGE_OVERAGE_TOLERANCE_PERCENT,
-            "has_credits": False,
+            "has_credits": promotional_credit > 0,
             "has_active_subscription": has_active_subscription,
             "has_analytics_access": bool(abonnement) and int(abonnement.get("priorite") or 1) >= 2,
             "abo_costs": {
@@ -9874,8 +10016,10 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
         "stockage": storage,
         "credit_max": credit_max,
         "stockage_max": storage_max,
+        "promotional_credit": promotional_credit,
+        "promotional_credit_expirations": promotional_credit_expirations,
         "storage_overage_tolerance_percent": STORAGE_OVERAGE_TOLERANCE_PERCENT,
-        "has_credits": credit > 0,
+        "has_credits": (credit + promotional_credit) > 0,
         "has_active_subscription": has_active_subscription,
         "has_analytics_access": bool(abonnement) and int(abonnement.get("priorite") or 1) >= 2,
         "abo_costs": abo_costs,
@@ -9905,6 +10049,220 @@ async def get_user_history(
         "page":      page,
         "page_size": page_size,
     }
+
+
+# ---------------------------------------------------------------------------
+# Referral program
+# ---------------------------------------------------------------------------
+
+class AssociateReferralRequest(BaseModel):
+    referral_code: str
+
+
+@app.get("/api/referrals/config")
+async def get_referral_config():
+    """Public reward configuration -- the frontend must never hardcode
+    these amounts (see spec section 3): it always reads them from here so
+    the "invite a friend" copy stays in sync with whatever the backend
+    actually grants. A later env var change only ever affects REWARDS
+    GRANTED AFTER that change -- see insert_promotional_credit_batch,
+    which always fixes amount_initial/expires_at at grant time."""
+    return {
+        "signup_bonus_credits": REFERRAL_SIGNUP_BONUS_CREDITS,
+        "monthly_bonus_credits": REFERRAL_MONTHLY_BONUS_CREDITS,
+        "annual_bonus_credits": REFERRAL_ANNUAL_BONUS_CREDITS,
+        "expiration_days": PROMOTIONAL_CREDITS_EXPIRATION_DAYS,
+    }
+
+
+@app.get("/api/referrals/me", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
+async def get_my_referrals(request: Request, user_id: Annotated[str, Depends(get_user_id_header)]):
+    """The authenticated user's own referral link, plus a privacy-minded
+    summary of who they've referred (section 14: ordinal labels only, no
+    referee email/name -- see dashboard/src/pages/ParrainagePage.jsx)."""
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    code = await supabase_get_or_create_referral_code(user_id)
+    default_base_url = _frontend_base_url(request)
+
+    rows = await supabase_list_referrals_by_referrer(user_id)
+    referrals = [
+        {
+            "label": f"Filleul #{index}",
+            "created_at": row.get("created_at"),
+            "status": row.get("status"),
+            "first_subscription_type": row.get("first_subscription_type"),
+            "subscription_reward_granted_at": row.get("subscription_reward_granted_at"),
+        }
+        for index, row in enumerate(rows, start=1)
+    ]
+
+    return {
+        "code": code,
+        "link": f"{default_base_url}/r/{code}",
+        "referred_count": len(rows),
+        "rewarded_count": sum(1 for row in rows if row.get("subscription_reward_granted_at")),
+        "referrals": referrals,
+    }
+
+
+def _get_client_ip(request: Request) -> str:
+    client_ip = request.client.host if request.client else "unknown"
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        client_ip = fwd.split(",")[0].strip()
+    return client_ip
+
+
+@app.post("/api/referrals/associate", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def associate_referral(
+    request: Request, payload: AssociateReferralRequest, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Associates the authenticated user with a referrer and grants the
+    referee's signup bonus -- exactly once per user, ever. Called by the
+    frontend right after a genuinely new signup (email/password or
+    OAuth) completes; the association itself is still verified
+    server-side (see get_auth_user_created_at) rather than trusted from
+    the frontend's own "is this a new account" guess, since the frontend
+    is never authoritative for a reward (section 12).
+
+    Idempotent and deliberately unrevealing: a repeat call, a call for an
+    already-referred account, or a self-referral attempt all come back as
+    {"associated": false} rather than a distinct error that would let a
+    caller probe whether a code/account exists. Every grant and every
+    suspicious rejection (self-referral, stale account) is logged with
+    the caller's IP/user-agent -- not to block in real time, but so a
+    later audit pass (mass account creation, the same IP farming many
+    referred accounts, ...) has something to look at (section 12)."""
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    code = (payload.referral_code or "").strip()
+    client_ip = _get_client_ip(request)
+    user_agent = request.headers.get("user-agent", "")
+    if not code:
+        raise _coded_error(400, "invalid_referral_code", "Invalid referral code")
+
+    referrer_user_id = await supabase_get_referral_code_owner(code)
+    if not referrer_user_id:
+        raise _coded_error(404, "referral_code_not_found", "Referral code not found")
+
+    if referrer_user_id == user_id:
+        logger.warning(
+            "Self-referral attempt blocked for user %s (code=%s, ip=%s, ua=%s)",
+            user_id, code, client_ip, user_agent,
+        )
+        return {"associated": False}
+
+    if await supabase_get_referral_by_referred_user(user_id):
+        return {"associated": False}
+
+    created_at = await supabase_get_auth_user_created_at(user_id)
+    if created_at is None or (datetime.now(timezone.utc) - created_at) > timedelta(minutes=REFERRAL_ASSOCIATION_WINDOW_MINUTES):
+        logger.warning(
+            "Referral association rejected for user %s: account not new enough "
+            "(created_at=%s, ip=%s, ua=%s)",
+            user_id, created_at, client_ip, user_agent,
+        )
+        return {"associated": False}
+
+    referral, created = await supabase_insert_referral(referrer_user_id, user_id, code)
+    if not created or not referral:
+        return {"associated": False}
+
+    logger.info(
+        "Referral signup bonus granted: referrer=%s referee=%s code=%s ip=%s ua=%s",
+        referrer_user_id, user_id, code, client_ip, user_agent,
+    )
+
+    batch = await supabase_insert_promotional_credit_batch(
+        user_id, REFERRAL_SIGNUP_BONUS_CREDITS, "REFERRAL_SIGNUP", PROMOTIONAL_CREDITS_EXPIRATION_DAYS,
+        source_reference=str(referral["id"]),
+    )
+    await supabase_update_referral_row(referral["id"], {
+        "signup_reward_granted_at": datetime.now(timezone.utc).isoformat(),
+        "signup_reward_batch_id": batch.get("id"),
+    })
+
+    await _create_notification(
+        user_id, "referral_signup_bonus", "Bienvenue sur Vireel !",
+        f"Tu as reçu {REFERRAL_SIGNUP_BONUS_CREDITS:.0f} crédits promotionnels de bienvenue.",
+        {"amount": REFERRAL_SIGNUP_BONUS_CREDITS},
+    )
+    await _create_notification(
+        referrer_user_id, "referral_referee_joined", "Un ami a rejoint Vireel !",
+        "Quelqu'un vient de s'inscrire grâce à ton lien de parrainage.",
+        {},
+    )
+
+    return {"associated": True, "signup_bonus_credits": REFERRAL_SIGNUP_BONUS_CREDITS}
+
+
+def _require_admin_secret(x_admin_secret: Annotated[Optional[str], Header()] = None) -> None:
+    """Minimal shared-secret gate for the handful of administrative
+    endpoints this app has (see section 12: a referral can be
+    invalidated administratively) -- consistent with this codebase's
+    other secret-based protections (e.g. the Stripe webhook signature)
+    rather than a new RBAC system for one endpoint."""
+    if not ADMIN_API_SECRET or not x_admin_secret or not secrets.compare_digest(x_admin_secret, ADMIN_API_SECRET):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+class InvalidateReferralRequest(BaseModel):
+    reason: str
+
+
+@app.post("/api/admin/referrals/{referral_id}/invalidate", responses={403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def invalidate_referral_endpoint(
+    referral_id: str, payload: InvalidateReferralRequest, _admin: Annotated[None, Depends(_require_admin_secret)],
+):
+    """Administrative kill switch for a fraudulent/abusive referral --
+    never reachable by a normal user; see _require_admin_secret."""
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    row = await supabase_invalidate_referral(referral_id, payload.reason)
+    if not row:
+        raise _coded_error(404, "referral_not_found", "Referral not found")
+    return row
+
+
+# ---------------------------------------------------------------------------
+# In-app notifications (generic, not email -- referrals are the first
+# source of these, not the only one)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/notifications", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
+async def list_notifications_endpoint(
+    user_id: Annotated[str, Depends(get_user_id_header)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    unread_only: bool = False,
+):
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+    items, unread_count = await supabase_list_notifications(user_id, limit=limit, unread_only=unread_only)
+    return {"items": items, "unread_count": unread_count}
+
+
+@app.post("/api/notifications/{notification_id}/read", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def mark_notification_read_endpoint(
+    notification_id: str, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+    row = await supabase_mark_notification_read(notification_id, user_id)
+    if not row:
+        raise _coded_error(404, "notification_not_found", "Notification not found")
+    return row
+
+
+@app.post("/api/notifications/read-all", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
+async def mark_all_notifications_read_endpoint(user_id: Annotated[str, Depends(get_user_id_header)]):
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+    count = await supabase_mark_all_notifications_read(user_id)
+    return {"marked_read": count}
 
 
 # ---------------------------------------------------------------------------
