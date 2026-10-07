@@ -13904,6 +13904,27 @@ class FilmSummaryTranslateNarrationRequest(BaseModel):
     narration_language: str
 
 
+def _film_summary_media_urls(row: Dict[str, Any], bucket_name: str) -> Dict[str, str]:
+    """The review panel's video preview and clip-swap picker need the
+    original source video (not just the preview/final render) to let the
+    user see and seek through the whole film -- source_s3_key is always
+    populated by the time analysis finishes (even for a youtube source,
+    see _run_film_summary_analysis_pipeline) and only cleared once the
+    final render completes (_finalize_film_summary_render), so it's
+    reliably available throughout the awaiting_review window. Isolated
+    out of _normalize_film_summary_row to keep that function's cognitive
+    complexity under this codebase's limit (audit: SonarQube
+    python:S3776)."""
+    urls: Dict[str, str] = {}
+    if row.get("source_s3_key"):
+        urls["source_url"] = generate_presigned_url(bucket_name, row["source_s3_key"], expiration=3600)
+    if row.get("preview_s3_key"):
+        urls["preview_url"] = generate_presigned_url(bucket_name, row["preview_s3_key"], expiration=3600)
+    if row.get("final_s3_key"):
+        urls["final_url"] = generate_presigned_url(bucket_name, row["final_s3_key"], expiration=3600)
+    return urls
+
+
 def _normalize_film_summary_row(row: Dict[str, Any], *, include_content: bool = False) -> Dict[str, Any]:
     item = {
         "id": row.get("id"),
@@ -13936,20 +13957,7 @@ def _normalize_film_summary_row(row: Dict[str, Any], *, include_content: bool = 
         item["validation_report"] = row.get("validation_report") or {}
         item["manual_selection"] = row.get("manual_selection") or []
         bucket_name = os.environ.get("AWS_S3_BUCKET", "my-clips-bucket")
-        # The review panel's video preview and clip-swap picker need the
-        # original source video (not just the preview/final render) to let
-        # the user see and seek through the whole film -- source_s3_key is
-        # always populated by the time analysis finishes (even for a
-        # youtube source, see _run_film_summary_analysis_pipeline) and only
-        # cleared once the final render completes
-        # (_finalize_film_summary_render), so it's reliably available
-        # throughout the awaiting_review window.
-        if row.get("source_s3_key"):
-            item["source_url"] = generate_presigned_url(bucket_name, row["source_s3_key"], expiration=3600)
-        if row.get("preview_s3_key"):
-            item["preview_url"] = generate_presigned_url(bucket_name, row["preview_s3_key"], expiration=3600)
-        if row.get("final_s3_key"):
-            item["final_url"] = generate_presigned_url(bucket_name, row["final_s3_key"], expiration=3600)
+        item.update(_film_summary_media_urls(row, bucket_name))
     return item
 
 
