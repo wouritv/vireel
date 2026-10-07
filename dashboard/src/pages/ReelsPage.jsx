@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowLeft, Play, Plus, Download, Loader2, Scissors, Search, Share2, Trash2, X } from "lucide-react";
+import { Play, Plus, Download, Loader2, Scissors, Search, Share2, Trash2, X } from "lucide-react";
 import { fetchAppConfig, getApiUrl, getDefaultHideSocialPlatforms } from "../config";
 import { useAuth } from "../state/AuthContext";
 import { useUserCredits } from "../state/UserCreditsContext";
@@ -8,6 +8,7 @@ import ResultCard from "../components/ResultCard";
 import SharePostModal from "../components/SharePostModal";
 import MobileFilterDropdown from "../components/MobileFilterDropdown";
 import GridThumbnail from "../components/GridThumbnail";
+import Breadcrumbs from "../components/Breadcrumbs";
 import { toResultCardClip } from "../lib/clips";
 import { statusLabel, statusClass } from "../lib/status";
 import { getAuthHeaders } from "../lib/apiAuth";
@@ -355,13 +356,23 @@ export default function ReelsPage({ projectId = "" }) {
         : 0;
     const previewJobId = typeof previewItem?.reel_job_id === "string" ? previewItem.reel_job_id : "";
 
+    const breadcrumbItems = projectId
+        ? [
+            { label: t("breadcrumbs.dashboard", "Dashboard"), href: "/dashboard" },
+            { label: t("breadcrumbs.reels", "Reels"), href: "/dashboard/reels" },
+            { label: projectMeta?.name || t("projects.reelProjectTitle", "Projet Reel") },
+        ]
+        : [];
+
     return (
         <div className="flex-1 overflow-y-auto p-8 space-y-6">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-                <div>
-                    <h1 className="text-3xl font-black tracking-tight">
-                        {projectId ? (projectMeta?.name || t('projects.reelProjectTitle', 'Projet Reel')) : t('reels.title', 'Generated reels')}
-                    </h1>
+                <div className="min-w-0 space-y-2">
+                    {projectId ? (
+                        <Breadcrumbs items={breadcrumbItems} ariaLabel={t('breadcrumbs.ariaLabel', 'Breadcrumb')} />
+                    ) : (
+                        <h1 className="text-3xl font-black tracking-tight">{t('reels.title', 'Generated reels')}</h1>
+                    )} <br/>
                     <p className="mt-2 text-sm text-slate-500 dark:text-zinc-400">
                         {projectId ? t('projects.reelProjectSubtitle', 'Contenus generes pour ce projet.') : t('reels.subtitle', 'Search, filter, delete, share and download.')}
                     </p>
@@ -376,14 +387,6 @@ export default function ReelsPage({ projectId = "" }) {
                         >
                             <Scissors size={14} />
                             {t('projects.manualCreationButton', 'Creation manuelle')}
-                        </button>
-                        <button
-                            type="button"
-                            onClick={() => navigate("/dashboard/reels")}
-                            className="inline-flex items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
-                        >
-                            <ArrowLeft size={14} />
-                            {t('projects.backToProjects', 'Retour aux projets')}
                         </button>
                     </div>
                 ) : (

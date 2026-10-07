@@ -5570,6 +5570,11 @@ def test_create_stripe_checkout_session_reuses_existing_stripe_customer(monkeypa
 
 def test_annual_price_for_plan_applies_discount_rate():
     import app as app_module
+    assert app_module._annual_price_for_plan({"price": 10, "reduction_annuelle": 5}) == 114.0
+
+
+def test_annual_price_for_plan_accepts_legacy_fractional_discount_during_rollout():
+    import app as app_module
     assert app_module._annual_price_for_plan({"price": 10, "reduction_annuelle": 0.05}) == 114.0
 
 
@@ -5580,7 +5585,7 @@ def test_annual_price_for_plan_defaults_to_no_discount():
 
 def test_annual_price_for_plan_clamps_out_of_range_rate():
     import app as app_module
-    assert app_module._annual_price_for_plan({"price": 10, "reduction_annuelle": 1.5}) == 0.0
+    assert app_module._annual_price_for_plan({"price": 10, "reduction_annuelle": 150}) == 0.0
     assert app_module._annual_price_for_plan({"price": 10, "reduction_annuelle": -1}) == 120.0
 
 
@@ -5592,7 +5597,7 @@ def test_create_stripe_checkout_session_annual_interval_uses_discounted_price(mo
     monkeypatch.setattr(app, "stripe", fake_stripe)
     monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "plan-1", "name": "Pro", "price": 10.0, "reduction_annuelle": 0.05}))
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "plan-1", "name": "Pro", "price": 10.0, "reduction_annuelle": 5}))
     monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value=None))
 
     payload = app.StripeCheckoutRequest(plan_id="plan-1", billing_interval="year")
@@ -5616,7 +5621,7 @@ def test_create_stripe_checkout_session_defaults_to_monthly_interval(monkeypatch
     monkeypatch.setattr(app, "stripe", fake_stripe)
     monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "plan-1", "name": "Pro", "price": 10.0, "reduction_annuelle": 0.05}))
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "plan-1", "name": "Pro", "price": 10.0, "reduction_annuelle": 5}))
     monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value=None))
 
     payload = app.StripeCheckoutRequest(plan_id="plan-1")

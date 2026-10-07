@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowLeft, Download, Loader2, Play, Plus, Search, Share2, Trash2, X } from "lucide-react";
+import { Download, Loader2, Play, Plus, Search, Share2, Trash2, X } from "lucide-react";
 import { fetchAppConfig, getApiUrl, getDefaultHideSocialPlatforms } from "../config";
 import { useAuth } from "../state/AuthContext";
 import { useUserCredits } from "../state/UserCreditsContext";
@@ -8,6 +8,7 @@ import ResultCard from "../components/ResultCard";
 import SharePostModal from "../components/SharePostModal";
 import MobileFilterDropdown from "../components/MobileFilterDropdown";
 import GridThumbnail from "../components/GridThumbnail";
+import Breadcrumbs from "../components/Breadcrumbs";
 import { useTranslation } from "../state/LanguageContext";
 import { statusClass, statusLabel } from "../lib/status";
 import { getAuthHeaders } from "../lib/apiAuth";
@@ -355,29 +356,29 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
     const previewClip = previewItem ? toResultCardClipFromCaption(previewItem, previewUrl) : null;
     const previewClipIndex = Number.isFinite(Number(previewItem?.caption_clip_index)) ? Number(previewItem?.caption_clip_index) : 0;
     const previewJobId = typeof previewItem?.caption_job_id === "string" ? previewItem.caption_job_id : "";
+    const breadcrumbItems = projectId
+        ? [
+            { label: t("breadcrumbs.dashboard", "Dashboard"), href: "/dashboard" },
+            { label: t("breadcrumbs.captions", "Captions"), href: "/dashboard/captions" },
+            { label: projectMeta?.name || t("projects.captionProjectTitle", "Projet Sous-titres") },
+        ]
+        : [];
 
     return (
         <div className="captions-page-shell flex-1 overflow-y-auto overflow-x-hidden md:overflow-x-visible px-4 py-6 md:p-8 space-y-5 md:space-y-6">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-                <div>
-                    <h1 className="text-2xl md:text-3xl font-black tracking-tight">
-                        {projectId ? (projectMeta?.name || t("projects.captionProjectTitle", "Projet Sous-titres")) : t("common.subtitles", "Sous-titres")}
-                    </h1>
+                <div className="min-w-0 space-y-2">
+                    {projectId ? (
+                        <Breadcrumbs items={breadcrumbItems} ariaLabel={t('breadcrumbs.ariaLabel', 'Breadcrumb')} />
+                    ) : (
+                        <h1 className="text-2xl md:text-3xl font-black tracking-tight">{t("common.subtitles", "Sous-titres")}</h1>
+                    )}
                     <p className="mt-2 text-sm text-slate-500 dark:text-zinc-400">
                         {projectId ? t("projects.captionProjectSubtitle", "Contenu genere pour ce projet.") : t("reels.subtitle2", "Search, filter, delete, share and download.")}
                     </p>
                 </div>
 
-                {projectId ? (
-                    <button
-                        type="button"
-                        onClick={() => navigate("/dashboard/captions")}
-                        className="inline-flex items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
-                    >
-                        <ArrowLeft size={14} />
-                        {t("projects.backToProjects", "Retour aux projets")}
-                    </button>
-                ) : (
+                {projectId ? null : (
                     <button
                         type="button"
                         onClick={() => {

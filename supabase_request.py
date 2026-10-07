@@ -239,6 +239,41 @@ async def update_reel_media_by_job_clip(
 	return rows[0]
 
 
+async def update_reel_base_media_by_job_clip(
+	job_id: str,
+	clip_index: int,
+	reel_base_url: str,
+	reel_base_s3_key: Optional[str] = None,
+	user_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+	"""Persist a reel baseline media reference by (job_id, clip_index)."""
+	if not job_id or clip_index is None or not reel_base_url:
+		return None
+
+	client = await get_client()
+	now_iso = datetime.now(timezone.utc).isoformat()
+	payload: Dict[str, Any] = {
+		"reel_base_url": reel_base_url,
+		"reel_base_s3_key": reel_base_s3_key,
+		"reel_updated_at": now_iso,
+	}
+
+	q = (
+		client.table(SUPABASE_REELS_TABLE)
+		.update(payload)
+		.eq("reel_job_id", job_id)
+		.eq("reel_clip_index", int(clip_index))
+		.is_("deleted_at", "null")
+	)
+	if user_id:
+		q = q.eq("reel_user_id", user_id)
+	response = await q.execute()
+	rows = response.data or []
+	if not rows:
+		return None
+	return rows[0]
+
+
 async def soft_delete_reel(reel_id: str, user_id: str) -> bool:
 	client = await get_client()
 	now_iso = datetime.now(timezone.utc).isoformat()

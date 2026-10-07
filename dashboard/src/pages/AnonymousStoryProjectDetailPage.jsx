@@ -1,12 +1,13 @@
-import { useEffect, useRef, useState } from "react";
-import { AlertCircle, ArrowLeft, Check, Copy, Loader2, RefreshCw, Save, Share2 } from "lucide-react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { AlertCircle, Check, Copy, Loader2, RefreshCw, Save, Share2 } from "lucide-react";
+import { useParams } from "react-router-dom";
 import { getApiUrl } from "../config";
 import { getAuthHeaders } from "../lib/apiAuth";
 import { useAuth } from "../state/AuthContext";
 import { useTranslation } from "../state/LanguageContext";
 import { buildFullText, errorMessageForCode, describePlatformPublishError } from "../lib/anonymousStories";
 import { describePublishError } from "../lib/publishErrors";
+import Breadcrumbs from "../components/Breadcrumbs";
 import AnonymousStoryPublishModal from "../components/AnonymousStoryPublishModal";
 
 // Same "project detail" role as ReelProjectDetailPage / CaptionProjectDetailPage:
@@ -18,8 +19,6 @@ export default function AnonymousStoryProjectDetailPage() {
     const { projectId } = useParams();
     const { user } = useAuth();
     const { t } = useTranslation();
-    const navigate = useNavigate();
-
     const [storyId, setStoryId] = useState("");
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState("");
@@ -29,7 +28,6 @@ export default function AnonymousStoryProjectDetailPage() {
     const [savedFlash, setSavedFlash] = useState(false);
 
     const [title, setTitle] = useState("");
-    const titleRef = useRef(null);
     const [hook, setHook] = useState("");
     const [introduction, setIntroduction] = useState("");
     const [story, setStory] = useState("");
@@ -46,6 +44,11 @@ export default function AnonymousStoryProjectDetailPage() {
     const [publishScheduleDate, setPublishScheduleDate] = useState("");
     const [publishing, setPublishing] = useState(false);
     const [publishResult, setPublishResult] = useState(null);
+    const breadcrumbItems = [
+        { label: t("breadcrumbs.dashboard", "Dashboard"), href: "/dashboard" },
+        { label: t("breadcrumbs.anonymousStories", "Anonymous stories"), href: "/dashboard/anonymous-stories" },
+        { label: title || t("anonymousStories.editorTitle", "Temoignage") },
+    ];
 
     const applyStory = (data) => {
         const content = data.edited_content && Object.keys(data.edited_content).length ? data.edited_content : data.generated_content || {};
@@ -87,19 +90,6 @@ export default function AnonymousStoryProjectDetailPage() {
         loadStory();
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [projectId, user?.id]);
-
-    // The title field is a single-row-by-default textarea (see below) that
-    // grows to fit long titles instead of clipping them -- resetting height
-    // to auto before reading scrollHeight lets it shrink back down too, not
-    // just grow. Re-run whenever the text changes, including the async load
-    // above (typing alone would trigger the textarea's own onInput handler,
-    // but the fetched title arrives via setState, not a user keystroke).
-    useEffect(() => {
-        const el = titleRef.current;
-        if (!el) return;
-        el.style.height = "auto";
-        el.style.height = `${el.scrollHeight}px`;
-    }, [title]);
 
     useEffect(() => {
         if (!user?.id) return;
@@ -299,30 +289,10 @@ export default function AnonymousStoryProjectDetailPage() {
     return (
         <div className="flex-1 overflow-y-auto p-8 space-y-6">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-                <div className="min-w-0 flex-1">
-                    <textarea
-                        ref={titleRef}
-                        value={title}
-                        onChange={(e) => setTitle(e.target.value)}
-                        onKeyDown={(e) => {
-                            // The title stays a single logical line (it only
-                            // *wraps* visually to stay fully readable) --
-                            // Enter would otherwise insert a literal newline.
-                            if (e.key === "Enter") e.preventDefault();
-                        }}
-                        placeholder={t("anonymousStories.editorTitle", "Temoignage")}
-                        rows={1}
-                        className="w-full resize-none overflow-hidden bg-transparent text-3xl font-black tracking-tight text-slate-900 dark:text-white focus:outline-none"
-                    />
+                <div className="min-w-0 flex-1 space-y-2">
+                    <Breadcrumbs items={breadcrumbItems} ariaLabel={t('breadcrumbs.ariaLabel', 'Breadcrumb')} />
                 </div>
-                <button
-                    type="button"
-                    onClick={() => navigate("/dashboard/anonymous-stories")}
-                    className="inline-flex shrink-0 items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
-                >
-                    <ArrowLeft size={14} />
-                    {t("anonymousStories.backToList", "Retour aux histoires anonymes")}
-                </button>
+                <div className="shrink-0" />
             </div>
 
             {error ? (

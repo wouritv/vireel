@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertCircle, ArrowLeft, Ban, Download, Loader2, RefreshCw, Share2, Trash2 } from "lucide-react";
+import { AlertCircle, Ban, Download, Loader2, RefreshCw, Share2, Trash2 } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
 import { getApiUrl, fetchAppConfig } from "../config";
 import { getAuthHeaders } from "../lib/apiAuth";
@@ -11,6 +11,7 @@ import { describeMediaAvailability } from "../lib/mediaAvailability";
 import FilmSummaryProcessingPanel from "../components/FilmSummaryProcessingPanel";
 import FilmSummaryReviewPanel from "../components/FilmSummaryReviewPanel";
 import SharePostModal from "../components/SharePostModal";
+import Breadcrumbs from "../components/Breadcrumbs";
 
 // Statuses for which the film summary's own job_id is still meaningful to
 // poll via the generic /api/status/{job_id} endpoint -- "rendering" reuses
@@ -307,6 +308,12 @@ export default function FilmSummaryProjectDetailPage() {
         );
     }
 
+    const breadcrumbItems = [
+        { label: t("breadcrumbs.dashboard", "Dashboard"), href: "/dashboard" },
+        { label: t("breadcrumbs.filmSummaries", "Film summaries"), href: "/dashboard/film-summaries" },
+        { label: filmSummary?.title || t("filmSummary.untitled", "Resume de film sans titre") },
+    ];
+
     const status = filmSummary?.status;
     const cancelButton = (
         <button
@@ -334,19 +341,10 @@ export default function FilmSummaryProjectDetailPage() {
     return (
         <div className="flex-1 overflow-y-auto p-8 space-y-6">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-                <div className="min-w-0">
-                    <h1 className="truncate text-3xl font-black tracking-tight">{filmSummary?.title || t("filmSummary.untitled", "Resume de film sans titre")}</h1>
+                <div className="min-w-0 space-y-2">
+                    <Breadcrumbs items={breadcrumbItems} ariaLabel={t('breadcrumbs.ariaLabel', 'Breadcrumb')} />
                 </div>
-                <div className="flex shrink-0 flex-wrap items-center gap-2">
-                    <button
-                        type="button"
-                        onClick={() => navigate("/dashboard/film-summaries")}
-                        className="inline-flex items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
-                    >
-                        <ArrowLeft size={14} />
-                        {t("filmSummary.backToList", "Retour aux resumes de film")}
-                    </button>
-                </div>
+                <div className="flex shrink-0 flex-wrap items-center gap-2" />
             </div>
 
             {error ? (

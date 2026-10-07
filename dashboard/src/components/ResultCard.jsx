@@ -7,6 +7,7 @@ import VisualsModal from './VisualsModal';
 import SharePostModal from './SharePostModal';
 import { renderInBrowser } from '../lib/renderInBrowser';
 import { inputFilenameFromVideoUrl } from '../lib/clips';
+import { listReelVisuals, applyReelVisuals, resetReelVisuals, ReelVisualsApiError } from '../lib/reelVisuals';
 import { useAuth } from '../state/AuthContext';
 import { getAuthHeaders } from '../lib/apiAuth';
 import { useUserCredits } from '../state/UserCreditsContext';
@@ -143,6 +144,28 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
             })
             .catch(() => {});
     }, [jobId, clipIndexForApi]);
+
+    // Rehydrate manual visuals on page reload so split-screen config remains
+    // available for preview and for subsequent renders (captions/hook/effects).
+    useEffect(() => {
+        if (!hasClipContext) return;
+        listReelVisuals(jobId, clipIndexForApi, user?.id)
+            .then((data) => {
+                const items = Array.isArray(data?.items) ? data.items : [];
+                const visualsLayer = items.map((v) => ({
+                    id: String(v.id || ''),
+                    position: String(v.position || 'TOP').toUpperCase() === 'BOTTOM' ? 'BOTTOM' : 'TOP',
+                    startSec: Number(v.start_time) || 0,
+                    durationSec: Number(v.duration) || 0,
+                    imageUrl: String(v.image_url || ''),
+                }));
+                setActiveLayers((prev) => ({
+                    ...prev,
+                    visuals: visualsLayer,
+                }));
+            })
+            .catch(() => {});
+    }, [hasClipContext, jobId, clipIndexForApi, user?.id]);
 
     // Keep player source in sync when preview URL updates (fixes stale/empty playback in modal previews).
     useEffect(() => {
@@ -298,6 +321,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
                             subtitles: resolveTextLayer(newLayers),
                             hook: newLayers.hook,
                             effects: newLayers.effects,
+                            visuals: newLayers.visuals,
                         });
                         setCurrentVideoUrl(blobUrl);
                         if (videoRef.current) videoRef.current.load();
@@ -461,6 +485,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
                     subtitles: resolveTextLayer(newLayers),
                     hook: newLayers.hook,
                     effects: newLayers.effects,
+                    visuals: newLayers.visuals,
                 });
             } catch (renderError) {
                 console.warn('Client-side captions render failed, falling back to server-side rendering:', renderError);
@@ -552,6 +577,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
                         subtitles: resolveTextLayer(newLayers),
                     hook: newLayers.hook,
                     effects: newLayers.effects,
+                    visuals: newLayers.visuals,
                 });
                 setCurrentVideoUrl(blobUrl);
                 if (videoRef.current) videoRef.current.load();
@@ -623,41 +649,24 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
         setVisualsCreditError('');
         try {
             const effectiveInputUrl = currentVideoUrl?.startsWith('blob:') ? originalVideoUrl : currentVideoUrl;
-            const res = await fetch(getApiUrl(`/api/reels/${jobId}/${clipIndexForApi}/visuals/apply`), {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    ...getAuthHeaders(user?.id),
-                },
-                body: JSON.stringify({
-                    input_filename: inputFilenameFromVideoUrl(currentVideoUrl),
-                    input_url: effectiveInputUrl,
-                }),
+            const data = await applyReelVisuals(jobId, clipIndexForApi, user?.id, {
+                input_filename: inputFilenameFromVideoUrl(currentVideoUrl),
+                input_url: effectiveInputUrl,
             });
-
-            if (!res.ok) {
-                const errText = await res.text();
-                if (res.status === 402) {
-                    const creditMsg = parseApiErrorText(errText) || t('visualsModal.insufficientCredits', 'Crédits insuffisants.');
-                    const creditMsgText = typeof creditMsg === 'string' ? creditMsg : (creditMsg?.message || JSON.stringify(creditMsg));
-                    setVisualsCreditBlocked(true);
-                    setVisualsCreditError(creditMsgText);
-                    setEditError(creditMsgText);
-                    setTimeout(() => setEditError(null), 5000);
-                    return;
-                }
-                const errorDetail = parseApiErrorText(errText);
-                setEditError(typeof errorDetail === 'string' ? errorDetail : (errorDetail?.message || JSON.stringify(errorDetail)));
-                setTimeout(() => setEditError(null), 5000);
-                return;
-            }
-            const data = await res.json();
             if (data.new_video_url) {
                 setCurrentVideoUrl(getApiUrl(data.new_video_url));
                 if (videoRef.current) videoRef.current.load();
                 setShowVisualsModal(false);
             }
         } catch (e) {
+            if (e instanceof ReelVisualsApiError && e.status === 402) {
+                const creditMsgText = e.message || t('visualsModal.insufficientCredits', 'Crédits insuffisants.');
+                setVisualsCreditBlocked(true);
+                setVisualsCreditError(creditMsgText);
+                setEditError(creditMsgText);
+                setTimeout(() => setEditError(null), 5000);
+                return;
+            }
             setEditError(e.message);
             setTimeout(() => setEditError(null), 5000);
         } finally {
@@ -674,27 +683,40 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
         setIsResettingStyles(true);
         setEditError(null);
         try {
-            const res = await fetch(getApiUrl(`/api/reels/${jobId}/${clipIndexForApi}/captions/reset`), {
+            const visualsResetData = await resetReelVisuals(jobId, clipIndexForApi, user?.id);
+            if (visualsResetData?.new_video_url) {
+                setCurrentVideoUrl(getApiUrl(visualsResetData.new_video_url));
+                if (videoRef.current) videoRef.current.load();
+            }
+
+            const captionsRes = await fetch(getApiUrl(`/api/reels/${jobId}/${clipIndexForApi}/captions/reset`), {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                     ...getAuthHeaders(user?.id),
                 },
             });
-            if (!res.ok) {
-                const errText = await res.text();
+            if (!captionsRes.ok) {
+                const errText = await captionsRes.text();
                 setEditError(parseApiErrorText(errText));
                 setTimeout(() => setEditError(null), 5000);
                 return;
             }
-            const data = await res.json();
-            if (data.video_url) {
-                setCurrentVideoUrl(getApiUrl(data.video_url));
+            const captionsResetData = await captionsRes.json();
+            if (captionsResetData.video_url) {
+                setCurrentVideoUrl(getApiUrl(captionsResetData.video_url));
                 if (videoRef.current) videoRef.current.load();
             }
-            setActiveLayers({ subtitles: null, captions: null, hook: null, effects: null, visuals: null });
+            setActiveLayers(() => ({
+                subtitles: null,
+                captions: null,
+                hook: null,
+                effects: null,
+                visuals: null,
+            }));
         } catch (e) {
-            setEditError(e.message);
+            const message = e instanceof ReelVisualsApiError ? e.message : e.message;
+            setEditError(message);
             setTimeout(() => setEditError(null), 5000);
         } finally {
             setIsResettingStyles(false);

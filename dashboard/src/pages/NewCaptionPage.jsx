@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Activity, ArrowLeft, CheckCircle2, Clock3, Loader2 } from "lucide-react";
+import { Activity, CheckCircle2, Clock3, Loader2 } from "lucide-react";
 import { getApiUrl } from "../config";
 import { getAuthHeaders } from "../lib/apiAuth";
 import { useAuth } from "../state/AuthContext";
 import { useUserCredits } from "../state/UserCreditsContext";
 import { useLocation, useNavigate } from "react-router-dom";
+import Breadcrumbs from "../components/Breadcrumbs";
 import MediaInput from "../components/MediaInput";
 import { useTranslation } from "../state/LanguageContext";
 
@@ -31,6 +32,11 @@ export default function NewCaptionPage() {
     const pollFailureCountRef = useRef(0);
 
     const hasCreditsForCaption = Number(credits || 0) > 0;
+    const breadcrumbItems = [
+        { label: t("breadcrumbs.dashboard", "Dashboard"), href: "/dashboard" },
+        { label: t("breadcrumbs.captions", "Captions"), href: "/dashboard/captions" },
+        { label: t("breadcrumbs.create", "Create") },
+    ];
 
     useEffect(() => {
         if (!projectId || !user?.id) return;
@@ -251,19 +257,13 @@ export default function NewCaptionPage() {
     return (
         <div className="captions-page-shell flex-1 overflow-y-auto overflow-x-hidden md:overflow-x-visible p-8 space-y-6">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-                <div>
+                <div className="space-y-2">
+                    <Breadcrumbs items={breadcrumbItems} ariaLabel={t('breadcrumbs.ariaLabel', 'Breadcrumb')} />
                     <h1 className="text-3xl font-black tracking-tight">{t("common.subtitles", "Génération des sous-titres")}</h1>
                     <p className="mt-2 text-sm text-slate-500 dark:text-zinc-400">{t("common.subtitlesdesc", "Upload local only then generate via the job queue.")}</p>
                 </div>
 
-                <button
-                    type="button"
-                    onClick={() => navigate("/dashboard/captions")}
-                    className="inline-flex items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
-                >
-                    <ArrowLeft size={14} />
-                    {t("app.backToList", "Back to list")}
-                </button>
+                <div className="shrink-0" />
             </div>
 
             {!projectId ? (

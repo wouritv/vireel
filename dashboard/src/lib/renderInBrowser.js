@@ -12,6 +12,7 @@ import { toBrowserSafeMediaUrl } from './clips';
  * @param {object|null} params.subtitles - SubtitleConfig
  * @param {object|null} params.hook - HookConfig
  * @param {object|null} params.effects - EffectsConfig
+ * @param {Array|null} params.visuals - VisualConfig[]
  * @param {function} [params.onProgress] - Progress callback (0-1)
  * @param {AbortSignal} [params.signal] - Abort signal for cancellation
  * @returns {Promise<string>} Blob URL of the rendered MP4
@@ -22,12 +23,19 @@ export async function renderInBrowser({
     subtitles = null,
     hook = null,
     effects = null,
+    visuals = null,
     onProgress,
     signal,
 }) {
     const fps = 30;
     const durationInFrames = Math.max(1, Math.round(durationInSeconds * fps));
     const browserSafeVideoUrl = toBrowserSafeMediaUrl(videoUrl);
+    const browserSafeVisuals = Array.isArray(visuals)
+        ? visuals.map((visual) => ({
+            ...visual,
+            imageUrl: toBrowserSafeMediaUrl(visual?.imageUrl || ''),
+        }))
+        : visuals;
 
     const { getBlob } = await renderMediaOnWeb({
         composition: {
@@ -48,6 +56,7 @@ export async function renderInBrowser({
             subtitles,
             hook,
             effects,
+            visuals: browserSafeVisuals,
         },
         container: 'mp4',
         videoCodec: 'h264',
