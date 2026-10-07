@@ -566,6 +566,16 @@
     "generating": "Generating...",
     "generate": "Generate Subtitles"
   },
+  "breadcrumbs": {
+    "ariaLabel": "Breadcrumb",
+    "dashboard": "Dashboard",
+    "reels": "Reels",
+    "captions": "Captions",
+    "filmSummaries": "Film summaries",
+    "anonymousStories": "Anonymous stories",
+    "projects": "Projects",
+    "create": "Create"
+  },
   "dashboard": {
     "welcomeBack": "Welcome back",
     "generationInProgress": "A generation is currently in progress. You can reopen the generation page to follow progress and view ready reels.",
@@ -667,7 +677,7 @@
     "an": "year",
     "billingMonthly": "Monthly",
     "billingAnnual": "Annual",
-    "annualDiscountBadge": "-{{percent}}%",
+    "annualDiscountBadge": "up to -{{percent}}%",
     "annualSavings": "Save {{amount}}€ per year",
     "fillCredit": "Top up credits",
     "creditRate": "credits · current balance ",

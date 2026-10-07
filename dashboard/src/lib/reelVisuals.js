@@ -1,20 +1,9 @@
-/**
- * Shared validation/overlap logic for manual reel visuals (split-screen
- * image overlays), used by both the VisualsModal timeline UI and its
- * add/edit forms so the user gets instant feedback before ever calling
- * the backend -- which enforces the exact same rules server-side (see
- * app.py's _validate_reel_visual_timing). Error codes below intentionally
- * match the backend's own `detail.code` values so a single i18n lookup
- * (`visualsModal.errors.<code>`) covers both client- and server-raised
- * errors.
- */
+import { getApiUrl } from '../config';
+import { getAuthHeaders } from './apiAuth';
 
 export const ALLOWED_VISUAL_IMAGE_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
 
-// Generous client-side guard only -- the backend's own configured limit
-// (REEL_VISUAL_MAX_IMAGE_BYTES, 8MB by default) is authoritative and may
-// differ; its own error still surfaces to the user if this guard is ever
-// looser than what the backend actually accepts.
+// Generous client-side guard only -- backend validation stays authoritative.
 export const MAX_VISUAL_IMAGE_BYTES = 8 * 1024 * 1024;
 
 /**
@@ -33,8 +22,8 @@ export function visualsOverlap(a, b) {
 /**
  * @param {{start_time: number, duration: number}} candidate
  * @param {Array<{id?: string, start_time: number, duration: number}>} existingVisuals
- * @param {string} [excludeId] - the visual being edited, skipped from the check
- * @returns {object|null} the first overlapping visual, or null
+ * @param {string} [excludeId]
+ * @returns {object|null}
  */
 export function findOverlappingVisual(candidate, existingVisuals, excludeId = null) {
     if (!Array.isArray(existingVisuals)) return null;
@@ -73,10 +62,6 @@ export function validateVisualTiming(candidate, reelDurationSeconds, existingVis
 }
 
 /**
- * Client-side guard for the image picked for a new visual -- JPG/JPEG/PNG/
- * WebP only, under MAX_VISUAL_IMAGE_BYTES. Accepts anything File-shaped
- * ({type, size}), so it's testable without a real DOM File.
- *
  * @param {{type?: string, size?: number}} file
  * @returns {{valid: boolean, error?: string}}
  */
@@ -90,4 +75,63 @@ export function validateVisualImageFile(file) {
         return { valid: false, error: 'image_too_large' };
     }
     return { valid: true };
+}
+
+export class ReelVisualsApiError extends Error {
+    constructor(message, status, detail = null) {
+        super(message || 'Request failed');
+        this.name = 'ReelVisualsApiError';
+        this.status = Number(status) || 0;
+        this.detail = detail;
+    }
+}
+
+const parseApiErrorDetail = async (response) => {
+    const raw = await response.text();
+    try {
+        const parsed = JSON.parse(raw || '{}');
+        return parsed?.detail || raw || 'Request failed';
+    } catch {
+        return raw || 'Request failed';
+    }
+};
+
+const requestJson = async (path, { method = 'GET', userId, body, headers = {} } = {}) => {
+    const response = await fetch(getApiUrl(path), {
+        method,
+        headers: {
+            ...getAuthHeaders(userId),
+            ...headers,
+        },
+        body,
+    });
+
+    if (!response.ok) {
+        const detail = await parseApiErrorDetail(response);
+        const message = typeof detail === 'string' ? detail : (detail?.message || JSON.stringify(detail));
+        throw new ReelVisualsApiError(message, response.status, detail);
+    }
+
+    return response.json().catch(() => ({}));
+};
+
+export async function listReelVisuals(jobId, clipIndex, userId) {
+    return requestJson(`/api/reels/${jobId}/${clipIndex}/visuals`, { userId });
+}
+
+export async function applyReelVisuals(jobId, clipIndex, userId, payload = {}) {
+    return requestJson(`/api/reels/${jobId}/${clipIndex}/visuals/apply`, {
+        method: 'POST',
+        userId,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload || {}),
+    });
+}
+
+export async function resetReelVisuals(jobId, clipIndex, userId) {
+    return requestJson(`/api/reels/${jobId}/${clipIndex}/visuals/reset`, {
+        method: 'POST',
+        userId,
+        headers: { 'Content-Type': 'application/json' },
+    });
 }

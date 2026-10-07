@@ -2,7 +2,7 @@ import React, {useEffect, useState} from "react";
 import {Check, X, CreditCardIcon, Star, Crown, Sparkles, Zap, Building2, Loader2, Coins, Plus, Minus, MessageCircle, Clock} from "lucide-react";
 import {getApiUrl} from "../config.js";
 import { getAuthHeaders } from "../lib/apiAuth";
-import { annualSavingsAmount, computeAnnualPrice } from "../lib/billing";
+import { annualSavingsAmount, computeAnnualPrice, normalizeAnnualDiscountPercent } from "../lib/billing";
 import { daysUntilDate } from "../lib/formatting";
 import { useAuth } from "../state/AuthContext";
 import { useUserCredits } from "../state/UserCreditsContext";
@@ -118,7 +118,7 @@ export default function AbonnementPage() {
     const CREDIT_RATE = 100;
     const creditsToAdd = Math.round(buyAmount * CREDIT_RATE);
     const currentPlan = items.find((plan) => String(plan.id) === String(souscription?.abonnement || "")) || null;
-    const maxAnnualDiscount = items.reduce((max, plan) => Math.max(max, Number(plan.reduction_annuelle) || 0), 0);
+    const maxAnnualDiscount = items.reduce((max, plan) => Math.max(max, normalizeAnnualDiscountPercent(plan.reduction_annuelle)), 0);
 
     useEffect(() => {
         const params = new URLSearchParams(globalThis.location.search || "");
@@ -288,7 +288,7 @@ export default function AbonnementPage() {
                     {t("abonnement.billingAnnual", "Annuel")}
                     {maxAnnualDiscount > 0 && (
                         <span className="rounded-full bg-emerald-500/20 text-emerald-600 dark:text-emerald-300 px-1.5 py-0.5 text-[0.65rem] font-semibold">
-                            {t("abonnement.annualDiscountBadge", "-{{percent}}%", { percent: Math.round(maxAnnualDiscount * 100) })}
+                            {t("abonnement.annualDiscountBadge", "jusqu'a -{{percent}}%", { percent: Math.round(maxAnnualDiscount) })}
                         </span>
                     )}
                 </button>
@@ -329,7 +329,7 @@ export default function AbonnementPage() {
                     const descriptionItems = Array.isArray(plan.description)
                         ? plan.description
                         : (plan.description ? [plan.description] : []);
-                    const discountRate = Number(plan.reduction_annuelle) || 0;
+                    const discountRate = normalizeAnnualDiscountPercent(plan.reduction_annuelle);
                     const displayedPrice = billingInterval === "year"
                         ? computeAnnualPrice(plan.price, discountRate)
                         : plan.price;

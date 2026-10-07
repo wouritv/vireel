@@ -53,14 +53,14 @@ export const ShortVideo: React.FC<Record<string, unknown>> = (rawProps) => {
         </VideoEffects>
       </div>
 
-      {/* Layer 2: Animated subtitles */}
+      {/* Layer 2: Manual split-screen image overlays */}
+      {visuals && visuals.length > 0 && <VisualOverlay visuals={visuals} />}
+
+      {/* Layer 3: Animated subtitles */}
       {subtitles && <Subtitles config={subtitles} />}
 
-      {/* Layer 3: Hook text overlay */}
+      {/* Layer 4: Hook text overlay */}
       {hook && <HookOverlay config={hook} />}
-
-      {/* Layer 4: Manual split-screen image overlays */}
-      {visuals && visuals.length > 0 && <VisualOverlay visuals={visuals} />}
     </AbsoluteFill>
   );
 };

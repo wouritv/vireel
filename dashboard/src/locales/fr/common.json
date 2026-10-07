@@ -567,6 +567,16 @@
     "generating": "Generation...",
     "generate": "Generer les sous-titres"
   },
+  "breadcrumbs": {
+    "ariaLabel": "Fil d'ariane",
+    "dashboard": "Tableau de bord",
+    "reels": "Réels",
+    "captions": "Sous-titres",
+    "filmSummaries": "Résumés de film",
+    "anonymousStories": "Histoires anonymes",
+    "projects": "Projets",
+    "create": "Créer"
+  },
   "dashboard": {
     "welcomeBack": "Bon retour",
     "generationInProgress": "Une génération est toujours en cours. Tu peux rouvrir la page de génération pour suivre les étapes et voir les réels déjà prêts.",
@@ -668,7 +678,7 @@
     "an": "an",
     "billingMonthly": "Mensuel",
     "billingAnnual": "Annuel",
-    "annualDiscountBadge": "-{{percent}}%",
+    "annualDiscountBadge": "jusqu'a -{{percent}}%",
     "annualSavings": "Économisez {{amount}}€ par an",
     "fillCredit": "Recharger des crédits",
     "creditRate": "crédits · solde actuel ",

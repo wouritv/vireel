@@ -59,6 +59,7 @@ from supabase_request import (
 	get_reel as supabase_get_reel,
 	get_reel_by_job_clip as supabase_get_reel_by_job_clip,
 	update_reel_media_by_job_clip as supabase_update_reel_media_by_job_clip,
+  update_reel_base_media_by_job_clip as supabase_update_reel_base_media_by_job_clip,
 	soft_delete_reel as supabase_soft_delete_reel,
 	insert_reel_visual as supabase_insert_reel_visual,
 	list_reel_visuals as supabase_list_reel_visuals,
@@ -229,6 +230,7 @@ _STORY_NOT_FOUND = "Anonymous story not found"
 _STORIES_PREFIX = "anonymous_stories/"
 _ANONYMOUS_STORIES_DISABLED = "Anonymous stories are not enabled on this deployment."
 _FILM_SUMMARIES_PREFIX = "film_summaries/"
+_PROJECTS_PREFIX = "projects/"
 _FILM_SUMMARY_DISABLED = "Film summaries are not enabled on this deployment."
 _FILM_SUMMARY_NOT_FOUND = "Film summary not found"
 _SUPABASE_PROJECTS_NOT_CONFIGURED = "Supabase projects is not configured"
@@ -1507,6 +1509,51 @@ def _reel_thumbnail_url_from_s3_key(s3_key: str) -> str:
     return generate_presigned_url(bucket, s3_key, expiration=7200) or ""
 
 
+def _project_thumbnail_url_from_s3_key(s3_key: str) -> str:
+    if not s3_key:
+        return ""
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket:
+        return ""
+    return generate_presigned_url(bucket, s3_key, expiration=7200) or ""
+
+
+def _project_thumbnail_url_from_ref(thumbnail_ref: str) -> str:
+    ref = str(thumbnail_ref or "").strip()
+    if not ref:
+        return ""
+    if ref.startswith(_HTTPS_SCHEME_PREFIX):
+        return ref
+    s3_key = _extract_s3_key_from_thumbnail_ref(ref)
+    if not s3_key and ref.startswith(_PROJECTS_PREFIX):
+        s3_key = ref
+    if not s3_key:
+        return ref
+    return _project_thumbnail_url_from_s3_key(s3_key) or ref
+
+
+def _generate_and_upload_project_thumbnail_from_source(source_video_path: str, bucket: str, user_id: str, project_ref_id: str) -> str:
+    if not source_video_path or not os.path.exists(source_video_path) or not bucket:
+        return ""
+
+    thumb_local = _generate_reel_thumbnail_from_video(
+        source_video_path,
+        OUTPUT_DIR,
+        f"project_{project_ref_id}",
+        0,
+    )
+    if not thumb_local or not os.path.exists(thumb_local):
+        return ""
+
+    thumbnail_s3_key = f"{_PROJECTS_PREFIX}{user_id}/{project_ref_id}/thumbnail_source.jpg"
+    uploaded = upload_file_to_s3(thumb_local, bucket, thumbnail_s3_key)
+    try:
+        os.remove(thumb_local)
+    except Exception:
+        pass
+    return thumbnail_s3_key if uploaded else ""
+
+
 def _cleanup_generated_clips_after_job(output_dir: str, base_name: str) -> None:
     """Remove generated clip files only after the reel job has fully completed."""
     if not output_dir or not base_name or not os.path.isdir(output_dir):
@@ -2047,7 +2094,7 @@ def _extract_s3_key_from_thumbnail_ref(thumbnail_ref: str) -> str:
         if len(parts) == 2:
             return parts[1]
         return ""
-    if ref.startswith("reels/"):
+    if ref.startswith(("reels/", _CAPTIONS_PREFIX, _PROJECTS_PREFIX, _STORIES_PREFIX, _FILM_SUMMARIES_PREFIX)):
         return ref
     return ""
 
@@ -3102,11 +3149,6 @@ def _derive_reel_completion_summary_text(enriched_clips: List[Dict[str, Any]], s
 
 
 def _build_reel_completion_project_updates(job_data: Dict[str, Any], summary_text: str, saved_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    thumbnail_url = ""
-    if saved_rows:
-        first_row = saved_rows[0] if isinstance(saved_rows[0], dict) else {}
-        thumbnail_url = str(first_row.get("reel_thumbnail_url") or "")
-
     project_updates = {
         "description": _build_short_project_summary(summary_text),
         "output_count": len(saved_rows),
@@ -3114,8 +3156,6 @@ def _build_reel_completion_project_updates(job_data: Dict[str, Any], summary_tex
     source_duration_value = int(float((job_data or {}).get("source_duration_seconds") or 0.0))
     if source_duration_value > 0:
         project_updates["source_duration"] = source_duration_value
-    if thumbnail_url:
-        project_updates["thumbnail_url"] = thumbnail_url
     return project_updates
 
 
@@ -5251,6 +5291,12 @@ async def _create_process_endpoint_project(
 
         if input_path and os.path.exists(input_path):
             upload_file_to_s3(input_path, bucket_name, s3_source_key)
+        project_thumbnail_ref = _generate_and_upload_project_thumbnail_from_source(
+            input_path,
+            bucket_name,
+            user_id,
+            job_id,
+        )
 
         # Create project record
         project = await supabase_create_project(
@@ -5263,6 +5309,7 @@ async def _create_process_endpoint_project(
             source_size=source_size_bytes,
             source_url=url if url else None,
             source_duration=int(source_duration_seconds) if source_duration_seconds else None,
+            thumbnail_url=project_thumbnail_ref,
             status="processing",
         )
         await _finalize_source_media_retention(job_id, user_id, project, source_size_bytes, bucket_name, s3_source_key)
@@ -5815,6 +5862,12 @@ async def _create_caption_endpoint_project(user_id: str, caption_job_id: str, so
 
         if os.path.exists(input_path):
             upload_file_to_s3(input_path, bucket_name, s3_source_key)
+        project_thumbnail_ref = _generate_and_upload_project_thumbnail_from_source(
+            input_path,
+            bucket_name,
+            user_id,
+            caption_job_id,
+        )
 
         # Create project record
         project = await supabase_create_project(
@@ -5826,6 +5879,7 @@ async def _create_caption_endpoint_project(user_id: str, caption_job_id: str, so
             source_s3_key=s3_source_key,
             source_size=size_bytes,
             source_duration=int(local_duration) if local_duration else None,
+            thumbnail_url=project_thumbnail_ref,
             status="processing",
         )
         await _finalize_source_media_retention(caption_job_id, user_id, project, size_bytes, bucket_name, s3_source_key)
@@ -5984,6 +6038,133 @@ def _extract_clip_captions_from_transcript(transcript: Dict[str, Any], clip_star
                     "endMs": int((max(0, word_info['end'] - clip_start)) * 1000),
                 })
     return captions
+
+
+def _saved_subtitle_captions_from_clip_data(clip_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not isinstance(clip_data, dict):
+        return []
+
+    subtitle_config = clip_data.get("subtitle_config")
+    if isinstance(subtitle_config, dict):
+        captions = subtitle_config.get("captions")
+        if isinstance(captions, list):
+            return captions
+
+    remotion_layers = clip_data.get("remotion_layers")
+    if isinstance(remotion_layers, dict):
+        for layer_key in ("captions", "subtitles"):
+            layer = remotion_layers.get(layer_key)
+            if isinstance(layer, dict) and isinstance(layer.get("captions"), list):
+                return layer.get("captions")
+
+    return []
+
+
+def _style_from_clip_subtitle_state(clip_data: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    if not isinstance(clip_data, dict):
+        return {}, ""
+
+    subtitle_config = clip_data.get("subtitle_config")
+    if isinstance(subtitle_config, dict):
+        style = subtitle_config.get("style")
+        if isinstance(style, dict) and style:
+            return style, "clip_data.subtitle_config"
+
+    remotion_layers = clip_data.get("remotion_layers")
+    if isinstance(remotion_layers, dict):
+        for layer_key in ("captions", "subtitles"):
+            layer = remotion_layers.get(layer_key)
+            if isinstance(layer, dict):
+                style = layer.get("style")
+                if isinstance(style, dict) and style:
+                    return style, f"clip_data.remotion_layers.{layer_key}"
+
+    return {}, ""
+
+
+async def _resolve_active_subtitle_style_for_clip(job_id: str, clip_index: int, user_id: str, clip_data: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    """Resolve subtitle style in explicit priority order for visuals re-burn:
+
+    1. The last persisted clip-local subtitle payload (`subtitle_config`)
+    2. Persisted Remotion layer style on the clip metadata
+    3. The latest Supabase style_edit_versions row for this clip
+    4. The user's saved global default (or factory default fallback)
+    """
+    clip_style, source = _style_from_clip_subtitle_state(clip_data)
+    if clip_style:
+        return {**_DEFAULT_AUTO_CAPTION_STYLE_KWARGS, **clip_style}, source
+
+    if is_supabase_configured():
+        try:
+            versions = await supabase_list_style_edit_versions(job_id, int(clip_index), user_id)
+            if versions:
+                style_config = versions[-1].get("style_config")
+                if isinstance(style_config, dict) and style_config:
+                    return {**_DEFAULT_AUTO_CAPTION_STYLE_KWARGS, **style_config}, "style_edit_versions.latest"
+        except Exception as exc:
+            logger.warning("Failed to resolve latest subtitle style for job %s clip %s: %s", job_id, clip_index, exc)
+
+    return await _get_user_default_caption_style(user_id), "user_default_or_factory_default"
+
+
+def _write_saved_captions_to_srt(captions: List[Dict[str, Any]], srt_path: str) -> bool:
+    lines: List[str] = []
+    index = 1
+    for caption in captions:
+        text = str((caption or {}).get("text") or "").strip()
+        start_ms = (caption or {}).get("startMs")
+        end_ms = (caption or {}).get("endMs")
+        if not text:
+            continue
+        try:
+            start_seconds = max(0.0, float(start_ms) / 1000.0)
+            end_seconds = max(start_seconds, float(end_ms) / 1000.0)
+        except (TypeError, ValueError):
+            continue
+        lines.extend([
+            str(index),
+            f"{_srt_timestamp(start_seconds)} --> {_srt_timestamp(end_seconds)}",
+            text,
+            "",
+        ])
+        index += 1
+
+    if index == 1:
+        return False
+
+    with open(srt_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+    return True
+
+
+async def _generate_subtitle_srt_from_clip_context(
+    input_path: str,
+    filename: str,
+    transcript: Optional[Dict[str, Any]],
+    clip_data: Dict[str, Any],
+    srt_path: str,
+    words_per_line: int,
+    animation: str = "none",
+) -> bool:
+    if transcript:
+        return await _generate_subtitle_srt(
+            input_path,
+            filename,
+            transcript,
+            clip_data,
+            srt_path,
+            words_per_line,
+            animation=animation,
+        )
+    saved_captions = _saved_subtitle_captions_from_clip_data(clip_data)
+    if saved_captions:
+        return _write_saved_captions_to_srt(saved_captions, srt_path)
+    return False
+
+
+def _build_subtitle_request_from_style(job_id: str, clip_index: int, style_config: Dict[str, Any]) -> SubtitleRequest:
+    merged_style = {**_DEFAULT_AUTO_CAPTION_STYLE_KWARGS, **(style_config or {})}
+    return SubtitleRequest(job_id=job_id, clip_index=clip_index, **merged_style)
 
 
 @app.get("/api/clip/{job_id}/{clip_index}/transcript", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
@@ -7861,14 +8042,23 @@ async def apply_reel_visuals(
         raise HTTPException(status_code=404, detail=_CLIP_NOT_FOUND)
     clip_data = clips[clip_index]
 
-    # _resolve_add_subtitles_input_path only reads .job_id/.clip_index/
-    # .input_filename/.input_url off its `req` argument -- it's already
-    # the shared resolver /api/hook uses too, despite the name.
+    transcript = data.get('transcript') if isinstance(data.get('transcript'), dict) else None
+    subtitle_style_config, subtitle_style_source = await _resolve_active_subtitle_style_for_clip(
+        job_id,
+        clip_index,
+        user_id,
+        clip_data,
+    )
+    has_subtitle_material = bool(transcript) or bool(_saved_subtitle_captions_from_clip_data(clip_data))
+
+    # _resolve_burn_source_input_path already resolves the clean, pre-caption
+    # source when one exists, so visuals render onto clean pixels first and
+    # subtitles can be re-burned afterward with the persisted style.
     resolve_req = types.SimpleNamespace(
         job_id=job_id, clip_index=clip_index,
         input_filename=payload.input_filename, input_url=payload.input_url,
     )
-    input_path, filename = _resolve_add_subtitles_input_path(resolve_req, output_dir, clip_data, metadata_path)
+    input_path, filename = await _resolve_burn_source_input_path(resolve_req, output_dir, clip_data, metadata_path, user_id)
 
     input_size_bytes = float(os.path.getsize(input_path) if os.path.exists(input_path) else 0)
     input_duration_seconds = _probe_local_video_duration_seconds(input_path)
@@ -7884,6 +8074,9 @@ async def apply_reel_visuals(
 
     bucket = os.environ.get("AWS_S3_BUCKET", "")
     local_image_paths: List[str] = []
+    visuals_stage_path = ""
+    srt_path = ""
+    subtitle_reapplied = False
     try:
         burn_visuals = []
         for row in rows:
@@ -7900,11 +8093,42 @@ async def apply_reel_visuals(
                 "duration": float(row.get("duration") or 0),
             })
 
+        visuals_stage_filename = f"visuals_stage_{filename}"
+        visuals_stage_path = os.path.join(output_dir, visuals_stage_filename)
         output_filename = f"visuals_{filename}"
         output_path = os.path.join(output_dir, output_filename)
 
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, apply_visuals_to_video, input_path, burn_visuals, output_path)
+        await loop.run_in_executor(None, apply_visuals_to_video, input_path, burn_visuals, visuals_stage_path)
+
+        if has_subtitle_material:
+            subtitle_req = _build_subtitle_request_from_style(job_id, clip_index, subtitle_style_config)
+            words_per_line = max(2, min(8, int(subtitle_req.words_per_line or 4)))
+            srt_path = os.path.join(output_dir, f"visuals_subs_{clip_index}_{int(time.time())}.srt")
+            has_srt = await _generate_subtitle_srt_from_clip_context(
+                visuals_stage_path,
+                filename,
+                transcript,
+                clip_data,
+                srt_path,
+                words_per_line,
+                animation=subtitle_req.animation,
+            )
+            if has_srt:
+                visual_windows = await _reel_visual_windows_for_job_clip(job_id, clip_index, user_id)
+                await loop.run_in_executor(
+                    None,
+                    _burn_subtitles_for_request,
+                    subtitle_req,
+                    visuals_stage_path,
+                    srt_path,
+                    output_path,
+                    visual_windows,
+                )
+                subtitle_reapplied = True
+
+        if not subtitle_reapplied:
+            shutil.move(visuals_stage_path, output_path)
     except HTTPException:
         raise
     except Exception as e:
@@ -7916,9 +8140,75 @@ async def apply_reel_visuals(
                     os.remove(path)
             except Exception:
                 pass
+        try:
+            if srt_path and os.path.exists(srt_path):
+                os.remove(srt_path)
+        except Exception:
+            pass
+        try:
+            if visuals_stage_path and os.path.exists(visuals_stage_path):
+                os.remove(visuals_stage_path)
+        except Exception:
+            pass
+
+    if subtitle_reapplied:
+        logger.info(
+            "Visuals apply re-burned subtitles for job %s clip %s using style source %s",
+            job_id,
+            clip_index,
+            subtitle_style_source,
+        )
+
+    existing_reel_base_url = str(reel.get("reel_base_url") or "").strip()
+    existing_reel_base_s3_key = str(reel.get("reel_base_s3_key") or "").strip()
+    if is_supabase_configured() and not existing_reel_base_url:
+        current_reel_s3_key = str(reel.get("reel_s3_key") or "").strip()
+        baseline_video_url = _reel_media_url_from_s3_key(current_reel_s3_key) or str(reel.get("reel_url") or "").strip()
+        if baseline_video_url:
+            try:
+                await supabase_update_reel_base_media_by_job_clip(
+                    job_id=job_id,
+                    clip_index=clip_index,
+                    reel_base_url=baseline_video_url,
+                    reel_base_s3_key=current_reel_s3_key or None,
+                    user_id=user_id,
+                )
+                existing_reel_base_url = baseline_video_url
+                existing_reel_base_s3_key = current_reel_s3_key
+            except Exception as e:
+                print(f"⚠️ Failed to persist visuals reset baseline: {e}")
 
     new_video_url = f"/videos/{job_id}/{output_filename}"
-    _persist_new_video_url_to_clip(job, clip_index, clips, data, metadata_path, new_video_url, "visuals")
+    persisted_video_url = new_video_url
+    visuals_s3_key = ""
+    if bucket and os.path.exists(output_path):
+        visuals_s3_key = f"reels/{user_id}/{job_id}/{output_filename}"
+        if upload_file_to_s3(output_path, bucket, visuals_s3_key):
+            persisted_video_url = _reel_media_url_from_s3_key(visuals_s3_key) or new_video_url
+
+    _persist_new_video_url_to_clip(job, clip_index, clips, data, metadata_path, persisted_video_url, "visuals")
+
+    if is_supabase_configured() and persisted_video_url:
+        try:
+            await supabase_update_reel_media_by_job_clip(
+                job_id=job_id,
+                clip_index=clip_index,
+                reel_url=persisted_video_url,
+                reel_s3_key=visuals_s3_key or None,
+                user_id=user_id,
+            )
+            # Keep baseline sticky once initialized so reset consistently
+            # restores the pre-visuals media.
+            if existing_reel_base_url:
+                await supabase_update_reel_base_media_by_job_clip(
+                    job_id=job_id,
+                    clip_index=clip_index,
+                    reel_base_url=existing_reel_base_url,
+                    reel_base_s3_key=existing_reel_base_s3_key or None,
+                    user_id=user_id,
+                )
+        except Exception as e:
+            print(f"⚠️ Failed to sync reel URL after visuals apply: {e}")
 
     if is_supabase_configured() and visuals_required_credits > 0:
         await supabase_deduct_user_credits(user_id, visuals_required_credits)
@@ -7933,7 +8223,71 @@ async def apply_reel_visuals(
 
     return {
         "success": True,
-        "new_video_url": new_video_url,
+        "new_video_url": persisted_video_url,
+    }
+
+
+@app.post("/api/reels/{job_id}/{clip_index}/visuals/reset", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def reset_reel_visuals(
+    job_id: str,
+    clip_index: int,
+    user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    await _require_job_ownership(job_id, user_id)
+    reel = await _resolve_reel_for_visuals(job_id, clip_index, user_id)
+
+    metadata_path, data = await _get_or_build_job_metadata(job_id, clip_index)
+    if not metadata_path or not data:
+        raise HTTPException(status_code=404, detail=_METADATA_NOT_FOUND)
+
+    clips = data.get("shorts") or []
+    if clip_index < 0 or clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail=_CLIP_NOT_FOUND)
+
+    clip_data = clips[clip_index] if isinstance(clips[clip_index], dict) else {}
+    base_s3_key = str(reel.get("reel_base_s3_key") or "").strip()
+    reset_video_url = _reel_media_url_from_s3_key(base_s3_key) or str(reel.get("reel_base_url") or "").strip()
+    if not reset_video_url:
+        reset_video_url = str(clip_data.get("original_video_url") or "").strip()
+    if not reset_video_url:
+        raise _coded_error(400, "missing_visuals_reset_source", "No baseline video reference found for visuals reset")
+
+    rows = await supabase_list_reel_visuals(str(reel["id"]))
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    deleted_count = 0
+    for row in rows:
+        visual_id = str(row.get("id") or "")
+        if visual_id:
+            deleted = await supabase_delete_reel_visual(visual_id, user_id)
+            if deleted:
+                deleted_count += 1
+
+        image_s3_key = str(row.get("image_s3_key") or "").strip()
+        if bucket and image_s3_key:
+            try:
+                delete_s3_object(bucket, image_s3_key)
+            except Exception:
+                logger.warning("Failed to delete reel visual image %s from S3", image_s3_key, exc_info=True)
+
+    job = jobs.get(job_id)
+    _persist_new_video_url_to_clip(job, clip_index, clips, data, metadata_path, reset_video_url, "visuals reset")
+
+    if is_supabase_configured():
+        try:
+            await supabase_update_reel_media_by_job_clip(
+                job_id=job_id,
+                clip_index=clip_index,
+                reel_url=reset_video_url,
+                reel_s3_key=base_s3_key or None,
+                user_id=user_id,
+            )
+        except Exception as e:
+            print(f"⚠️ Failed to sync reel URL after visuals reset: {e}")
+
+    return {
+        "success": True,
+        "new_video_url": reset_video_url,
+        "deleted_visuals": deleted_count,
     }
 
 
@@ -9389,12 +9743,18 @@ async def _existing_stripe_customer_id(user_id: str) -> Optional[str]:
 
 
 def _annual_price_for_plan(plan: Dict[str, Any]) -> float:
-    """annual_price = monthly_price * 12 * (1 - reduction_annuelle) --
-    reduction_annuelle is a fraction (0..1) stored on the plan, so a plan
-    with no annual discount configured (column missing/0) simply charges
-    12 months at the monthly price."""
+    """annual_price = monthly_price * 12 * (1 - reduction_annuelle/100).
+
+    `reduction_annuelle` is stored as an integer percentage on the plan
+    (5 => 5%). During rollout we still accept legacy fractional values
+    strictly between 0 and 1 (0.05 => 5%) so older rows keep pricing
+    correctly until the migration is applied everywhere.
+    """
     monthly_price = float(plan.get("price") or 0)
-    discount_rate = min(1.0, max(0.0, float(plan.get("reduction_annuelle") or 0)))
+    raw_discount = float(plan.get("reduction_annuelle") or 0)
+    if 0 < raw_discount < 1:
+        raw_discount *= 100.0
+    discount_rate = min(1.0, max(0.0, raw_discount / 100.0))
     return round(monthly_price * 12 * (1 - discount_rate), 2)
 
 
@@ -12040,6 +12400,12 @@ async def _create_anonymous_story_endpoint_project(
 
         if os.path.exists(input_path):
             upload_file_to_s3(input_path, bucket_name, s3_source_key)
+        project_thumbnail_ref = _generate_and_upload_project_thumbnail_from_source(
+            input_path,
+            bucket_name,
+            user_id,
+            story_job_id,
+        )
 
         project = await supabase_create_project(
             user_id=user_id,
@@ -12051,6 +12417,7 @@ async def _create_anonymous_story_endpoint_project(
             source_s3_key=s3_source_key,
             source_size=size_bytes,
             source_duration=int(local_duration) if local_duration else None,
+            thumbnail_url=project_thumbnail_ref,
             status="processing",
         )
         await _finalize_source_media_retention(story_job_id, user_id, project, size_bytes, bucket_name, s3_source_key)
@@ -13529,6 +13896,12 @@ async def _create_film_summary_endpoint_project(
 
         if os.path.exists(input_path):
             upload_file_to_s3(input_path, bucket_name, s3_source_key)
+        project_thumbnail_ref = _generate_and_upload_project_thumbnail_from_source(
+            input_path,
+            bucket_name,
+            user_id,
+            film_job_id,
+        )
 
         project = await supabase_create_project(
             user_id=user_id,
@@ -13540,6 +13913,7 @@ async def _create_film_summary_endpoint_project(
             source_s3_key=s3_source_key,
             source_size=size_bytes,
             source_duration=int(local_duration) if local_duration else None,
+            thumbnail_url=project_thumbnail_ref,
             status="processing",
         )
         await _finalize_source_media_retention(film_job_id, user_id, project, size_bytes, bucket_name, s3_source_key)
@@ -15092,44 +15466,103 @@ async def share_film_summary(film_summary_id: str, payload: ReelShareRequest, us
 # Projects Endpoints
 # --------------------------------------------------------------------------
 
+def _normalize_project_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    thumbnail_ref = str((row or {}).get("thumbnail_url") or "").strip()
+    return {
+        **(row or {}),
+        "thumbnail_url": _project_thumbnail_url_from_ref(thumbnail_ref),
+    }
+
+
+async def _ensure_project_thumbnail_for_row(row: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    project = dict(row or {})
+    if not project:
+        return project
+
+    if str(project.get("thumbnail_url") or "").strip():
+        return project
+
+    if not is_supabase_configured():
+        return project
+
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    source_s3_key = str(project.get("source_s3_key") or "").strip()
+    project_id = str(project.get("id") or "").strip()
+    if not (bucket and source_s3_key and project_id):
+        return project
+
+    tmp_dir = os.path.join(OUTPUT_DIR, "project_thumbnails")
+    os.makedirs(tmp_dir, exist_ok=True)
+    ext = os.path.splitext(source_s3_key)[1] or ".mp4"
+    source_local_path = os.path.join(tmp_dir, f"{project_id}_source{ext}")
+
+    try:
+        if not download_s3_object(bucket, source_s3_key, source_local_path):
+            return project
+
+        thumbnail_s3_key = _generate_and_upload_project_thumbnail_from_source(
+            source_local_path,
+            bucket,
+            user_id,
+            project_id,
+        )
+        if not thumbnail_s3_key:
+            return project
+
+        updated = await supabase_update_project(project_id, user_id, {"thumbnail_url": thumbnail_s3_key})
+        return updated or {**project, "thumbnail_url": thumbnail_s3_key}
+    except Exception:
+        return project
+    finally:
+        try:
+            if os.path.exists(source_local_path):
+                os.remove(source_local_path)
+        except Exception:
+            pass
+
 @app.get("/api/projects", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
 async def list_projects(
-	user_id: Annotated[str, Depends(get_user_id_header)],
-	page: Annotated[int, Query(ge=1)] = 1,
-	page_size: Annotated[int, Query(ge=1, le=100)] = 20,
-	project_type: Annotated[Optional[str], Query()] = None,
-	status: Annotated[Optional[str], Query()] = None,
-	q: Optional[str] = None,
+  user_id: Annotated[str, Depends(get_user_id_header)],
+  page: Annotated[int, Query(ge=1)] = 1,
+  page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+  project_type: Annotated[Optional[str], Query()] = None,
+  status: Annotated[Optional[str], Query()] = None,
+  q: Optional[str] = None,
 ):
-	if not is_supabase_configured():
-		raise HTTPException(status_code=503, detail=_SUPABASE_PROJECTS_NOT_CONFIGURED)
+  if not is_supabase_configured():
+    raise HTTPException(status_code=503, detail=_SUPABASE_PROJECTS_NOT_CONFIGURED)
 
-	rows, total = await supabase_list_projects(
-		user_id=user_id,
-		page=page,
-		page_size=page_size,
-		project_type=project_type,
-		status=status,
-		query=q,
-	)
-	return {
-		"items": rows,
-		"total": total,
-		"page": max(page, 1),
-		"page_size": min(max(page_size, 1), 100),
-	}
+  rows, total = await supabase_list_projects(
+    user_id=user_id,
+    page=page,
+    page_size=page_size,
+    project_type=project_type,
+    status=status,
+    query=q,
+  )
+  normalized_rows: List[Dict[str, Any]] = []
+  for row in rows:
+    ensured = await _ensure_project_thumbnail_for_row(row, user_id)
+    normalized_rows.append(_normalize_project_row(ensured))
+  return {
+    "items": normalized_rows,
+    "total": total,
+    "page": max(page, 1),
+    "page_size": min(max(page_size, 1), 100),
+  }
 
 
 @app.get("/api/projects/{project_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
 async def get_project_endpoint(project_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
-	if not is_supabase_configured():
-		raise HTTPException(status_code=503, detail=_SUPABASE_PROJECTS_NOT_CONFIGURED)
+  if not is_supabase_configured():
+    raise HTTPException(status_code=503, detail=_SUPABASE_PROJECTS_NOT_CONFIGURED)
 
-	project = await supabase_get_project(project_id, user_id)
-	if not project:
-		raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND)
+  project = await supabase_get_project(project_id, user_id)
+  if not project:
+    raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND)
 
-	return project
+  project = await _ensure_project_thumbnail_for_row(project, user_id)
+  return _normalize_project_row(project)
 
 
 class ProjectUpdateRequest(BaseModel):
