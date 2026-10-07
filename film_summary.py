@@ -1224,7 +1224,6 @@ async def generate_edit_plan(
 
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
     plan: Dict[str, Any] = {}
-    validation_report: Dict[str, Any] = {"valid": False, "errors": [], "warnings": []}
 
     for attempt in range(max(1, max_attempts)):
         response = await asyncio.to_thread(_call_planning_model, client, model_name, messages)

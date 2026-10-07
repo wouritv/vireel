@@ -8047,6 +8047,72 @@ class ApplyReelVisualsRequest(BaseModel):
     input_url: Optional[str] = None
 
 
+def _download_visuals_for_burn(
+    rows: List[Dict[str, Any]], output_dir: str, bucket: str, local_image_paths: List[str],
+) -> List[Dict[str, Any]]:
+    """Downloads every configured visual's source image to local disk so
+    apply_visuals_to_video can read them -- isolated out of
+    _burn_reel_visuals to cut that function's cognitive complexity
+    further (audit: SonarQube python:S3776). Appends to the caller's own
+    `local_image_paths` list (rather than building and returning its own)
+    so a mid-loop failure still leaves every already-downloaded path
+    where the caller's cleanup will find and remove it."""
+    burn_visuals: List[Dict[str, Any]] = []
+    for row in rows:
+        image_s3_key = row.get("image_s3_key")
+        ext = os.path.splitext(image_s3_key or "")[1] or ".jpg"
+        local_image_path = os.path.join(output_dir, f"visual_src_{row['id']}{ext}")
+        if not bucket or not image_s3_key or not download_s3_object(bucket, image_s3_key, local_image_path):
+            raise HTTPException(status_code=503, detail="Failed to download a visual's image")
+        local_image_paths.append(local_image_path)
+        burn_visuals.append({
+            "image_path": local_image_path,
+            "position": row.get("position"),
+            "start_time": float(row.get("start_time") or 0),
+            "duration": float(row.get("duration") or 0),
+        })
+    return burn_visuals
+
+
+async def _reburn_subtitles_onto_visuals_stage(
+    *, job_id: str, clip_index: int, user_id: str, filename: str, output_dir: str,
+    visuals_stage_path: str, output_path: str, transcript: Optional[Dict[str, Any]],
+    clip_data: Dict[str, Any], subtitle_style_config: Any, loop: asyncio.AbstractEventLoop,
+) -> Tuple[str, bool]:
+    """Re-burns subtitles on top of the just-burned visuals stage, using
+    the clip's active subtitle style -- isolated out of _burn_reel_visuals
+    to cut that function's cognitive complexity further (audit:
+    SonarQube python:S3776). Returns (srt_path, whether subtitles were
+    actually reapplied) so the caller can still clean up the temp SRT
+    file even when generation comes back empty."""
+    subtitle_req = _build_subtitle_request_from_style(job_id, clip_index, subtitle_style_config)
+    words_per_line = max(2, min(8, int(subtitle_req.words_per_line or 4)))
+    srt_path = os.path.join(output_dir, f"visuals_subs_{clip_index}_{int(time.time())}.srt")
+    has_srt = await _generate_subtitle_srt_from_clip_context(
+        visuals_stage_path,
+        filename,
+        transcript,
+        clip_data,
+        srt_path,
+        words_per_line,
+        animation=subtitle_req.animation,
+    )
+    if not has_srt:
+        return srt_path, False
+
+    visual_windows = await _reel_visual_windows_for_job_clip(job_id, clip_index, user_id)
+    await loop.run_in_executor(
+        None,
+        _burn_subtitles_for_request,
+        subtitle_req,
+        visuals_stage_path,
+        srt_path,
+        output_path,
+        visual_windows,
+    )
+    return srt_path, True
+
+
 async def _burn_reel_visuals(
     *, job_id: str, clip_index: int, user_id: str, rows: List[Dict[str, Any]],
     input_path: str, filename: str, output_dir: str,
@@ -8067,49 +8133,17 @@ async def _burn_reel_visuals(
     srt_path = ""
     subtitle_reapplied = False
     try:
-        burn_visuals = []
-        for row in rows:
-            image_s3_key = row.get("image_s3_key")
-            ext = os.path.splitext(image_s3_key or "")[1] or ".jpg"
-            local_image_path = os.path.join(output_dir, f"visual_src_{row['id']}{ext}")
-            if not bucket or not image_s3_key or not download_s3_object(bucket, image_s3_key, local_image_path):
-                raise HTTPException(status_code=503, detail="Failed to download a visual's image")
-            local_image_paths.append(local_image_path)
-            burn_visuals.append({
-                "image_path": local_image_path,
-                "position": row.get("position"),
-                "start_time": float(row.get("start_time") or 0),
-                "duration": float(row.get("duration") or 0),
-            })
+        burn_visuals = _download_visuals_for_burn(rows, output_dir, bucket, local_image_paths)
 
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, apply_visuals_to_video, input_path, burn_visuals, visuals_stage_path)
 
         if has_subtitle_material:
-            subtitle_req = _build_subtitle_request_from_style(job_id, clip_index, subtitle_style_config)
-            words_per_line = max(2, min(8, int(subtitle_req.words_per_line or 4)))
-            srt_path = os.path.join(output_dir, f"visuals_subs_{clip_index}_{int(time.time())}.srt")
-            has_srt = await _generate_subtitle_srt_from_clip_context(
-                visuals_stage_path,
-                filename,
-                transcript,
-                clip_data,
-                srt_path,
-                words_per_line,
-                animation=subtitle_req.animation,
+            srt_path, subtitle_reapplied = await _reburn_subtitles_onto_visuals_stage(
+                job_id=job_id, clip_index=clip_index, user_id=user_id, filename=filename, output_dir=output_dir,
+                visuals_stage_path=visuals_stage_path, output_path=output_path, transcript=transcript,
+                clip_data=clip_data, subtitle_style_config=subtitle_style_config, loop=loop,
             )
-            if has_srt:
-                visual_windows = await _reel_visual_windows_for_job_clip(job_id, clip_index, user_id)
-                await loop.run_in_executor(
-                    None,
-                    _burn_subtitles_for_request,
-                    subtitle_req,
-                    visuals_stage_path,
-                    srt_path,
-                    output_path,
-                    visual_windows,
-                )
-                subtitle_reapplied = True
 
         if not subtitle_reapplied:
             shutil.move(visuals_stage_path, output_path)
