@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import { getSupabaseBrowserClient } from "../lib/supabase-browser";
 import { setCachedAccessToken } from "../lib/apiAuth";
-import { associateReferralCode, getStoredReferralCode, looksLikeFreshSignup } from "../lib/referral";
+import { associateReferralCode, getStoredReferralCode } from "../lib/referral";
 
 const AuthContext = createContext(null);
 
@@ -50,16 +50,21 @@ export function AuthProvider({ children }) {
         };
     }, []);
 
-    // OAuth signup detection: email/password signup already knows it just
-    // created an account (see Login.jsx), but Supabase fires the same
-    // SIGNED_IN event for a brand-new OAuth account and a returning one.
-    // getStoredReferralCode() is cleared inside associateReferralCode as
-    // soon as it is attempted, so this only ever fires once per code.
+    // Retries the referral association on every authenticated session this
+    // browser gets, as long as a code is still stored -- covers OAuth
+    // signup, and email/password signup when Supabase requires email
+    // confirmation (signUp() returns no session, so Login.jsx's own
+    // immediate attempt 401s before a session exists; the code is only
+    // cleared on a terminal response, see associateReferralCode, so it
+    // survives for this effect to pick up once the user actually confirms
+    // and signs in). No freshness heuristic needed here: the backend
+    // independently re-verifies the account is new enough before granting
+    // anything, so attempting this for a long-stale code is harmless --
+    // it just comes back {"associated": false} and clears it.
     useEffect(() => {
         if (!user) return;
         const referralCode = getStoredReferralCode();
         if (!referralCode) return;
-        if (!looksLikeFreshSignup(user)) return;
         associateReferralCode(user.id, referralCode);
     }, [user]);
 

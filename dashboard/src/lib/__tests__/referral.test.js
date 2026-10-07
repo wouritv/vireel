@@ -3,7 +3,6 @@ import {
     associateReferralCode,
     clearStoredReferralCode,
     getStoredReferralCode,
-    looksLikeFreshSignup,
     storeReferralCode,
 } from '../referral';
 import { setCachedAccessToken } from '../apiAuth';
@@ -33,34 +32,6 @@ describe('storeReferralCode / getStoredReferralCode / clearStoredReferralCode', 
         storeReferralCode('');
         storeReferralCode(undefined);
         expect(getStoredReferralCode()).toBeNull();
-    });
-});
-
-describe('looksLikeFreshSignup', () => {
-    it('is true when created_at and last_sign_in_at are within 2 minutes', () => {
-        const user = {
-            created_at: '2026-01-01T00:00:00.000Z',
-            last_sign_in_at: '2026-01-01T00:01:30.000Z',
-        };
-        expect(looksLikeFreshSignup(user)).toBe(true);
-    });
-
-    it('is false when they are far apart (returning user)', () => {
-        const user = {
-            created_at: '2026-01-01T00:00:00.000Z',
-            last_sign_in_at: '2026-02-01T00:00:00.000Z',
-        };
-        expect(looksLikeFreshSignup(user)).toBe(false);
-    });
-
-    it('is false and never throws when fields are missing', () => {
-        expect(looksLikeFreshSignup(undefined)).toBe(false);
-        expect(looksLikeFreshSignup({})).toBe(false);
-        expect(looksLikeFreshSignup(null)).toBe(false);
-    });
-
-    it('is false and never throws when fields are unparseable', () => {
-        expect(looksLikeFreshSignup({ created_at: 'nope', last_sign_in_at: 'nope' })).toBe(false);
     });
 });
 
