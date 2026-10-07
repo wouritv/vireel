@@ -18,7 +18,7 @@ import { describeMediaAvailability } from "../lib/mediaAvailability";
 
 export default function ReelsPage({ projectId = "" }) {
     const { user } = useAuth();
-    const { credits, hasActiveSubscription } = useUserCredits();
+    const { hasCredits, hasActiveSubscription } = useUserCredits();
     const {t} = useTranslation();
     const [items, setItems] = useState([]);
     const [loading, setLoading] = useState(true);
@@ -47,7 +47,7 @@ export default function ReelsPage({ projectId = "" }) {
     const navigate = useNavigate();
 
     const totalPages = useMemo(() => Math.max(1, Math.ceil(total / pageSize)), [total, pageSize]);
-    const hasAnyReelCredit = Number(credits || 0) > 0;
+    const hasAnyReelCredit = hasCredits !== false;
     const canShareReel = hasActiveSubscription === true;
     const statusOptions = [
         { value: "", label: t('reels.allStatuses', 'All statuses') },

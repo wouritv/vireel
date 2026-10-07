@@ -34,7 +34,7 @@ function toResultCardClipFromCaption(item, mediaUrl) {
 
 export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) {
     const { user } = useAuth();
-    const { credits, hasActiveSubscription } = useUserCredits();
+    const { hasCredits, hasActiveSubscription } = useUserCredits();
     const { t } = useTranslation();
     const navigate = useNavigate();
 
@@ -70,7 +70,7 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
     const [didAutoOpen, setDidAutoOpen] = useState(false);
 
     const canShareCaption = hasActiveSubscription === true;
-    const canCreateCaption = Number(credits || 0) > 0;
+    const canCreateCaption = hasCredits !== false;
     const statusOptions = [
         { value: "", label: t("reels.allStatuses", "All statuses") },
         { value: "en_cours", label: t("reels.statusInProgress", "In progress") },

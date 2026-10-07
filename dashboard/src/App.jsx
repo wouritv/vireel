@@ -309,7 +309,7 @@ const pollJob = async (jobId, userId = "") => {
 function App({ activeTab = "reel-generator", embedded = false } = {}) {
 
   const { user } = useAuth();
-  const { credits } = useUserCredits();
+  const { hasCredits } = useUserCredits();
   const { t } = useTranslation();
 
   const [jobId, setJobId] = useState(null);
@@ -336,7 +336,7 @@ function App({ activeTab = "reel-generator", embedded = false } = {}) {
   const actionReadyClips = visibleClips.filter((clip) => typeof clip?.video_url === 'string' && clip.video_url.length > 0);
   const pendingClips = visibleClips.filter((clip) => !clip?.video_url);
 
-  const hasAnyReelCredit = Number(credits || 0) > 0;
+  const hasAnyReelCredit = hasCredits !== false;
 
   const handleClipPlay = (startTime) => {
     setSyncedTime(startTime);

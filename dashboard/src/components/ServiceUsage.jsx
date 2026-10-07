@@ -8,12 +8,12 @@ import { daysUntilDate } from "../lib/formatting";
 function ProgressBar({ value, max, color = "green", label, unit = "" }) {
     const pct = max > 0 ? Math.min(100, Math.round((value / max) * 100)) : 0;
     const colors = {
-        green:  "bg-green-500",
-        blue:   "bg-blue-500",
-        red:    "bg-red-500",
+        green: "bg-green-500",
+        blue: "bg-blue-500",
+        red: "bg-red-500",
         purple: "bg-purple-500",
-        zinc:   "bg-zinc-400",
-        amber:  "bg-amber-400",
+        zinc: "bg-zinc-400",
+        amber: "bg-amber-400",
     };
     const barColor = pct < 20 ? "red" : pct < 50 ? "amber" : color;
 
@@ -37,17 +37,26 @@ function ProgressBar({ value, max, color = "green", label, unit = "" }) {
 
 export default function ServiceUsage() {
     const {
-        credits, creditMax, hasCredits, aboCosts, loading, error, refresh,
-        promotionalCredit, promotionalCreditExpirations, purchasedCredit, purchasedCreditExpirations,
+        totalCredits,
+        creditMax,
+        hasCredits,
+        aboCosts,
+        loading,
+        error,
+        refresh,
+        promotionalCredit,
+        promotionalCreditExpirations,
+        purchasedCredit,
+        purchasedCreditExpirations,
     } = useUserCredits();
     const navigate = useNavigate();
     const { t } = useTranslation();
 
-    // Estimate a "max" credit pool for display.
-    // We take 10× the reel cost as the reference maximum (so users see a meaningful bar).
     const creditLimit = Math.max(0, Number(creditMax ?? aboCosts?.credit ?? 0));
+    const combinedCredits = Number(totalCredits ?? 0);
+    const combinedCreditLimit = Math.max(creditLimit, combinedCredits);
 
-    if (loading && credits === 0) {
+    if (loading && combinedCredits === 0) {
         return (
             <div className="p-4 flex items-center gap-2 text-slate-500 dark:text-zinc-400 text-sm">
                 <Loader2 size={16} className="animate-spin" /> Chargement du solde...
@@ -67,27 +76,22 @@ export default function ServiceUsage() {
                 </div>
             )}
 
-            {/* Credit balance bar */}
             <ProgressBar
                 label="Crédits disponibles"
-                value={credits}
-                max={creditLimit}
+                value={combinedCredits}
+                max={combinedCreditLimit}
                 color="blue"
                 unit=" cr"
             />
 
-            {/* Three-pool split -- total available always combines
-                subscription (standard), promotional, and purchased, but
-                they're distinct batches on the backend, consumed in that
-                order: promo first, then purchased, then subscription. */}
             {(promotionalCredit > 0 || purchasedCredit > 0) && (
                 <div className="mb-4 -mt-2 rounded-lg border border-slate-200 dark:border-white/5 bg-black/10 px-3 py-2">
                     <p className="text-xs text-slate-600 dark:text-zinc-300">
-                        {t("serviceUsage.totalAvailable", "{{total}} crédits disponibles", { total: (credits + promotionalCredit + purchasedCredit).toLocaleString() })}
+                        {t("serviceUsage.totalAvailable", "{{total}} crédits disponibles", { total: combinedCredits.toLocaleString() })}
                     </p>
                     <p className="text-xs text-slate-500 dark:text-zinc-400 mt-0.5">
                         {t("serviceUsage.creditsBreakdown3", "{{standard}} crédits abonnement · {{purchased}} crédits achetés · {{promo}} crédits promotionnels", {
-                            standard: credits.toLocaleString(),
+                            standard: Math.max(0, combinedCredits - promotionalCredit - purchasedCredit).toLocaleString(),
                             purchased: purchasedCredit.toLocaleString(),
                             promo: promotionalCredit.toLocaleString(),
                         })}
@@ -125,7 +129,6 @@ export default function ServiceUsage() {
                 </div>
             )}
 
-            {/* Warning if low credits */}
             {hasCredits === false && (
                 <div className="flex items-center justify-between gap-4 mt-2">
                     <div className="flex-1 p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg">
@@ -143,7 +146,6 @@ export default function ServiceUsage() {
                     </button>
                 </div>
             )}
-
 
         </div>
     );
