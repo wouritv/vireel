@@ -4371,14 +4371,18 @@ async def _finalize_media_retention_billing(
                 retention_days=retention_days,
                 retention_started_at=now,
                 retention_expires_at=retention_expires_at,
-                job_id=job_id,
-                s3_bucket=s3_bucket,
-                s3_key=s3_key,
-                size_bytes=int(size_bytes or 0),
-                s3_storage_cost_per_gb_day=S3_STORAGE_COST_PER_GB_DAY,
-                retention_storage_cost_usd=retention_storage_cost_usd,
-                retention_storage_credit_cost=retention_storage_credit_cost,
-                billing_created_at=now,
+                storage={
+                    "job_id": job_id,
+                    "s3_bucket": s3_bucket,
+                    "s3_key": s3_key,
+                    "size_bytes": int(size_bytes or 0),
+                },
+                billing={
+                    "s3_storage_cost_per_gb_day": S3_STORAGE_COST_PER_GB_DAY,
+                    "retention_storage_cost_usd": retention_storage_cost_usd,
+                    "retention_storage_credit_cost": retention_storage_credit_cost,
+                    "billing_created_at": now,
+                },
             )
         except Exception:
             logger.exception("Failed to persist media_assets row for job %s / %s:%s", job_id, content_kind, content_id)
@@ -10313,9 +10317,11 @@ async def _handle_subscription_purchase(ctx: dict) -> dict:
         payment_status="completed",
         payment_comment=f"Stripe checkout session {ctx['session_id']}".strip(),
         payment_date=ctx["payment_date"],
-        stripe_subscription_id=ctx.get("stripe_subscription_id"),
-        stripe_customer_id=ctx.get("stripe_customer_id"),
-        billing_interval=billing_interval,
+        billing={
+            "stripe_subscription_id": ctx.get("stripe_subscription_id"),
+            "stripe_customer_id": ctx.get("stripe_customer_id"),
+            "billing_interval": billing_interval,
+        },
     )
 
     if previous_souscription_id:
@@ -10408,10 +10414,12 @@ async def _handle_subscription_renewal_invoice(invoice: "stripe.Invoice") -> dic
         payment_status="completed",
         payment_comment=f"Stripe subscription renewal {subscription_id}",
         payment_date=payment_date,
-        period_end_date=period_end,
-        stripe_subscription_id=subscription_id,
-        stripe_customer_id=invoice.customer or None,
-        billing_interval=billing_interval,
+        billing={
+            "period_end_date": period_end,
+            "stripe_subscription_id": subscription_id,
+            "stripe_customer_id": invoice.customer or None,
+            "billing_interval": billing_interval,
+        },
     )
     await _allocate_plan_resources(
         user_id=user_id,
@@ -11510,15 +11518,19 @@ async def _finalize_immediate_upgrade(
         payment_status="completed",
         payment_comment=f"Plan upgraded to {new_plan.get('name')} (prorated)",
         payment_date=now,
-        period_end_date=period_end,
-        stripe_subscription_id=subscription["stripe_subscription_id"],
-        stripe_customer_id=subscription.get("stripe_customer_id"),
-        billing_interval=billing_interval,
-        plan_credit=new_plan_credit,
-        plan_stockage=new_plan_storage,
-        next_credit_allocation_at=next_allocation,
-        credit_cycle_start_at=credit_cycle_start,
-        credit_cycle_end_at=credit_cycle_end,
+        billing={
+            "period_end_date": period_end,
+            "stripe_subscription_id": subscription["stripe_subscription_id"],
+            "stripe_customer_id": subscription.get("stripe_customer_id"),
+            "billing_interval": billing_interval,
+        },
+        allocation={
+            "plan_credit": new_plan_credit,
+            "plan_stockage": new_plan_storage,
+            "next_credit_allocation_at": next_allocation,
+            "credit_cycle_start_at": credit_cycle_start,
+            "credit_cycle_end_at": credit_cycle_end,
+        },
     )
     new_souscription_id = str(new_souscription.get("id") or "")
 
@@ -14365,15 +14377,24 @@ async def _run_film_summary_analysis_job(
             shutil.rmtree(output_dir, ignore_errors=True)
 
 
+async def _update_film_summary_if_tracked(film_summary_id: Optional[str], user_id: str, updates: Dict[str, Any]) -> None:
+    """Persists progress-tracking fields onto the film_summary row, when
+    one is actually being tracked for this job (Supabase configured and a
+    row id was given) -- the same two-part gate repeated at each stage of
+    _run_transcription_and_scene_detection_stages, extracted to cut that
+    function's cognitive complexity (audit: SonarQube python:S3776)."""
+    if film_summary_id and is_supabase_configured():
+        await supabase_update_film_summary(film_summary_id, user_id, updates)
+
+
 async def _run_transcription_and_scene_detection_stages(
     job_id: str, user_id: str, film_summary_id: Optional[str], input_path: str,
     source_language: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
-    if film_summary_id and is_supabase_configured():
-        await supabase_update_film_summary(film_summary_id, user_id, {
-            "status": film_summary.FilmSummaryStatus.PROCESSING,
-            "stage": film_summary.FilmSummaryStage.TRANSCRIBING,
-        })
+    await _update_film_summary_if_tracked(film_summary_id, user_id, {
+        "status": film_summary.FilmSummaryStatus.PROCESSING,
+        "stage": film_summary.FilmSummaryStage.TRANSCRIBING,
+    })
     await reel_job_manager.update_progress(job_id, 20, film_summary.FilmSummaryStage.TRANSCRIBING)
 
     try:
@@ -14403,12 +14424,11 @@ async def _run_transcription_and_scene_detection_stages(
             "transcript_text": transcript_text,
         })
 
-    if film_summary_id and is_supabase_configured():
-        await supabase_update_film_summary(film_summary_id, user_id, {
-            "stage": film_summary.FilmSummaryStage.DETECTING_SCENES,
-            "transcript_segments": transcript_segments,
-            "source_language": effective_source_language,
-        })
+    await _update_film_summary_if_tracked(film_summary_id, user_id, {
+        "stage": film_summary.FilmSummaryStage.DETECTING_SCENES,
+        "transcript_segments": transcript_segments,
+        "source_language": effective_source_language,
+    })
     await reel_job_manager.update_progress(job_id, 40, film_summary.FilmSummaryStage.DETECTING_SCENES)
 
     try:
@@ -14425,8 +14445,7 @@ async def _run_transcription_and_scene_detection_stages(
         raise film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.SCENE_DETECTION_FAILED, str(exc)) from exc
 
     scene_index = film_summary.build_scene_index(scenes, transcript_segments)
-    if film_summary_id and is_supabase_configured():
-        await supabase_update_film_summary(film_summary_id, user_id, {"scene_index": scene_index})
+    await _update_film_summary_if_tracked(film_summary_id, user_id, {"scene_index": scene_index})
 
     return transcript_segments, scene_index, str(transcript.get("language") or "")
 
@@ -15159,6 +15178,78 @@ async def _run_film_summary_render_pipeline_stages(
     )
 
 
+async def _cleanup_film_summary_source_media(
+    job_id: str, source_s3_key: Optional[str], bucket_name: str, project_id: Optional[str],
+) -> None:
+    """Deletes the source video from S3 once its film summary is complete
+    (neither /render nor /retry can reach it again past this point) and
+    marks its own media_assets row DELETED (volitional), never EXPIRED
+    (that status is reserved for the retention sweep itself, see
+    process_media_expiration_jobs) -- isolated out of
+    _finalize_film_summary_render to cut that function's cognitive
+    complexity (audit: SonarQube python:S3776)."""
+    if not source_s3_key or not bucket_name:
+        return
+    delete_s3_object(bucket_name, source_s3_key)
+    if not project_id:
+        return
+    try:
+        source_media_asset = await supabase_get_media_asset_by_content(CONTENT_KIND_PROJECT_SOURCE, project_id)
+        if source_media_asset and source_media_asset.get("id"):
+            await supabase_mark_media_asset_deleted(source_media_asset["id"])
+    except Exception:
+        logger.exception("Failed to mark film summary source media_asset deleted (job %s)", job_id)
+
+
+async def _settle_film_summary_render_credits(
+    *, job_id: str, user_id: str, film_summary_id: str, bucket_name: str, final_s3_key: str,
+    output_storage_bytes: float, final_credits: float, cost_breakdown: Dict[str, Any], reserved_credits: float,
+) -> Tuple[float, Dict[str, Any]]:
+    """Bills the produced media's retention storage (preview + final share
+    one combined media_assets row, since they're always deleted/expired
+    together, so size_bytes is their combined total), folds that line into
+    the cost breakdown, and debits the job's final credits -- isolated out
+    of _finalize_film_summary_render (audit: SonarQube python:S3776)."""
+    retention = await _finalize_retention_billing_batch(job_id, user_id, [
+        {
+            "content_kind": CONTENT_KIND_FILM_SUMMARY,
+            "content_id": film_summary_id,
+            "media_type": MEDIA_TYPE_PRODUCED,
+            "size_bytes": output_storage_bytes,
+            "s3_bucket": bucket_name,
+            "s3_key": final_s3_key,
+        }
+    ])
+    final_credits = round(final_credits + retention["retention_storage_credit_cost"], 2)
+    if retention["retention_storage_cost_usd"] or retention["retention_storage_credit_cost"]:
+        cost_breakdown = {
+            **cost_breakdown,
+            "retention_storage_cost_usd": retention["retention_storage_cost_usd"],
+            "retention_storage_credit_cost": retention["retention_storage_credit_cost"],
+            "media_assets": retention["media_assets"],
+        }
+
+    debit_ok = await reel_job_manager.debit_credits_for_job(
+        job_id=job_id, user_id=user_id, credits=final_credits,
+        storage_delta=-_bytes_to_gb(float(output_storage_bytes or 0.0)),
+        operation_type=film_summary.CREDIT_OPERATION_TYPE, reserved_credits=reserved_credits,
+    )
+    if not debit_ok:
+        logger.warning(f"Insufficient balance to settle film summary render job {job_id}")
+
+    return final_credits, cost_breakdown
+
+
+async def _mark_film_summary_project_completed(project_id: Optional[str], user_id: str) -> None:
+    if not project_id or not is_supabase_configured():
+        return
+    try:
+        await supabase_update_project_status(project_id, "completed", user_id=user_id)
+        await supabase_update_project(project_id, user_id, {"output_count": 1})
+    except Exception as e:
+        logger.warning(f"Failed to mark project {project_id} completed: {str(e)}")
+
+
 async def _finalize_film_summary_render(
     job_id: str, user_id: str, film_summary_id: str, project_id: Optional[str], plan: Dict[str, Any],
     preview_s3_key: str, final_s3_key: str, render_result: Dict[str, Any], output_storage_bytes: float = 0.0,
@@ -15191,57 +15282,14 @@ async def _finalize_film_summary_render(
             # keep does (billed below).
             "source_s3_key": None,
         })
-        if source_s3_key and bucket_name:
-            delete_s3_object(bucket_name, source_s3_key)
-            # The source's own media_assets row (created at project upload
-            # time, see _create_film_summary_endpoint_project) now points at
-            # a file we just deleted ourselves -- DELETED (volitional),
-            # never EXPIRED (that status is reserved for the retention
-            # sweep itself, see process_media_expiration_jobs).
-            if project_id:
-                try:
-                    source_media_asset = await supabase_get_media_asset_by_content(CONTENT_KIND_PROJECT_SOURCE, project_id)
-                    if source_media_asset and source_media_asset.get("id"):
-                        await supabase_mark_media_asset_deleted(source_media_asset["id"])
-                except Exception:
-                    logger.exception("Failed to mark film summary source media_asset deleted (job %s)", job_id)
-
-        # One combined media_assets row for both produced outputs (preview
-        # + final share the same film_summary_id and are always deleted/
-        # expired together) -- size_bytes is their combined total.
-        retention = await _finalize_retention_billing_batch(job_id, user_id, [
-            {
-                "content_kind": CONTENT_KIND_FILM_SUMMARY,
-                "content_id": film_summary_id,
-                "media_type": MEDIA_TYPE_PRODUCED,
-                "size_bytes": output_storage_bytes,
-                "s3_bucket": bucket_name,
-                "s3_key": final_s3_key,
-            }
-        ])
-        final_credits = round(final_credits + retention["retention_storage_credit_cost"], 2)
-        if retention["retention_storage_cost_usd"] or retention["retention_storage_credit_cost"]:
-            cost_breakdown = {
-                **cost_breakdown,
-                "retention_storage_cost_usd": retention["retention_storage_cost_usd"],
-                "retention_storage_credit_cost": retention["retention_storage_credit_cost"],
-                "media_assets": retention["media_assets"],
-            }
-
-        debit_ok = await reel_job_manager.debit_credits_for_job(
-            job_id=job_id, user_id=user_id, credits=final_credits,
-            storage_delta=-_bytes_to_gb(float(output_storage_bytes or 0.0)),
-            operation_type=film_summary.CREDIT_OPERATION_TYPE, reserved_credits=reserved_credits,
+        await _cleanup_film_summary_source_media(job_id, source_s3_key, bucket_name, project_id)
+        final_credits, cost_breakdown = await _settle_film_summary_render_credits(
+            job_id=job_id, user_id=user_id, film_summary_id=film_summary_id, bucket_name=bucket_name,
+            final_s3_key=final_s3_key, output_storage_bytes=output_storage_bytes,
+            final_credits=final_credits, cost_breakdown=cost_breakdown, reserved_credits=reserved_credits,
         )
-        if not debit_ok:
-            logger.warning(f"Insufficient balance to settle film summary render job {job_id}")
 
-    if project_id and is_supabase_configured():
-        try:
-            await supabase_update_project_status(project_id, "completed", user_id=user_id)
-            await supabase_update_project(project_id, user_id, {"output_count": 1})
-        except Exception as e:
-            logger.warning(f"Failed to mark project {project_id} completed: {str(e)}")
+    await _mark_film_summary_project_completed(project_id, user_id)
 
     await reel_job_manager.complete_job(
         job_id,

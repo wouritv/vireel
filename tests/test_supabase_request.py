@@ -984,9 +984,11 @@ def test_insert_souscription_uses_explicit_period_end_date_and_stripe_ids(monkey
             payment_amount=99.99,
             payment_reference="in_renewal_1",
             payment_status="completed",
-            period_end_date=period_end,
-            stripe_subscription_id="sub_123",
-            stripe_customer_id="cus_456",
+            billing={
+                "period_end_date": period_end,
+                "stripe_subscription_id": "sub_123",
+                "stripe_customer_id": "cus_456",
+            },
         )
     )
     assert result["payment_end_date"] == period_end.isoformat()
@@ -1006,7 +1008,8 @@ def test_insert_souscription_annual_defaults_to_plus_one_year(monkeypatch):
         supabase_request.insert_souscription(
             user_id="u1", abonnement="plan-pro", payment_mode="stripe",
             payment_amount=114.0, payment_reference="ref-annual",
-            payment_status="completed", payment_date=start, billing_interval="year",
+            payment_status="completed", payment_date=start,
+            billing={"billing_interval": "year"},
         )
     )
     assert result["billing_interval"] == "year"
@@ -1025,8 +1028,11 @@ def test_insert_souscription_persists_plan_snapshot_and_next_allocation(monkeypa
         supabase_request.insert_souscription(
             user_id="u1", abonnement="plan-pro", payment_mode="stripe",
             payment_amount=114.0, payment_reference="ref-annual", payment_status="completed",
-            billing_interval="year", plan_credit=500.0, plan_stockage=1.0,
-            next_credit_allocation_at=next_allocation,
+            billing={"billing_interval": "year"},
+            allocation={
+                "plan_credit": 500.0, "plan_stockage": 1.0,
+                "next_credit_allocation_at": next_allocation,
+            },
         )
     )
     assert result["plan_credit"] == 500.0
@@ -1076,7 +1082,8 @@ def test_insert_souscription_annual_credit_cycle_is_one_month_subwindow(monkeypa
         supabase_request.insert_souscription(
             user_id="u1", abonnement="plan-pro", payment_mode="stripe",
             payment_amount=114.0, payment_reference="ref-annual-cycle",
-            payment_status="completed", payment_date=start, billing_interval="year",
+            payment_status="completed", payment_date=start,
+            billing={"billing_interval": "year"},
         )
     )
     assert result["payment_end_date"] == datetime(2027, 1, 15, tzinfo=timezone.utc).isoformat()
@@ -1100,8 +1107,9 @@ def test_insert_souscription_credit_cycle_explicit_override_wins(monkeypatch):
         supabase_request.insert_souscription(
             user_id="u1", abonnement="plan-pro", payment_mode="stripe",
             payment_amount=7.5, payment_reference="ref-upgrade",
-            payment_status="completed", billing_interval="year",
-            credit_cycle_start_at=cycle_start, credit_cycle_end_at=cycle_end,
+            payment_status="completed",
+            billing={"billing_interval": "year"},
+            allocation={"credit_cycle_start_at": cycle_start, "credit_cycle_end_at": cycle_end},
         )
     )
     assert result["credit_cycle_start_at"] == cycle_start.isoformat()
@@ -2544,13 +2552,17 @@ def test_insert_media_asset_sends_fixed_policy_snapshot(monkeypatch):
         retention_days=30,
         retention_started_at=started,
         retention_expires_at=expires,
-        job_id="job-1",
-        s3_bucket="bucket",
-        s3_key="key.mp4",
-        size_bytes=4_000_000_000,
-        s3_storage_cost_per_gb_day=0.0008,
-        retention_storage_cost_usd=0.096,
-        retention_storage_credit_cost=1.5,
+        storage={
+            "job_id": "job-1",
+            "s3_bucket": "bucket",
+            "s3_key": "key.mp4",
+            "size_bytes": 4_000_000_000,
+        },
+        billing={
+            "s3_storage_cost_per_gb_day": 0.0008,
+            "retention_storage_cost_usd": 0.096,
+            "retention_storage_credit_cost": 1.5,
+        },
     ))
     assert row["id"] == "m1"
     insert_payload = _event_args(fake_client.events, supabase_request.SUPABASE_MEDIA_ASSETS_TABLE, "insert")[0]

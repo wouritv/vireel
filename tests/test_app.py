@@ -5760,9 +5760,9 @@ def test_handle_subscription_renewal_invoice_credits_plan_and_persists_period(mo
     assert kwargs["user_id"] == "u1"
     assert kwargs["abonnement"] == "plan-1"
     assert kwargs["payment_reference"] == "pi_renewal_1"
-    assert kwargs["stripe_subscription_id"] == "sub_123"
-    assert kwargs["stripe_customer_id"] == "cus_456"
-    assert kwargs["period_end_date"] == datetime.fromtimestamp(1702592000, tz=timezone.utc)
+    assert kwargs["billing"]["stripe_subscription_id"] == "sub_123"
+    assert kwargs["billing"]["stripe_customer_id"] == "cus_456"
+    assert kwargs["billing"]["period_end_date"] == datetime.fromtimestamp(1702592000, tz=timezone.utc)
     assert kwargs["payment_amount"] == 29.99
     allocate_mock.assert_awaited_once()
     email_mock.assert_called_once()
@@ -5798,7 +5798,7 @@ def test_handle_subscription_renewal_invoice_threads_billing_interval(monkeypatc
     asyncio.run(app._handle_subscription_renewal_invoice(invoice))
 
     insert_kwargs = insert_mock.await_args.kwargs
-    assert insert_kwargs["billing_interval"] == "year"
+    assert insert_kwargs["billing"]["billing_interval"] == "year"
     allocate_kwargs = allocate_mock.await_args.kwargs
     assert allocate_kwargs["billing_interval"] == "year"
     assert allocate_kwargs["period_start"] == datetime.fromtimestamp(1700000000, tz=timezone.utc)
@@ -6060,7 +6060,7 @@ def test_handle_subscription_purchase_threads_annual_billing_interval(monkeypatc
     asyncio.run(app._handle_subscription_purchase(ctx))
 
     insert_kwargs = insert_mock.await_args.kwargs
-    assert insert_kwargs["billing_interval"] == "year"
+    assert insert_kwargs["billing"]["billing_interval"] == "year"
     allocate_kwargs = allocate_mock.await_args.kwargs
     assert allocate_kwargs["billing_interval"] == "year"
     assert allocate_kwargs["period_start"] == payment_date
@@ -7425,9 +7425,9 @@ def test_apply_immediate_upgrade_monthly_charges_exact_proration_and_adds_delta(
 
     insert_kwargs = insert_mock.await_args.kwargs
     assert insert_kwargs["abonnement"] == "gold"
-    assert insert_kwargs["plan_credit"] == 1500.0  # full new quota snapshotted, not prorated
-    assert insert_kwargs["credit_cycle_start_at"] == start  # carried forward, not restarted
-    assert insert_kwargs["credit_cycle_end_at"] == end
+    assert insert_kwargs["allocation"]["plan_credit"] == 1500.0  # full new quota snapshotted, not prorated
+    assert insert_kwargs["allocation"]["credit_cycle_start_at"] == start  # carried forward, not restarted
+    assert insert_kwargs["allocation"]["credit_cycle_end_at"] == end
 
     # Delta applied on top of the existing balance -- never a reset (spec
     # section 6: existing credits/expirations untouched).

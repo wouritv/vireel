@@ -1013,73 +1013,57 @@ def add_one_year(dt: datetime) -> datetime:
 	return dt.replace(year=year, day=day)
 
 
-async def insert_souscription(
+def _ensure_utc(dt: datetime) -> datetime:
+	return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _resolve_souscription_period_end(start_date: datetime, billing: Dict[str, Any]) -> datetime:
+	period_end_date = billing.get("period_end_date")
+	if period_end_date is not None:
+		return _ensure_utc(period_end_date)
+	if billing.get("billing_interval") == "year":
+		return _ensure_utc(add_one_year(start_date))
+	return _ensure_utc(add_one_month(start_date))
+
+
+def _resolve_souscription_credit_cycle(
+	start_date: datetime,
+	end_date: datetime,
+	billing: Dict[str, Any],
+	allocation: Dict[str, Any],
+) -> Tuple[datetime, datetime]:
+	cycle_start = allocation.get("credit_cycle_start_at")
+	if cycle_start is None:
+		cycle_start = start_date
+
+	cycle_end = allocation.get("credit_cycle_end_at")
+	if cycle_end is None:
+		# An annual row's credit cycle is a one-month sub-window, not the
+		# whole paid year -- default it to +1 month from the cycle start
+		# rather than to end_date (the annual payment_end_date) when the
+		# caller hasn't already resolved it explicitly.
+		if billing.get("billing_interval") == "year":
+			cycle_end = add_one_month(cycle_start)
+		else:
+			cycle_end = end_date
+
+	return _ensure_utc(cycle_start), _ensure_utc(cycle_end)
+
+
+def _build_souscription_payload(
 	user_id: str,
 	abonnement: Optional[str],
 	payment_mode: str,
 	payment_amount: float,
 	payment_reference: str,
-	payment_status: str = "confirmed",
-	payment_comment: str = "",
-	payment_date: Optional[datetime] = None,
-	period_end_date: Optional[datetime] = None,
-	stripe_subscription_id: Optional[str] = None,
-	stripe_customer_id: Optional[str] = None,
-	billing_interval: str = "month",
-	plan_credit: Optional[float] = None,
-	plan_stockage: Optional[float] = None,
-	next_credit_allocation_at: Optional[datetime] = None,
-	credit_cycle_start_at: Optional[datetime] = None,
-	credit_cycle_end_at: Optional[datetime] = None,
+	payment_status: str,
+	payment_comment: str,
+	start_date: datetime,
+	end_date: datetime,
+	cycle_start: datetime,
+	cycle_end: datetime,
+	billing: Dict[str, Any],
 ) -> Dict[str, Any]:
-	"""Create a subscription row after a confirmed payment.
-
-	period_end_date overrides the default end date (+1 calendar month, or
-	+1 calendar year when billing_interval == "year") -- a Stripe
-	subscription renewal invoice carries its own authoritative billing
-	period (see _handle_subscription_renewal_invoice in app.py), which
-	must be used as-is instead of recomputed, so the stored period stays
-	exactly in sync with what Stripe actually billed.
-
-	plan_credit/plan_stockage snapshot the plan's allowance at the moment
-	of this payment -- see the annual-billing migration's comment on
-	souscription for why this must never be a live lookup.
-
-	credit_cycle_start_at/credit_cycle_end_at default to this row's own
-	billing period (start_date/end_date) when omitted -- correct for a
-	monthly subscription, where the credit cycle and the billing period
-	are the same thing. A caller allocating resources for an annual
-	subscription's one-month sub-cycle (not the whole paid year) passes
-	these explicitly -- see _allocate_plan_resources in app.py."""
-	client = await get_client()
-	start_date = payment_date or datetime.now(timezone.utc)
-	if start_date.tzinfo is None:
-		start_date = start_date.replace(tzinfo=timezone.utc)
-	if period_end_date is not None:
-		end_date = period_end_date
-	elif billing_interval == "year":
-		end_date = add_one_year(start_date)
-	else:
-		end_date = add_one_month(start_date)
-	if end_date.tzinfo is None:
-		end_date = end_date.replace(tzinfo=timezone.utc)
-
-	cycle_start = credit_cycle_start_at if credit_cycle_start_at is not None else start_date
-	# An annual row's credit cycle is a one-month sub-window, not the
-	# whole paid year -- default it to +1 month from the cycle start
-	# rather than to end_date (the annual payment_end_date) when the
-	# caller hasn't already resolved it explicitly.
-	if credit_cycle_end_at is not None:
-		cycle_end = credit_cycle_end_at
-	elif billing_interval == "year":
-		cycle_end = add_one_month(cycle_start)
-	else:
-		cycle_end = end_date
-	if cycle_start.tzinfo is None:
-		cycle_start = cycle_start.replace(tzinfo=timezone.utc)
-	if cycle_end.tzinfo is None:
-		cycle_end = cycle_end.replace(tzinfo=timezone.utc)
-
 	payload = {
 		"userid": user_id,
 		"abonnement": abonnement,
@@ -1090,22 +1074,74 @@ async def insert_souscription(
 		"payment_end_date": end_date.isoformat(),
 		"payment_status": payment_status,
 		"payment_comment": payment_comment,
-		"billing_interval": billing_interval,
+		"billing_interval": billing.get("billing_interval", "month"),
 		"credit_cycle_start_at": cycle_start.isoformat(),
 		"credit_cycle_end_at": cycle_end.isoformat(),
 	}
-	if stripe_subscription_id:
-		payload["stripe_subscription_id"] = stripe_subscription_id
-	if stripe_customer_id:
-		payload["stripe_customer_id"] = stripe_customer_id
-	if plan_credit is not None:
-		payload["plan_credit"] = float(plan_credit)
-	if plan_stockage is not None:
-		payload["plan_stockage"] = float(plan_stockage)
-	if next_credit_allocation_at is not None:
-		if next_credit_allocation_at.tzinfo is None:
-			next_credit_allocation_at = next_credit_allocation_at.replace(tzinfo=timezone.utc)
-		payload["next_credit_allocation_at"] = next_credit_allocation_at.isoformat()
+	if billing.get("stripe_subscription_id"):
+		payload["stripe_subscription_id"] = billing["stripe_subscription_id"]
+	if billing.get("stripe_customer_id"):
+		payload["stripe_customer_id"] = billing["stripe_customer_id"]
+	return payload
+
+
+def _apply_souscription_plan_allocation(payload: Dict[str, Any], allocation: Dict[str, Any]) -> None:
+	if allocation.get("plan_credit") is not None:
+		payload["plan_credit"] = float(allocation["plan_credit"])
+	if allocation.get("plan_stockage") is not None:
+		payload["plan_stockage"] = float(allocation["plan_stockage"])
+	next_allocation = allocation.get("next_credit_allocation_at")
+	if next_allocation is not None:
+		payload["next_credit_allocation_at"] = _ensure_utc(next_allocation).isoformat()
+
+
+async def insert_souscription(
+	user_id: str,
+	abonnement: Optional[str],
+	payment_mode: str,
+	payment_amount: float,
+	payment_reference: str,
+	payment_status: str = "confirmed",
+	payment_comment: str = "",
+	payment_date: Optional[datetime] = None,
+	billing: Optional[Dict[str, Any]] = None,
+	allocation: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+	"""Create a subscription row after a confirmed payment.
+
+	``billing`` carries Stripe linkage and billing-period overrides:
+	period_end_date, stripe_subscription_id, stripe_customer_id,
+	billing_interval. period_end_date overrides the default end date (+1
+	calendar month, or +1 calendar year when billing_interval == "year")
+	-- a Stripe subscription renewal invoice carries its own authoritative
+	billing period (see _handle_subscription_renewal_invoice in app.py),
+	which must be used as-is instead of recomputed, so the stored period
+	stays exactly in sync with what Stripe actually billed.
+
+	``allocation`` carries the plan snapshot and credit-cycle window:
+	plan_credit, plan_stockage, next_credit_allocation_at,
+	credit_cycle_start_at, credit_cycle_end_at. plan_credit/plan_stockage
+	snapshot the plan's allowance at the moment of this payment -- see the
+	annual-billing migration's comment on souscription for why this must
+	never be a live lookup. credit_cycle_start_at/credit_cycle_end_at
+	default to this row's own billing period (start_date/end_date) when
+	omitted -- correct for a monthly subscription, where the credit cycle
+	and the billing period are the same thing. A caller allocating
+	resources for an annual subscription's one-month sub-cycle (not the
+	whole paid year) passes these explicitly -- see
+	_allocate_plan_resources in app.py."""
+	billing = billing or {}
+	allocation = allocation or {}
+	client = await get_client()
+	start_date = _ensure_utc(payment_date or datetime.now(timezone.utc))
+	end_date = _resolve_souscription_period_end(start_date, billing)
+	cycle_start, cycle_end = _resolve_souscription_credit_cycle(start_date, end_date, billing, allocation)
+
+	payload = _build_souscription_payload(
+		user_id, abonnement, payment_mode, payment_amount, payment_reference,
+		payment_status, payment_comment, start_date, end_date, cycle_start, cycle_end, billing,
+	)
+	_apply_souscription_plan_allocation(payload, allocation)
 
 	response = await client.table(SUPABASE_SOUSCRIPTION_TABLE).insert(payload).execute()
 	rows = response.data or []
@@ -2940,6 +2976,40 @@ MEDIA_STATUS_DELETED = "DELETED"
 MEDIA_STATUS_MISSING = "MISSING"
 
 
+def _build_media_asset_payload(
+	user_id: str,
+	content_kind: str,
+	content_id: str,
+	media_type: str,
+	subscription_status_at_creation: str,
+	retention_days: int,
+	retention_started_at: datetime,
+	retention_expires_at: datetime,
+	storage: Dict[str, Any],
+	billing: Dict[str, Any],
+) -> Dict[str, Any]:
+	size_bytes = storage.get("size_bytes")
+	billing_created_at = billing.get("billing_created_at")
+	return {
+		"user_id": user_id,
+		"content_kind": content_kind,
+		"content_id": content_id,
+		"job_id": storage.get("job_id"),
+		"media_type": media_type,
+		"s3_bucket": storage.get("s3_bucket"),
+		"s3_key": storage.get("s3_key"),
+		"size_bytes": int(size_bytes) if size_bytes is not None else None,
+		"subscription_status_at_creation": subscription_status_at_creation,
+		"retention_days": int(retention_days),
+		"retention_started_at": retention_started_at.isoformat(),
+		"retention_expires_at": retention_expires_at.isoformat(),
+		"s3_storage_cost_per_gb_day": billing.get("s3_storage_cost_per_gb_day"),
+		"retention_storage_cost_usd": billing.get("retention_storage_cost_usd"),
+		"retention_storage_credit_cost": billing.get("retention_storage_credit_cost"),
+		"billing_created_at": billing_created_at.isoformat() if billing_created_at else datetime.now(timezone.utc).isoformat(),
+	}
+
+
 async def insert_media_asset(
 	user_id: str,
 	content_kind: str,
@@ -2949,39 +3019,24 @@ async def insert_media_asset(
 	retention_days: int,
 	retention_started_at: datetime,
 	retention_expires_at: datetime,
-	job_id: Optional[str] = None,
-	s3_bucket: Optional[str] = None,
-	s3_key: Optional[str] = None,
-	size_bytes: Optional[int] = None,
-	s3_storage_cost_per_gb_day: Optional[float] = None,
-	retention_storage_cost_usd: Optional[float] = None,
-	retention_storage_credit_cost: Optional[float] = None,
-	billing_created_at: Optional[datetime] = None,
+	storage: Optional[Dict[str, Any]] = None,
+	billing: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
 	"""Creates this media's lifecycle row, fixing its retention policy and
 	billing snapshot forever (see _finalize_media_retention_billing in
 	app.py -- this is called exactly once, at the moment the media's
 	definitive size is known, and never updated afterward to reflect a
-	later env var or subscription change)."""
+	later env var or subscription change).
+
+	``storage`` carries the file location: job_id, s3_bucket, s3_key,
+	size_bytes. ``billing`` carries the retention-cost snapshot:
+	s3_storage_cost_per_gb_day, retention_storage_cost_usd,
+	retention_storage_credit_cost, billing_created_at."""
 	client = await get_client()
-	payload = {
-		"user_id": user_id,
-		"content_kind": content_kind,
-		"content_id": content_id,
-		"job_id": job_id,
-		"media_type": media_type,
-		"s3_bucket": s3_bucket,
-		"s3_key": s3_key,
-		"size_bytes": int(size_bytes) if size_bytes is not None else None,
-		"subscription_status_at_creation": subscription_status_at_creation,
-		"retention_days": int(retention_days),
-		"retention_started_at": retention_started_at.isoformat(),
-		"retention_expires_at": retention_expires_at.isoformat(),
-		"s3_storage_cost_per_gb_day": s3_storage_cost_per_gb_day,
-		"retention_storage_cost_usd": retention_storage_cost_usd,
-		"retention_storage_credit_cost": retention_storage_credit_cost,
-		"billing_created_at": billing_created_at.isoformat() if billing_created_at else datetime.now(timezone.utc).isoformat(),
-	}
+	payload = _build_media_asset_payload(
+		user_id, content_kind, content_id, media_type, subscription_status_at_creation,
+		retention_days, retention_started_at, retention_expires_at, storage or {}, billing or {},
+	)
 	response = await client.table(SUPABASE_MEDIA_ASSETS_TABLE).insert(payload).execute()
 	rows = response.data or []
 	return rows[0] if rows else payload
