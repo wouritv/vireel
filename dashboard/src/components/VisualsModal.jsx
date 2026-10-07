@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertCircle, ImagePlus, Loader2, MoveVertical, Plus, Trash2, Upload, X } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { getAuthHeaders } from '../lib/apiAuth';
+import { toBrowserSafeMediaUrl } from '../lib/clips';
 import { useAuth } from '../state/AuthContext';
 import { useTranslation } from '../state/LanguageContext';
 import { validateVisualImageFile, validateVisualTiming } from '../lib/reelVisuals';
@@ -144,8 +145,13 @@ export default function VisualsModal({
         position: v.position,
         startSec: Number(v.start_time) || 0,
         durationSec: Number(v.duration) || 0,
-        imageUrl: v.image_url,
+        imageUrl: toBrowserSafeMediaUrl(v.image_url),
     })), [visuals]);
+
+    const selectedVisualImageUrl = useMemo(
+        () => toBrowserSafeMediaUrl(selectedVisual?.image_url || ''),
+        [selectedVisual?.image_url]
+    );
 
     const patchVisual = async (visualId, patch) => {
         const res = await fetch(getApiUrl(`/api/reels/${jobId}/${clipIndex}/visuals/${visualId}`), {
@@ -489,7 +495,7 @@ export default function VisualsModal({
                                 </div>
 
                                 <img
-                                    src={selectedVisual.image_url}
+                                    src={selectedVisualImageUrl}
                                     alt=""
                                     className="w-full h-20 object-cover rounded-md border border-slate-200 dark:border-white/10"
                                 />

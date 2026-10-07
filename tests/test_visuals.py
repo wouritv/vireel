@@ -20,19 +20,19 @@ def test_build_visuals_filter_complex_single_top_visual():
 
     # Base video is SAR-normalized once, up front, before anything else reads it.
     assert "[0:v]setsar=1[vsar]" in result
-    # 35% of 1920 = 672 (even already), video half = 1920-672=1248.
+    # 50% of 1920 = 960 for both halves.
     assert "[vsar]split=2[vfull0][vsrc0]" in result
-    assert "scale=1080:1248:force_original_aspect_ratio=increase" in result
-    assert "crop=1080:1248[vcrop0]" in result
-    # TOP: image at y=0, video padded down to y=image_height=672.
-    assert "pad=1080:1920:0:672:black[vpad0]" in result
+    assert "scale=1080:960:force_original_aspect_ratio=increase" in result
+    assert "crop=1080:960:(iw-ow)/2:(ih-oh)/2[vcrop0]" in result
+    # TOP: image at y=0, video padded down to y=image_height=960.
+    assert "pad=1080:1920:0:960:black[vpad0]" in result
     # Image is split into a blurred, stretch-filled (always-opaque) backdrop
     # and a cover-fit (possibly still-alpha) foreground, composited together
     # before ever reaching the video's black pad -- so a transparent source
     # image can never let that black show through.
     assert "[1:v]split=2[vimgbgsrc0][vimgsrc0]" in result
     assert "boxblur=" in result and "format=yuv420p[vimgbg0]" in result
-    assert "crop=1080:672[vimgfg0]" in result
+    assert "crop=1080:960:(iw-ow)/2:(ih-oh)/2[vimgfg0]" in result
     assert "[vimgbg0][vimgfg0]overlay=0:0[vimg0]" in result
     assert "[vpad0][vimg0]overlay=0:0[vsplit0]" in result
     assert "[vfull0][vsplit0]overlay=0:0:enable='between(t,12.500,17.500)'[out]" in result
@@ -44,9 +44,9 @@ def test_build_visuals_filter_complex_single_bottom_visual():
 
     result = visuals_mod.build_visuals_filter_complex(visuals, 1080, 1920)
 
-    # BOTTOM: video at y=0 (top), image at y=video_half_height=1248.
+    # BOTTOM: video at y=0 (top), image at y=video_half_height=960.
     assert "pad=1080:1920:0:0:black[vpad0]" in result
-    assert "[vpad0][vimg0]overlay=0:1248[vsplit0]" in result
+    assert "[vpad0][vimg0]overlay=0:960[vsplit0]" in result
     assert "between(t,0.000,3.000)" in result
 
 
@@ -62,9 +62,9 @@ def test_build_visuals_filter_complex_chains_multiple_visuals():
     # First stage reads from the SAR-normalized input, feeds into a named intermediate stage...
     assert "[vsar]split=2[vfull0][vsrc0]" in result
     assert "[vfull0][vsplit0]overlay=0:0:enable='between(t,2.000,5.000)'[vstage0]" in result
-    # ...the second visual reads from that intermediate stage and produces [out].
     assert "[vstage0]split=2[vfull1][vsrc1]" in result
-    assert "[1:v]" in result and "[2:v]" in result  # two distinct image inputs
+    assert "[1:v]" in result
+    assert "[2:v]" in result
     assert "[vfull1][vsplit1]overlay=0:0:enable='between(t,10.000,14.000)'[out]" in result
 
 
@@ -74,12 +74,10 @@ def test_build_visuals_filter_complex_dimensions_stay_even():
     visuals_mod = importlib.import_module("visuals")
     visuals = [{"position": "TOP", "start_time": 0.0, "duration": 1.0}]
 
-    # An odd height (1921) must still produce even scale/crop/pad targets
-    # (libx264/yuv420p requires even dimensions).
     result = visuals_mod.build_visuals_filter_complex(visuals, 1081, 1921)
     for match in re.finditer(r"(?:scale|crop|pad)=(\d+):(\d+)", result):
-        assert int(match.group(1)) % 2 == 0
-        assert int(match.group(2)) % 2 == 0
+        assert not int(match.group(1)) % 2
+        assert not int(match.group(2)) % 2
 
 
 def test_build_visuals_filter_complex_image_backdrop_is_forced_opaque():
@@ -93,7 +91,7 @@ def test_build_visuals_filter_complex_image_backdrop_is_forced_opaque():
 
     bg_stage = next(part for part in result.split(";") if part.endswith("[vimgbg0]"))
     assert "format=yuv420p" in bg_stage
-    assert "scale=1080:672" in bg_stage
+    assert "scale=1080:960" in bg_stage
 
 
 def test_probe_video_dimensions_falls_back_on_failure(monkeypatch):
@@ -148,11 +146,20 @@ def test_apply_visuals_to_video_builds_correct_ffmpeg_command(monkeypatch):
     assert "img1.jpg" in cmd
     assert "img2.jpg" in cmd
     assert "-filter_complex" in cmd
+    filter_complex = cmd[cmd.index("-filter_complex") + 1]
+    # The image is flattened onto its own blurred backdrop (boxblur +
+    # format=yuv420p) before its cover-fit crop, so transparency in a
+    # PNG/WebP visual can never reveal the video's black pad underneath.
+    assert "boxblur" in filter_complex
+    assert "force_original_aspect_ratio=decrease" not in filter_complex
+    assert "crop=1080:960:(iw-ow)/2:(ih-oh)/2[vimgfg0]" in filter_complex
+    assert "crop=1080:960:(iw-ow)/2:(ih-oh)/2[vcrop0]" in filter_complex
     assert "-map" in cmd
     map_values = [cmd[i + 1] for i, token in enumerate(cmd) if token == "-map"]
     assert map_values == ["[out]", "0:a?"]
-    assert "-c:a" in cmd and cmd[cmd.index("-c:a") + 1] == "copy"
-    assert "out.mp4" == cmd[-1]
+    assert "-c:a" in cmd
+    assert cmd[cmd.index("-c:a") + 1] == "copy"
+    assert cmd[-1] == "out.mp4"
 
 
 def test_apply_visuals_to_video_raises_runtime_error_on_ffmpeg_failure(monkeypatch):

@@ -6,11 +6,11 @@ EXPORT_VIDEO_PRESET = os.environ.get("VIREEL_EXPORT_PRESET", "medium")
 FFPROBE_TIMEOUT_SECONDS = int(os.environ.get("FFPROBE_TIMEOUT_SECONDS", "60"))
 FFMPEG_STEP_TIMEOUT_SECONDS = int(os.environ.get("FFMPEG_STEP_TIMEOUT_SECONDS", str(2 * 3600)))
 
-# Spec: ~35% of the frame for the image, ~65% for the video. Not
+# Spec: ~50% of the frame for the image, ~50% for the video. Not
 # user-configurable in V1. subtitles.py's bottom-split subtitle
 # repositioning assumes this exact ratio -- keep both in sync if it ever
 # changes.
-SPLIT_IMAGE_RATIO = 0.35
+SPLIT_IMAGE_RATIO = 0.50
 
 
 def _probe_video_dimensions(video_path):
@@ -68,13 +68,13 @@ def build_visuals_filter_complex(visuals, video_width: int, video_height: int) -
     Both the video and the image are cover-fit via the standard
     scale(force_original_aspect_ratio=increase)+crop idiom: scale up just
     enough that both target dimensions are covered (never distorting the
-    source's own aspect ratio), then crop the overflow -- crop's own
-    default x/y is centered, which is also the fallback this pipeline
-    needs: there is no persisted subject/focal-point data surviving from
-    the original reel-generation pass (see main.py's face/speaker
-    tracking) by the time a visual is burned in here, in a later,
-    separate request, so a plain centered crop is the correct behavior,
-    not a missing feature.
+    source's own aspect ratio), then crop the overflow -- explicitly
+    centered ((iw-ow)/2:(ih-oh)/2, matching crop's own default), which is
+    also the fallback this pipeline needs: there is no persisted
+    subject/focal-point data surviving from the original reel-generation
+    pass (see main.py's face/speaker tracking) by the time a visual is
+    burned in here, in a later, separate request, so a plain centered
+    crop is the correct behavior, not a missing feature.
 
     The image gets one extra step the video doesn't need: PNG/WebP visuals
     can carry an alpha channel, and alpha-blending that straight onto the
@@ -129,7 +129,7 @@ def build_visuals_filter_complex(visuals, video_width: int, video_height: int) -
         filter_parts.append(f"[{current_label}]split=2[{full_label}][{src_label}]")
         filter_parts.append(
             f"[{src_label}]scale={video_width}:{video_half_height}:force_original_aspect_ratio=increase,"
-            f"crop={video_width}:{video_half_height}[{cropped_label}]"
+            f"crop={video_width}:{video_half_height}:(iw-ow)/2:(ih-oh)/2[{cropped_label}]"
         )
         filter_parts.append(
             f"[{cropped_label}]pad={video_width}:{video_height}:0:{video_y}:black[{padded_label}]"
@@ -141,7 +141,7 @@ def build_visuals_filter_complex(visuals, video_width: int, video_height: int) -
         )
         filter_parts.append(
             f"[{img_src_label}]scale={video_width}:{image_height}:force_original_aspect_ratio=increase,"
-            f"crop={video_width}:{image_height}[{img_fg_label}]"
+            f"crop={video_width}:{image_height}:(iw-ow)/2:(ih-oh)/2[{img_fg_label}]"
         )
         filter_parts.append(f"[{img_bg_label}][{img_fg_label}]overlay=0:0[{img_label}]")
         filter_parts.append(f"[{padded_label}][{img_label}]overlay=0:{image_y}[{composed_label}]")

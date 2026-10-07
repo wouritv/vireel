@@ -15,9 +15,8 @@ export const ShortVideo: React.FC<Record<string, unknown>> = (rawProps) => {
   const { videoUrl, subtitles, hook, effects, visuals } =
     rawProps as unknown as ShortVideoProps;
 
-  // When a visual is active for the current frame, the video shrinks into
-  // the 65% of the frame the image half (rendered by VisualOverlay below)
-  // doesn't occupy -- otherwise it fills the whole frame as usual.
+  // When a visual is active for the current frame, the video is clipped to
+  // the other 50% of the frame while preserving centered cover rendering.
   const activeVisual = useActiveVisual(visuals);
   const videoRegionStyle: React.CSSProperties = activeVisual
     ? {
@@ -25,20 +24,31 @@ export const ShortVideo: React.FC<Record<string, unknown>> = (rawProps) => {
         left: 0,
         right: 0,
         top: activeVisual.position === "TOP" ? `${VISUAL_IMAGE_HEIGHT_PERCENT}%` : 0,
-        height: `${100 - VISUAL_IMAGE_HEIGHT_PERCENT}%`,
+        bottom: activeVisual.position === "TOP" ? 0 : `${VISUAL_IMAGE_HEIGHT_PERCENT}%`,
+        overflow: "hidden",
       }
-    : { position: "absolute", top: 0, left: 0, right: 0, bottom: 0 };
+    : {
+        position: "absolute",
+        inset: 0,
+        overflow: "hidden",
+      };
 
   return (
     <AbsoluteFill style={{ backgroundColor: "#000" }}>
-      {/* Layer 1: Base video with optional zoom/color effects, shrunk into
-          its 65% region while a visual is active */}
+      {/* Layer 1: Base video with optional zoom/color effects, clipped into
+          its half while a visual is active. */}
       <div style={videoRegionStyle}>
         <VideoEffects config={effects}>
           <Video
             src={videoUrl}
             crossOrigin="anonymous"
-            style={{ width: "100%", height: "100%", objectFit: "cover" }}
+            style={{
+              width: "100%",
+              height: "100%",
+              objectFit: "cover",
+              objectPosition: "center center",
+              display: "block",
+            }}
           />
         </VideoEffects>
       </div>

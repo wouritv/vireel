@@ -211,7 +211,7 @@ def test_burn_subtitles_repositions_dialogue_overlapping_bottom_visual(monkeypat
     ass_content = captured["ass_content"]
     hello_line = next(line for line in ass_content.splitlines() if "Hello world" in line)
     again_line = next(line for line in ass_content.splitlines() if "Again" in line)
-    assert "\\an2\\pos(540,1223)" in hello_line  # 1920*0.65 - 25 = 1223
+    assert "\\an2\\pos(540,935)" in hello_line  # 1920*0.50 - 25 = 935
     assert "\\pos" not in again_line
 
 
