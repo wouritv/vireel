@@ -15643,6 +15643,31 @@ def _normalize_project_row(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+async def _generate_and_persist_project_thumbnail(
+    bucket: str, source_s3_key: str, source_local_path: str, project_id: str, user_id: str, project: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Downloads the project's source video, generates its thumbnail, and
+    persists it -- the try-block body of _ensure_project_thumbnail_for_row,
+    isolated to cut that function's cognitive complexity (audit: SonarQube
+    python:S3776). Any failure here just means no thumbnail -- never
+    raised, since the caller's own try/except already treats this the
+    same as a deliberate early return."""
+    if not download_s3_object(bucket, source_s3_key, source_local_path):
+        return project
+
+    thumbnail_s3_key = _generate_and_upload_project_thumbnail_from_source(
+        source_local_path,
+        bucket,
+        user_id,
+        project_id,
+    )
+    if not thumbnail_s3_key:
+        return project
+
+    updated = await supabase_update_project(project_id, user_id, {"thumbnail_url": thumbnail_s3_key})
+    return updated or {**project, "thumbnail_url": thumbnail_s3_key}
+
+
 async def _ensure_project_thumbnail_for_row(row: Dict[str, Any], user_id: str) -> Dict[str, Any]:
     project = dict(row or {})
     if not project:
@@ -15666,20 +15691,9 @@ async def _ensure_project_thumbnail_for_row(row: Dict[str, Any], user_id: str) -
     source_local_path = os.path.join(tmp_dir, f"{project_id}_source{ext}")
 
     try:
-        if not download_s3_object(bucket, source_s3_key, source_local_path):
-            return project
-
-        thumbnail_s3_key = _generate_and_upload_project_thumbnail_from_source(
-            source_local_path,
-            bucket,
-            user_id,
-            project_id,
+        return await _generate_and_persist_project_thumbnail(
+            bucket, source_s3_key, source_local_path, project_id, user_id, project,
         )
-        if not thumbnail_s3_key:
-            return project
-
-        updated = await supabase_update_project(project_id, user_id, {"thumbnail_url": thumbnail_s3_key})
-        return updated or {**project, "thumbnail_url": thumbnail_s3_key}
     except Exception:
         return project
     finally:
@@ -15783,6 +15797,25 @@ def _delete_project_source_s3_file(project: Dict[str, Any], bucket_name: str) ->
     return _delete_s3_and_get_freed_bytes(bucket_name, source_s3_key, "project source S3 file")
 
 
+async def _delete_reel_visuals_s3_images(reel_id: str, bucket_name: str) -> int:
+    """reel_visuals rows cascade-delete at the DB level (FK ON DELETE
+    CASCADE) once the reel row itself is deleted by the caller, but that
+    would leave their S3 images orphaned -- clean those up here too, same
+    as every other reel asset. Isolated out of
+    _delete_project_reels_s3_files to cut that function's cognitive
+    complexity (audit: SonarQube python:S3776)."""
+    freed = 0
+    try:
+        visuals = await supabase_list_reel_visuals(reel_id)
+        for visual in visuals:
+            image_s3_key = visual.get("image_s3_key")
+            if image_s3_key:
+                freed += _delete_s3_and_get_freed_bytes(bucket_name, image_s3_key, "reel visual image S3 file")
+    except Exception as e:
+        logger.warning(f"Failed to retrieve or delete visuals for reel {reel_id}: {str(e)}")
+    return freed
+
+
 async def _delete_project_reels_s3_files(project_id: str, bucket_name: str) -> int:
     freed = 0
     try:
@@ -15796,18 +15829,7 @@ async def _delete_project_reels_s3_files(project_id: str, bucket_name: str) -> i
             if reel_thumbnail_url and reel_thumbnail_url.startswith("reels/"):
                 freed += _delete_s3_and_get_freed_bytes(bucket_name, reel_thumbnail_url, "reel thumbnail S3 file")
 
-            # reel_visuals rows cascade-delete at the DB level (FK ON DELETE
-            # CASCADE) once the reel row itself is deleted below in the
-            # caller, but that would leave their S3 images orphaned --
-            # clean those up here too, same as every other reel asset.
-            try:
-                visuals = await supabase_list_reel_visuals(str(reel.get("id") or ""))
-                for visual in visuals:
-                    image_s3_key = visual.get("image_s3_key")
-                    if image_s3_key:
-                        freed += _delete_s3_and_get_freed_bytes(bucket_name, image_s3_key, "reel visual image S3 file")
-            except Exception as e:
-                logger.warning(f"Failed to retrieve or delete visuals for reel {reel.get('id')}: {str(e)}")
+            freed += await _delete_reel_visuals_s3_images(str(reel.get("id") or ""), bucket_name)
     except Exception as e:
         logger.warning(f"Failed to retrieve or delete reels for project {project_id}: {str(e)}")
     return freed

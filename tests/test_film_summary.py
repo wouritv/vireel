@@ -1420,7 +1420,7 @@ def test_transcribe_video_with_timecodes_enables_language_detection_without_hint
         captured_config.update(config or {})
         real_transcriber_init(self, config)
 
-    sys.modules["assemblyai"].Transcriber.__init__ = _capturing_init
+    monkeypatch.setattr(sys.modules["assemblyai"].Transcriber, "__init__", _capturing_init)
 
     asyncio.run(fs.transcribe_video_with_timecodes("/tmp/video.mp4"))
 
@@ -1438,7 +1438,7 @@ def test_transcribe_video_with_timecodes_uses_language_hint_instead_of_detection
         captured_config.update(config or {})
         real_transcriber_init(self, config)
 
-    sys.modules["assemblyai"].Transcriber.__init__ = _capturing_init
+    monkeypatch.setattr(sys.modules["assemblyai"].Transcriber, "__init__", _capturing_init)
 
     asyncio.run(fs.transcribe_video_with_timecodes("/tmp/video.mp4", language_hint="FR"))
 

@@ -2595,8 +2595,9 @@ def test_publish_facebook_native_failure_always_reraises(monkeypatch):
     account = {"platform_user_id": "page-1"}
     content = app.PublishRequest(user_id="u1", text="Une courte histoire.", facebook_text_format_preset_id="1881421442117417")
 
+    coro = app._publish_facebook(account, "token-1", content, "Une courte histoire.")
     with pytest.raises(app.HTTPException):
-        asyncio.run(app._publish_facebook(account, "token-1", content, "Une courte histoire."))
+        asyncio.run(coro)
 
 
 def test_facebook_text_with_background_never_combines_media(monkeypatch):
@@ -3284,7 +3285,8 @@ def test_retry_film_summary_succeeds_from_awaiting_review_and_resets_manual_stat
     assert result["status"] == "queued"
     update_mock.assert_awaited_once()
     args, kwargs = update_mock.await_args
-    assert args[0] == "fs_1" and args[1] == "u1"
+    assert args[0] == "fs_1"
+    assert args[1] == "u1"
     updates = args[2]
     assert updates["status"] == film_summary.FilmSummaryStatus.QUEUED
     assert updates["manual_selection"] is None

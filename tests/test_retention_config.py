@@ -4,6 +4,12 @@ import sys
 import pytest
 
 
+# Each call below pops and reimports retention_config, which redefines
+# RetentionConfigError as a brand-new class object every time -- a
+# pytest.raises(RetentionConfigError) bound to an earlier import would
+# never match an instance raised by a later one. ValueError (its stable
+# base class) is specific enough to satisfy SonarQube's "don't catch bare
+# Exception" rule without that reload-identity trap.
 def _reload_retention_config(monkeypatch, **env):
     for key in [
         "RETENTION_FREE_SOURCE_DAYS", "RETENTION_FREE_PRODUCED_DAYS",
@@ -30,32 +36,32 @@ def test_defaults_match_spec(monkeypatch):
 
 
 def test_rejects_negative_value(monkeypatch):
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         _reload_retention_config(monkeypatch, RETENTION_FREE_SOURCE_DAYS="-1")
 
 
 def test_rejects_non_numeric_value(monkeypatch):
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         _reload_retention_config(monkeypatch, RETENTION_FREE_SOURCE_DAYS="not-a-number")
 
 
 def test_rejects_subscriber_shorter_than_free_source(monkeypatch):
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         _reload_retention_config(monkeypatch, RETENTION_SUBSCRIBER_SOURCE_DAYS="1", RETENTION_FREE_SOURCE_DAYS="2")
 
 
 def test_rejects_subscriber_shorter_than_free_produced(monkeypatch):
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         _reload_retention_config(monkeypatch, RETENTION_SUBSCRIBER_PRODUCED_DAYS="5", RETENTION_FREE_PRODUCED_DAYS="14")
 
 
 def test_rejects_produced_shorter_than_source_within_free_tier(monkeypatch):
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         _reload_retention_config(monkeypatch, RETENTION_FREE_PRODUCED_DAYS="1", RETENTION_FREE_SOURCE_DAYS="2")
 
 
 def test_rejects_produced_shorter_than_source_within_subscriber_tier(monkeypatch):
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         _reload_retention_config(
             monkeypatch, RETENTION_SUBSCRIBER_PRODUCED_DAYS="5", RETENTION_SUBSCRIBER_SOURCE_DAYS="10",
         )

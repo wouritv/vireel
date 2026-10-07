@@ -31,7 +31,8 @@ def test_build_visuals_filter_complex_single_top_visual():
     # before ever reaching the video's black pad -- so a transparent source
     # image can never let that black show through.
     assert "[1:v]split=2[vimgbgsrc0][vimgsrc0]" in result
-    assert "boxblur=" in result and "format=yuv420p[vimgbg0]" in result
+    assert "boxblur=" in result
+    assert "format=yuv420p[vimgbg0]" in result
     assert "crop=1080:960:(iw-ow)/2:(ih-oh)/2[vimgfg0]" in result
     assert "[vimgbg0][vimgfg0]overlay=0:0[vimg0]" in result
     assert "[vpad0][vimg0]overlay=0:0[vsplit0]" in result
