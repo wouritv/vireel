@@ -217,6 +217,9 @@ _DEFAULT_UPLOAD_FILENAME = "upload.mp4"
 _CLIP_INDEX_SUFFIX_PATTERN = r"_clip_(\d+)\.mp4$"
 _JOB_NOT_FOUND = "Job not found"
 _INVALID_INPUT_FILENAME = "Invalid input filename"
+_SUBSCRIPTION_PLAN_NOT_FOUND = "Subscription plan not found"
+_NO_ACTIVE_SUBSCRIPTION = "No active subscription"
+_VISUAL_NOT_FOUND = "Visual not found"
 _CLIP_NOT_FOUND = "Clip not found"
 _FACEBOOK_TOKEN_EXPIRED_OR_MISSING = "Facebook page access token expired or missing"
 _FACEBOOK_TARGET_ID_MISSING = "Connected Facebook target id is missing"
@@ -6060,24 +6063,35 @@ def _saved_subtitle_captions_from_clip_data(clip_data: Dict[str, Any]) -> List[D
     return []
 
 
+def _style_from_dict_field(container: Any, source_label: str) -> Tuple[Dict[str, Any], str]:
+    """One "does this dict carry a usable, non-empty style?" check, reused
+    by every candidate source in _style_from_clip_subtitle_state instead of
+    being duplicated per source (audit: SonarQube python:S3776 -- that
+    duplication was what pushed the caller's cognitive complexity over the
+    limit)."""
+    if isinstance(container, dict):
+        style = container.get("style")
+        if isinstance(style, dict) and style:
+            return style, source_label
+    return {}, ""
+
+
 def _style_from_clip_subtitle_state(clip_data: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
     if not isinstance(clip_data, dict):
         return {}, ""
 
-    subtitle_config = clip_data.get("subtitle_config")
-    if isinstance(subtitle_config, dict):
-        style = subtitle_config.get("style")
-        if isinstance(style, dict) and style:
-            return style, "clip_data.subtitle_config"
+    style, source = _style_from_dict_field(clip_data.get("subtitle_config"), "clip_data.subtitle_config")
+    if style:
+        return style, source
 
     remotion_layers = clip_data.get("remotion_layers")
     if isinstance(remotion_layers, dict):
         for layer_key in ("captions", "subtitles"):
-            layer = remotion_layers.get(layer_key)
-            if isinstance(layer, dict):
-                style = layer.get("style")
-                if isinstance(style, dict) and style:
-                    return style, f"clip_data.remotion_layers.{layer_key}"
+            style, source = _style_from_dict_field(
+                remotion_layers.get(layer_key), f"clip_data.remotion_layers.{layer_key}",
+            )
+            if style:
+                return style, source
 
     return {}, ""
 
@@ -7785,7 +7799,11 @@ async def add_hook(req: HookRequest, user_id: Annotated[str, Depends(get_user_id
 # ---------------------------------------------------------------------------
 
 _REEL_VISUAL_ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
-_REEL_VISUAL_ALLOWED_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+# Shared across every place in this file that accepts a user-uploaded image
+# (reel visuals, comment attachments, scheduled-post media) -- defined once
+# so the extension list itself is never retyped (audit: SonarQube python:S1192).
+_STANDARD_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+_REEL_VISUAL_ALLOWED_EXTENSIONS = tuple(ext for ext in _STANDARD_IMAGE_EXTENSIONS if ext != ".gif")
 REEL_VISUAL_MAX_IMAGE_BYTES = int(os.environ.get("REEL_VISUAL_MAX_IMAGE_BYTES", str(8 * 1024 * 1024)))
 _REEL_VISUAL_POSITIONS = {"TOP", "BOTTOM"}
 
@@ -7948,18 +7966,13 @@ class UpdateReelVisualRequest(BaseModel):
     duration: Optional[float] = None
 
 
-@app.patch("/api/reels/{job_id}/{clip_index}/visuals/{visual_id}", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 503: {"description": "Service Unavailable"}})
-async def update_reel_visual_endpoint(
-    job_id: str, clip_index: int, visual_id: str, payload: UpdateReelVisualRequest,
-    user_id: Annotated[str, Depends(get_user_id_header)],
-):
-    """Updates a visual's position and/or timing -- never its image (swap
-    the image by deleting and re-adding the visual instead)."""
-    reel = await _resolve_reel_for_visuals(job_id, clip_index, user_id)
-    existing_visual = await supabase_get_reel_visual(visual_id, user_id)
-    if not existing_visual or str(existing_visual.get("reel_id")) != str(reel["id"]):
-        raise _coded_error(404, "visual_not_found", "Visual not found")
-
+async def _build_reel_visual_updates(
+    payload: UpdateReelVisualRequest, existing_visual: Dict[str, Any], reel: Dict[str, Any], visual_id: str,
+) -> Dict[str, Any]:
+    """Validates and assembles the partial-update dict for
+    update_reel_visual_endpoint -- isolated so that endpoint's own
+    cognitive complexity stays under this codebase's limit (audit:
+    SonarQube python:S3776)."""
     updates: Dict[str, Any] = {}
     if payload.position is not None:
         position = str(payload.position).upper()
@@ -7976,12 +7989,28 @@ async def update_reel_visual_endpoint(
         updates["start_time"] = float(start_time)
         updates["duration"] = float(duration)
 
+    return updates
+
+
+@app.patch("/api/reels/{job_id}/{clip_index}/visuals/{visual_id}", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 503: {"description": "Service Unavailable"}})
+async def update_reel_visual_endpoint(
+    job_id: str, clip_index: int, visual_id: str, payload: UpdateReelVisualRequest,
+    user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Updates a visual's position and/or timing -- never its image (swap
+    the image by deleting and re-adding the visual instead)."""
+    reel = await _resolve_reel_for_visuals(job_id, clip_index, user_id)
+    existing_visual = await supabase_get_reel_visual(visual_id, user_id)
+    if not existing_visual or str(existing_visual.get("reel_id")) != str(reel["id"]):
+        raise _coded_error(404, "visual_not_found", _VISUAL_NOT_FOUND)
+
+    updates = await _build_reel_visual_updates(payload, existing_visual, reel, visual_id)
     if not updates:
         return _normalize_reel_visual_row(existing_visual)
 
     row = await supabase_update_reel_visual(visual_id, user_id, updates)
     if not row:
-        raise _coded_error(404, "visual_not_found", "Visual not found")
+        raise _coded_error(404, "visual_not_found", _VISUAL_NOT_FOUND)
     return _normalize_reel_visual_row(row)
 
 
@@ -7992,11 +8021,11 @@ async def delete_reel_visual_endpoint(
     reel = await _resolve_reel_for_visuals(job_id, clip_index, user_id)
     existing_visual = await supabase_get_reel_visual(visual_id, user_id)
     if not existing_visual or str(existing_visual.get("reel_id")) != str(reel["id"]):
-        raise _coded_error(404, "visual_not_found", "Visual not found")
+        raise _coded_error(404, "visual_not_found", _VISUAL_NOT_FOUND)
 
     deleted = await supabase_delete_reel_visual(visual_id, user_id)
     if not deleted:
-        raise _coded_error(404, "visual_not_found", "Visual not found")
+        raise _coded_error(404, "visual_not_found", _VISUAL_NOT_FOUND)
 
     bucket = os.environ.get("AWS_S3_BUCKET", "")
     image_s3_key = deleted.get("image_s3_key")
@@ -8014,7 +8043,171 @@ class ApplyReelVisualsRequest(BaseModel):
     input_url: Optional[str] = None
 
 
-@app.post("/api/reels/{job_id}/{clip_index}/visuals/apply", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}})
+async def _burn_reel_visuals(
+    *, job_id: str, clip_index: int, user_id: str, rows: List[Dict[str, Any]],
+    input_path: str, filename: str, output_dir: str,
+    has_subtitle_material: bool, transcript: Optional[Dict[str, Any]],
+    clip_data: Dict[str, Any], subtitle_style_config: Any,
+) -> Tuple[str, str, bool]:
+    """Downloads every configured visual's image, burns them onto the clip
+    (re-burning subtitles on top when the clip has any), and cleans up every
+    temp file it creates along the way -- the self-contained "do the burn"
+    step apply_reel_visuals used to inline, which pushed its own cognitive
+    complexity well past this codebase's limit (audit: SonarQube
+    python:S3776)."""
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    local_image_paths: List[str] = []
+    visuals_stage_path = os.path.join(output_dir, f"visuals_stage_{filename}")
+    output_filename = f"visuals_{filename}"
+    output_path = os.path.join(output_dir, output_filename)
+    srt_path = ""
+    subtitle_reapplied = False
+    try:
+        burn_visuals = []
+        for row in rows:
+            image_s3_key = row.get("image_s3_key")
+            ext = os.path.splitext(image_s3_key or "")[1] or ".jpg"
+            local_image_path = os.path.join(output_dir, f"visual_src_{row['id']}{ext}")
+            if not bucket or not image_s3_key or not download_s3_object(bucket, image_s3_key, local_image_path):
+                raise HTTPException(status_code=503, detail="Failed to download a visual's image")
+            local_image_paths.append(local_image_path)
+            burn_visuals.append({
+                "image_path": local_image_path,
+                "position": row.get("position"),
+                "start_time": float(row.get("start_time") or 0),
+                "duration": float(row.get("duration") or 0),
+            })
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, apply_visuals_to_video, input_path, burn_visuals, visuals_stage_path)
+
+        if has_subtitle_material:
+            subtitle_req = _build_subtitle_request_from_style(job_id, clip_index, subtitle_style_config)
+            words_per_line = max(2, min(8, int(subtitle_req.words_per_line or 4)))
+            srt_path = os.path.join(output_dir, f"visuals_subs_{clip_index}_{int(time.time())}.srt")
+            has_srt = await _generate_subtitle_srt_from_clip_context(
+                visuals_stage_path,
+                filename,
+                transcript,
+                clip_data,
+                srt_path,
+                words_per_line,
+                animation=subtitle_req.animation,
+            )
+            if has_srt:
+                visual_windows = await _reel_visual_windows_for_job_clip(job_id, clip_index, user_id)
+                await loop.run_in_executor(
+                    None,
+                    _burn_subtitles_for_request,
+                    subtitle_req,
+                    visuals_stage_path,
+                    srt_path,
+                    output_path,
+                    visual_windows,
+                )
+                subtitle_reapplied = True
+
+        if not subtitle_reapplied:
+            shutil.move(visuals_stage_path, output_path)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _generic_error("Visuals Error", e)
+    finally:
+        for path in local_image_paths:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+        try:
+            if srt_path and os.path.exists(srt_path):
+                os.remove(srt_path)
+        except Exception:
+            pass
+        try:
+            if visuals_stage_path and os.path.exists(visuals_stage_path):
+                os.remove(visuals_stage_path)
+        except Exception:
+            pass
+
+    return output_path, output_filename, subtitle_reapplied
+
+
+async def _persist_visuals_reset_baseline_if_needed(
+    reel: Dict[str, Any], job_id: str, clip_index: int, user_id: str,
+) -> Tuple[str, str]:
+    """The first time visuals are applied to a clip, its pre-visuals media
+    becomes the "reset baseline" that /visuals/reset later restores -- a
+    no-op once a baseline already exists."""
+    existing_reel_base_url = str(reel.get("reel_base_url") or "").strip()
+    existing_reel_base_s3_key = str(reel.get("reel_base_s3_key") or "").strip()
+    if not is_supabase_configured() or existing_reel_base_url:
+        return existing_reel_base_url, existing_reel_base_s3_key
+
+    current_reel_s3_key = str(reel.get("reel_s3_key") or "").strip()
+    baseline_video_url = _reel_media_url_from_s3_key(current_reel_s3_key) or str(reel.get("reel_url") or "").strip()
+    if not baseline_video_url:
+        return existing_reel_base_url, existing_reel_base_s3_key
+
+    try:
+        await supabase_update_reel_base_media_by_job_clip(
+            job_id=job_id,
+            clip_index=clip_index,
+            reel_base_url=baseline_video_url,
+            reel_base_s3_key=current_reel_s3_key or None,
+            user_id=user_id,
+        )
+        return baseline_video_url, current_reel_s3_key
+    except Exception as e:
+        print(f"⚠️ Failed to persist visuals reset baseline: {e}")
+        return existing_reel_base_url, existing_reel_base_s3_key
+
+
+async def _upload_and_sync_visuals_output(
+    *, job_id: str, clip_index: int, user_id: str, job: Any, clips: List[Any], data: Dict[str, Any],
+    metadata_path: str, output_path: str, output_filename: str, bucket: str,
+    existing_reel_base_url: str, existing_reel_base_s3_key: str,
+) -> str:
+    """Uploads the just-burned video (when S3 is configured), persists its
+    new URL onto the local job metadata, and syncs it to Supabase -- keeping
+    the reset baseline sticky once one exists."""
+    new_video_url = f"/videos/{job_id}/{output_filename}"
+    persisted_video_url = new_video_url
+    visuals_s3_key = ""
+    if bucket and os.path.exists(output_path):
+        visuals_s3_key = f"reels/{user_id}/{job_id}/{output_filename}"
+        if upload_file_to_s3(output_path, bucket, visuals_s3_key):
+            persisted_video_url = _reel_media_url_from_s3_key(visuals_s3_key) or new_video_url
+
+    _persist_new_video_url_to_clip(job, clip_index, clips, data, metadata_path, persisted_video_url, "visuals")
+
+    if is_supabase_configured() and persisted_video_url:
+        try:
+            await supabase_update_reel_media_by_job_clip(
+                job_id=job_id,
+                clip_index=clip_index,
+                reel_url=persisted_video_url,
+                reel_s3_key=visuals_s3_key or None,
+                user_id=user_id,
+            )
+            # Keep baseline sticky once initialized so reset consistently
+            # restores the pre-visuals media.
+            if existing_reel_base_url:
+                await supabase_update_reel_base_media_by_job_clip(
+                    job_id=job_id,
+                    clip_index=clip_index,
+                    reel_base_url=existing_reel_base_url,
+                    reel_base_s3_key=existing_reel_base_s3_key or None,
+                    user_id=user_id,
+                )
+        except Exception as e:
+            print(f"⚠️ Failed to sync reel URL after visuals apply: {e}")
+
+    return persisted_video_url
+
+
+@app.post("/api/reels/{job_id}/{clip_index}/visuals/apply", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
 async def apply_reel_visuals(
     job_id: str, clip_index: int, payload: ApplyReelVisualsRequest,
     user_id: Annotated[str, Depends(get_user_id_header)],
@@ -8072,84 +8265,12 @@ async def apply_reel_visuals(
     )
     await _assert_user_has_required_credits(user_id, visuals_required_credits)
 
-    bucket = os.environ.get("AWS_S3_BUCKET", "")
-    local_image_paths: List[str] = []
-    visuals_stage_path = ""
-    srt_path = ""
-    subtitle_reapplied = False
-    try:
-        burn_visuals = []
-        for row in rows:
-            image_s3_key = row.get("image_s3_key")
-            ext = os.path.splitext(image_s3_key or "")[1] or ".jpg"
-            local_image_path = os.path.join(output_dir, f"visual_src_{row['id']}{ext}")
-            if not bucket or not image_s3_key or not download_s3_object(bucket, image_s3_key, local_image_path):
-                raise HTTPException(status_code=503, detail="Failed to download a visual's image")
-            local_image_paths.append(local_image_path)
-            burn_visuals.append({
-                "image_path": local_image_path,
-                "position": row.get("position"),
-                "start_time": float(row.get("start_time") or 0),
-                "duration": float(row.get("duration") or 0),
-            })
-
-        visuals_stage_filename = f"visuals_stage_{filename}"
-        visuals_stage_path = os.path.join(output_dir, visuals_stage_filename)
-        output_filename = f"visuals_{filename}"
-        output_path = os.path.join(output_dir, output_filename)
-
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, apply_visuals_to_video, input_path, burn_visuals, visuals_stage_path)
-
-        if has_subtitle_material:
-            subtitle_req = _build_subtitle_request_from_style(job_id, clip_index, subtitle_style_config)
-            words_per_line = max(2, min(8, int(subtitle_req.words_per_line or 4)))
-            srt_path = os.path.join(output_dir, f"visuals_subs_{clip_index}_{int(time.time())}.srt")
-            has_srt = await _generate_subtitle_srt_from_clip_context(
-                visuals_stage_path,
-                filename,
-                transcript,
-                clip_data,
-                srt_path,
-                words_per_line,
-                animation=subtitle_req.animation,
-            )
-            if has_srt:
-                visual_windows = await _reel_visual_windows_for_job_clip(job_id, clip_index, user_id)
-                await loop.run_in_executor(
-                    None,
-                    _burn_subtitles_for_request,
-                    subtitle_req,
-                    visuals_stage_path,
-                    srt_path,
-                    output_path,
-                    visual_windows,
-                )
-                subtitle_reapplied = True
-
-        if not subtitle_reapplied:
-            shutil.move(visuals_stage_path, output_path)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise _generic_error("Visuals Error", e)
-    finally:
-        for path in local_image_paths:
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except Exception:
-                pass
-        try:
-            if srt_path and os.path.exists(srt_path):
-                os.remove(srt_path)
-        except Exception:
-            pass
-        try:
-            if visuals_stage_path and os.path.exists(visuals_stage_path):
-                os.remove(visuals_stage_path)
-        except Exception:
-            pass
+    output_path, output_filename, subtitle_reapplied = await _burn_reel_visuals(
+        job_id=job_id, clip_index=clip_index, user_id=user_id, rows=rows,
+        input_path=input_path, filename=filename, output_dir=output_dir,
+        has_subtitle_material=has_subtitle_material, transcript=transcript,
+        clip_data=clip_data, subtitle_style_config=subtitle_style_config,
+    )
 
     if subtitle_reapplied:
         logger.info(
@@ -8159,56 +8280,16 @@ async def apply_reel_visuals(
             subtitle_style_source,
         )
 
-    existing_reel_base_url = str(reel.get("reel_base_url") or "").strip()
-    existing_reel_base_s3_key = str(reel.get("reel_base_s3_key") or "").strip()
-    if is_supabase_configured() and not existing_reel_base_url:
-        current_reel_s3_key = str(reel.get("reel_s3_key") or "").strip()
-        baseline_video_url = _reel_media_url_from_s3_key(current_reel_s3_key) or str(reel.get("reel_url") or "").strip()
-        if baseline_video_url:
-            try:
-                await supabase_update_reel_base_media_by_job_clip(
-                    job_id=job_id,
-                    clip_index=clip_index,
-                    reel_base_url=baseline_video_url,
-                    reel_base_s3_key=current_reel_s3_key or None,
-                    user_id=user_id,
-                )
-                existing_reel_base_url = baseline_video_url
-                existing_reel_base_s3_key = current_reel_s3_key
-            except Exception as e:
-                print(f"⚠️ Failed to persist visuals reset baseline: {e}")
+    existing_reel_base_url, existing_reel_base_s3_key = await _persist_visuals_reset_baseline_if_needed(
+        reel, job_id, clip_index, user_id,
+    )
 
-    new_video_url = f"/videos/{job_id}/{output_filename}"
-    persisted_video_url = new_video_url
-    visuals_s3_key = ""
-    if bucket and os.path.exists(output_path):
-        visuals_s3_key = f"reels/{user_id}/{job_id}/{output_filename}"
-        if upload_file_to_s3(output_path, bucket, visuals_s3_key):
-            persisted_video_url = _reel_media_url_from_s3_key(visuals_s3_key) or new_video_url
-
-    _persist_new_video_url_to_clip(job, clip_index, clips, data, metadata_path, persisted_video_url, "visuals")
-
-    if is_supabase_configured() and persisted_video_url:
-        try:
-            await supabase_update_reel_media_by_job_clip(
-                job_id=job_id,
-                clip_index=clip_index,
-                reel_url=persisted_video_url,
-                reel_s3_key=visuals_s3_key or None,
-                user_id=user_id,
-            )
-            # Keep baseline sticky once initialized so reset consistently
-            # restores the pre-visuals media.
-            if existing_reel_base_url:
-                await supabase_update_reel_base_media_by_job_clip(
-                    job_id=job_id,
-                    clip_index=clip_index,
-                    reel_base_url=existing_reel_base_url,
-                    reel_base_s3_key=existing_reel_base_s3_key or None,
-                    user_id=user_id,
-                )
-        except Exception as e:
-            print(f"⚠️ Failed to sync reel URL after visuals apply: {e}")
+    persisted_video_url = await _upload_and_sync_visuals_output(
+        job_id=job_id, clip_index=clip_index, user_id=user_id, job=job, clips=clips, data=data,
+        metadata_path=metadata_path, output_path=output_path, output_filename=output_filename,
+        bucket=os.environ.get("AWS_S3_BUCKET", ""),
+        existing_reel_base_url=existing_reel_base_url, existing_reel_base_s3_key=existing_reel_base_s3_key,
+    )
 
     if is_supabase_configured() and visuals_required_credits > 0:
         await supabase_deduct_user_credits(user_id, visuals_required_credits)
@@ -8225,6 +8306,39 @@ async def apply_reel_visuals(
         "success": True,
         "new_video_url": persisted_video_url,
     }
+
+
+def _resolve_visuals_reset_video_url(reel: Dict[str, Any], clip_data: Dict[str, Any]) -> str:
+    """A reset restores a clip to its stored visuals baseline when one
+    exists, otherwise to its original pre-processing video."""
+    base_s3_key = str(reel.get("reel_base_s3_key") or "").strip()
+    reset_video_url = _reel_media_url_from_s3_key(base_s3_key) or str(reel.get("reel_base_url") or "").strip()
+    if reset_video_url:
+        return reset_video_url
+    return str(clip_data.get("original_video_url") or "").strip()
+
+
+async def _delete_reel_visuals_and_images(rows: List[Dict[str, Any]], user_id: str, bucket: str) -> int:
+    """Deletes every visual row for a reel and its S3 image, used by
+    reset_reel_visuals -- isolated so that endpoint's own cognitive
+    complexity stays under this codebase's limit (audit: SonarQube
+    python:S3776)."""
+    deleted_count = 0
+    for row in rows:
+        visual_id = str(row.get("id") or "")
+        if visual_id:
+            deleted = await supabase_delete_reel_visual(visual_id, user_id)
+            if deleted:
+                deleted_count += 1
+
+        image_s3_key = str(row.get("image_s3_key") or "").strip()
+        if bucket and image_s3_key:
+            try:
+                delete_s3_object(bucket, image_s3_key)
+            except Exception:
+                logger.warning("Failed to delete reel visual image %s from S3", image_s3_key, exc_info=True)
+
+    return deleted_count
 
 
 @app.post("/api/reels/{job_id}/{clip_index}/visuals/reset", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
@@ -8245,35 +8359,20 @@ async def reset_reel_visuals(
         raise HTTPException(status_code=404, detail=_CLIP_NOT_FOUND)
 
     clip_data = clips[clip_index] if isinstance(clips[clip_index], dict) else {}
-    base_s3_key = str(reel.get("reel_base_s3_key") or "").strip()
-    reset_video_url = _reel_media_url_from_s3_key(base_s3_key) or str(reel.get("reel_base_url") or "").strip()
-    if not reset_video_url:
-        reset_video_url = str(clip_data.get("original_video_url") or "").strip()
+    reset_video_url = _resolve_visuals_reset_video_url(reel, clip_data)
     if not reset_video_url:
         raise _coded_error(400, "missing_visuals_reset_source", "No baseline video reference found for visuals reset")
 
     rows = await supabase_list_reel_visuals(str(reel["id"]))
     bucket = os.environ.get("AWS_S3_BUCKET", "")
-    deleted_count = 0
-    for row in rows:
-        visual_id = str(row.get("id") or "")
-        if visual_id:
-            deleted = await supabase_delete_reel_visual(visual_id, user_id)
-            if deleted:
-                deleted_count += 1
-
-        image_s3_key = str(row.get("image_s3_key") or "").strip()
-        if bucket and image_s3_key:
-            try:
-                delete_s3_object(bucket, image_s3_key)
-            except Exception:
-                logger.warning("Failed to delete reel visual image %s from S3", image_s3_key, exc_info=True)
+    deleted_count = await _delete_reel_visuals_and_images(rows, user_id, bucket)
 
     job = jobs.get(job_id)
     _persist_new_video_url_to_clip(job, clip_index, clips, data, metadata_path, reset_video_url, "visuals reset")
 
     if is_supabase_configured():
         try:
+            base_s3_key = str(reel.get("reel_base_s3_key") or "").strip()
             await supabase_update_reel_media_by_job_clip(
                 job_id=job_id,
                 clip_index=clip_index,
@@ -9857,7 +9956,7 @@ async def create_stripe_checkout_session(
 
     plan = await supabase_get_abonnement(payload.plan_id)
     if not plan:
-        raise _coded_error(404, "plan_not_found", "Subscription plan not found")
+        raise _coded_error(404, "plan_not_found", _SUBSCRIPTION_PLAN_NOT_FOUND)
 
     default_base_url = _frontend_base_url(request)
     success_url = (payload.success_url or STRIPE_SUCCESS_URL or f"{default_base_url}/dashboard/abonnement?payment=success").strip()
@@ -10561,7 +10660,7 @@ async def _get_active_stripe_souscription(user_id: str) -> Dict[str, Any]:
     the time this raises, changing plan is the only way out for the user."""
     subscription = await get_user_abonnement(user_id)
     if not subscription:
-        raise _coded_error(404, "no_active_subscription", "No active subscription")
+        raise _coded_error(404, "no_active_subscription", _NO_ACTIVE_SUBSCRIPTION)
     if not subscription.get("stripe_subscription_id"):
         raise _coded_error(
             400,
@@ -11523,7 +11622,7 @@ async def change_souscription_plan(
 
     subscription = await get_user_abonnement(user_id)
     if not subscription:
-        raise _coded_error(404, "no_active_subscription", "No active subscription")
+        raise _coded_error(404, "no_active_subscription", _NO_ACTIVE_SUBSCRIPTION)
 
     current_plan = await supabase_get_abonnement(str(subscription.get("abonnement") or ""))
     if not current_plan:
@@ -11531,7 +11630,7 @@ async def change_souscription_plan(
 
     new_plan = await supabase_get_abonnement(payload.plan_id)
     if not new_plan:
-        raise _coded_error(404, "plan_not_found", "Subscription plan not found")
+        raise _coded_error(404, "plan_not_found", _SUBSCRIPTION_PLAN_NOT_FOUND)
 
     current_interval = subscription.get("billing_interval") or "month"
     new_interval = payload.billing_interval or current_interval
@@ -11577,11 +11676,43 @@ async def cancel_scheduled_plan_change(user_id: Annotated[str, Depends(get_user_
         raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
     subscription = await get_user_abonnement(user_id)
     if not subscription:
-        raise _coded_error(404, "no_active_subscription", "No active subscription")
+        raise _coded_error(404, "no_active_subscription", _NO_ACTIVE_SUBSCRIPTION)
     if not subscription.get("scheduled_abonnement_id"):
         raise _coded_error(404, "no_scheduled_change", "Aucun changement programme sur cet abonnement.")
     await _cancel_scheduled_plan_change(user_id, subscription)
     return {"cancelled": True}
+
+
+async def _preview_immediate_upgrade_summary(
+    subscription: Dict[str, Any], current_plan: Dict[str, Any], new_plan: Dict[str, Any],
+    current_interval: str, user_id: str, now: datetime,
+) -> Dict[str, Any]:
+    """The PLAN_CHANGE_UPGRADE_IMMEDIATE branch of
+    preview_souscription_plan_change's summary -- isolated out since it
+    alone (proration math + wallet lookups) made up most of that endpoint's
+    cognitive complexity (audit: SonarQube python:S3776)."""
+    proration = _compute_plan_change_proration(subscription, current_plan, new_plan, current_interval, now)
+    amount_due_today = proration["amount_due_today"]
+    credits_to_add = proration["credits_to_add"]
+    inconsistent = amount_due_today < 0 or credits_to_add < 0
+
+    user_data = await supabase_get_user_data(user_id)
+    current_credit = float((user_data or {}).get("credit") or 0.0)
+    promotional_batches = await supabase_list_active_promotional_credit_batches(user_id)
+    promotional_credit = sum(float(b.get("amount_remaining") or 0.0) for b in promotional_batches)
+
+    next_price = _annual_price_for_plan(new_plan) if current_interval == "year" else float(new_plan.get("price") or 0)
+    return {
+        "effective_at": now.isoformat(),
+        "amount_due_today": amount_due_today,
+        "inconsistent_configuration": inconsistent,
+        "credits_added_now": credits_to_add,
+        "credits_added_expires_at": subscription.get("credit_cycle_end_at") or subscription.get("payment_end_date"),
+        "resulting_credit_balance": current_credit + promotional_credit + (credits_to_add if not inconsistent else 0),
+        "future_monthly_credit_quota": float(new_plan.get("credit") or 0),
+        "next_amount": next_price,
+        "next_billing_date": subscription.get("payment_end_date"),
+    }
 
 
 @app.get("/api/souscription/change-plan/preview", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
@@ -11599,7 +11730,7 @@ async def preview_souscription_plan_change(
 
     subscription = await get_user_abonnement(user_id)
     if not subscription:
-        raise _coded_error(404, "no_active_subscription", "No active subscription")
+        raise _coded_error(404, "no_active_subscription", _NO_ACTIVE_SUBSCRIPTION)
 
     current_plan = await supabase_get_abonnement(str(subscription.get("abonnement") or ""))
     if not current_plan:
@@ -11607,7 +11738,7 @@ async def preview_souscription_plan_change(
 
     new_plan = await supabase_get_abonnement(plan_id)
     if not new_plan:
-        raise _coded_error(404, "plan_not_found", "Subscription plan not found")
+        raise _coded_error(404, "plan_not_found", _SUBSCRIPTION_PLAN_NOT_FOUND)
 
     current_interval = subscription.get("billing_interval") or "month"
     new_interval = billing_interval or current_interval
@@ -11628,28 +11759,9 @@ async def preview_souscription_plan_change(
     }
 
     if classification == PLAN_CHANGE_UPGRADE_IMMEDIATE:
-        proration = _compute_plan_change_proration(subscription, current_plan, new_plan, current_interval, now)
-        amount_due_today = proration["amount_due_today"]
-        credits_to_add = proration["credits_to_add"]
-        inconsistent = amount_due_today < 0 or credits_to_add < 0
-
-        user_data = await supabase_get_user_data(user_id)
-        current_credit = float((user_data or {}).get("credit") or 0.0)
-        promotional_batches = await supabase_list_active_promotional_credit_batches(user_id)
-        promotional_credit = sum(float(b.get("amount_remaining") or 0.0) for b in promotional_batches)
-
-        next_price = _annual_price_for_plan(new_plan) if current_interval == "year" else float(new_plan.get("price") or 0)
-        summary.update({
-            "effective_at": now.isoformat(),
-            "amount_due_today": amount_due_today,
-            "inconsistent_configuration": inconsistent,
-            "credits_added_now": credits_to_add,
-            "credits_added_expires_at": subscription.get("credit_cycle_end_at") or subscription.get("payment_end_date"),
-            "resulting_credit_balance": current_credit + promotional_credit + (credits_to_add if not inconsistent else 0),
-            "future_monthly_credit_quota": float(new_plan.get("credit") or 0),
-            "next_amount": next_price,
-            "next_billing_date": subscription.get("payment_end_date"),
-        })
+        summary.update(await _preview_immediate_upgrade_summary(
+            subscription, current_plan, new_plan, current_interval, user_id, now,
+        ))
     elif classification in (PLAN_CHANGE_DOWNGRADE_SCHEDULED, PLAN_CHANGE_PERIODICITY_SCHEDULED):
         effective_at = subscription.get("payment_end_date")
         summary.update({
@@ -11670,6 +11782,30 @@ async def preview_souscription_plan_change(
 # User credits & history
 # ---------------------------------------------------------------------------
 
+def _bonus_credit_summary(bonus_batches: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Splits a user's active promotional-credit batches into the two
+    independently-expiring pools (see the credit-tiers migration) and
+    summarizes each, soonest-expiry-first (matching their own FEFO
+    consumption order) -- isolated out of get_user_credits to keep that
+    endpoint's cognitive complexity under this codebase's limit (audit:
+    SonarQube python:S3776). Never summed into one "bonus_credit" so the
+    wallet UI can label each pool correctly."""
+    promotional_batches = [b for b in bonus_batches if int(b.get("tier") or CREDIT_BATCH_TIER_PROMOTIONAL) == CREDIT_BATCH_TIER_PROMOTIONAL]
+    purchased_batches = [b for b in bonus_batches if int(b.get("tier") or CREDIT_BATCH_TIER_PROMOTIONAL) == CREDIT_BATCH_TIER_PURCHASED]
+    return {
+        "promotional_credit": sum(float(b.get("amount_remaining") or 0.0) for b in promotional_batches),
+        "promotional_credit_expirations": [
+            {"amount": float(b.get("amount_remaining") or 0.0), "expires_at": b.get("expires_at")}
+            for b in promotional_batches
+        ],
+        "purchased_credit": sum(float(b.get("amount_remaining") or 0.0) for b in purchased_batches),
+        "purchased_credit_expirations": [
+            {"amount": float(b.get("amount_remaining") or 0.0), "expires_at": b.get("expires_at")}
+            for b in purchased_batches
+        ],
+    }
+
+
 @app.get("/api/user/credits", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
 async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get_user_id_header)]):
     """Return the credit/storage balance for the authenticated user."""
@@ -11683,35 +11819,15 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
 
     data = await supabase_get_user_data(user_id)
     bonus_batches = await supabase_list_active_promotional_credit_batches(user_id)
-    # Two distinct, independently-expiring bonus pools sharing the same
-    # table (see the credit-tiers migration) -- always consumed in order
-    # promotional, then purchased, then (last) the plain subscription
-    # `credit` field below. Keeping them split here (never summed into
-    # one "bonus_credit") lets the wallet UI label each one correctly.
-    promotional_batches = [b for b in bonus_batches if int(b.get("tier") or CREDIT_BATCH_TIER_PROMOTIONAL) == CREDIT_BATCH_TIER_PROMOTIONAL]
-    purchased_batches = [b for b in bonus_batches if int(b.get("tier") or CREDIT_BATCH_TIER_PROMOTIONAL) == CREDIT_BATCH_TIER_PURCHASED]
-    promotional_credit = sum(float(batch.get("amount_remaining") or 0.0) for batch in promotional_batches)
-    purchased_credit = sum(float(batch.get("amount_remaining") or 0.0) for batch in purchased_batches)
-    # Soonest-expiry-first, matching the batches' own FEFO consumption
-    # order -- the wallet UI (section 15) shows this so a user understands
-    # why Vireel is about to consume certain credits before others.
-    promotional_credit_expirations = [
-        {"amount": float(batch.get("amount_remaining") or 0.0), "expires_at": batch.get("expires_at")}
-        for batch in promotional_batches
-    ]
-    purchased_credit_expirations = [
-        {"amount": float(batch.get("amount_remaining") or 0.0), "expires_at": batch.get("expires_at")}
-        for batch in purchased_batches
-    ]
+    bonus_summary = _bonus_credit_summary(bonus_batches)
+    promotional_credit = bonus_summary["promotional_credit"]
+    purchased_credit = bonus_summary["purchased_credit"]
 
     if not data:
         return {
             "credit":   0.0,
             "credit_max": 0.0,
-            "promotional_credit": promotional_credit,
-            "promotional_credit_expirations": promotional_credit_expirations,
-            "purchased_credit": purchased_credit,
-            "purchased_credit_expirations": purchased_credit_expirations,
+            **bonus_summary,
             "has_credits": (promotional_credit + purchased_credit) > 0,
             "has_active_subscription": has_active_subscription,
             "has_analytics_access": bool(abonnement) and int(abonnement.get("priorite") or 1) >= 2,
@@ -11740,10 +11856,7 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
     return {
         "credit":   credit,
         "credit_max": credit_max,
-        "promotional_credit": promotional_credit,
-        "promotional_credit_expirations": promotional_credit_expirations,
-        "purchased_credit": purchased_credit,
-        "purchased_credit_expirations": purchased_credit_expirations,
+        **bonus_summary,
         "has_credits": (credit + promotional_credit + purchased_credit) > 0,
         "has_active_subscription": has_active_subscription,
         "has_analytics_access": bool(abonnement) and int(abonnement.get("priorite") or 1) >= 2,
@@ -13514,7 +13627,7 @@ async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotate
     }
 
 
-_COMMENT_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+_COMMENT_IMAGE_EXTENSIONS = _STANDARD_IMAGE_EXTENSIONS
 _COMMENT_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 # Longest a presigned S3 URL signed with static IAM credentials (SigV4) can
 # live -- AWS's own hard cap, not a choice made here. A comment's image_url
@@ -13588,7 +13701,7 @@ async def upload_social_comment_image(
     return {"image_url": image_url}
 
 
-_POST_MEDIA_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+_POST_MEDIA_IMAGE_EXTENSIONS = _STANDARD_IMAGE_EXTENSIONS
 _POST_MEDIA_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 _POST_MEDIA_VIDEO_MAX_BYTES = 200 * 1024 * 1024
 # Matches _COMMENT_IMAGE_URL_EXPIRATION_SECONDS: a scheduled post's
