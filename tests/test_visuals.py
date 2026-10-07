@@ -18,12 +18,22 @@ def test_build_visuals_filter_complex_single_top_visual():
 
     result = visuals_mod.build_visuals_filter_complex(visuals, 1080, 1920)
 
+    # Base video is SAR-normalized once, up front, before anything else reads it.
+    assert "[0:v]setsar=1[vsar]" in result
     # 35% of 1920 = 672 (even already), video half = 1920-672=1248.
-    assert "[0:v]split=2[vfull0][vsrc0]" in result
+    assert "[vsar]split=2[vfull0][vsrc0]" in result
+    assert "scale=1080:1248:force_original_aspect_ratio=increase" in result
     assert "crop=1080:1248[vcrop0]" in result
     # TOP: image at y=0, video padded down to y=image_height=672.
     assert "pad=1080:1920:0:672:black[vpad0]" in result
-    assert "crop=1080:672[vimg0]" in result
+    # Image is split into a blurred, stretch-filled (always-opaque) backdrop
+    # and a cover-fit (possibly still-alpha) foreground, composited together
+    # before ever reaching the video's black pad -- so a transparent source
+    # image can never let that black show through.
+    assert "[1:v]split=2[vimgbgsrc0][vimgsrc0]" in result
+    assert "boxblur=" in result and "format=yuv420p[vimgbg0]" in result
+    assert "crop=1080:672[vimgfg0]" in result
+    assert "[vimgbg0][vimgfg0]overlay=0:0[vimg0]" in result
     assert "[vpad0][vimg0]overlay=0:0[vsplit0]" in result
     assert "[vfull0][vsplit0]overlay=0:0:enable='between(t,12.500,17.500)'[out]" in result
 
@@ -49,8 +59,8 @@ def test_build_visuals_filter_complex_chains_multiple_visuals():
 
     result = visuals_mod.build_visuals_filter_complex(visuals, 1080, 1920)
 
-    # First stage reads from the raw input, feeds into a named intermediate stage...
-    assert "[0:v]split=2[vfull0][vsrc0]" in result
+    # First stage reads from the SAR-normalized input, feeds into a named intermediate stage...
+    assert "[vsar]split=2[vfull0][vsrc0]" in result
     assert "[vfull0][vsplit0]overlay=0:0:enable='between(t,2.000,5.000)'[vstage0]" in result
     # ...the second visual reads from that intermediate stage and produces [out].
     assert "[vstage0]split=2[vfull1][vsrc1]" in result
@@ -70,6 +80,20 @@ def test_build_visuals_filter_complex_dimensions_stay_even():
     for match in re.finditer(r"(?:scale|crop|pad)=(\d+):(\d+)", result):
         assert int(match.group(1)) % 2 == 0
         assert int(match.group(2)) % 2 == 0
+
+
+def test_build_visuals_filter_complex_image_backdrop_is_forced_opaque():
+    """The image's blurred backdrop must drop any alpha channel
+    (format=yuv420p) -- otherwise a transparent source image would still
+    let the video's black pad show through after compositing."""
+    visuals_mod = importlib.import_module("visuals")
+    visuals = [{"position": "BOTTOM", "start_time": 0.0, "duration": 2.0}]
+
+    result = visuals_mod.build_visuals_filter_complex(visuals, 1080, 1920)
+
+    bg_stage = next(part for part in result.split(";") if part.endswith("[vimgbg0]"))
+    assert "format=yuv420p" in bg_stage
+    assert "scale=1080:672" in bg_stage
 
 
 def test_probe_video_dimensions_falls_back_on_failure(monkeypatch):
