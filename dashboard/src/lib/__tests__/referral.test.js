@@ -95,9 +95,9 @@ describe('associateReferralCode', () => {
         expect(JSON.parse(options.body)).toEqual({ referral_code: 'ABC1234' });
     });
 
-    it('returns null on a non-ok response and still clears the stored code', async () => {
+    it('returns null on an unknown/invalid code response (404) and clears the stored code', async () => {
         storeReferralCode('ABC1234');
-        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, json: async () => ({}) }));
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 404, json: async () => ({}) }));
 
         const result = await associateReferralCode('user-1', 'ABC1234');
 
@@ -105,13 +105,33 @@ describe('associateReferralCode', () => {
         expect(getStoredReferralCode()).toBeNull();
     });
 
-    it('returns null on a network error and still clears the stored code', async () => {
+    it('returns null on a bad-request response (400) and clears the stored code', async () => {
+        storeReferralCode('ABC1234');
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 400, json: async () => ({}) }));
+
+        const result = await associateReferralCode('user-1', 'ABC1234');
+
+        expect(result).toBeNull();
+        expect(getStoredReferralCode()).toBeNull();
+    });
+
+    it('returns null on a 401 (no session yet) but keeps the stored code for a later retry', async () => {
+        storeReferralCode('ABC1234');
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 401, json: async () => ({}) }));
+
+        const result = await associateReferralCode('user-1', 'ABC1234');
+
+        expect(result).toBeNull();
+        expect(getStoredReferralCode()).toBe('ABC1234');
+    });
+
+    it('returns null on a network error but keeps the stored code for a later retry', async () => {
         storeReferralCode('ABC1234');
         vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('network down')));
 
         const result = await associateReferralCode('user-1', 'ABC1234');
 
         expect(result).toBeNull();
-        expect(getStoredReferralCode()).toBeNull();
+        expect(getStoredReferralCode()).toBe('ABC1234');
     });
 });
