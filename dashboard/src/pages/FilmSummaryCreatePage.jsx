@@ -1,14 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Check, Loader2, Pause, Play } from "lucide-react";
+import { Check, Loader2, Pause, Play } from "lucide-react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { getApiUrl, fetchAppConfig } from "../config";
 import { getAuthHeaders } from "../lib/apiAuth";
 import { useAuth } from "../state/AuthContext";
 import { useUserCredits } from "../state/UserCreditsContext";
 import { useTranslation } from "../state/LanguageContext";
+import Breadcrumbs from "../components/Breadcrumbs";
 import MediaInput from "../components/MediaInput";
 import FilmSummaryProcessingPanel from "../components/FilmSummaryProcessingPanel";
-import { errorMessageForCode, normalizeFilmSummaryJobStatus as normalizeStatus } from "../lib/filmSummary";
+import { errorMessageForCode, normalizeFilmSummaryJobStatus as normalizeStatus, NARRATION_LANGUAGE_OPTIONS } from "../lib/filmSummary";
 
 const NARRATION_STYLE_KEYS = [
     {
@@ -31,17 +32,6 @@ const NARRATION_STYLE_KEYS = [
         descKey: "filmSummary.narrationStyleEnergeticDesc",
         descFallback: "Rythme rapide et dynamique, adapte a un resume court et percutant.",
     },
-];
-
-// Same language set as CaptionsModal.jsx's FALLBACK_LANGUAGES, for a
-// consistent dropdown across the app's language pickers.
-const LANGUAGE_OPTIONS = [
-    { value: "fr", labelKey: "filmSummary.languageFrench", fallback: "Francais" },
-    { value: "en", labelKey: "filmSummary.languageEnglish", fallback: "Anglais" },
-    { value: "es", labelKey: "filmSummary.languageSpanish", fallback: "Espagnol" },
-    { value: "de", labelKey: "filmSummary.languageGerman", fallback: "Allemand" },
-    { value: "it", labelKey: "filmSummary.languageItalian", fallback: "Italien" },
-    { value: "pt", labelKey: "filmSummary.languagePortuguese", fallback: "Portugais" },
 ];
 
 export default function FilmSummaryCreatePage() {
@@ -340,22 +330,20 @@ export default function FilmSummaryCreatePage() {
     };
 
     const isProcessing = normalizeStatus(status) === "processing";
+    const breadcrumbItems = [
+        { label: t("breadcrumbs.dashboard", "Dashboard"), href: "/dashboard" },
+        { label: t("breadcrumbs.filmSummaries", "Film summaries"), href: "/dashboard/film-summaries" },
+        { label: t("breadcrumbs.create", "Create") },
+    ];
 
     return (
         <div className="flex-1 overflow-y-auto p-8 space-y-6">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-                <div>
-                    <h1 className="text-3xl font-black tracking-tight">{t("filmSummary.createTitle", "Creer un resume de film")}</h1>
+                <div className="space-y-2">
+                    <Breadcrumbs items={breadcrumbItems} ariaLabel={t('breadcrumbs.ariaLabel', 'Breadcrumb')} />
                     <p className="mt-2 text-sm text-slate-500 dark:text-zinc-400">{t("filmSummary.createSubtitle", "Importe un film complet ou colle un lien YouTube. Seuls les films narratifs sont pris en charge.")}</p>
                 </div>
-                <button
-                    type="button"
-                    onClick={() => navigate("/dashboard/film-summaries")}
-                    className="inline-flex items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
-                >
-                    <ArrowLeft size={14} />
-                    {t("filmSummary.backToList", "Retour aux resumes de film")}
-                </button>
+                <div className="shrink-0" />
             </div>
 
             {!jobId && !projectIdFromUrl ? (
@@ -415,7 +403,7 @@ export default function FilmSummaryCreatePage() {
                                 className="input-field w-full dark:text-white"
                             >
                                 <option value="">{t("filmSummary.sourceLanguageAuto", "Detection automatique")}</option>
-                                {LANGUAGE_OPTIONS.map((option) => (
+                                {NARRATION_LANGUAGE_OPTIONS.map((option) => (
                                     <option key={option.value} value={option.value}>{t(option.labelKey, option.fallback)}</option>
                                 ))}
                             </select>
@@ -432,7 +420,7 @@ export default function FilmSummaryCreatePage() {
                                 className="input-field w-full dark:text-white"
                             >
                                 <option value="">{t("filmSummary.narrationLanguageAuto", "Meme langue que la source")}</option>
-                                {LANGUAGE_OPTIONS.map((option) => (
+                                {NARRATION_LANGUAGE_OPTIONS.map((option) => (
                                     <option key={option.value} value={option.value}>{t(option.labelKey, option.fallback)}</option>
                                 ))}
                             </select>

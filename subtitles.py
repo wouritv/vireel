@@ -51,20 +51,36 @@ def transcribe_audio(video_path):
     return transcript
 
 
+def _probe_video_duration_seconds(video_path):
+    """Returns video_path's duration in seconds via ffprobe, or 0.0 if it
+    can't be determined (missing binary, unreadable file, ...). Used
+    instead of deriving duration from cv2.VideoCapture's frame_count/fps
+    (CAP_PROP_FRAME_COUNT is well known to read back 0 or wrong for many
+    ffmpeg-produced H.264/mp4 containers), which silently collapsed the
+    word-timestamp range generate_srt_from_video transcribes against to
+    [0, 0) and made every subtitle disappear without any error at all."""
+    try:
+        probe_cmd = [
+            'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1', video_path,
+        ]
+        output = subprocess.check_output(probe_cmd, timeout=30).decode().strip()
+        return max(0.0, float(output))
+    except Exception:
+        return 0.0
+
+
 def generate_srt_from_video(video_path, output_path, max_chars=20, max_duration=2.0, max_words_per_line=4, highlight=False):
     """
     Transcribe a video and generate SRT directly.
     Used for dubbed videos that don't have a pre-existing transcript.
+    Returns False (and writes no file) when the video has no detectable
+    speech, or no duration at all -- callers must check this and treat it
+    as subtitle generation failing, not silently ship a video with no
+    subtitles burned in.
     """
     transcript = transcribe_audio(video_path)
-
-    # Get video duration to use as clip_end
-    import cv2
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = frame_count / fps if fps else 0
-    cap.release()
+    duration = _probe_video_duration_seconds(video_path)
 
     generator = generate_highlighted_srt if highlight else generate_srt
     return generator(
@@ -394,7 +410,41 @@ class _AssStyleParams:
     highlight_colour: str = ""
 
 
-def _build_ass_document(blocks, params: _AssStyleParams) -> str:
+# Must match visuals.py's SPLIT_IMAGE_RATIO (the video gets the
+# remaining share of the frame) -- kept as a separate constant here since
+# this codebase doesn't share constants across feature modules, but the
+# two values must stay in sync if the split ratio ever changes.
+_VISUALS_SPLIT_VIDEO_RATIO = 0.50
+_ASS_DEFAULT_MARGIN_V = 25
+
+
+def _dialogue_overlaps_bottom_split_visual(start: float, end: float, visual_windows) -> bool:
+    """True if a subtitle line's [start,end) overlaps a BOTTOM-position
+    visual's time window at all -- see _bottom_split_position_tag for why
+    such a line needs repositioning. Partial overlap repositions the
+    whole line for simplicity (re-timing a single SRT entry into several
+    differently-positioned fragments is out of scope)."""
+    for window in (visual_windows or []):
+        if str(window.get("position", "")).upper() != "BOTTOM":
+            continue
+        if start < float(window.get("end", 0)) and float(window.get("start", 0)) < end:
+            return True
+    return False
+
+
+def _bottom_split_position_tag(width: int, height: int) -> str:
+    """Inline ASS override forcing a dialogue line to sit just above the
+    image in a BOTTOM-position split (video occupies the TOP
+    _VISUALS_SPLIT_VIDEO_RATIO share of the frame there) -- without this,
+    the default bottom-of-frame alignment would place the subtitle on top
+    of the image instead of the video. \\an2 keeps the usual
+    bottom-center anchor; only the Y it anchors to moves up."""
+    x = width // 2
+    y = int(height * _VISUALS_SPLIT_VIDEO_RATIO) - _ASS_DEFAULT_MARGIN_V
+    return f"{{\\an2\\pos({x},{y})}}"
+
+
+def _build_ass_document(blocks, params: _AssStyleParams, visual_windows=None) -> str:
     """Builds a complete .ass script with its own [Script Info] PlayResX/
     PlayResY set to the video's real resolution -- unlike a bare .srt (which
     carries no resolution info of its own and makes ffmpeg's `subtitles`
@@ -405,7 +455,15 @@ def _build_ass_document(blocks, params: _AssStyleParams) -> str:
     so Fontsize maps 1:1 to real pixels here, matching how the same
     font_size looks in the Remotion-based manual caption editor (whose
     composition is sized to the real output resolution and treats fontSize
-    as literal CSS pixels -- see remotion/src/Root.tsx)."""
+    as literal CSS pixels -- see remotion/src/Root.tsx).
+
+    visual_windows (optional): manually-added visuals' time windows (see
+    visuals.py), as [{"position": "TOP"|"BOTTOM", "start": float, "end":
+    float}, ...]. A dialogue line overlapping a BOTTOM-position window
+    gets an inline position override so it stays over the video instead
+    of the image (see _bottom_split_position_tag) -- TOP-position visuals
+    need no override since the video's own bottom edge is unchanged by a
+    TOP split."""
     p = params
     header = (
         "[Script Info]\n"
@@ -426,6 +484,7 @@ def _build_ass_document(blocks, params: _AssStyleParams) -> str:
     effective_highlight_colour = p.highlight_colour or p.primary_colour
     events = "".join(
         f"Dialogue: 0,{_format_ass_time(start)},{_format_ass_time(end)},Default,,0,0,0,,"
+        f"{_bottom_split_position_tag(p.width, p.height) if _dialogue_overlaps_bottom_split_visual(start, end, visual_windows) else ''}"
         f"{_escape_ass_text_with_highlight(text, p.primary_colour, effective_highlight_colour)}\n"
         for start, end, text in blocks
     )
@@ -459,12 +518,21 @@ def _run_ffmpeg_subtitle_burn(cmd: list) -> None:
         raise RuntimeError(f"FFmpeg failed: {result.stderr.decode()}")
 
 
-def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16, style_options=None):
+def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16, style_options=None, visual_windows=None):
     """
     Burns subtitles into the video using FFmpeg.
     Supports two modes:
     - Outline mode (bg_opacity=0): Text with colored outline/border
     - Box mode (bg_opacity>0): Text with semi-transparent background box
+
+    visual_windows (optional): see _build_ass_document -- pass the
+    reel's manually-added visuals' time windows so a subtitle line that
+    falls inside a BOTTOM-position visual's window is repositioned onto
+    the video half instead of sitting on top of the image. Only matters
+    when subtitles are burned in AFTER visuals are applied; burning
+    subtitles first and visuals second re-crops whatever subtitle pixels
+    land in the video's cropped region, which is a separate, acceptable
+    V1 limitation (see visuals.py's apply_visuals_to_video).
     """
     style = style_options or SubtitleStyleOptions()
 
@@ -494,7 +562,7 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16, 
     )
 
     blocks = _parse_srt_blocks(srt_path)
-    ass_content = _build_ass_document(blocks, ass_params)
+    ass_content = _build_ass_document(blocks, ass_params, visual_windows=visual_windows)
     ass_path = f"{os.path.splitext(srt_path)[0]}.ass"
     with open(ass_path, 'w', encoding='utf-8') as f:
         f.write(ass_content)

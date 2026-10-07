@@ -1,7 +1,9 @@
 import React, {useEffect, useState} from "react";
-import {Check, X, CreditCardIcon, Star, Crown, Sparkles, Zap, Building2, Loader2, Coins, Plus, Minus, MessageCircle} from "lucide-react";
+import {Check, X, CreditCardIcon, Star, Crown, Sparkles, Zap, Building2, Loader2, Coins, Plus, Minus, MessageCircle, Clock} from "lucide-react";
 import {getApiUrl} from "../config.js";
 import { getAuthHeaders } from "../lib/apiAuth";
+import { annualSavingsAmount, computeAnnualPrice, normalizeAnnualDiscountPercent } from "../lib/billing";
+import { daysUntilDate } from "../lib/formatting";
 import { useAuth } from "../state/AuthContext";
 import { useUserCredits } from "../state/UserCreditsContext";
 import { useTranslation } from "../state/LanguageContext";
@@ -97,13 +99,17 @@ const iconMap = {
 export default function AbonnementPage() {
     const { t } = useTranslation();
     const { user } = useAuth();
-    const { credits, creditMax, refresh: refreshCredits } = useUserCredits();
+    const {
+        credits, creditMax, refresh: refreshCredits,
+        promotionalCredit, promotionalCreditExpirations, purchasedCredit, purchasedCreditExpirations,
+    } = useUserCredits();
     const [items, setItems] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState("");
     const [souscription, setSouscription] = useState(null);
     const [loadingPlanId, setLoadingPlanId] = useState("");
     const [paymentMessage, setPaymentMessage] = useState("");
+    const [billingInterval, setBillingInterval] = useState("month");
 
     // Buy credits
     const [buyAmount, setBuyAmount] = useState(10);
@@ -112,6 +118,7 @@ export default function AbonnementPage() {
     const CREDIT_RATE = 100;
     const creditsToAdd = Math.round(buyAmount * CREDIT_RATE);
     const currentPlan = items.find((plan) => String(plan.id) === String(souscription?.abonnement || "")) || null;
+    const maxAnnualDiscount = items.reduce((max, plan) => Math.max(max, normalizeAnnualDiscountPercent(plan.reduction_annuelle)), 0);
 
     useEffect(() => {
         const params = new URLSearchParams(globalThis.location.search || "");
@@ -138,6 +145,7 @@ export default function AbonnementPage() {
                 },
                 body: JSON.stringify({
                     plan_id: plan.id,
+                    billing_interval: billingInterval,
                 }),
             });
 
@@ -255,6 +263,37 @@ export default function AbonnementPage() {
                 {paymentMessage ? <p className="mt-3 text-sm text-green-300">{paymentMessage}</p> : null}
             </div>
 
+            {/* Billing interval toggle -- mirrors the active/inactive
+                button-pair pattern used by the credit-amount quick-picks
+                further down. */}
+            <div className="flex items-center gap-2 mb-8">
+                <button
+                    onClick={() => setBillingInterval("month")}
+                    className={`px-3 py-1.5 rounded-lg border text-sm font-medium transition ${
+                        billingInterval === "month"
+                            ? "border-amber-300 dark:border-yellow-400 bg-amber-100 dark:bg-yellow-400/10 text-amber-800 dark:text-yellow-300"
+                            : "border-slate-300 dark:border-white/10 bg-white/5 text-slate-700 dark:text-zinc-300 hover:border-slate-400 dark:hover:border-white/20"
+                    }`}
+                >
+                    {t("abonnement.billingMonthly", "Mensuel")}
+                </button>
+                <button
+                    onClick={() => setBillingInterval("year")}
+                    className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border text-sm font-medium transition ${
+                        billingInterval === "year"
+                            ? "border-amber-300 dark:border-yellow-400 bg-amber-100 dark:bg-yellow-400/10 text-amber-800 dark:text-yellow-300"
+                            : "border-slate-300 dark:border-white/10 bg-white/5 text-slate-700 dark:text-zinc-300 hover:border-slate-400 dark:hover:border-white/20"
+                    }`}
+                >
+                    {t("abonnement.billingAnnual", "Annuel")}
+                    {maxAnnualDiscount > 0 && (
+                        <span className="rounded-full bg-emerald-500/20 text-emerald-600 dark:text-emerald-300 px-1.5 py-0.5 text-[0.65rem] font-semibold">
+                            {t("abonnement.annualDiscountBadge", "jusqu'a -{{percent}}%", { percent: Math.round(maxAnnualDiscount) })}
+                        </span>
+                    )}
+                </button>
+            </div>
+
             {/* Plans -- responsive to however many plans the catalog has
                 (was hardcoded to 3 columns, broke once a 4th plan was added) */}
             <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-8 items-start">
@@ -290,6 +329,11 @@ export default function AbonnementPage() {
                     const descriptionItems = Array.isArray(plan.description)
                         ? plan.description
                         : (plan.description ? [plan.description] : []);
+                    const discountRate = normalizeAnnualDiscountPercent(plan.reduction_annuelle);
+                    const displayedPrice = billingInterval === "year"
+                        ? computeAnnualPrice(plan.price, discountRate)
+                        : plan.price;
+                    const savings = billingInterval === "year" ? annualSavingsAmount(plan.price, discountRate) : 0;
 
                     return (
                         <div
@@ -321,8 +365,13 @@ export default function AbonnementPage() {
 
                             {/* Prix */}
                             <div className="mb-6">
-                                <span className="text-3xl font-bold">{plan.price}€</span>
-                                <span className="text-slate-500 dark:text-zinc-400 text-sm"> / {t("abonnement.mois","mois")}</span>
+                                <span className="text-3xl font-bold">{displayedPrice}€</span>
+                                <span className="text-slate-500 dark:text-zinc-400 text-sm"> / {billingInterval === "year" ? t("abonnement.an","an") : t("abonnement.mois","mois")}</span>
+                                {billingInterval === "year" && discountRate > 0 && (
+                                    <p className="mt-1 text-xs text-emerald-600 dark:text-emerald-400">
+                                        {t("abonnement.annualSavings", "Économisez {{amount}}€ par an", { amount: savings })}
+                                    </p>
+                                )}
                             </div>
 
                             {/* Fonctionnalites IA incluses dans les credits */}
@@ -393,10 +442,11 @@ export default function AbonnementPage() {
                 <ul className="flex flex-col gap-3">
                     {[
                         t("abonnement.offre1", "Génération de réels"),
-                        t("abonnement.offre2", "Génération de captions"),
+                        t("abonnement.offre2", "Génération de sous-titres"),
                         t("abonnement.offre3", "Publication et suivi sur les réseaux sociaux"),
-                        t("abonnement.offre4", "Génération des sous titres et hooks viraux"),
+                        t("abonnement.offre4", "Génération des histoires anonymes"),
                         t("abonnement.offre5", "Traduction de texte et sous-titres"),
+                        t("abonnement.offre6", "Génération de résumés de films"),
                     ].map((item) => (
                         <li key={item} className="flex items-start gap-2 text-sm text-slate-700 dark:text-zinc-300">
                             <Check size={16} className="text-blue-400 mt-0.5 shrink-0" />
@@ -418,6 +468,45 @@ export default function AbonnementPage() {
                             1 EUR = {CREDIT_RATE} {t("abonnement.creditRate","crédits · solde actuel ")} :{" "}
                             <span className="text-slate-900 dark:text-white font-semibold">{credits.toLocaleString()} / {Number(creditMax || 0).toLocaleString()} cr</span>
                         </p>
+                        {(promotionalCredit > 0 || purchasedCredit > 0) && (
+                            <p className="text-xs text-slate-500 dark:text-zinc-400 mt-1">
+                                {t("abonnement.creditsBreakdown3", "{{standard}} crédits abonnement · {{purchased}} crédits achetés · {{promo}} crédits promotionnels", {
+                                    standard: credits.toLocaleString(),
+                                    purchased: purchasedCredit.toLocaleString(),
+                                    promo: promotionalCredit.toLocaleString(),
+                                })}
+                            </p>
+                        )}
+                        {(promotionalCreditExpirations.length > 0 || purchasedCreditExpirations.length > 0) && (
+                            <ul className="mt-1 space-y-0.5">
+                                {promotionalCreditExpirations.map((batch, index) => {
+                                    const days = daysUntilDate(batch.expires_at);
+                                    if (days === null) return null;
+                                    return (
+                                        <li key={`promo-${batch.expires_at}-${index}`} className="flex items-center gap-1.5 text-[0.7rem] text-amber-600 dark:text-amber-400">
+                                            <Clock size={11} />
+                                            {t("abonnement.expiringBatch", "{{amount}} crédits promotionnels expirent dans {{days}} jour(s)", {
+                                                amount: Number(batch.amount).toLocaleString(),
+                                                days,
+                                            })}
+                                        </li>
+                                    );
+                                })}
+                                {purchasedCreditExpirations.map((batch, index) => {
+                                    const days = daysUntilDate(batch.expires_at);
+                                    if (days === null) return null;
+                                    return (
+                                        <li key={`purchased-${batch.expires_at}-${index}`} className="flex items-center gap-1.5 text-[0.7rem] text-amber-600 dark:text-amber-400">
+                                            <Clock size={11} />
+                                            {t("abonnement.expiringPurchasedBatch", "{{amount}} crédits achetés expirent dans {{days}} jour(s)", {
+                                                amount: Number(batch.amount).toLocaleString(),
+                                                days,
+                                            })}
+                                        </li>
+                                    );
+                                })}
+                            </ul>
+                        )}
                     </div>
                 </div>
 

@@ -1,7 +1,9 @@
 import React from "react";
-import { CreditCardIcon, Loader2, RefreshCw, AlertTriangle } from "lucide-react";
+import { CreditCardIcon, Loader2, RefreshCw, AlertTriangle, Clock } from "lucide-react";
 import { useUserCredits } from "../state/UserCreditsContext";
 import { useNavigate } from "react-router-dom";
+import { useTranslation } from "../state/LanguageContext";
+import { daysUntilDate } from "../lib/formatting";
 
 function ProgressBar({ value, max, color = "green", label, unit = "" }) {
     const pct = max > 0 ? Math.min(100, Math.round((value / max) * 100)) : 0;
@@ -34,13 +36,16 @@ function ProgressBar({ value, max, color = "green", label, unit = "" }) {
 }
 
 export default function ServiceUsage() {
-    const { credits, storage, creditMax, storageMax, hasCredits, aboCosts, loading, error, refresh } = useUserCredits();
+    const {
+        credits, creditMax, hasCredits, aboCosts, loading, error, refresh,
+        promotionalCredit, promotionalCreditExpirations, purchasedCredit, purchasedCreditExpirations,
+    } = useUserCredits();
     const navigate = useNavigate();
+    const { t } = useTranslation();
 
     // Estimate a "max" credit pool for display.
     // We take 10× the reel cost as the reference maximum (so users see a meaningful bar).
     const creditLimit = Math.max(0, Number(creditMax ?? aboCosts?.credit ?? 0));
-    const storageLimit = Math.max(0, Number(storageMax ?? aboCosts?.storage ?? 0));
 
     if (loading && credits === 0) {
         return (
@@ -71,14 +76,54 @@ export default function ServiceUsage() {
                 unit=" cr"
             />
 
-            {/* Storage bar (GB) */}
-            <ProgressBar
-                label="Stockage disponibles"
-                value={Number.parseFloat(storage.toFixed(2))}
-                max={storageLimit}
-                color="purple"
-                unit=" Go"
-            />
+            {/* Three-pool split -- total available always combines
+                subscription (standard), promotional, and purchased, but
+                they're distinct batches on the backend, consumed in that
+                order: promo first, then purchased, then subscription. */}
+            {(promotionalCredit > 0 || purchasedCredit > 0) && (
+                <div className="mb-4 -mt-2 rounded-lg border border-slate-200 dark:border-white/5 bg-black/10 px-3 py-2">
+                    <p className="text-xs text-slate-600 dark:text-zinc-300">
+                        {t("serviceUsage.totalAvailable", "{{total}} crédits disponibles", { total: (credits + promotionalCredit + purchasedCredit).toLocaleString() })}
+                    </p>
+                    <p className="text-xs text-slate-500 dark:text-zinc-400 mt-0.5">
+                        {t("serviceUsage.creditsBreakdown3", "{{standard}} crédits abonnement · {{purchased}} crédits achetés · {{promo}} crédits promotionnels", {
+                            standard: credits.toLocaleString(),
+                            purchased: purchasedCredit.toLocaleString(),
+                            promo: promotionalCredit.toLocaleString(),
+                        })}
+                    </p>
+                    {(promotionalCreditExpirations.length > 0 || purchasedCreditExpirations.length > 0) && (
+                        <ul className="mt-1.5 space-y-0.5">
+                            {promotionalCreditExpirations.map((batch, index) => {
+                                const days = daysUntilDate(batch.expires_at);
+                                if (days === null) return null;
+                                return (
+                                    <li key={`promo-${batch.expires_at}-${index}`} className="flex items-center gap-1.5 text-[0.7rem] text-amber-600 dark:text-amber-400">
+                                        <Clock size={11} />
+                                        {t("serviceUsage.expiringBatch", "{{amount}} crédits promotionnels expirent dans {{days}} jour(s)", {
+                                            amount: Number(batch.amount).toLocaleString(),
+                                            days,
+                                        })}
+                                    </li>
+                                );
+                            })}
+                            {purchasedCreditExpirations.map((batch, index) => {
+                                const days = daysUntilDate(batch.expires_at);
+                                if (days === null) return null;
+                                return (
+                                    <li key={`purchased-${batch.expires_at}-${index}`} className="flex items-center gap-1.5 text-[0.7rem] text-amber-600 dark:text-amber-400">
+                                        <Clock size={11} />
+                                        {t("serviceUsage.expiringPurchasedBatch", "{{amount}} crédits achetés expirent dans {{days}} jour(s)", {
+                                            amount: Number(batch.amount).toLocaleString(),
+                                            days,
+                                        })}
+                                    </li>
+                                );
+                            })}
+                        </ul>
+                    )}
+                </div>
+            )}
 
             {/* Warning if low credits */}
             {hasCredits === false && (

@@ -1,10 +1,14 @@
 // Shared helpers for the "Resume de film" (Film Summary) feature pages.
-// Pure UI logic only -- no HTTP calls -- mirrors the anonymousStories.js
-// module's conventions exactly (see FilmSummaryStatus / FilmSummaryStage /
+// Mostly pure UI logic (mirrors the anonymousStories.js module's
+// conventions) plus, further down, a small set of fetch() wrappers for the
+// manual-editor endpoints (audio/subtitle settings, manual clip selection,
+// narration generation) -- see FilmSummaryStatus / FilmSummaryStage /
 // FilmSummaryErrorCode in film_summary.py for the backend side of this
-// contract).
+// contract.
 
 import { resolveJobStepState, errorMessageForCodeWithNamespace } from "./jobStepStatus";
+import { getApiUrl } from "../config";
+import { getAuthHeaders } from "./apiAuth";
 
 /**
  * Normalize a raw /api/status/{job_id} job status to the frontend canonical
@@ -49,10 +53,68 @@ export function isFilmSummaryRejectionErrorCode(code) {
     return FILM_SUMMARY_REJECTION_ERROR_CODES.includes(String(code || ""));
 }
 
-// Segment types (film_summary.SEGMENT_TYPES).
+// The only segment type (film_summary.SEGMENT_TYPES) -- "il ne dois y
+// avoir aucune parole du film originale, uniquement les sequences videos
+// + voix off de narration".
 export const SEGMENT_TYPE_VOICE_OVER = "voice_over";
-export const SEGMENT_TYPE_ORIGINAL_DIALOGUE = "original_dialogue";
-export const SEGMENT_TYPE_BREATHING = "breathing";
+
+/**
+ * Shared response reader for the fetch() wrappers below: parses the JSON
+ * body (tolerating an empty/invalid one) and, on a non-2xx response,
+ * throws an Error carrying the backend's `detail` when present -- same
+ * shape every film-summary page already builds inline around its own
+ * fetch() calls, just not duplicated several more times here.
+ */
+async function readJsonOrThrow(response, fallbackMessage) {
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        throw new Error(typeof data?.detail === "string" ? data.detail : fallbackMessage);
+    }
+    return data;
+}
+
+/**
+ * PATCH /api/film-summaries/{id}/audio-settings -- `patch` is any subset of
+ * {subtitles_enabled, subtitle_style}; callers send only the fields they
+ * changed. Returns the normalized full-content film summary row.
+ */
+export async function updateFilmSummaryAudioSettings(filmSummaryId, userId, patch) {
+    const response = await fetch(getApiUrl(`/api/film-summaries/${filmSummaryId}/audio-settings`), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders(userId) },
+        body: JSON.stringify(patch || {}),
+    });
+    return readJsonOrThrow(response, "Impossible d'enregistrer les reglages audio/sous-titres.");
+}
+
+/**
+ * POST /api/film-summaries/{id}/translate-narration -- body
+ * {narration_language}. Has the AI retranslate the already-generated
+ * narration into the given language (e.g. when the wrong one was picked at
+ * creation time). Returns the normalized full-content film summary row with
+ * `edit_plan` updated.
+ */
+export async function translateFilmSummaryNarration(filmSummaryId, userId, narrationLanguage) {
+    const response = await fetch(getApiUrl(`/api/film-summaries/${filmSummaryId}/translate-narration`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders(userId) },
+        body: JSON.stringify({ narration_language: narrationLanguage }),
+    });
+    return readJsonOrThrow(response, "Impossible de retraduire la narration.");
+}
+
+// Same language set as CaptionsModal.jsx's FALLBACK_LANGUAGES, for a
+// consistent dropdown across the app's language pickers. Shared here (moved
+// out of FilmSummaryCreatePage.jsx) since the review panel's narration
+// retranslation picker needs the exact same options.
+export const NARRATION_LANGUAGE_OPTIONS = [
+    { value: "fr", labelKey: "filmSummary.languageFrench", fallback: "Francais" },
+    { value: "en", labelKey: "filmSummary.languageEnglish", fallback: "Anglais" },
+    { value: "es", labelKey: "filmSummary.languageSpanish", fallback: "Espagnol" },
+    { value: "de", labelKey: "filmSummary.languageGerman", fallback: "Allemand" },
+    { value: "it", labelKey: "filmSummary.languageItalian", fallback: "Italien" },
+    { value: "pt", labelKey: "filmSummary.languagePortuguese", fallback: "Portugais" },
+];
 
 /**
  * Format a millisecond duration as "mm:ss" (or "h:mm:ss" past an hour), for
@@ -77,8 +139,13 @@ export function formatMsClock(ms) {
 const ANALYSIS_STAGE_ORDER = ["transcribing", "detecting_scenes", "validating_film", "planning", "validating_plan"];
 
 // Render-phase pipeline stages, in the order
-// _run_film_summary_render_pipeline_stages reports them (10-40/45/90%).
-const RENDER_STAGE_ORDER = ["generating_voice", "rendering_preview", "rendering_final"];
+// _run_film_summary_render_pipeline_stages reports them (10-40/45/90/95%).
+// "adding_subtitles" is only ever reported when subtitles_enabled is set on
+// the row -- otherwise the pipeline jumps straight from rendering_final to
+// completed, and resolveJobStepState's "complete -> every step done" rule
+// still marks it done retroactively, same as any other step a given plan
+// happens to skip (e.g. generating_voice with zero voice_over segments).
+const RENDER_STAGE_ORDER = ["generating_voice", "rendering_preview", "rendering_final", "adding_subtitles"];
 
 // Step data for both phases -- a plain list instead of two near-identical
 // functions, so there's one small builder (buildProcessSteps below) instead
@@ -100,6 +167,7 @@ const RENDER_STEPS = [
     { key: "generating_voice", labelFallback: "Generation de la voix off", descFallback: "Synthese vocale de chaque segment narre." },
     { key: "rendering_preview", labelFallback: "Assemblage de l'apercu", descFallback: "Montage des extraits et de la narration." },
     { key: "rendering_final", labelFallback: "Finalisation de la video", descFallback: "Encodage et enregistrement du resultat final." },
+    { key: "adding_subtitles", labelFallback: "Ajout des sous-titres", descFallback: "Incrustation des sous-titres choisis dans la video finale." },
 ];
 
 // "detecting_scenes" -> "DetectingScenes", matching the stepXxx/stepXxxDesc
@@ -135,4 +203,112 @@ export function buildFilmSummaryProcessSteps({ status, stage, t, phase }) {
     return resolvedPhase === "render"
         ? buildProcessSteps(RENDER_STEPS, RENDER_STAGE_ORDER, status, stage, t)
         : buildProcessSteps(ANALYSIS_STEPS, ANALYSIS_STAGE_ORDER, status, stage, t);
+}
+
+// ---------------------------------------------------------------------------
+// Per-segment clip-replacement suggestions (FilmSummaryClipSwapPicker): the
+// main review editor now lets the creator replace a single narrative
+// block's clips from ranked suggestions instead of rebuilding the whole cut
+// from a flat scene browser. Pure, client-side, no new backend call --
+// scene_index already carries everything used here (see film_summary.py's
+// build_scene_index: scene_id/start_ms/end_ms/duration_ms/speakers/
+// transcript_overlap/quality_flags).
+// ---------------------------------------------------------------------------
+
+function clipSignature(clip) {
+    return `${clip?.scene_id}|${clip?.start_ms}|${clip?.end_ms}`;
+}
+
+/**
+ * Every exact (scene_id, start_ms, end_ms) clip signature used by any
+ * voice_over segment of `segments` other than `excludeSegmentId` -- mirrors
+ * film_summary.py's _voice_over_clip_signature. Used only to flag a
+ * suggestion as "already used elsewhere" in the picker UI (a soft warning,
+ * never a block -- unlike the automatic planner, a deliberate user edit
+ * here is never silently overridden).
+ */
+export function usedClipSignaturesExcluding(segments, excludeSegmentId) {
+    const signatures = new Set();
+    (segments || []).forEach((seg) => {
+        if (seg.id === excludeSegmentId) return;
+        (seg.clips || []).forEach((clip) => signatures.add(clipSignature(clip)));
+    });
+    return signatures;
+}
+
+const STOPWORDS = new Set([
+    "le", "la", "les", "un", "une", "des", "de", "du", "et", "est", "il", "elle", "que", "qui", "dans", "sur",
+    "pour", "avec", "au", "aux", "ce", "ces", "son", "sa", "ses", "the", "a", "an", "of", "in", "on", "and",
+    "is", "to", "it", "that", "was", "were", "not", "you", "this",
+]);
+
+function tokenize(text) {
+    return (text || "")
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/[̀-ͯ]/g, "")
+        .match(/[a-z0-9]+/g) || [];
+}
+
+function significantWords(text) {
+    return new Set(tokenize(text).filter((word) => word.length > 2 && !STOPWORDS.has(word)));
+}
+
+/**
+ * Cheap lexical-overlap relevance score (0-1, higher is more relevant)
+ * between a segment's narration and a candidate scene's transcribed
+ * dialogue -- the fraction of the smaller word set's significant words
+ * that also appear in the other text. No AI call; only ever used to rank
+ * suggestions, never to validate the plan.
+ */
+export function narrationSceneOverlapScore(narration, transcriptOverlap) {
+    const narrationWords = significantWords(narration);
+    const sceneWords = significantWords(transcriptOverlap);
+    if (!narrationWords.size || !sceneWords.size) return 0;
+    let shared = 0;
+    narrationWords.forEach((word) => {
+        if (sceneWords.has(word)) shared += 1;
+    });
+    return shared / Math.min(narrationWords.size, sceneWords.size);
+}
+
+/**
+ * Ranks every scene_index entry as a clip-replacement suggestion for
+ * `segment`, highest relevance first, excluding scenes already used by
+ * that same segment. Rewards narration/dialogue word overlap and
+ * continuity with speakers already present in the segment's current
+ * clips, favors temporal proximity to those clips (nearby footage tends to
+ * match the same narrated beat), and penalizes a scene flagged by scene
+ * detection (quality_flags, e.g. blurred/black/transition frames -- same
+ * signal VISUAL MATCHING RULE 4 asks the planner to avoid) or already used
+ * by another segment of the plan (surfaced via `alreadyUsedElsewhere`, not
+ * excluded -- the creator decides, this is their deliberate edit).
+ */
+export function rankSceneSuggestionsForSegment({ segment, sceneIndex, allSegments }) {
+    const clips = segment?.clips || [];
+    const currentSceneIds = new Set(clips.map((clip) => clip.scene_id));
+    const sceneById = new Map((sceneIndex || []).map((scene) => [scene.scene_id, scene]));
+    const currentSpeakers = new Set();
+    clips.forEach((clip) => {
+        (sceneById.get(clip.scene_id)?.speakers || []).forEach((speaker) => currentSpeakers.add(speaker));
+    });
+    const referenceMs = clips.length ? clips[0].start_ms : null;
+    const usedElsewhere = usedClipSignaturesExcluding(allSegments, segment?.id);
+
+    return (sceneIndex || [])
+        .filter((scene) => !currentSceneIds.has(scene.scene_id))
+        .map((scene) => {
+            const overlapScore = narrationSceneOverlapScore(segment?.narration, scene.transcript_overlap);
+            const sharedSpeakerCount = (scene.speakers || []).filter((speaker) => currentSpeakers.has(speaker)).length;
+            let score = overlapScore * 3 + sharedSpeakerCount * 1.5;
+            if (referenceMs != null) {
+                const distanceMs = Math.abs((scene.start_ms ?? 0) - referenceMs);
+                score += Math.max(0, 2 - distanceMs / 60000);
+            }
+            score -= (scene.quality_flags?.length || 0) * 1.5;
+            const alreadyUsedElsewhere = usedElsewhere.has(clipSignature(scene));
+            if (alreadyUsedElsewhere) score -= 5;
+            return { ...scene, score, overlapScore, sharedSpeakerCount, alreadyUsedElsewhere };
+        })
+        .sort((a, b) => b.score - a.score);
 }

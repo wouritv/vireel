@@ -118,11 +118,36 @@ def _import_app_with_stubs(monkeypatch):
         "get_film_summaries_by_project", "list_caption_style_themes",
         "upsert_caption_style_theme", "delete_caption_style_theme",
         "list_reel_dates_since", "list_caption_dates_since",
-        "list_anonymous_story_dates_since", "list_film_summary_dates_since"]:
+        "list_anonymous_story_dates_since", "list_film_summary_dates_since",
+        "update_reel_base_media_by_job_clip", "insert_reel_visual",
+        "list_reel_visuals", "get_reel_visual", "update_reel_visual",
+        "delete_reel_visual", "zero_subscription_credit",
+        "set_user_max_daily_publications", "consume_publish_quota",
+        "upsert_user_data_history_entry",
+        "list_souscriptions_due_for_monthly_credit_allocation", "add_one_month",
+        "get_or_create_referral_code", "get_referral_code_owner",
+        "get_referral_by_referred_user", "insert_referral", "update_referral_row",
+        "claim_referral_subscription_reward", "list_referrals_by_referrer",
+        "invalidate_referral", "get_auth_user_created_at",
+        "insert_promotional_credit_batch", "list_active_promotional_credit_batches",
+        "revoke_promotional_credit_batches_by_source_reference",
+        "insert_notification", "list_notifications", "mark_notification_read",
+        "mark_all_notifications_read", "insert_media_asset",
+        "get_media_asset_by_content", "list_media_assets_due_for_expiration",
+        "mark_media_asset_expired", "mark_media_asset_deleted",
+        "list_produced_media_due_for_notification",
+        "list_media_assets_by_content_ids", "mark_media_asset_notified"]:
         setattr(supabase_request_mod, func_name, MagicMock(return_value=None) if "get" not in func_name else AsyncMock(return_value=None))
 
     supabase_request_mod.is_supabase_configured = MagicMock(return_value=False)
     supabase_request_mod.SUPABASE_USER_DATA_HISTORY_TABLE = "user_data_history"
+    supabase_request_mod.CREDIT_BATCH_TIER_PROMOTIONAL = 1
+    supabase_request_mod.CREDIT_BATCH_TIER_PURCHASED = 2
+    supabase_request_mod.CONTENT_KIND_PROJECT_SOURCE = "project_source"
+    supabase_request_mod.CONTENT_KIND_REEL = "reel"
+    supabase_request_mod.CONTENT_KIND_CAPTION = "caption"
+    supabase_request_mod.CONTENT_KIND_FILM_SUMMARY = "film_summary"
+    supabase_request_mod.CONTENT_KIND_ANONYMOUS_STORY = "anonymous_story"
     monkeypatch.setitem(sys.modules, "supabase_request", supabase_request_mod)
 
     billing_mod = types.ModuleType("billing")
@@ -135,6 +160,7 @@ def _import_app_with_stubs(monkeypatch):
     billing_mod.estimate_llm_usage_cost_usd = MagicMock(return_value=0.05)
     billing_mod.estimate_film_summary_analysis_cost_usd = MagicMock(return_value=0.2)
     billing_mod.estimate_film_summary_render_cost_usd = MagicMock(return_value=0.3)
+    billing_mod.add_retention_cost_to_breakdown = MagicMock(side_effect=lambda breakdown, *a, **k: breakdown)
     billing_mod.DEFAULT_REEL_CREDITS = 100
     billing_mod.DEFAULT_CAPTION_CREDITS = 50
     billing_mod.DEFAULT_PUBLICATION_CREDITS = 25

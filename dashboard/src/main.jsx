@@ -6,10 +6,14 @@ import "./index.css";
 import { AuthProvider, useAuth } from "./state/AuthContext";
 import { ThemeProvider } from "./state/ThemeContext";
 import { UserCreditsProvider } from "./state/UserCreditsContext";
+import { NotificationsProvider } from "./state/NotificationsContext";
 import { LanguageProvider } from "./state/LanguageContext";
 import ProtectedRoute from "./components/ProtectedRoute";
+import ReferralCapture from "./components/ReferralCapture";
 import DashboardLayout from "./layouts/DashboardLayout";
 import Login from "./pages/Login";
+import ReferralLandingPage from "./pages/ReferralLandingPage";
+import ParrainagePage from "./pages/ParrainagePage";
 import Dashboard from "./pages/Dashboard";
 import DashboardTabPage from "./pages/DashboardTabPage";
 import ReelsProjectsPage from "./pages/ReelsProjectsPage";
@@ -53,11 +57,14 @@ ReactDOM.createRoot(document.getElementById("root")).render(
         <AuthProvider>
             <ThemeProvider>
                 <UserCreditsProvider>
+                <NotificationsProvider>
                 <LanguageProvider>
                 <BrowserRouter>
+                    <ReferralCapture />
                     <Routes>
                         <Route path="/" element={<RootRedirect />} />
                         <Route path="/login" element={<Login />} />
+                        <Route path="/r/:code" element={<ReferralLandingPage />} />
                         <Route path="/reset-password" element={<ResetPassword />} />
                         <Route path="/update-password" element={<UpdatePassword />} />
 
@@ -86,12 +93,14 @@ ReactDOM.createRoot(document.getElementById("root")).render(
                             <Route path="social-publications" element={<SocialPublicationsPage />} />
                             <Route path="settings" element={<DashboardTabPage tabKey="settings" />} />
                             <Route path="abonnements" element={<AbonnementPage />} />
+                            <Route path="parrainage" element={<ParrainagePage />} />
                         </Route>
 
                         <Route path="*" element={<RootRedirect />} />
                     </Routes>
                 </BrowserRouter>
                 </LanguageProvider>
+                </NotificationsProvider>
                 </UserCreditsProvider>
             </ThemeProvider>
         </AuthProvider>

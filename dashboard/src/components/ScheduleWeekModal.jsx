@@ -3,11 +3,14 @@ import { X, Loader2, Calendar, Clock, CheckCircle, AlertCircle, Video, Instagram
 import { getApiUrl } from '../config';
 import { DAYS, MONTHS, TIMEZONES, getDayLabel, formatDate, detectTimezone } from '../lib/formatting';
 import { getAuthHeaders } from '../lib/apiAuth';
+import { describePublishError } from '../lib/publishErrors';
+import { useTranslation } from '../state/LanguageContext';
 
 const SCHEDULE_WEEK_PLATFORMS = ['tiktok', 'instagram', 'youtube'];
 const SCHEDULE_WEEK_PLATFORM_ICONS = { tiktok: Video, instagram: Instagram, youtube: Youtube };
 
 export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, userId }) {
+    const { t } = useTranslation();
     const [time, setTime] = useState('12:00');
     const [timezone, setTimezone] = useState(detectTimezone);
     // Keyed by account id (not platform) -- a plan can have several accounts
@@ -112,7 +115,13 @@ export default function ScheduleWeekModal({ isOpen, onClose, clips, jobId, userI
 
                 if (!res.ok) {
                     const errText = await res.text();
-                    throw new Error(errText);
+                    let detail;
+                    try {
+                        detail = JSON.parse(errText)?.detail;
+                    } catch {
+                        detail = undefined;
+                    }
+                    throw new Error(describePublishError(t, detail, errText));
                 }
 
                 results.push({ index: i, success: true });

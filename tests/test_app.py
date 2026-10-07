@@ -1,6 +1,7 @@
 import importlib
 import asyncio
 import io
+import json
 import os
 import sys
 import time
@@ -2594,8 +2595,9 @@ def test_publish_facebook_native_failure_always_reraises(monkeypatch):
     account = {"platform_user_id": "page-1"}
     content = app.PublishRequest(user_id="u1", text="Une courte histoire.", facebook_text_format_preset_id="1881421442117417")
 
+    coro = app._publish_facebook(account, "token-1", content, "Une courte histoire.")
     with pytest.raises(app.HTTPException):
-        asyncio.run(app._publish_facebook(account, "token-1", content, "Une courte histoire."))
+        asyncio.run(coro)
 
 
 def test_facebook_text_with_background_never_combines_media(monkeypatch):
@@ -3109,14 +3111,220 @@ def test_normalize_film_summary_row_includes_content_when_requested(monkeypatch)
     row = {
         "id": "fs_1", "title": "T", "status": "completed", "stage": "completed",
         "edit_plan": {"segments": []}, "scene_index": [], "classification": {},
-        "validation_report": {"valid": True}, "preview_s3_key": "preview/key.mp4", "final_s3_key": "final/key.mp4",
+        "validation_report": {"valid": True}, "source_s3_key": "source/key.mp4",
+        "preview_s3_key": "preview/key.mp4", "final_s3_key": "final/key.mp4",
     }
     item = app._normalize_film_summary_row(row, include_content=True)
     assert item["edit_plan"] == {"segments": []}
     assert item["validation_report"] == {"valid": True}
     # generate_presigned_url is stubbed to return "" in this test environment.
+    assert item["source_url"] == ""
     assert item["preview_url"] == ""
     assert item["final_url"] == ""
+
+
+def test_normalize_film_summary_row_omits_source_url_once_source_cleared(monkeypatch):
+    # _finalize_film_summary_render clears source_s3_key after a
+    # successful render to free storage -- the editor only needs
+    # source_url during awaiting_review, while it's still set.
+    app = _import_app_with_stubs(monkeypatch)
+    row = {"id": "fs_1", "status": "completed", "stage": "completed", "classification": {}}
+    item = app._normalize_film_summary_row(row, include_content=True)
+    assert "source_url" not in item
+
+
+def _awaiting_review_film_summary_row(**overrides):
+    row = {
+        "id": "fs_1", "status": "awaiting_review", "stage": "awaiting_user_review",
+        "source_duration_seconds": 100.0,
+        "scene_index": [{"scene_id": "scene_001", "start_ms": 0, "end_ms": 50000}],
+        "edit_plan": {}, "classification": {},
+    }
+    row.update(overrides)
+    return row
+
+
+def test_update_film_summary_audio_settings_blocks_outside_awaiting_review(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row(status="rendering")))
+
+    coro = app.update_film_summary_audio_settings_endpoint(
+        film_summary_id="fs_1", payload=app.FilmSummaryAudioSettingsUpdateRequest(subtitles_enabled=True), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+
+
+def test_translate_film_summary_narration_404_when_missing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=None))
+
+    coro = app.translate_film_summary_narration_endpoint(
+        film_summary_id="fs_1", payload=app.FilmSummaryTranslateNarrationRequest(narration_language="fr"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 404
+
+
+def test_translate_film_summary_narration_blocks_outside_awaiting_review(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row(
+        status="completed",
+    )))
+
+    coro = app.translate_film_summary_narration_endpoint(
+        film_summary_id="fs_1", payload=app.FilmSummaryTranslateNarrationRequest(narration_language="fr"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+
+
+def test_translate_film_summary_narration_rejects_empty_language(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row()))
+
+    coro = app.translate_film_summary_narration_endpoint(
+        film_summary_id="fs_1", payload=app.FilmSummaryTranslateNarrationRequest(narration_language="   "), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 400
+
+
+def test_translate_film_summary_narration_persists_plan_and_language(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    original_plan = {
+        "schema_version": "1.0", "segments": [{"id": "seg_01", "type": "voice_over", "narration": "Hello."}],
+        "target_duration_ms": 3000, "total_estimated_duration_ms": 3000,
+    }
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row(
+        edit_plan=original_plan, title="My Movie", source_language="en", narration_language="en", narration_style="cinematic",
+    )))
+    translated_plan = dict(original_plan, segments=[{"id": "seg_01", "type": "voice_over", "narration": "Bonjour."}])
+    translated_validation_report = {"valid": True, "errors": [], "warnings": [], "total_estimated_duration_ms": 3000}
+    translate_mock = AsyncMock(return_value={
+        "plan": translated_plan, "validation_report": translated_validation_report, "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    })
+    monkeypatch.setattr(app.film_summary, "translate_edit_plan_narration", translate_mock)
+    update_mock = AsyncMock(return_value=_awaiting_review_film_summary_row(
+        edit_plan=translated_plan, validation_report=translated_validation_report, narration_language="fr",
+    ))
+    monkeypatch.setattr(app, "supabase_update_film_summary", update_mock)
+
+    result = asyncio.run(app.translate_film_summary_narration_endpoint(
+        film_summary_id="fs_1", payload=app.FilmSummaryTranslateNarrationRequest(narration_language=" fr "), user_id="u1",
+    ))
+
+    translate_mock.assert_awaited_once()
+    assert translate_mock.await_args.kwargs["target_language"] == "fr"
+    assert translate_mock.await_args.kwargs["plan"] == original_plan
+    update_mock.assert_awaited_once_with("fs_1", "u1", {
+        "edit_plan": translated_plan, "validation_report": translated_validation_report, "narration_language": "fr",
+    })
+    assert result["edit_plan"] == translated_plan
+    assert result["narration_language"] == "fr"
+
+
+def test_translate_film_summary_narration_returns_502_on_planning_failure(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=_awaiting_review_film_summary_row(
+        edit_plan={"segments": [{"id": "seg_01", "type": "voice_over", "narration": "Hello."}]},
+    )))
+    monkeypatch.setattr(app.film_summary, "translate_edit_plan_narration", AsyncMock(
+        side_effect=film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.PLAN_INVALID, "boom"),
+    ))
+
+    coro = app.translate_film_summary_narration_endpoint(
+        film_summary_id="fs_1", payload=app.FilmSummaryTranslateNarrationRequest(narration_language="fr"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 502
+
+
+def _setup_retry_film_summary_mocks(app, monkeypatch, row, tmp_path):
+    """Shared plumbing for retry_film_summary_endpoint tests: supabase is
+    not configured in this test environment, so _enforce_job_concurrency_
+    limit/_reserve_job_credits already no-op on their own -- only the real
+    job-manager/background-task calls need stubbing. _spawn_background_task
+    is replaced with a stub that closes the coroutine without running it,
+    since _run_film_summary_retry_job's own behavior (S3 download, cached-
+    stage resume, ...) is exercised separately and isn't this endpoint's
+    concern."""
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "supabase_get_film_summary", AsyncMock(return_value=row))
+    monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
+    app.reel_job_manager.create_job = AsyncMock()
+    app.reel_job_manager.enqueue_job = AsyncMock()
+    spawned = {}
+
+    def _fake_spawn(coro):
+        spawned["coro"] = coro
+        coro.close()
+        return None
+
+    monkeypatch.setattr(app, "_spawn_background_task", _fake_spawn)
+    update_mock = AsyncMock(return_value=dict(row, status="queued"))
+    monkeypatch.setattr(app, "supabase_update_film_summary", update_mock)
+    return update_mock
+
+
+def test_retry_film_summary_succeeds_from_awaiting_review_and_resets_manual_state(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    row = _awaiting_review_film_summary_row(
+        manual_selection=[{"scene_id": "scene_001", "start_ms": 0, "end_ms": 1000}], edit_mode="manual",
+        subtitles_enabled=True, subtitle_style={"font": "Arial"},
+    )
+    update_mock = _setup_retry_film_summary_mocks(app, monkeypatch, row, tmp_path)
+
+    result = asyncio.run(app.retry_film_summary_endpoint(film_summary_id="fs_1", user_id="u1"))
+
+    assert result["status"] == "queued"
+    update_mock.assert_awaited_once()
+    args, kwargs = update_mock.await_args
+    assert args[0] == "fs_1"
+    assert args[1] == "u1"
+    updates = args[2]
+    assert updates["status"] == film_summary.FilmSummaryStatus.QUEUED
+    assert updates["manual_selection"] is None
+    assert updates["edit_mode"] == "automatic"
+    # Independent user preferences must survive a regenerate untouched --
+    # i.e. never even mentioned in the update payload.
+    for untouched_key in ("subtitles_enabled", "subtitle_style"):
+        assert untouched_key not in updates
+
+
+def test_retry_film_summary_succeeds_from_failed_without_resetting_manual_state(monkeypatch, tmp_path):
+    # No regression: retrying a FAILED film summary (the pre-existing
+    # behavior) must keep working exactly as before, with no manual_
+    # selection/edit_mode reset -- that reset only matters when retried
+    # from awaiting_review, where stale manual-editor state could exist.
+    app = _import_app_with_stubs(monkeypatch)
+    row = _awaiting_review_film_summary_row(status="failed")
+    update_mock = _setup_retry_film_summary_mocks(app, monkeypatch, row, tmp_path)
+
+    result = asyncio.run(app.retry_film_summary_endpoint(film_summary_id="fs_1", user_id="u1"))
+
+    assert result["status"] == "queued"
+    updates = update_mock.await_args.args[2]
+    assert updates["status"] == film_summary.FilmSummaryStatus.QUEUED
+    assert "manual_selection" not in updates
+    assert "edit_mode" not in updates
+
+
+@pytest.mark.parametrize("status", ["completed", "rendering", "queued", "processing", "cancelled", "rejected"])
+def test_retry_film_summary_blocked_from_other_statuses(monkeypatch, tmp_path, status):
+    app = _import_app_with_stubs(monkeypatch)
+    row = _awaiting_review_film_summary_row(status=status)
+    _setup_retry_film_summary_mocks(app, monkeypatch, row, tmp_path)
+
+    coro = app.retry_film_summary_endpoint(film_summary_id="fs_1", user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
 
 
 def test_mark_film_summary_job_terminal_noops_without_supabase(monkeypatch):
@@ -3150,6 +3358,64 @@ def test_scene_detection_timeout_fails_job_instead_of_hanging(monkeypatch):
     with pytest.raises(app.film_summary.FilmSummaryValidationError) as exc:
         asyncio.run(coro)
     assert exc.value.code == app.film_summary.FilmSummaryErrorCode.SCENE_DETECTION_FAILED
+
+
+def test_transcription_stage_protects_explicit_source_language_from_detection(monkeypatch):
+    # The user chose French explicitly, but AssemblyAI's detection (mocked
+    # here as if it got it wrong) reports English -- the user's own choice
+    # must win, never be silently overwritten by the detected value.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    app.reel_job_manager.update_progress = AsyncMock()
+    transcribe_mock = AsyncMock(return_value={
+        "text": "bonjour", "language": "en",
+        "segments": [{"start_ms": 0, "end_ms": 1000, "speaker": "", "text": "bonjour"}],
+    })
+    monkeypatch.setattr(app.film_summary, "transcribe_video_with_timecodes", transcribe_mock)
+    monkeypatch.setattr(app.film_summary, "detect_scenes", lambda video_path, threshold: [])
+    monkeypatch.setattr(app.film_summary, "build_scene_index", lambda scenes, segments: [])
+    upsert_mock = AsyncMock()
+    app.supabase_upsert_transcription = upsert_mock
+    update_mock = AsyncMock()
+    app.supabase_update_film_summary = update_mock
+
+    asyncio.run(app._run_transcription_and_scene_detection_stages(
+        "job-1", "u1", "fs-1", "/tmp/input.mp4", source_language="fr",
+    ))
+
+    assert transcribe_mock.await_args.kwargs["language_hint"] == "fr"
+    assert upsert_mock.await_args.args[0]["transcript_language"] == "fr"
+    source_language_updates = [
+        call.args[2] for call in update_mock.await_args_list if "source_language" in call.args[2]
+    ]
+    assert len(source_language_updates) == 1
+    assert source_language_updates[0]["source_language"] == "fr"
+
+
+def test_transcription_stage_falls_back_to_detected_language_when_unset(monkeypatch):
+    # When the user left source_language on auto-detect (None), the
+    # detected language from AssemblyAI should be used as-is.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    app.reel_job_manager.update_progress = AsyncMock()
+    transcribe_mock = AsyncMock(return_value={
+        "text": "hello", "language": "en",
+        "segments": [{"start_ms": 0, "end_ms": 1000, "speaker": "", "text": "hello"}],
+    })
+    monkeypatch.setattr(app.film_summary, "transcribe_video_with_timecodes", transcribe_mock)
+    monkeypatch.setattr(app.film_summary, "detect_scenes", lambda video_path, threshold: [])
+    monkeypatch.setattr(app.film_summary, "build_scene_index", lambda scenes, segments: [])
+    upsert_mock = AsyncMock()
+    app.supabase_upsert_transcription = upsert_mock
+    update_mock = AsyncMock()
+    app.supabase_update_film_summary = update_mock
+
+    asyncio.run(app._run_transcription_and_scene_detection_stages(
+        "job-1", "u1", "fs-1", "/tmp/input.mp4", source_language=None,
+    ))
+
+    assert transcribe_mock.await_args.kwargs["language_hint"] is None
+    assert upsert_mock.await_args.args[0]["transcript_language"] == "en"
 
 
 def test_finalize_film_summary_analysis_never_debits_source_storage(monkeypatch):
@@ -3302,7 +3568,7 @@ def test_finalize_completed_reel_billing_debits_auto_caption_credits(monkeypatch
     deduct_mock = AsyncMock(return_value=True)
     monkeypatch.setattr(app, "supabase_deduct_user_credits", deduct_mock)
     history_mock = AsyncMock()
-    monkeypatch.setattr(app, "supabase_insert_user_data_history", history_mock)
+    monkeypatch.setattr(app, "supabase_upsert_user_data_history_entry", history_mock)
 
     saved_rows = [
         {"reel_size_bytes": 100, "billing_details": {"auto_caption": {"applied": True, "credit_cost": 1.5}}},
@@ -3315,7 +3581,12 @@ def test_finalize_completed_reel_billing_debits_auto_caption_credits(monkeypatch
 
     deduct_mock.assert_awaited_once_with("u1", pytest.approx(1.5), 0.0)
     history_mock.assert_awaited_once()
+    # operation_type stays "sous_titre" when creating a fresh row (no merge
+    # target yet in this test's stubbed world); operation_id is the bare
+    # job_id (not suffixed) so a real upsert_user_data_history_entry call
+    # would merge this into the job's own primary "generation_reel" row.
     assert history_mock.await_args.kwargs["operation_type"] == "sous_titre"
+    assert history_mock.await_args.kwargs["operation_id"] == "job-reel-2"
     assert history_mock.await_args.kwargs["credit"] == pytest.approx(1.5)
 
 
@@ -3340,6 +3611,373 @@ def test_finalize_completed_reel_billing_skips_auto_caption_debit_when_none_appl
     ))
 
     deduct_mock.assert_not_awaited()
+
+
+def test_finalize_media_retention_billing_active_subscription_uses_longer_tier(monkeypatch):
+    import retention_config
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value={"id": "sub1"}))
+    insert_mock = AsyncMock(return_value={"id": "asset1"})
+    monkeypatch.setattr(app, "supabase_insert_media_asset", insert_mock)
+
+    result = asyncio.run(app._finalize_media_retention_billing(
+        job_id="job-1", user_id="u1", content_kind=app.CONTENT_KIND_REEL, content_id="reel-1",
+        media_type=app.MEDIA_TYPE_PRODUCED, size_bytes=4 * 1024 ** 3,
+        s3_bucket="bucket", s3_key="reels/reel-1.mp4",
+    ))
+
+    assert result["subscription_status_at_creation"] == "active"
+    assert result["retention_days"] == retention_config.RETENTION_SUBSCRIBER_PRODUCED_DAYS
+    assert result["retention_storage_cost_usd"] > 0
+    assert result["retention_storage_credit_cost"] > 0
+    insert_mock.assert_awaited_once()
+    assert insert_mock.await_args.kwargs["content_kind"] == app.CONTENT_KIND_REEL
+    assert insert_mock.await_args.kwargs["content_id"] == "reel-1"
+    assert insert_mock.await_args.kwargs["subscription_status_at_creation"] == "active"
+    assert insert_mock.await_args.kwargs["retention_days"] == retention_config.RETENTION_SUBSCRIBER_PRODUCED_DAYS
+
+
+def test_finalize_media_retention_billing_no_subscription_uses_free_tier(monkeypatch):
+    import retention_config
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    insert_mock = AsyncMock(return_value={"id": "asset2"})
+    monkeypatch.setattr(app, "supabase_insert_media_asset", insert_mock)
+
+    result = asyncio.run(app._finalize_media_retention_billing(
+        job_id="job-2", user_id="u2", content_kind=app.CONTENT_KIND_PROJECT_SOURCE, content_id="proj-1",
+        media_type=app.MEDIA_TYPE_SOURCE, size_bytes=1024 ** 3,
+    ))
+
+    assert result["subscription_status_at_creation"] == "free"
+    assert result["retention_days"] == retention_config.RETENTION_FREE_SOURCE_DAYS
+
+
+def test_finalize_media_retention_billing_never_raises_on_persistence_failure(monkeypatch):
+    # A media_assets insert failure must never block the job's own
+    # credit settlement -- only skip this media's own retention line item.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_media_asset", AsyncMock(side_effect=RuntimeError("boom")))
+
+    result = asyncio.run(app._finalize_media_retention_billing(
+        job_id="job-3", user_id="u3", content_kind=app.CONTENT_KIND_CAPTION, content_id="cap-1",
+        media_type=app.MEDIA_TYPE_PRODUCED, size_bytes=1024 ** 3,
+    ))
+    assert result["retention_storage_credit_cost"] > 0
+
+
+def test_finalize_media_retention_billing_subscription_lookup_failure_defaults_to_free(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(side_effect=RuntimeError("down")))
+    monkeypatch.setattr(app, "supabase_insert_media_asset", AsyncMock(return_value={"id": "asset4"}))
+
+    result = asyncio.run(app._finalize_media_retention_billing(
+        job_id="job-4", user_id="u4", content_kind=app.CONTENT_KIND_REEL, content_id="reel-4",
+        media_type=app.MEDIA_TYPE_PRODUCED, size_bytes=1024 ** 3,
+    ))
+    assert result["subscription_status_at_creation"] == "free"
+
+
+def test_finalize_retention_billing_batch_sums_across_entries_and_skips_missing_id(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_media_asset", AsyncMock(return_value={"id": "x"}))
+
+    result = asyncio.run(app._finalize_retention_billing_batch("job-5", "u5", [
+        {"content_kind": app.CONTENT_KIND_REEL, "content_id": "r1", "media_type": app.MEDIA_TYPE_PRODUCED, "size_bytes": 1024 ** 3},
+        {"content_kind": app.CONTENT_KIND_REEL, "content_id": "r2", "media_type": app.MEDIA_TYPE_PRODUCED, "size_bytes": 1024 ** 3},
+        {"content_kind": app.CONTENT_KIND_REEL, "content_id": None, "media_type": app.MEDIA_TYPE_PRODUCED, "size_bytes": 1024 ** 3},
+    ]))
+
+    assert len(result["media_assets"]) == 2
+    single = asyncio.run(app._finalize_media_retention_billing(
+        job_id="job-5", user_id="u5", content_kind=app.CONTENT_KIND_REEL, content_id="r1",
+        media_type=app.MEDIA_TYPE_PRODUCED, size_bytes=1024 ** 3,
+    ))
+    assert result["retention_storage_credit_cost"] == pytest.approx(2 * single["retention_storage_credit_cost"], rel=1e-6)
+
+
+def test_finalize_source_media_retention_skips_without_project(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    debit_mock = AsyncMock()
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+
+    asyncio.run(app._finalize_source_media_retention("job-6", "u6", None, 1024 ** 3, "bucket", "key"))
+    debit_mock.assert_not_awaited()
+
+
+def test_finalize_source_media_retention_debits_standalone_retention_charge(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_media_asset", AsyncMock(return_value={"id": "asset5"}))
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+
+    asyncio.run(app._finalize_source_media_retention(
+        "job-7", "u7", {"id": "proj-7"}, 4 * 1024 ** 3, "bucket", "key",
+    ))
+
+    debit_mock.assert_awaited_once()
+    assert debit_mock.await_args.kwargs["operation_type"] == "retention_storage_source"
+    assert debit_mock.await_args.kwargs["reserved_credits"] == 0.0
+    assert debit_mock.await_args.kwargs["credits"] > 0
+
+
+def test_attach_media_asset_fields_enriches_rows_from_batch_lookup(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_list_media_assets_by_content_ids", AsyncMock(return_value={
+        "r1": {"media_status": "AVAILABLE", "retention_expires_at": "2026-01-01T00:00:00+00:00"},
+    }))
+
+    items = [{"id": "r1"}, {"id": "r2"}]
+    result = asyncio.run(app._attach_media_asset_fields(items, app.CONTENT_KIND_REEL))
+
+    assert result[0]["media_status"] == "AVAILABLE"
+    assert result[0]["media_expires_at"] == "2026-01-01T00:00:00+00:00"
+    assert result[1]["media_status"] is None
+    assert result[1]["media_expires_at"] is None
+
+
+def test_attach_media_asset_fields_skips_without_supabase_or_rows(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+    items = [{"id": "r1"}]
+    result = asyncio.run(app._attach_media_asset_fields(items, app.CONTENT_KIND_REEL))
+    assert "media_status" not in result[0]
+
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    assert asyncio.run(app._attach_media_asset_fields([], app.CONTENT_KIND_REEL)) == []
+
+
+def test_attach_media_asset_fields_never_raises_on_lookup_failure(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_list_media_assets_by_content_ids", AsyncMock(side_effect=RuntimeError("down")))
+
+    items = [{"id": "r1"}]
+    result = asyncio.run(app._attach_media_asset_fields(items, app.CONTENT_KIND_REEL))
+    assert result == [{"id": "r1"}]
+
+
+def test_finalize_completed_reel_billing_adds_retention_cost_when_rows_have_ids(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_media_asset", AsyncMock(return_value={"id": "asset-x"}))
+    app.jobs["job-reel-ret"] = {"logs": []}
+
+    monkeypatch.setattr(app, "_estimate_reel_job_consumption", lambda **kwargs: {
+        "actual_credit": 2.0, "actual_storage_gb": 0.5, "actual_cost_usd": 0.1,
+        "processing_ratio": 1.0, "cost_breakdown": {},
+    })
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+    complete_mock = AsyncMock()
+    app.reel_job_manager.complete_job = complete_mock
+
+    saved_rows = [{"id": "reel-ret-1", "reel_size_bytes": 1024 ** 3, "reel_s3_key": "reels/r1.mp4"}]
+    asyncio.run(app._finalize_completed_reel_billing(
+        job_id="job-reel-ret", job_data={"reel_required_credits": 2.0}, user_id="u1", source_is_url=False,
+        start_ts=time.time(), enriched_clips=[{}], cost_analysis={}, saved_rows=saved_rows,
+    ))
+
+    assert debit_mock.await_args.kwargs["credits"] > 2.0
+    assert "retention_storage_credit_cost" in complete_mock.await_args.kwargs["cost_breakdown"]
+
+
+def test_process_and_complete_caption_job_bills_retention_on_top(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setenv("AWS_S3_BUCKET", "test-bucket")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_media_asset", AsyncMock(return_value={"id": "asset-y"}))
+    monkeypatch.setattr(app, "supabase_insert_captions", AsyncMock(return_value=[{"id": "cap-ret-1", "caption_s3_key": "captions/c1.mp4"}]))
+    monkeypatch.setattr(app, "_normalize_caption_row", lambda row: row)
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+    complete_mock = AsyncMock()
+    app.reel_job_manager.complete_job = complete_mock
+    monkeypatch.setattr(app, "_update_project_on_caption_completion", AsyncMock())
+    monkeypatch.setattr(app, "_persist_transcription_cache", AsyncMock())
+    monkeypatch.setattr(app, "_get_user_default_caption_style", AsyncMock(return_value={}))
+    monkeypatch.setattr(app, "_burn_default_captions_for_clip", AsyncMock(return_value=False))
+    monkeypatch.setattr(app, "_build_and_persist_caption_metadata", lambda *a, **k: None)
+    monkeypatch.setattr(app, "_upload_caption_source_and_thumbnail", lambda *a, **k: ("captions/c1.mp4", "http://x/c1.mp4", "", ""))
+    # A real multi-GB file would make this test slow/flaky to write --
+    # fake a large-enough size instead, so the computed retention credit
+    # cost isn't rounded away to 0 by a tiny test fixture file.
+    monkeypatch.setattr(app.os.path, "getsize", lambda path: 4 * 1024 ** 3)
+
+    output_dir = str(tmp_path)
+    input_path = os.path.join(output_dir, "source.mp4")
+    with open(input_path, "wb") as fh:
+        fh.write(b"x" * 1024)
+
+    job_id = "job-caption-ret"
+    app.jobs[job_id] = {"logs": [], "result": None, "status": "running"}
+
+    asyncio.run(app._process_and_complete_caption_job(
+        job_id, {"project_id": None}, "u1", pipeline=AsyncMock(persisting=AsyncMock(), rendering=AsyncMock()),
+        input_path=input_path, source_name="source.mp4", local_duration=5.0, transcript={"segments": []},
+        caption_required_credits=1.0, output_dir=output_dir,
+    ))
+
+    debit_mock.assert_awaited_once()
+    assert debit_mock.await_args.kwargs["credits"] > 1.0
+    assert "retention_storage_credit_cost" in complete_mock.await_args.kwargs["cost_breakdown"]
+    assert complete_mock.await_args.kwargs["actual_credit"] > 1.0
+
+
+def test_finalize_film_summary_render_bills_retention_and_marks_source_deleted(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_media_asset", AsyncMock(return_value={"id": "asset-z"}))
+    monkeypatch.setattr(app, "supabase_get_media_asset_by_content", AsyncMock(return_value={"id": "src-asset-1"}))
+    mark_deleted_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_mark_media_asset_deleted", mark_deleted_mock)
+    monkeypatch.setattr(app, "supabase_update_film_summary", AsyncMock())
+    monkeypatch.setattr(app, "supabase_get_job_record", AsyncMock(return_value={"reserved_quota": 1.0}))
+    monkeypatch.setattr(app, "supabase_update_project_status", AsyncMock())
+    monkeypatch.setattr(app, "supabase_update_project", AsyncMock())
+    delete_s3_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(app, "delete_s3_object", delete_s3_mock)
+    debit_mock = AsyncMock(return_value=True)
+    app.reel_job_manager.debit_credits_for_job = debit_mock
+    complete_mock = AsyncMock()
+    app.reel_job_manager.complete_job = complete_mock
+
+    asyncio.run(app._finalize_film_summary_render(
+        job_id="job-fs-ret", user_id="u1", film_summary_id="fs-1", project_id="proj-1",
+        plan={"segments": []}, preview_s3_key="film_summaries/u1/fs-1/preview.mp4",
+        final_s3_key="film_summaries/u1/fs-1/final.mp4", render_result={"final_duration_seconds": 30.0},
+        output_storage_bytes=1024 ** 3, source_s3_key="film_summaries/u1/fs-1/source.mp4", bucket_name="bucket",
+    ))
+
+    delete_s3_mock.assert_called_once_with("bucket", "film_summaries/u1/fs-1/source.mp4")
+    mark_deleted_mock.assert_awaited_once_with("src-asset-1")
+    assert debit_mock.await_args.kwargs["credits"] > 0
+    assert "retention_storage_credit_cost" in complete_mock.await_args.kwargs["cost_breakdown"]
+
+
+def test_expire_one_media_asset_deletes_s3_then_marks_expired(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    delete_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(app, "delete_s3_object", delete_mock)
+    mark_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_mark_media_asset_expired", mark_mock)
+
+    asyncio.run(app._expire_one_media_asset({"id": "m1", "s3_bucket": "b", "s3_key": "k"}))
+
+    delete_mock.assert_called_once_with("b", "k")
+    mark_mock.assert_awaited_once_with("m1")
+
+
+def test_expire_one_media_asset_never_marks_expired_on_s3_failure(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "delete_s3_object", MagicMock(return_value=False))
+    mark_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_mark_media_asset_expired", mark_mock)
+
+    asyncio.run(app._expire_one_media_asset({"id": "m1", "s3_bucket": "b", "s3_key": "k"}))
+
+    mark_mock.assert_not_awaited()
+
+
+def test_expire_one_media_asset_marks_expired_directly_without_s3_key(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    delete_mock = MagicMock()
+    monkeypatch.setattr(app, "delete_s3_object", delete_mock)
+    mark_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_mark_media_asset_expired", mark_mock)
+
+    asyncio.run(app._expire_one_media_asset({"id": "m1", "s3_bucket": None, "s3_key": None}))
+
+    delete_mock.assert_not_called()
+    mark_mock.assert_awaited_once_with("m1")
+
+
+def test_expire_one_media_asset_skips_without_id(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    mark_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_mark_media_asset_expired", mark_mock)
+    asyncio.run(app._expire_one_media_asset({}))
+    mark_mock.assert_not_awaited()
+
+
+def test_run_media_expiration_sweep_continues_past_per_asset_failure(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_list_media_assets_due_for_expiration", AsyncMock(return_value=[
+        {"id": "m1", "s3_bucket": "b", "s3_key": "k1"},
+        {"id": "m2", "s3_bucket": "b", "s3_key": "k2"},
+    ]))
+    calls = []
+
+    async def _fake_expire(asset):
+        calls.append(asset["id"])
+        if asset["id"] == "m1":
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(app, "_expire_one_media_asset", _fake_expire)
+    asyncio.run(app._run_media_expiration_sweep())
+
+    assert calls == ["m1", "m2"]
+
+
+def test_notify_one_media_asset_expiring_marks_before_sending(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    mark_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app, "supabase_mark_media_asset_notified", mark_mock)
+    insert_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_notification", insert_mock)
+
+    asyncio.run(app._notify_one_media_asset_expiring({
+        "id": "m1", "user_id": "u1", "content_kind": "reel", "content_id": "r1",
+        "retention_expires_at": "2026-01-01T00:00:00+00:00",
+    }))
+
+    mark_mock.assert_awaited_once_with("m1")
+    insert_mock.assert_awaited_once()
+    assert insert_mock.await_args.kwargs["user_id"] == "u1"
+    assert insert_mock.await_args.kwargs["data"]["media_asset_id"] == "m1"
+
+
+def test_notify_one_media_asset_expiring_skips_send_when_already_notified(monkeypatch):
+    # supabase_mark_media_asset_notified only succeeds while the column is
+    # still null -- a second (racing or retried) attempt must send
+    # nothing, which is the idempotency guarantee the spec requires.
+    app = _import_app_with_stubs(monkeypatch)
+    mark_mock = AsyncMock(return_value=False)
+    monkeypatch.setattr(app, "supabase_mark_media_asset_notified", mark_mock)
+    insert_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_notification", insert_mock)
+
+    asyncio.run(app._notify_one_media_asset_expiring({"id": "m1", "user_id": "u1"}))
+
+    insert_mock.assert_not_awaited()
+
+
+def test_run_media_expiry_notification_sweep_uses_lead_time_window(monkeypatch):
+    import retention_config
+    app = _import_app_with_stubs(monkeypatch)
+    list_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr(app, "supabase_list_produced_media_due_for_notification", list_mock)
+
+    asyncio.run(app._run_media_expiry_notification_sweep())
+
+    list_mock.assert_awaited_once()
+    notify_before_time = list_mock.await_args.args[0]
+    delta_hours = (notify_before_time - app.datetime.now(app.timezone.utc)).total_seconds() / 3600
+    assert delta_hours == pytest.approx(retention_config.RETENTION_NOTIFICATION_HOURS_BEFORE, abs=0.1)
 
 
 def test_burn_default_captions_for_clip_returns_false_without_transcript(monkeypatch):
@@ -3621,7 +4259,7 @@ def test_render_pipeline_reports_incremental_progress_per_segment(monkeypatch, t
 
     monkeypatch.setattr(app.film_summary_render, "render_edit_plan", _fake_render_edit_plan)
 
-    plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "original_dialogue", "start_ms": 0, "end_ms": 1000}]}
+    plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "voice_over", "narration": "", "estimated_duration_ms": 1000, "clips": []}]}
     asyncio.run(app._run_film_summary_render_pipeline_stages(
         "job-1", "u1", "fs-1", "proj-1", "source-key", str(tmp_path), plan, "cedar", "fr",
     ))
@@ -3635,9 +4273,214 @@ def test_render_pipeline_reports_incremental_progress_per_segment(monkeypatch, t
     assert all(45 <= pct <= 85 for pct in reported_percentages)
 
 
+def test_map_film_summary_subtitle_style_maps_camel_case_and_fills_defaults(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    kwargs = app._map_film_summary_subtitle_style({
+        "fontSize": 22, "fontFamily": "Impact", "highlightColor": "#00FF00", "wordsPerLine": 7,
+    })
+
+    # Position is always hardcoded to "bottom" -- never read from the row --
+    # consistent with CaptionsModal.jsx's own handleSetAsDefaultStyle.
+    assert kwargs["position"] == "bottom"
+    assert kwargs["font_size"] == 22
+    assert kwargs["font_name"] == "Impact"
+    assert kwargs["highlight_color"] == "#00FF00"
+    assert kwargs["words_per_line"] == 7
+    # Anything the row's subtitle_style didn't set falls back to the factory
+    # default auto-caption style.
+    assert kwargs["font_color"] == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS["font_color"]
+    assert kwargs["bg_opacity"] == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS["bg_opacity"]
+
+
+def test_map_film_summary_subtitle_style_handles_missing_style(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+
+    kwargs = app._map_film_summary_subtitle_style(None)
+
+    assert kwargs["position"] == "bottom"
+    assert kwargs["font_size"] == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS["font_size"]
+    assert kwargs["words_per_line"] == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS["words_per_line"]
+
+
+def test_build_film_summary_subtitle_style_builds_style_options(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    captured = {}
+
+    class _StyleOptions:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(app, "SubtitleStyleOptions", _StyleOptions)
+
+    app._build_film_summary_subtitle_style({"fontColor": "#111111", "borderWidth": 9})
+
+    assert captured["font_color"] == "#111111"
+    assert captured["border_width"] == 9
+    assert captured["highlight_color"] == app._DEFAULT_AUTO_CAPTION_STYLE_KWARGS["highlight_color"]
+
+
+def test_apply_film_summary_subtitle_burn_in_skips_when_disabled(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    calls = []
+    monkeypatch.setattr(app, "generate_srt_from_video", lambda *a, **k: calls.append((a, k)))
+
+    final_path = str(tmp_path / "final.mp4")
+    result = asyncio.run(app._apply_film_summary_subtitle_burn_in(str(tmp_path), final_path, False, None))
+
+    assert result == final_path
+    assert calls == []
+
+
+def test_apply_film_summary_subtitle_burn_in_burns_and_cleans_up_temp_files(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    srt_path = str(tmp_path / "film_summary_subtitles.srt")
+    ass_path = str(tmp_path / "film_summary_subtitles.ass")
+    transcribe_calls = []
+    burn_calls = []
+
+    def _fake_transcribe(input_path, out_srt_path, max_words_per_line=4):
+        transcribe_calls.append((input_path, out_srt_path, max_words_per_line))
+        with open(out_srt_path, "w", encoding="utf-8") as handle:
+            handle.write("1\n00:00:00,000 --> 00:00:01,000\nhello\n")
+        # A real burn_subtitles writes (and later removes) a sibling .ass
+        # file next to the srt -- write one here so the cleanup assertion
+        # below actually exercises something.
+        with open(ass_path, "w", encoding="utf-8") as handle:
+            handle.write("[Script Info]\n")
+        return True
+
+    def _fake_burn(input_path, srt_path_arg, output_path, alignment=None, fontsize=None, style_options=None):
+        burn_calls.append((input_path, srt_path_arg, output_path, alignment, fontsize))
+        return True
+
+    monkeypatch.setattr(app, "generate_srt_from_video", _fake_transcribe)
+    monkeypatch.setattr(app, "burn_subtitles", _fake_burn)
+
+    class _StyleOptions:
+        def __init__(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(app, "SubtitleStyleOptions", _StyleOptions)
+
+    final_path = str(tmp_path / "final.mp4")
+    result = asyncio.run(app._apply_film_summary_subtitle_burn_in(
+        str(tmp_path), final_path, True, {"wordsPerLine": 6, "fontSize": 20},
+    ))
+
+    assert result == str(tmp_path / "final_with_subtitles.mp4")
+    assert transcribe_calls == [(final_path, srt_path, 6)]
+    assert burn_calls == [(final_path, srt_path, str(tmp_path / "final_with_subtitles.mp4"), "bottom", 20)]
+    assert not os.path.exists(srt_path)
+    assert not os.path.exists(ass_path)
+
+
+def test_apply_film_summary_subtitle_burn_in_raises_when_no_transcript_produced(monkeypatch, tmp_path):
+    # "s'assurer qu'une transcription existe pour la video finale" --
+    # generate_srt_from_video returning False (no speech detected, or no
+    # duration to transcribe against) must be treated as subtitle
+    # generation failing, never silently shipping a final video with no
+    # subtitles burned in.
+    app = _import_app_with_stubs(monkeypatch)
+    burn_calls = []
+    monkeypatch.setattr(app, "generate_srt_from_video", lambda *a, **k: False)
+    monkeypatch.setattr(app, "burn_subtitles", lambda *a, **k: burn_calls.append(a) or True)
+
+    final_path = str(tmp_path / "final.mp4")
+    coro = app._apply_film_summary_subtitle_burn_in(str(tmp_path), final_path, True, None)
+    with pytest.raises(film_summary.FilmSummaryValidationError) as exc_info:
+        asyncio.run(coro)
+
+    assert exc_info.value.code == film_summary.FilmSummaryErrorCode.TRANSCRIPTION_FAILED
+    # burn_subtitles must never be called against a .srt file that was
+    # never written.
+    assert burn_calls == []
+
+
+def test_run_film_summary_render_pipeline_applies_subtitles_and_reencodes_preview(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "download_s3_object", lambda bucket, key, path: True)
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda *a, **k: True)
+    app._finalize_film_summary_render = AsyncMock()
+    app.reel_job_manager.update_progress = AsyncMock()
+
+    render_calls = []
+
+    def _fake_render_edit_plan(*, on_segment_done, **kwargs):
+        render_calls.append(True)
+        return {"segment_count": 1, "final_duration_seconds": 10.0}
+
+    monkeypatch.setattr(app.film_summary_render, "render_edit_plan", _fake_render_edit_plan)
+
+    subtitle_calls = []
+    monkeypatch.setattr(app, "generate_srt_from_video", lambda *a, **k: True)
+
+    def _fake_burn(input_path, srt_path_arg, output_path, alignment=None, fontsize=None, style_options=None):
+        subtitle_calls.append((input_path, output_path))
+        open(output_path, "wb").write(b"x")
+        return True
+
+    monkeypatch.setattr(app, "burn_subtitles", _fake_burn)
+
+    class _StyleOptions:
+        def __init__(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(app, "SubtitleStyleOptions", _StyleOptions)
+
+    preview_reencode_calls = []
+    monkeypatch.setattr(
+        app.film_summary_render, "encode_preview",
+        lambda inp, out, **k: preview_reencode_calls.append((inp, out)),
+    )
+
+    plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "voice_over", "narration": "", "estimated_duration_ms": 1000, "clips": []}]}
+    asyncio.run(app._run_film_summary_render_pipeline_stages(
+        "job-1", "u1", "fs-1", "proj-1", "source-key", str(tmp_path), plan, "cedar", "fr",
+        subtitles_enabled=True, subtitle_style={"fontSize": 18},
+    ))
+
+    assert render_calls == [True]
+    assert len(subtitle_calls) == 1
+    assert subtitle_calls[0][0] == str(tmp_path / "final.mp4")
+    # Preview re-encoded once at the end, from the fully post-processed path.
+    assert preview_reencode_calls == [(str(tmp_path / "final_with_subtitles.mp4"), str(tmp_path / "preview.mp4"))]
+    # Burning subtitles in gets its own dedicated, user-visible progress
+    # stage -- the final step before upload -- rather than being silently
+    # folded into RENDERING_FINAL.
+    stage_calls = [call.args[2] for call in app.reel_job_manager.update_progress.await_args_list]
+    assert film_summary.FilmSummaryStage.ADDING_SUBTITLES in stage_calls
+    assert stage_calls.index(film_summary.FilmSummaryStage.ADDING_SUBTITLES) > stage_calls.index(film_summary.FilmSummaryStage.RENDERING_FINAL)
+
+
+def test_run_film_summary_render_pipeline_leaves_preview_untouched_without_new_settings(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "download_s3_object", lambda bucket, key, path: True)
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda *a, **k: True)
+    app._finalize_film_summary_render = AsyncMock()
+    app.reel_job_manager.update_progress = AsyncMock()
+    monkeypatch.setattr(app.film_summary_render, "render_edit_plan", lambda *a, on_segment_done, **k: {"segment_count": 1, "final_duration_seconds": 10.0})
+    preview_reencode_calls = []
+    monkeypatch.setattr(app.film_summary_render, "encode_preview", lambda *a, **k: preview_reencode_calls.append(a))
+
+    plan = {"segments": [{"id": "seg_1", "sequence": 1, "type": "voice_over", "narration": "", "estimated_duration_ms": 1000, "clips": []}]}
+    asyncio.run(app._run_film_summary_render_pipeline_stages(
+        "job-1", "u1", "fs-1", "proj-1", "source-key", str(tmp_path), plan, "cedar", "fr",
+    ))
+
+    # No subtitle setting to act on, so the preview render_edit_plan already
+    # built is never touched again.
+    assert preview_reencode_calls == []
+    # ...and no ADDING_SUBTITLES stage is reported either, since nothing
+    # happens in that step when subtitles aren't enabled.
+    stage_calls = [call.args[2] for call in app.reel_job_manager.update_progress.await_args_list]
+    assert film_summary.FilmSummaryStage.ADDING_SUBTITLES not in stage_calls
+
+
 def test_share_film_summary_rejects_when_not_completed(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     app.supabase_get_film_summary = AsyncMock(return_value={"id": "fs-1", "status": "awaiting_review"})
 
     with TestClient(app.app) as client:
@@ -3652,6 +4495,7 @@ def test_share_film_summary_rejects_when_not_completed(monkeypatch):
 def test_share_film_summary_publishes_immediately(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     app.supabase_get_film_summary = AsyncMock(return_value={
         "id": "fs-1", "status": "completed", "title": "Mon film", "final_s3_key": "final/fs-1.mp4",
     })
@@ -3686,6 +4530,7 @@ def test_share_film_summary_publishes_immediately(monkeypatch):
 def test_share_film_summary_schedules_future_post(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     app.supabase_get_film_summary = AsyncMock(return_value={
         "id": "fs-1", "status": "completed", "title": "Mon film", "final_s3_key": "final/fs-1.mp4",
     })
@@ -3712,6 +4557,7 @@ def test_share_film_summary_schedules_future_post(monkeypatch):
 def test_share_reel_publishes_to_each_selected_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     app.supabase_get_reel = AsyncMock(return_value={"reel_title": "Mon reel"})
     monkeypatch.setattr(app, "_normalize_reel_row", lambda row: {**row, "media_url": "https://s3.example/reel.mp4"})
     accounts_by_id = {
@@ -3738,6 +4584,7 @@ def test_share_reel_publishes_to_each_selected_account(monkeypatch):
 def test_share_reel_rejects_when_no_media_url(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     app.supabase_get_reel = AsyncMock(return_value={"reel_title": "Mon reel"})
     monkeypatch.setattr(app, "_normalize_reel_row", lambda row: {**row, "media_url": ""})
 
@@ -3753,6 +4600,7 @@ def test_share_reel_rejects_when_no_media_url(monkeypatch):
 def test_share_caption_publishes_to_each_selected_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     app.supabase_get_caption = AsyncMock(return_value={"caption_title": "Mes sous-titres"})
     monkeypatch.setattr(app, "_normalize_caption_row", lambda row: {**row, "media_url": "https://s3.example/caption.mp4"})
     monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "fb-acct", "platform": "facebook"}))
@@ -3776,6 +4624,7 @@ def test_share_caption_publishes_to_each_selected_account(monkeypatch):
 def test_post_to_socials_publishes_reel_clip_to_selected_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "fb-acct", "platform": "facebook"}))
     monkeypatch.setattr(
@@ -3804,6 +4653,7 @@ def test_create_social_post_blocks_when_over_comment_limit(monkeypatch):
     # rejected before any account is touched or anything is published.
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_active_plan_for_user", AsyncMock(return_value={"commentaire": 1}))
     resolve_accounts_mock = AsyncMock()
     monkeypatch.setattr(app, "_resolve_accounts_for_publish", resolve_accounts_mock)
@@ -3824,6 +4674,7 @@ def test_create_social_post_blocks_when_over_comment_limit(monkeypatch):
 def test_create_social_post_allows_comments_within_limit(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_active_plan_for_user", AsyncMock(return_value={"commentaire": 2}))
     monkeypatch.setattr(app, "_resolve_accounts_for_publish", AsyncMock(return_value=[{"id": "acct-1", "platform": "facebook"}]))
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
@@ -4177,7 +5028,7 @@ def test_preserve_source_video_uploads_to_s3_and_bills_storage(monkeypatch, tmp_
     deduct_mock = AsyncMock(return_value=True)
     monkeypatch.setattr(app, "supabase_deduct_user_credits", deduct_mock)
     history_mock = AsyncMock(return_value={})
-    monkeypatch.setattr(app, "supabase_insert_user_data_history", history_mock)
+    monkeypatch.setattr(app, "supabase_upsert_user_data_history_entry", history_mock)
 
     asyncio.run(app._preserve_source_video_for_manual_clipping(
         "job-1", {"input_path": str(src)}, str(tmp_path), "user-1",
@@ -4188,13 +5039,16 @@ def test_preserve_source_video_uploads_to_s3_and_bills_storage(monkeypatch, tmp_
 
     expected_storage_gb = app._bytes_to_gb(len(b"video-bytes"))
     deduct_mock.assert_awaited_once_with("user-1", 0.0, -expected_storage_gb)
+    # operation_id is the bare job_id (not suffixed) so this storage charge
+    # merges into the job's own primary "generation_reel" history row
+    # instead of becoming its own line.
     history_mock.assert_awaited_once_with(
         user_id="user-1",
         credit=0.0,
         storage=round(expected_storage_gb, 6),
         operation="output",
         operation_type="generation_reel",
-        operation_id="job-1:source_video",
+        operation_id="job-1",
     )
 
 
@@ -4716,6 +5570,74 @@ def test_create_stripe_checkout_session_reuses_existing_stripe_customer(monkeypa
     assert "customer_email" not in kwargs
 
 
+def test_annual_price_for_plan_applies_discount_rate():
+    import app as app_module
+    assert app_module._annual_price_for_plan({"price": 10, "reduction_annuelle": 5}) == 114.0
+
+
+def test_annual_price_for_plan_accepts_legacy_fractional_discount_during_rollout():
+    import app as app_module
+    assert app_module._annual_price_for_plan({"price": 10, "reduction_annuelle": 0.05}) == 114.0
+
+
+def test_annual_price_for_plan_defaults_to_no_discount():
+    import app as app_module
+    assert app_module._annual_price_for_plan({"price": 10}) == 120.0
+
+
+def test_annual_price_for_plan_clamps_out_of_range_rate():
+    import app as app_module
+    assert app_module._annual_price_for_plan({"price": 10, "reduction_annuelle": 150}) == 0.0
+    assert app_module._annual_price_for_plan({"price": 10, "reduction_annuelle": -1}) == 120.0
+
+
+def test_create_stripe_checkout_session_annual_interval_uses_discounted_price(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    fake_session = MagicMock(url="https://checkout.stripe.com/pay/cs_test_annual", id="cs_test_annual")
+    fake_stripe.checkout.Session.create.return_value = fake_session
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "plan-1", "name": "Pro", "price": 10.0, "reduction_annuelle": 5}))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value=None))
+
+    payload = app.StripeCheckoutRequest(plan_id="plan-1", billing_interval="year")
+    asyncio.run(app.create_stripe_checkout_session(
+        request=_FakeCheckoutRequest(headers={"X-User-Email": "user@example.com"}),
+        payload=payload, user_id="u1",
+    ))
+
+    _, kwargs = fake_stripe.checkout.Session.create.call_args
+    price_data = kwargs["line_items"][0]["price_data"]
+    assert price_data["recurring"] == {"interval": "year"}
+    assert price_data["unit_amount"] == 11400  # (10*12 - 5%) euros, in cents
+    assert kwargs["metadata"]["billing_interval"] == "year"
+
+
+def test_create_stripe_checkout_session_defaults_to_monthly_interval(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    fake_session = MagicMock(url="https://checkout.stripe.com/pay/cs_test_default", id="cs_test_default")
+    fake_stripe.checkout.Session.create.return_value = fake_session
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "plan-1", "name": "Pro", "price": 10.0, "reduction_annuelle": 5}))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value=None))
+
+    payload = app.StripeCheckoutRequest(plan_id="plan-1")
+    asyncio.run(app.create_stripe_checkout_session(
+        request=_FakeCheckoutRequest(), payload=payload, user_id="u1",
+    ))
+
+    _, kwargs = fake_stripe.checkout.Session.create.call_args
+    price_data = kwargs["line_items"][0]["price_data"]
+    assert price_data["recurring"] == {"interval": "month"}
+    assert price_data["unit_amount"] == 1000
+    assert kwargs["metadata"]["billing_interval"] == "month"
+
+
 def test_buy_credits_checkout_reuses_existing_stripe_customer(monkeypatch):
     # The card used to buy credits must be the same one on file for the
     # subscription (and vice versa) -- see _existing_stripe_customer_id --
@@ -4840,12 +5762,48 @@ def test_handle_subscription_renewal_invoice_credits_plan_and_persists_period(mo
     assert kwargs["user_id"] == "u1"
     assert kwargs["abonnement"] == "plan-1"
     assert kwargs["payment_reference"] == "pi_renewal_1"
-    assert kwargs["stripe_subscription_id"] == "sub_123"
-    assert kwargs["stripe_customer_id"] == "cus_456"
-    assert kwargs["period_end_date"] == datetime.fromtimestamp(1702592000, tz=timezone.utc)
+    assert kwargs["billing"]["stripe_subscription_id"] == "sub_123"
+    assert kwargs["billing"]["stripe_customer_id"] == "cus_456"
+    assert kwargs["billing"]["period_end_date"] == datetime.fromtimestamp(1702592000, tz=timezone.utc)
     assert kwargs["payment_amount"] == 29.99
     allocate_mock.assert_awaited_once()
     email_mock.assert_called_once()
+
+
+def test_handle_subscription_renewal_invoice_threads_billing_interval(monkeypatch):
+    # An annual subscription's renewal invoice (fired once a year by
+    # Stripe) must carry billing_interval through to both the new
+    # souscription row and _allocate_plan_resources, which is what
+    # actually schedules the in-between monthly refills.
+    app = _import_app_with_stubs(monkeypatch)
+    fake_subscription = types.SimpleNamespace(
+        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "plan-1", "billing_interval": "year"})
+    )
+    fake_stripe = MagicMock()
+    fake_stripe.Subscription.retrieve.return_value = fake_subscription
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    insert_mock = AsyncMock(return_value={"id": "sous-1"})
+    monkeypatch.setattr(app, "supabase_insert_souscription", insert_mock)
+    allocate_mock = AsyncMock()
+    monkeypatch.setattr(app, "_allocate_plan_resources", allocate_mock)
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+
+    period = types.SimpleNamespace(start=1700000000, end=1731536000)
+    invoice = types.SimpleNamespace(
+        subscription="sub_123", payment_intent="pi_renewal_annual", id="in_renewal_annual",
+        lines=types.SimpleNamespace(data=[types.SimpleNamespace(period=period)]),
+        created=1700000000, amount_paid=11400, customer="cus_456", customer_email="user@example.com",
+    )
+
+    asyncio.run(app._handle_subscription_renewal_invoice(invoice))
+
+    insert_kwargs = insert_mock.await_args.kwargs
+    assert insert_kwargs["billing"]["billing_interval"] == "year"
+    allocate_kwargs = allocate_mock.await_args.kwargs
+    assert allocate_kwargs["billing_interval"] == "year"
+    assert allocate_kwargs["period_start"] == datetime.fromtimestamp(1700000000, tz=timezone.utc)
 
 
 def test_handle_subscription_renewal_invoice_is_idempotent_on_duplicate_reference(monkeypatch):
@@ -4937,6 +5895,30 @@ def test_stripe_webhook_dispatches_subscription_cycle_invoice_to_renewal_handler
     renewal_mock.assert_awaited_once_with(invoice)
 
 
+def test_stripe_webhook_dispatches_subscription_update_invoice_to_renewal_handler(monkeypatch):
+    # A Stripe Subscription Schedule's phase-2 transition (the mechanism
+    # driving a deferred downgrade/periodicity change, see
+    # _create_or_replace_plan_change_schedule) raises its invoice with
+    # billing_reason "subscription_update" rather than "subscription_cycle"
+    # -- this must reach the SAME existing renewal handler unmodified, or
+    # a scheduled change would silently never get applied/credited.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "STRIPE_WEBHOOK_SECRET", "whsec_test")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "stripe", MagicMock())
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    invoice = types.SimpleNamespace(billing_reason="subscription_update")
+    fake_event = types.SimpleNamespace(type="invoice.paid", data=types.SimpleNamespace(object=invoice))
+    monkeypatch.setattr(app, "_verify_and_parse_event", lambda payload, signature: fake_event)
+    renewal_mock = AsyncMock(return_value={"received": True})
+    monkeypatch.setattr(app, "_handle_subscription_renewal_invoice", renewal_mock)
+
+    result = asyncio.run(app.stripe_webhook(_FakeWebhookRequest()))
+
+    assert result == {"received": True}
+    renewal_mock.assert_awaited_once_with(invoice)
+
+
 def test_stripe_webhook_dispatches_payment_failed_invoice(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "STRIPE_WEBHOOK_SECRET", "whsec_test")
@@ -4946,13 +5928,13 @@ def test_stripe_webhook_dispatches_payment_failed_invoice(monkeypatch):
     invoice = types.SimpleNamespace()
     fake_event = types.SimpleNamespace(type="invoice.payment_failed", data=types.SimpleNamespace(object=invoice))
     monkeypatch.setattr(app, "_verify_and_parse_event", lambda payload, signature: fake_event)
-    failed_mock = MagicMock(return_value={"received": True})
+    failed_mock = AsyncMock(return_value={"received": True})
     monkeypatch.setattr(app, "_handle_subscription_payment_failed", failed_mock)
 
     result = asyncio.run(app.stripe_webhook(_FakeWebhookRequest()))
 
     assert result == {"received": True}
-    failed_mock.assert_called_once_with(invoice)
+    failed_mock.assert_awaited_once_with(invoice)
 
 
 def test_stripe_webhook_dispatches_setup_session_to_payment_method_handler(monkeypatch):
@@ -5024,6 +6006,7 @@ def test_handle_subscription_purchase_closes_out_previous_souscription(monkeypat
 def test_handle_subscription_purchase_without_previous_souscription_touches_nothing(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value={"id": "prior"}))
     monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-new"}))
     monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
     monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
@@ -5045,6 +6028,7 @@ def test_handle_subscription_purchase_syncs_default_payment_method(monkeypatch):
     # they actually paid with.
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value={"id": "prior"}))
     monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-new"}))
     monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
     monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
@@ -5057,6 +6041,138 @@ def test_handle_subscription_purchase_syncs_default_payment_method(monkeypatch):
     )))
 
     sync_mock.assert_called_once_with("sub_new", "cus_new")
+
+
+def test_handle_subscription_purchase_threads_annual_billing_interval(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value={"id": "prior"}))
+    insert_mock = AsyncMock(return_value={"id": "sous-new"})
+    monkeypatch.setattr(app, "supabase_insert_souscription", insert_mock)
+    allocate_mock = AsyncMock()
+    monkeypatch.setattr(app, "_allocate_plan_resources", allocate_mock)
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+    monkeypatch.setattr(app, "_sync_customer_default_payment_method", MagicMock())
+
+    payment_date = datetime.now(timezone.utc)
+    ctx = _fake_subscription_purchase_ctx(
+        metadata={"abonnement": "plan-1", "plan_name": "Pro", "billing_interval": "year"},
+        billing_interval="year", payment_date=payment_date,
+    )
+    asyncio.run(app._handle_subscription_purchase(ctx))
+
+    insert_kwargs = insert_mock.await_args.kwargs
+    assert insert_kwargs["billing"]["billing_interval"] == "year"
+    allocate_kwargs = allocate_mock.await_args.kwargs
+    assert allocate_kwargs["billing_interval"] == "year"
+    assert allocate_kwargs["period_start"] == payment_date
+
+
+def test_allocate_plan_resources_snapshots_values_onto_souscription_row(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "plan-1", "credit": 500.0, "stockage": 1.0}))
+    balance_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_set_user_data_balance", balance_mock)
+    history_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", history_mock)
+    update_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
+    monkeypatch.setattr(app, "supabase_set_user_max_daily_publications", AsyncMock())
+
+    asyncio.run(app._allocate_plan_resources(
+        user_id="u1", abonnement="plan-1", payment_reference="ref-1", souscription_id="sous-1",
+    ))
+
+    balance_mock.assert_awaited_once()
+    assert balance_mock.await_args.kwargs["credit"] == 500.0
+    assert balance_mock.await_args.kwargs["storage"] == 1.0
+    update_mock.assert_awaited_once()
+    args, _ = update_mock.await_args
+    assert args[0] == "sous-1"
+    assert args[1] == {"plan_credit": 500.0, "plan_stockage": 1.0}  # no next_credit_allocation_at for a monthly plan
+
+
+def test_allocate_plan_resources_schedules_next_allocation_for_annual_plan(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "plan-1", "credit": 500.0, "stockage": 1.0}))
+    monkeypatch.setattr(app, "supabase_set_user_data_balance", AsyncMock())
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
+    update_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
+    monkeypatch.setattr(app, "supabase_set_user_max_daily_publications", AsyncMock())
+
+    period_start = datetime(2026, 1, 15, tzinfo=timezone.utc)
+    asyncio.run(app._allocate_plan_resources(
+        user_id="u1", abonnement="plan-1", payment_reference="ref-1", souscription_id="sous-1",
+        billing_interval="year", period_start=period_start,
+    ))
+
+    args, _ = update_mock.await_args
+    assert args[0] == "sous-1"
+    assert args[1]["plan_credit"] == 500.0
+    assert args[1]["plan_stockage"] == 1.0
+    assert args[1]["next_credit_allocation_at"] == datetime(2026, 2, 15, tzinfo=timezone.utc).isoformat()
+
+
+def test_allocate_plan_resources_noop_when_plan_missing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value=None))
+    balance_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_set_user_data_balance", balance_mock)
+    update_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
+
+    asyncio.run(app._allocate_plan_resources(
+        user_id="u1", abonnement="missing-plan", payment_reference="ref-1", souscription_id="sous-1",
+    ))
+
+    balance_mock.assert_not_awaited()
+    update_mock.assert_not_awaited()
+
+
+def test_process_due_annual_credit_refills_uses_snapshot_not_live_plan(monkeypatch):
+    # The whole point of the snapshot is that this sweep must never read
+    # the live plan catalog -- only the souscription row's own
+    # plan_credit/plan_stockage, so a later change to the plan never
+    # retroactively changes an in-progress annual subscription's refill.
+    app = _import_app_with_stubs(monkeypatch)
+    due_row = {
+        "id": "sous-1", "userid": "u1", "plan_credit": 500.0, "plan_stockage": 1.0,
+        "next_credit_allocation_at": datetime(2026, 1, 15, tzinfo=timezone.utc).isoformat(),
+    }
+    monkeypatch.setattr(app, "supabase_list_souscriptions_due_for_monthly_credit_allocation", AsyncMock(return_value=[due_row]))
+    balance_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_set_user_data_balance", balance_mock)
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
+    get_abonnement_mock = AsyncMock(return_value={"credit": 999999.0, "stockage": 999.0})
+    monkeypatch.setattr(app, "supabase_get_abonnement", get_abonnement_mock)
+    update_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
+
+    asyncio.run(app._process_due_annual_credit_refills())
+
+    get_abonnement_mock.assert_not_awaited()
+    balance_mock.assert_awaited_once()
+    assert balance_mock.await_args.kwargs["credit"] == 500.0
+    assert balance_mock.await_args.kwargs["storage"] == 1.0
+    update_args, _ = update_mock.await_args
+    assert update_args[0] == "sous-1"
+    assert update_args[1]["next_credit_allocation_at"] == datetime(2026, 2, 15, tzinfo=timezone.utc).isoformat()
+
+
+def test_process_due_annual_credit_refills_skips_rows_missing_ids(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_list_souscriptions_due_for_monthly_credit_allocation", AsyncMock(return_value=[
+        {"id": "sous-1", "userid": None, "plan_credit": 500.0, "plan_stockage": 1.0},
+    ]))
+    balance_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_set_user_data_balance", balance_mock)
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
+    monkeypatch.setattr(app, "supabase_update_souscription_row", AsyncMock())
+
+    asyncio.run(app._process_due_annual_credit_refills())
+
+    balance_mock.assert_not_awaited()
 
 
 def test_sync_customer_default_payment_method_sets_default_from_expanded_subscription(monkeypatch):
@@ -5155,6 +6271,74 @@ def test_get_stripe_default_payment_method_falls_back_to_first_attached_card(mon
     result = app._get_stripe_default_payment_method("cus_1")
 
     assert result is first_card
+
+
+# ---------------------------------------------------------------------------
+# Credit top-up purchase: granted as its own tier-2 expiring batch, not a
+# plain delta into user_data.credit (see the credit-tiers migration).
+# ---------------------------------------------------------------------------
+
+def _fake_credit_purchase_ctx(**overrides):
+    ctx = {
+        "metadata": {"credits_to_add": 100.0},
+        "user_id": "u1",
+        "amount_total": 9.99,
+        "payment_reference": "cs_credits_1",
+        "payment_date": datetime.now(timezone.utc),
+        "customer_email": "user@example.com",
+    }
+    ctx.update(overrides)
+    return ctx
+
+
+def test_handle_credit_purchase_grants_tier_2_batch_not_plain_delta(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "_enforce_subscription_retention_policy", AsyncMock(return_value={"state": "active"}))
+    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-credits-1"}))
+    batch_mock = AsyncMock(return_value={"id": "batch-1"})
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+    delta_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_upsert_user_data_credits", delta_mock)
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+
+    result = asyncio.run(app._handle_credit_purchase(_fake_credit_purchase_ctx()))
+
+    assert result == {"received": True, "credits_added": 100.0}
+    batch_mock.assert_awaited_once_with(
+        "u1", 100.0, "CREDIT_PURCHASE", app.PURCHASED_CREDITS_EXPIRATION_DAYS,
+        source_reference="sous-credits-1", tier=app.CREDIT_BATCH_TIER_PURCHASED,
+    )
+    # Never a plain delta into user_data.credit -- that's what used to let
+    # a subscription renewal's reset-to-allowance silently wipe a
+    # purchased top-up.
+    delta_mock.assert_not_awaited()
+
+
+def test_handle_credit_purchase_duplicate_payment_reference_is_noop(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value={"id": "existing"}))
+    batch_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+
+    result = asyncio.run(app._handle_credit_purchase(_fake_credit_purchase_ctx()))
+
+    assert result == {"received": True, "duplicate": True}
+    batch_mock.assert_not_awaited()
+
+
+def test_handle_credit_purchase_requires_active_subscription(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "_enforce_subscription_retention_policy", AsyncMock(return_value={"state": "no_subscription"}))
+    batch_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+
+    result = asyncio.run(app._handle_credit_purchase(_fake_credit_purchase_ctx()))
+
+    assert result == {"received": True, "ignored": "no_active_subscription", "policy_state": "no_subscription"}
+    batch_mock.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -5319,6 +6503,8 @@ def test_send_transactional_email_swallows_bad_template_context(monkeypatch):
 
 
 def test_handle_subscription_payment_failed_sends_email_with_retry_date(monkeypatch):
+    # Not the final attempt (next_payment_attempt is set) -- Stripe will
+    # retry on its own, so subscription credit must NOT be zeroed yet.
     app = _import_app_with_stubs(monkeypatch)
     fake_subscription = types.SimpleNamespace(metadata=_FakeStripeMetadata({"userid": "u1", "plan_name": "Pro"}))
     fake_stripe = MagicMock()
@@ -5326,12 +6512,15 @@ def test_handle_subscription_payment_failed_sends_email_with_retry_date(monkeypa
     monkeypatch.setattr(app, "stripe", fake_stripe)
     email_mock = MagicMock()
     monkeypatch.setattr(app, "_send_transactional_email", email_mock)
+    zero_credit_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_zero_subscription_credit", zero_credit_mock)
 
     invoice = types.SimpleNamespace(
         subscription="sub_123", customer_email="user@example.com",
         amount_due=2999, next_payment_attempt=1700000000, hosted_invoice_url="https://billing.stripe.com/x",
+        id="in_123",
     )
-    result = app._handle_subscription_payment_failed(invoice)
+    result = asyncio.run(app._handle_subscription_payment_failed(invoice))
 
     assert result == {"received": True}
     email_mock.assert_called_once()
@@ -5342,34 +6531,514 @@ def test_handle_subscription_payment_failed_sends_email_with_retry_date(monkeypa
     assert kwargs["amount"] == pytest.approx(29.99)
     assert "aura lieu automatiquement" in kwargs["retry_message"]
     assert kwargs["update_payment_url"] == "https://billing.stripe.com/x"
+    zero_credit_mock.assert_not_awaited()
 
 
-def test_handle_subscription_payment_failed_no_retry_scheduled(monkeypatch):
+def test_handle_subscription_payment_failed_zeroes_credit_on_final_attempt(monkeypatch):
+    # next_payment_attempt is null/None -- Stripe has given up retrying,
+    # so this is the signal to actually zero the subscription's credit.
     app = _import_app_with_stubs(monkeypatch)
-    fake_subscription = types.SimpleNamespace(metadata=_FakeStripeMetadata({"plan_name": "Pro"}))
+    fake_subscription = types.SimpleNamespace(metadata=_FakeStripeMetadata({"userid": "u1", "plan_name": "Pro"}))
     fake_stripe = MagicMock()
     fake_stripe.Subscription.retrieve.return_value = fake_subscription
     monkeypatch.setattr(app, "stripe", fake_stripe)
     email_mock = MagicMock()
     monkeypatch.setattr(app, "_send_transactional_email", email_mock)
+    zero_credit_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_zero_subscription_credit", zero_credit_mock)
 
     invoice = types.SimpleNamespace(
         subscription="sub_123", customer_email="user@example.com",
         amount_due=2999, next_payment_attempt=None, hosted_invoice_url="https://billing.stripe.com/x",
+        id="in_123",
     )
-    app._handle_subscription_payment_failed(invoice)
+    asyncio.run(app._handle_subscription_payment_failed(invoice))
 
     kwargs = email_mock.call_args.kwargs
     assert "Aucune nouvelle tentative" in kwargs["retry_message"]
+    zero_credit_mock.assert_awaited_once_with("u1", operation_id="in_123")
+
+
+def test_handle_subscription_payment_failed_no_userid_skips_credit_zeroing(monkeypatch):
+    # Defensive: missing userid metadata must never crash this handler --
+    # it just can't zero anyone's credit.
+    app = _import_app_with_stubs(monkeypatch)
+    fake_subscription = types.SimpleNamespace(metadata=_FakeStripeMetadata({"plan_name": "Pro"}))
+    fake_stripe = MagicMock()
+    fake_stripe.Subscription.retrieve.return_value = fake_subscription
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+    zero_credit_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_zero_subscription_credit", zero_credit_mock)
+
+    invoice = types.SimpleNamespace(
+        subscription="sub_123", customer_email="user@example.com",
+        amount_due=2999, next_payment_attempt=None, hosted_invoice_url="https://billing.stripe.com/x",
+        id="in_123",
+    )
+    asyncio.run(app._handle_subscription_payment_failed(invoice))
+
+    zero_credit_mock.assert_not_awaited()
 
 
 def test_handle_subscription_payment_failed_ignores_invoice_without_subscription(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     invoice = types.SimpleNamespace(subscription=None)
 
-    result = app._handle_subscription_payment_failed(invoice)
+    result = asyncio.run(app._handle_subscription_payment_failed(invoice))
 
     assert result == {"received": True, "ignored": "no_subscription_on_invoice"}
+
+
+# ---------------------------------------------------------------------------
+# Referral program -- reward triggers
+# ---------------------------------------------------------------------------
+
+def test_maybe_reward_referrer_grants_monthly_bonus(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value={
+        "id": "ref-1", "referrer_user_id": "referrer-1", "status": "pending",
+    }))
+    claim_mock = AsyncMock(return_value={"id": "ref-1", "status": "rewarded"})
+    monkeypatch.setattr(app, "supabase_claim_referral_subscription_reward", claim_mock)
+    batch_mock = AsyncMock(return_value={"id": "batch-1"})
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+    monkeypatch.setattr(app, "supabase_update_referral_row", AsyncMock())
+    notify_mock = AsyncMock()
+    monkeypatch.setattr(app, "_create_notification", notify_mock)
+
+    asyncio.run(app._maybe_reward_referrer_for_first_subscription("referee-1", "month", "sous-1"))
+
+    claim_mock.assert_awaited_once_with("ref-1", "month", "sous-1")
+    batch_mock.assert_awaited_once_with(
+        "referrer-1", app.REFERRAL_MONTHLY_BONUS_CREDITS, "REFERRAL_MONTHLY_SUBSCRIPTION",
+        app.PROMOTIONAL_CREDITS_EXPIRATION_DAYS, source_reference="sous-1",
+    )
+    assert notify_mock.await_count == 2
+
+
+def test_maybe_reward_referrer_grants_annual_bonus(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value={
+        "id": "ref-1", "referrer_user_id": "referrer-1", "status": "pending",
+    }))
+    monkeypatch.setattr(app, "supabase_claim_referral_subscription_reward", AsyncMock(return_value={"id": "ref-1"}))
+    batch_mock = AsyncMock(return_value={"id": "batch-1"})
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+    monkeypatch.setattr(app, "supabase_update_referral_row", AsyncMock())
+    monkeypatch.setattr(app, "_create_notification", AsyncMock())
+
+    asyncio.run(app._maybe_reward_referrer_for_first_subscription("referee-1", "year", "sous-1"))
+
+    batch_mock.assert_awaited_once_with(
+        "referrer-1", app.REFERRAL_ANNUAL_BONUS_CREDITS, "REFERRAL_ANNUAL_SUBSCRIPTION",
+        app.PROMOTIONAL_CREDITS_EXPIRATION_DAYS, source_reference="sous-1",
+    )
+
+
+def test_maybe_reward_referrer_noop_when_not_referred(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value=None))
+    batch_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+
+    asyncio.run(app._maybe_reward_referrer_for_first_subscription("referee-1", "month", "sous-1"))
+
+    batch_mock.assert_not_awaited()
+
+
+def test_maybe_reward_referrer_noop_when_referral_invalidated(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value={
+        "id": "ref-1", "referrer_user_id": "referrer-1", "status": "invalid",
+    }))
+    batch_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+
+    asyncio.run(app._maybe_reward_referrer_for_first_subscription("referee-1", "month", "sous-1"))
+
+    batch_mock.assert_not_awaited()
+
+
+def test_maybe_reward_referrer_idempotent_on_duplicate_webhook(monkeypatch):
+    # claim_referral_subscription_reward returns None once the reward was
+    # already claimed (e.g. the webhook fired twice) -- no second batch.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value={
+        "id": "ref-1", "referrer_user_id": "referrer-1", "status": "rewarded",
+    }))
+    monkeypatch.setattr(app, "supabase_claim_referral_subscription_reward", AsyncMock(return_value=None))
+    batch_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+
+    asyncio.run(app._maybe_reward_referrer_for_first_subscription("referee-1", "month", "sous-1"))
+
+    batch_mock.assert_not_awaited()
+
+
+def test_handle_subscription_purchase_skips_reward_when_not_first_subscription(monkeypatch):
+    # A renewal never reaches _handle_subscription_purchase at all (see
+    # _handle_subscription_renewal_invoice's own docstring), and a plan
+    # change via fresh checkout always has a prior paid subscription --
+    # both end up here as "not first", which must never reward anyone.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value={"id": "prior"}))
+    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-new"}))
+    monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+    monkeypatch.setattr(app, "_sync_customer_default_payment_method", MagicMock())
+    reward_mock = AsyncMock()
+    monkeypatch.setattr(app, "_maybe_reward_referrer_for_first_subscription", reward_mock)
+
+    asyncio.run(app._handle_subscription_purchase(_fake_subscription_purchase_ctx()))
+
+    reward_mock.assert_not_awaited()
+
+
+def test_handle_subscription_purchase_rewards_referrer_on_first_subscription(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-new"}))
+    monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+    monkeypatch.setattr(app, "_sync_customer_default_payment_method", MagicMock())
+    reward_mock = AsyncMock()
+    monkeypatch.setattr(app, "_maybe_reward_referrer_for_first_subscription", reward_mock)
+
+    asyncio.run(app._handle_subscription_purchase(_fake_subscription_purchase_ctx(billing_interval="year")))
+
+    reward_mock.assert_awaited_once_with("u1", "year", "sous-new")
+
+
+def test_change_souscription_plan_never_rewards_referrer(monkeypatch):
+    # A plan change (upgrade/downgrade) must never trigger a referral
+    # reward -- only a genuinely first-ever paid subscription does. Not
+    # even indirectly: change_souscription_plan never references the
+    # referral-reward function at all.
+    app = _import_app_with_stubs(monkeypatch)
+    assert "_maybe_reward_referrer_for_first_subscription" not in app.change_souscription_plan.__code__.co_names
+    assert "_maybe_reward_referrer_for_first_subscription" not in app._apply_immediate_upgrade.__code__.co_names
+    assert "_maybe_reward_referrer_for_first_subscription" not in app._apply_scheduled_plan_change.__code__.co_names
+
+
+# ---------------------------------------------------------------------------
+# Referral program -- refunds/chargebacks revoke the reward batch
+# ---------------------------------------------------------------------------
+
+def test_handle_charge_refund_revokes_matching_batch(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value={"id": "sous-1"}))
+    revoke_mock = AsyncMock(return_value=1)
+    monkeypatch.setattr(app, "supabase_revoke_promotional_credit_batches_by_source_reference", revoke_mock)
+
+    charge = _FakeStripeObjectNoGet({"payment_intent": "pi_123"})
+    result = asyncio.run(app._handle_charge_refund_or_dispute(charge, "refund"))
+
+    assert result == {"received": True, "revoked_batches": 1}
+    revoke_mock.assert_awaited_once_with("sous-1", "refund")
+
+
+def test_handle_charge_dispute_revokes_matching_batch(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value={"id": "sous-1"}))
+    revoke_mock = AsyncMock(return_value=1)
+    monkeypatch.setattr(app, "supabase_revoke_promotional_credit_batches_by_source_reference", revoke_mock)
+
+    dispute = _FakeStripeObjectNoGet({"payment_intent": "pi_123"})
+    result = asyncio.run(app._handle_charge_refund_or_dispute(dispute, "chargeback"))
+
+    revoke_mock.assert_awaited_once_with("sous-1", "chargeback")
+
+
+def test_handle_charge_refund_ignored_when_no_matching_souscription(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_souscription_by_reference", AsyncMock(return_value=None))
+    revoke_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_revoke_promotional_credit_batches_by_source_reference", revoke_mock)
+
+    charge = _FakeStripeObjectNoGet({"payment_intent": "pi_unrelated"})
+    result = asyncio.run(app._handle_charge_refund_or_dispute(charge, "refund"))
+
+    assert result == {"received": True, "ignored": "no_matching_souscription"}
+    revoke_mock.assert_not_awaited()
+
+
+def test_handle_charge_refund_ignored_without_payment_intent(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    charge = _FakeStripeObjectNoGet({})
+    result = asyncio.run(app._handle_charge_refund_or_dispute(charge, "refund"))
+    assert result == {"received": True, "ignored": "no_payment_intent"}
+
+
+def test_stripe_webhook_dispatches_charge_refunded(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    monkeypatch.setattr(app, "STRIPE_WEBHOOK_SECRET", "whsec_123")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    event = types.SimpleNamespace(type="charge.refunded", data=types.SimpleNamespace(object=types.SimpleNamespace(payment_intent="pi_123")))
+    monkeypatch.setattr(app, "_verify_and_parse_event", lambda payload, sig: event)
+    handler_mock = AsyncMock(return_value={"received": True, "revoked_batches": 1})
+    monkeypatch.setattr(app, "_handle_charge_refund_or_dispute", handler_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.post("/api/stripe/webhook", data=b"{}", headers={"stripe-signature": "sig"})
+
+    assert resp.status_code == 200
+    handler_mock.assert_awaited_once_with(event.data.object, "refund")
+
+
+def test_stripe_webhook_dispatches_charge_dispute_created(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    fake_stripe = MagicMock()
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    monkeypatch.setattr(app, "STRIPE_WEBHOOK_SECRET", "whsec_123")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    event = types.SimpleNamespace(type="charge.dispute.created", data=types.SimpleNamespace(object=types.SimpleNamespace(payment_intent="pi_123")))
+    monkeypatch.setattr(app, "_verify_and_parse_event", lambda payload, sig: event)
+    handler_mock = AsyncMock(return_value={"received": True, "revoked_batches": 1})
+    monkeypatch.setattr(app, "_handle_charge_refund_or_dispute", handler_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.post("/api/stripe/webhook", data=b"{}", headers={"stripe-signature": "sig"})
+
+    assert resp.status_code == 200
+    handler_mock.assert_awaited_once_with(event.data.object, "chargeback")
+
+
+# ---------------------------------------------------------------------------
+# Referral program -- HTTP endpoints
+# ---------------------------------------------------------------------------
+
+def test_get_referral_config_reads_from_backend_env(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "REFERRAL_SIGNUP_BONUS_CREDITS", 50.0)
+    monkeypatch.setattr(app, "REFERRAL_MONTHLY_BONUS_CREDITS", 100.0)
+    monkeypatch.setattr(app, "REFERRAL_ANNUAL_BONUS_CREDITS", 300.0)
+    monkeypatch.setattr(app, "PROMOTIONAL_CREDITS_EXPIRATION_DAYS", 60)
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/referrals/config")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "signup_bonus_credits": 50.0, "monthly_bonus_credits": 100.0,
+        "annual_bonus_credits": 300.0, "expiration_days": 60,
+    }
+
+
+def test_get_my_referrals_returns_code_link_and_summary(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_or_create_referral_code", AsyncMock(return_value="ABC1234"))
+    monkeypatch.setattr(app, "supabase_list_referrals_by_referrer", AsyncMock(return_value=[
+        {"created_at": "t1", "status": "pending", "subscription_reward_granted_at": None},
+        {"created_at": "t2", "status": "rewarded", "subscription_reward_granted_at": "t3", "first_subscription_type": "month"},
+    ]))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/referrals/me", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["code"] == "ABC1234"
+    assert data["link"].endswith("/r/ABC1234")
+    assert data["referred_count"] == 2
+    assert data["rewarded_count"] == 1
+    assert data["referrals"][0]["label"] == "Filleul #1"
+    # No PII anywhere in the per-referral summary.
+    assert "email" not in data["referrals"][0]
+    assert "referred_user_id" not in data["referrals"][0]
+
+
+def test_associate_referral_success_grants_signup_bonus(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_referral_code_owner", AsyncMock(return_value="referrer-1"))
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_auth_user_created_at", AsyncMock(return_value=datetime.now(timezone.utc)))
+    monkeypatch.setattr(app, "supabase_insert_referral", AsyncMock(return_value=({"id": "ref-1"}, True)))
+    batch_mock = AsyncMock(return_value={"id": "batch-1"})
+    monkeypatch.setattr(app, "supabase_insert_promotional_credit_batch", batch_mock)
+    update_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_update_referral_row", update_mock)
+    notify_mock = AsyncMock()
+    monkeypatch.setattr(app, "_create_notification", notify_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/referrals/associate", json={"referral_code": "ABC1234"}, headers=_auth_headers("referee-1"),
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["associated"] is True
+    batch_mock.assert_awaited_once_with(
+        "referee-1", app.REFERRAL_SIGNUP_BONUS_CREDITS, "REFERRAL_SIGNUP",
+        app.PROMOTIONAL_CREDITS_EXPIRATION_DAYS, source_reference="ref-1",
+    )
+    update_mock.assert_awaited_once()
+    assert notify_mock.await_count == 2
+
+
+def test_associate_referral_blocks_self_referral(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_referral_code_owner", AsyncMock(return_value="u1"))
+    insert_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_referral", insert_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/referrals/associate", json={"referral_code": "ABC1234"}, headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["associated"] is False
+    insert_mock.assert_not_awaited()
+
+
+def test_associate_referral_idempotent_when_already_referred(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_referral_code_owner", AsyncMock(return_value="referrer-1"))
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value={"id": "existing-ref"}))
+    insert_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_referral", insert_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/referrals/associate", json={"referral_code": "ABC1234"}, headers=_auth_headers("referee-1"),
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["associated"] is False
+    insert_mock.assert_not_awaited()
+
+
+def test_associate_referral_rejects_unknown_code(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_referral_code_owner", AsyncMock(return_value=None))
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/referrals/associate", json={"referral_code": "NOPE000"}, headers=_auth_headers("referee-1"),
+        )
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["code"] == "referral_code_not_found"
+
+
+def test_associate_referral_rejects_account_too_old(monkeypatch):
+    # An existing user who clicks a referral link long after signing up
+    # must never retroactively get a referrer attached.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "REFERRAL_ASSOCIATION_WINDOW_MINUTES", 60)
+    monkeypatch.setattr(app, "supabase_get_referral_code_owner", AsyncMock(return_value="referrer-1"))
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_auth_user_created_at", AsyncMock(
+        return_value=datetime.now(timezone.utc) - timedelta(days=30)
+    ))
+    insert_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_referral", insert_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/referrals/associate", json={"referral_code": "ABC1234"}, headers=_auth_headers("referee-1"),
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["associated"] is False
+    insert_mock.assert_not_awaited()
+
+
+def test_associate_referral_rejects_when_account_age_unknown(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_referral_code_owner", AsyncMock(return_value="referrer-1"))
+    monkeypatch.setattr(app, "supabase_get_referral_by_referred_user", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_auth_user_created_at", AsyncMock(return_value=None))
+    insert_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_referral", insert_mock)
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/referrals/associate", json={"referral_code": "ABC1234"}, headers=_auth_headers("referee-1"),
+        )
+
+    assert resp.json()["associated"] is False
+    insert_mock.assert_not_awaited()
+
+
+def test_invalidate_referral_requires_admin_secret(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "ADMIN_API_SECRET", "top-secret")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+
+    with TestClient(app.app) as client:
+        resp = client.post("/api/admin/referrals/ref-1/invalidate", json={"reason": "fraud"})
+
+    assert resp.status_code == 403
+
+
+def test_invalidate_referral_succeeds_with_correct_secret(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "ADMIN_API_SECRET", "top-secret")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_invalidate_referral", AsyncMock(return_value={"id": "ref-1", "status": "invalid"}))
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/admin/referrals/ref-1/invalidate", json={"reason": "fraud"},
+            headers={"x-admin-secret": "top-secret"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "invalid"
+
+
+# ---------------------------------------------------------------------------
+# In-app notifications
+# ---------------------------------------------------------------------------
+
+def test_list_notifications_endpoint_returns_items_and_unread_count(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_list_notifications", AsyncMock(return_value=([{"id": "n1"}], 3)))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/notifications", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"items": [{"id": "n1"}], "unread_count": 3}
+
+
+def test_mark_notification_read_endpoint_404_when_not_found(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_mark_notification_read", AsyncMock(return_value=None))
+
+    with TestClient(app.app) as client:
+        resp = client.post("/api/notifications/n1/read", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 404
+
+
+def test_mark_all_notifications_read_endpoint_returns_count(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_mark_all_notifications_read", AsyncMock(return_value=5))
+
+    with TestClient(app.app) as client:
+        resp = client.post("/api/notifications/read-all", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"marked_read": 5}
 
 
 # ---------------------------------------------------------------------------
@@ -5584,97 +7253,522 @@ def test_extract_subscription_period_end_returns_none_when_absent_everywhere(mon
     assert app._extract_subscription_period_end(subscription) is None
 
 
-def test_change_souscription_plan_swaps_price_and_resets_resources(monkeypatch):
-    app = _import_app_with_stubs(monkeypatch)
-    fake_stripe, update_mock = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
+def _FixedDatetime(fixed_now):
+    """A datetime subclass whose .now() always returns `fixed_now`,
+    while fromtimestamp/fromisoformat/etc. keep behaving normally (real
+    datetime methods, inherited) -- lets a test pin "now" for proration
+    math that calls datetime.now(timezone.utc) deep inside app.py."""
+    class _Fixed(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now
+    return _Fixed
+
+
+class _FakeStripeCardError(Exception):
+    """Stands in for stripe.error.CardError -- fake_stripe.error.CardError
+    is set to THIS class (never a bare MagicMock, which `except` can't
+    catch) so _charge_plan_change_proration's except clause actually
+    matches what a test's side_effect raises."""
+    def __init__(self, message, user_message=None):
+        super().__init__(message)
+        self.user_message = user_message
+
+
+class _FakeStripeSchedule(dict):
+    """Supports both schedule.id (attribute) and schedule["phases"]
+    (bracket) access, matching how _create_or_replace_plan_change_schedule
+    reads a real stripe.SubscriptionSchedule."""
+    def __init__(self, data, id_):
+        super().__init__(data)
+        self.id = id_
+
+
+_SILVER_PLAN = {"id": "silver", "name": "Silver", "price": 10.0, "credit": 500, "stockage": 10.0, "ordre": 1, "max_social_account": 1}
+_GOLD_PLAN = {"id": "gold", "name": "Gold", "price": 25.0, "credit": 1500, "stockage": 50.0, "ordre": 2, "max_social_account": 3}
+_ULTIMATE_PLAN = {"id": "ultimate", "name": "Ultimate", "price": 40.0, "credit": 3000, "stockage": 100.0, "ordre": 3, "max_social_account": 10}
+
+
+def _plan_change_subscription(**overrides):
+    base = {
+        "id": "sous-1", "userid": "u1", "abonnement": "silver", "billing_interval": "month",
+        "stripe_subscription_id": "sub_123", "stripe_customer_id": "cus_456",
+        "plan_credit": 500.0, "plan_stockage": 10.0,
+        "payment_start_date": "2026-01-01T00:00:00+00:00", "payment_end_date": "2026-02-01T00:00:00+00:00",
+        "credit_cycle_start_at": "2026-01-01T00:00:00+00:00", "credit_cycle_end_at": "2026-02-01T00:00:00+00:00",
+        "next_credit_allocation_at": None, "scheduled_abonnement_id": None, "stripe_schedule_id": None,
+        "auto_renew": True,
+    }
+    base.update(overrides)
+    return base
+
+
+def _stub_plan_change_prereqs(monkeypatch, app, subscription=None, plans=None):
+    subscription = subscription if subscription is not None else _plan_change_subscription()
+    plans = plans if plans is not None else {"silver": _SILVER_PLAN, "gold": _GOLD_PLAN, "ultimate": _ULTIMATE_PLAN}
+
+    fake_stripe = MagicMock()
+    fake_stripe.error = types.SimpleNamespace(CardError=_FakeStripeCardError)
     fake_stripe.Subscription.retrieve.return_value = _FakeStripeSubscriptionObject(
-        {"items": {"data": [{"id": "si_123"}]}},
-        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
+        {"current_period_end": 1700000000, "items": {"data": [{"id": "si_123", "price": {"id": "price_old_1"}}]}},
+        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": subscription.get("abonnement"), "billing_interval": subscription.get("billing_interval")}),
     )
     fake_stripe.Subscription.modify.return_value = _FakeStripeObjectNoGet({"current_period_end": 1700000000})
     fake_stripe.Price.create.return_value = types.SimpleNamespace(id="price_new_1")
+    fake_stripe.Invoice.create.return_value = types.SimpleNamespace(id="in_1")
+    fake_stripe.Invoice.finalize_invoice.return_value = types.SimpleNamespace(id="in_1")
+    fake_stripe.SubscriptionSchedule.create.return_value = _FakeStripeSchedule({"phases": [{"start_date": 1690000000}]}, id_="sched_1")
+    fake_stripe.SubscriptionSchedule.modify.return_value = types.SimpleNamespace(id="sched_1")
 
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "new-plan", "name": "Premium", "price": 49.99, "max_social_account": 3}))
+    monkeypatch.setattr(app, "stripe", fake_stripe)
+    monkeypatch.setattr(app, "STRIPE_SECRET_KEY", "sk_test_123")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=subscription))
+
+    async def fake_get_abonnement(plan_id):
+        return plans.get(str(plan_id))
+    monkeypatch.setattr(app, "supabase_get_abonnement", fake_get_abonnement)
+
     monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
-    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"stockage": 5.0, "stockage_max": 10.0, "credit": 120.0}))
+    monkeypatch.setattr(app, "supabase_list_active_promotional_credit_batches", AsyncMock(return_value=[]))
+    update_mock = AsyncMock(return_value={"id": subscription.get("id")})
+    monkeypatch.setattr(app, "supabase_update_souscription_row", update_mock)
     insert_mock = AsyncMock(return_value={"id": "sous-2"})
     monkeypatch.setattr(app, "supabase_insert_souscription", insert_mock)
-    allocate_mock = AsyncMock()
-    monkeypatch.setattr(app, "_allocate_plan_resources", allocate_mock)
+    credits_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_upsert_user_data_credits", credits_mock)
+    history_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", history_mock)
+    monkeypatch.setattr(app, "supabase_set_user_max_daily_publications", AsyncMock())
+    monkeypatch.setattr(app, "_send_transactional_email", MagicMock())
+    return fake_stripe, update_mock, insert_mock, credits_mock, history_mock
+
+
+# -- 1. Classification by ordre, including names/prices that don't follow it --
+
+def test_classify_plan_change_upgrade_by_ordre_even_when_price_disagrees(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    cheap_but_higher_ordre = {"id": "b", "ordre": 2, "price": 1.0, "credit": 1}
+    expensive_but_lower_ordre = {"id": "a", "ordre": 1, "price": 999.0, "credit": 9999}
+    assert app._classify_plan_change(expensive_but_lower_ordre, cheap_but_higher_ordre, "month", "month") == app.PLAN_CHANGE_UPGRADE_IMMEDIATE
+
+
+def test_classify_plan_change_downgrade_by_ordre_even_when_name_disagrees(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    named_premium_but_lower_ordre = {"id": "b", "ordre": 1, "name": "Premium Plus"}
+    named_basic_but_higher_ordre = {"id": "a", "ordre": 2, "name": "Basic"}
+    assert app._classify_plan_change(named_basic_but_higher_ordre, named_premium_but_lower_ordre, "month", "month") == app.PLAN_CHANGE_DOWNGRADE_SCHEDULED
+
+
+def test_classify_plan_change_noop_same_plan_same_interval(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    plan = {"id": "a", "ordre": 1}
+    assert app._classify_plan_change(plan, plan, "month", "month") == app.PLAN_CHANGE_NOOP
+
+
+# -- 2. Equal / absent / invalid ordre --
+
+def test_classify_plan_change_lateral_unsupported_for_equal_ordre_distinct_plans(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    assert app._classify_plan_change({"id": "a", "ordre": 1}, {"id": "b", "ordre": 1}, "month", "month") == app.PLAN_CHANGE_LATERAL_UNSUPPORTED
+
+
+def test_classify_plan_change_invalid_when_ordre_absent(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    assert app._classify_plan_change({"id": "a", "ordre": None}, {"id": "b", "ordre": 2}, "month", "month") == app.PLAN_CHANGE_INVALID
+    assert app._classify_plan_change({"id": "a", "ordre": 1}, {"id": "b", "ordre": None}, "month", "month") == app.PLAN_CHANGE_INVALID
+
+
+def test_classify_plan_change_invalid_when_ordre_not_an_integer(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    assert app._classify_plan_change({"id": "a", "ordre": "not-a-number"}, {"id": "b", "ordre": 2}, "month", "month") == app.PLAN_CHANGE_INVALID
+
+
+# -- 3. Monthly upgrade with remaining balance + proration (worked example) --
+
+def test_compute_monthly_upgrade_proration_matches_spec_worked_example(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    mid = start + (end - start) / 2
+    result = app._compute_monthly_upgrade_proration(
+        current_plan_credit=500, current_plan_price=10, new_plan={"price": 25, "credit": 1500},
+        period_start=start, period_end=end, now=mid,
+    )
+    assert result["amount_due_today"] == 7.50
+    assert result["credits_to_add"] == 500
+
+
+def test_apply_immediate_upgrade_monthly_charges_exact_proration_and_adds_delta(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    mid = start + (end - start) / 2
+    monkeypatch.setattr(app, "datetime", _FixedDatetime(mid))
+    subscription = _plan_change_subscription(
+        payment_start_date=start.isoformat(), payment_end_date=end.isoformat(),
+        credit_cycle_start_at=start.isoformat(), credit_cycle_end_at=end.isoformat(),
+    )
+    fake_stripe, update_mock, insert_mock, credits_mock, history_mock = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
 
     result = asyncio.run(app.change_souscription_plan(
-        payload=app.ChangeSubscriptionPlanRequest(plan_id="new-plan"), user_id="u1",
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="gold"), user_id="u1",
     ))
 
     assert result == {"id": "sous-2"}
-    fake_stripe.Subscription.retrieve.assert_called_once_with("sub_123")
-    _, price_create_kwargs = fake_stripe.Price.create.call_args
-    assert price_create_kwargs == {
-        "currency": app.STRIPE_CURRENCY, "unit_amount": 4999, "recurring": {"interval": "month"},
-        "product_data": {"name": "Premium", "tax_code": "txcd_10103001"},
-    }
+    # Custom proration charged as its own invoice -- never Stripe's own
+    # proration engine (proration_behavior="none" below).
+    _, item_kwargs = fake_stripe.InvoiceItem.create.call_args
+    assert item_kwargs["amount"] == 750  # 7.50 EUR in cents
+    fake_stripe.Invoice.pay.assert_called_once()
     _, modify_kwargs = fake_stripe.Subscription.modify.call_args
-    assert modify_kwargs["items"] == [{"id": "si_123", "price": "price_new_1"}]
-    assert modify_kwargs["proration_behavior"] == "create_prorations"
-    assert modify_kwargs["metadata"]["abonnement"] == "new-plan"
-    assert modify_kwargs["metadata"]["userid"] == "u1"  # preserved from the existing subscription metadata
+    assert modify_kwargs["proration_behavior"] == "none"
 
-    insert_mock.assert_awaited_once()
     insert_kwargs = insert_mock.await_args.kwargs
-    assert insert_kwargs["abonnement"] == "new-plan"
-    assert insert_kwargs["stripe_subscription_id"] == "sub_123"
-    assert insert_kwargs["stripe_customer_id"] == "cus_456"
-    assert insert_kwargs["period_end_date"] == datetime.fromtimestamp(1700000000, tz=timezone.utc)
+    assert insert_kwargs["abonnement"] == "gold"
+    assert insert_kwargs["allocation"]["plan_credit"] == 1500.0  # full new quota snapshotted, not prorated
+    assert insert_kwargs["allocation"]["credit_cycle_start_at"] == start  # carried forward, not restarted
+    assert insert_kwargs["allocation"]["credit_cycle_end_at"] == end
 
-    allocate_mock.assert_awaited_once()
-    allocate_kwargs = allocate_mock.await_args.kwargs
-    assert allocate_kwargs["abonnement"] == "new-plan"
-    assert allocate_kwargs["souscription_id"] == "sous-2"
-
-    # The old (e.g. Silver) row must be closed out immediately -- with
-    # proration, Stripe keeps the same billing-cycle end, so the new row's
-    # payment_end_date would otherwise match the old row's almost exactly,
-    # leaving both "active" per get_user_abonnement's filter and making
-    # which one it returns arbitrary (reported bug: it kept showing the
-    # old plan as active after a successful upgrade).
-    update_mock.assert_awaited_once()
-    update_args, update_kwargs = update_mock.await_args
-    assert update_args[0] == "sous-1"
-    assert "payment_end_date" in update_args[1]
-    assert update_kwargs["user_id"] == "u1"
+    # Delta applied on top of the existing balance -- never a reset (spec
+    # section 6: existing credits/expirations untouched).
+    credits_mock.assert_awaited_once()
+    credit_kwargs = credits_mock.await_args.kwargs
+    assert credit_kwargs["credit_delta"] == 500.0
+    assert credit_kwargs["storage_delta"] == 40.0  # 50 - 10 plan_stockage snapshot, applied in full
+    assert credit_kwargs["update_credit_max"] is True
+    assert credit_kwargs["update_stockage_max"] is True
 
 
-def test_change_souscription_plan_sends_notification_email(monkeypatch):
+# -- 4. Annual upgrade: distinct annual-price and monthly-credit proration --
+
+def test_compute_annual_upgrade_proration_uses_two_distinct_ratios(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    fake_stripe, _ = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
-    fake_stripe.Subscription.retrieve.return_value = _FakeStripeSubscriptionObject(
-        {"items": {"data": [{"id": "si_123"}]}},
-        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
-    )
-    fake_stripe.Subscription.modify.return_value = _FakeStripeObjectNoGet({"current_period_end": 1700000000})
-    fake_stripe.Price.create.return_value = types.SimpleNamespace(id="price_new_1")
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "new-plan", "name": "Premium", "price": 49.99, "max_social_account": 3}))
-    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
-    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
-    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-2"}))
-    monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
-    email_mock = MagicMock()
-    monkeypatch.setattr(app, "_send_transactional_email", email_mock)
+    annual_start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    annual_end = datetime(2027, 1, 1, tzinfo=timezone.utc)
+    annual_mid = annual_start + (annual_end - annual_start) / 2  # exactly 50% of the YEAR remaining
+    # A credit sub-cycle that happens to be centered on the same instant,
+    # but much shorter -- proving the two ratios are computed completely
+    # independently of each other.
+    cycle_start = annual_mid - timedelta(days=5)
+    cycle_end = annual_mid + timedelta(days=5)
 
-    asyncio.run(app.change_souscription_plan(
-        payload=app.ChangeSubscriptionPlanRequest(plan_id="new-plan"), user_id="u1",
-        request=_FakeCheckoutRequest(headers={"X-User-Email": "user@example.com"}),
+    result = app._compute_annual_upgrade_proration(
+        current_plan_credit=500, current_annual_price=120.0,
+        new_plan={"price": 25.0, "credit": 1500, "reduction_annuelle": 0},
+        annual_period_start=annual_start, annual_period_end=annual_end,
+        credit_cycle_start=cycle_start, credit_cycle_end=cycle_end, now=annual_mid,
+    )
+    # Annual diff: 300 (25*12) - 120 = 180, at exactly 50% of the year remaining.
+    assert result["remaining_ratio"] == 0.5
+    assert result["amount_due_today"] == 90.0
+    # Credit diff: 1500-500=1000, at exactly 50% of the 10-day sub-cycle.
+    assert result["credit_remaining_ratio"] == 0.5
+    assert result["credits_to_add"] == 500
+
+
+# -- 5. Several successive upgrades without double-granting --
+
+def test_successive_upgrades_compute_only_the_complement(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    # Silver(500) -> Gold(1500) already happened: the row's plan_credit
+    # snapshot now reads 1500, matching Gold's own full nominal quota --
+    # a second upgrade straight to Ultimate(3000) must only add the
+    # COMPLEMENT (3000-1500), never re-grant the full 3000.
+    result = app._compute_monthly_upgrade_proration(
+        current_plan_credit=1500, current_plan_price=25, new_plan={"price": 40, "credit": 3000},
+        period_start=start, period_end=end, now=start,  # ratio 1.0, full period remaining
+    )
+    assert result["credits_to_add"] == 1500
+    assert result["amount_due_today"] == 15.0
+
+
+# -- 6. Monthly and annual downgrades land on the right boundary --
+
+def test_change_souscription_plan_schedules_monthly_downgrade_to_next_renewal(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="gold")
+    fake_stripe, update_mock, insert_mock, credits_mock, history_mock = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+
+    result = asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver"), user_id="u1",
     ))
 
-    email_mock.assert_called_once_with(
-        "user@example.com", "subscription_plan_changed", plan_name="Premium", amount=49.99,
+    assert result["classification"] == app.PLAN_CHANGE_DOWNGRADE_SCHEDULED
+    assert result["scheduled_effective_at"] == datetime.fromtimestamp(1700000000, tz=timezone.utc).isoformat()
+    # No charge, no credit change, no immediate price swap -- only a
+    # schedule's future phase.
+    fake_stripe.InvoiceItem.create.assert_not_called()
+    fake_stripe.Subscription.modify.assert_not_called()
+    credits_mock.assert_not_awaited()
+    fake_stripe.SubscriptionSchedule.create.assert_called_once_with(from_subscription="sub_123")
+    _, schedule_kwargs = fake_stripe.SubscriptionSchedule.modify.call_args
+    assert schedule_kwargs["phases"][1]["start_date"] == 1700000000
+    assert schedule_kwargs["phases"][1]["metadata"]["abonnement"] == "silver"
+
+    update_kwargs = update_mock.await_args.args[1]
+    assert update_kwargs["scheduled_abonnement_id"] == "silver"
+    assert update_kwargs["stripe_schedule_id"] == "sched_1"
+
+
+def test_change_souscription_plan_annual_downgrade_defers_to_annual_renewal_not_credit_anniversary(monkeypatch):
+    # The annual subscription's own Stripe current_period_end (the ANNUAL
+    # boundary) must drive the schedule -- never the separate monthly
+    # credit-allocation anniversary (next_credit_allocation_at).
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(
+        abonnement="ultimate", billing_interval="year",
+        next_credit_allocation_at="2026-01-20T00:00:00+00:00",  # much sooner than the annual boundary
     )
+    fake_stripe, *_ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+    fake_stripe.Subscription.retrieve.return_value = _FakeStripeSubscriptionObject(
+        {"current_period_end": 1735689600, "items": {"data": [{"id": "si_123", "price": {"id": "price_old_1"}}]}},
+        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "ultimate", "billing_interval": "year"}),
+    )
+
+    result = asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="gold"), user_id="u1",
+    ))
+
+    assert result["classification"] == app.PLAN_CHANGE_DOWNGRADE_SCHEDULED
+    assert result["scheduled_effective_at"] == datetime.fromtimestamp(1735689600, tz=timezone.utc).isoformat()
+
+
+# -- 7. Periodicity changes, alone or combined with a plan change --
+
+def test_change_souscription_plan_defers_periodicity_change_alone(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="silver")
+    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+
+    result = asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver", billing_interval="year"), user_id="u1",
+    ))
+    assert result["classification"] == app.PLAN_CHANGE_PERIODICITY_SCHEDULED
+
+
+def test_change_souscription_plan_defers_periodicity_change_even_when_target_plan_is_higher(monkeypatch):
+    # Spec section 5: deferred regardless of whether ordre also increases.
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="silver")
+    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+
+    result = asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="ultimate", billing_interval="year"), user_id="u1",
+    ))
+    assert result["classification"] == app.PLAN_CHANGE_PERIODICITY_SCHEDULED
+
+
+# -- 8. Cancel, replace, and single execution of a scheduled change --
+
+def test_cancel_scheduled_plan_change_releases_schedule(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(scheduled_abonnement_id="silver", stripe_schedule_id="sched_1")
+    fake_stripe, update_mock, *_ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+
+    result = asyncio.run(app.cancel_scheduled_plan_change(user_id="u1"))
+
+    assert result == {"cancelled": True}
+    fake_stripe.SubscriptionSchedule.release.assert_called_once_with("sched_1")
+    update_kwargs = update_mock.await_args.args[1]
+    assert update_kwargs["scheduled_abonnement_id"] is None
+    assert update_kwargs["stripe_schedule_id"] is None
+
+
+def test_cancel_scheduled_plan_change_404_when_none_pending(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    _stub_plan_change_prereqs(monkeypatch, app)
+    coro = app.cancel_scheduled_plan_change(user_id="u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 404
+
+
+def test_change_souscription_plan_replaces_existing_scheduled_change(monkeypatch):
+    # Only one scheduled change at a time -- scheduling a new one releases
+    # whichever schedule was already pending first.
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="gold", scheduled_abonnement_id="silver", stripe_schedule_id="sched_old")
+    fake_stripe, *_ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+
+    asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver", billing_interval="year"), user_id="u1",
+    ))
+
+    fake_stripe.SubscriptionSchedule.release.assert_called_once_with("sched_old")
+    fake_stripe.SubscriptionSchedule.create.assert_called_once_with(from_subscription="sub_123")
+
+
+def test_apply_immediate_upgrade_requires_confirmation_to_cancel_scheduled_change(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="silver", scheduled_abonnement_id="gold", stripe_schedule_id="sched_1")
+    fake_stripe, *_ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+
+    coro = app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="gold"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "plan_change_scheduled_change_exists"
+    fake_stripe.InvoiceItem.create.assert_not_called()
+
+    # With explicit confirmation, it proceeds and cancels the pending schedule.
+    asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="gold", confirm_cancel_scheduled=True), user_id="u1",
+    ))
+    fake_stripe.SubscriptionSchedule.release.assert_called_once_with("sched_1")
+
+
+# -- 9. Failed payments and events received more than once --
+
+def test_apply_immediate_upgrade_payment_failure_leaves_plan_unchanged(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    mid = datetime(2026, 1, 15, tzinfo=timezone.utc)  # inside the fixture's Jan 1 - Feb 1 period
+    monkeypatch.setattr(app, "datetime", _FixedDatetime(mid))
+    subscription = _plan_change_subscription(abonnement="silver")
+    fake_stripe, update_mock, insert_mock, credits_mock, _ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+    fake_stripe.Invoice.pay.side_effect = _FakeStripeCardError("declined", user_message="Card declined")
+
+    coro = app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="gold"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 402
+    assert exc_info.value.detail["code"] == "plan_change_payment_failed"
+
+    # Nothing about the plan was touched -- the current offer stays active.
+    fake_stripe.Subscription.modify.assert_not_called()
+    insert_mock.assert_not_awaited()
+    credits_mock.assert_not_awaited()
+    update_mock.assert_not_awaited()
+
+
+def test_change_souscription_plan_refuses_inconsistent_upgrade_configuration(monkeypatch):
+    # ordre says "upgrade" but the catalog's actual price/credit for that
+    # plan is lower -- must refuse outright, never invert to a downgrade
+    # or charge/credit a negative amount.
+    app = _import_app_with_stubs(monkeypatch)
+    mid = datetime(2026, 1, 15, tzinfo=timezone.utc)  # inside the fixture's Jan 1 - Feb 1 period
+    monkeypatch.setattr(app, "datetime", _FixedDatetime(mid))
+    subscription = _plan_change_subscription(abonnement="gold", plan_credit=1500.0)
+    misconfigured_plans = {
+        "gold": _GOLD_PLAN,
+        "ultimate": {"id": "ultimate", "name": "Ultimate", "price": 5.0, "credit": 10, "stockage": 100.0, "ordre": 3, "max_social_account": 10},
+    }
+    fake_stripe, update_mock, insert_mock, credits_mock, _ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription, plans=misconfigured_plans)
+
+    coro = app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="ultimate"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "plan_change_inconsistent_configuration"
+    fake_stripe.InvoiceItem.create.assert_not_called()
+    insert_mock.assert_not_awaited()
+
+
+# -- 10. Batches and their expirations are preserved --
+
+def test_apply_immediate_upgrade_never_resets_existing_balance(monkeypatch):
+    # The existing balance/expiration must never be wiped (spec section 6)
+    # -- supabase_upsert_user_data_credits (a DELTA) is used, never
+    # supabase_set_user_data_balance / _reset_user_plan_balance (a RESET).
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="silver")
+    reset_mock = AsyncMock()
+    monkeypatch.setattr(app, "_reset_user_plan_balance", reset_mock)
+    fake_stripe, *_ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+
+    asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="gold"), user_id="u1",
+    ))
+    reset_mock.assert_not_awaited()
+
+
+# -- 11. Month-end anniversaries and the end of an annual subscription --
+# (add_one_month/add_one_year + the credit-cycle defaulting are covered in
+# tests/test_supabase_request.py; _process_due_annual_credit_refills's own
+# "never past expiration" filter is covered by
+# test_list_souscriptions_due_for_monthly_credit_allocation_filters_correctly.)
+
+
+# -- 12. Storage is no longer a quota -- a plan change never considers it --
+
+def test_change_souscription_plan_never_blocks_or_warns_on_storage(monkeypatch):
+    # Storage is no longer a sellable/enforced quota at all: a plan
+    # change (immediate or scheduled) must never block on it, and the
+    # preview must never mention it.
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="gold")
+    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 0.0}))
+
+    result = asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver"), user_id="u1",
+    ))
+    assert result["classification"] == app.PLAN_CHANGE_DOWNGRADE_SCHEDULED
+
+    preview = asyncio.run(app.preview_souscription_plan_change(user_id="u1", plan_id="silver"))
+    assert "storage_overage_warning" not in preview
+    assert "new_storage_quota" not in preview
+
+
+# -- 13. No new referral reward on a plan change (see above, static check) --
+# -- 14. Classification refusals: lateral and invalid/absent ordre --
+
+def test_change_souscription_plan_refuses_lateral_change(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="silver")
+    plans = {"silver": _SILVER_PLAN, "silver-annual-only": {**_SILVER_PLAN, "id": "silver-annual-only"}}
+    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription, plans=plans)
+
+    coro = app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver-annual-only"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "plan_change_lateral_unsupported"
+
+
+def test_change_souscription_plan_refuses_when_ordre_missing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="silver")
+    plans = {"silver": _SILVER_PLAN, "retired": {"id": "retired", "name": "Retired", "ordre": None}}
+    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription, plans=plans)
+
+    coro = app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="retired"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "plan_change_invalid_order"
+
+
+def test_change_souscription_plan_noop_when_same_plan_and_interval(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="silver")
+    fake_stripe, update_mock, insert_mock, credits_mock, _ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+
+    result = asyncio.run(app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver"), user_id="u1",
+    ))
+    assert result == {"classification": app.PLAN_CHANGE_NOOP, "changed": False}
+    fake_stripe.Subscription.modify.assert_not_called()
+    insert_mock.assert_not_awaited()
+    credits_mock.assert_not_awaited()
 
 
 def test_change_souscription_plan_404_for_unknown_plan(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value=None))
+    _stub_plan_change_prereqs(monkeypatch, app)
 
     coro = app.change_souscription_plan(
         payload=app.ChangeSubscriptionPlanRequest(plan_id="missing-plan"), user_id="u1",
@@ -5686,10 +7780,9 @@ def test_change_souscription_plan_404_for_unknown_plan(monkeypatch):
 
 def test_change_souscription_plan_blocks_when_over_social_account_limit(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "silver", "name": "Silver", "max_social_account": 1}))
+    subscription = _plan_change_subscription(abonnement="gold")
+    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
     monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={"facebook": 5, "instagram": 1}))
-    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
 
     coro = app.change_souscription_plan(
         payload=app.ChangeSubscriptionPlanRequest(plan_id="silver"), user_id="u1",
@@ -5702,59 +7795,36 @@ def test_change_souscription_plan_blocks_when_over_social_account_limit(monkeypa
     assert "instagram" not in exc_info.value.detail["details"]
 
 
-def test_change_souscription_plan_blocks_when_over_storage_limit(monkeypatch):
+def test_change_souscription_plan_sends_notification_email(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
-    _stub_subscription_lifecycle_prereqs(monkeypatch, app)
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "silver", "name": "Silver", "max_social_account": 1, "stockage": 5.0}))
-    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
-    # stockage is the remaining balance, stockage_max the plan allowance --
-    # 20 Go used (30 max - 10 left) against a 5 Go new plan must block.
-    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"stockage": 10.0, "stockage_max": 30.0}))
+    subscription = _plan_change_subscription(abonnement="silver")
+    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+    email_mock = MagicMock()
+    monkeypatch.setattr(app, "_send_transactional_email", email_mock)
 
-    coro = app.change_souscription_plan(
-        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver"), user_id="u1",
-    )
-    with pytest.raises(app.HTTPException) as exc_info:
-        asyncio.run(coro)
-    assert exc_info.value.status_code == 409
-    assert "stockage" in exc_info.value.detail.lower() or "Go" in exc_info.value.detail
-
-
-def test_change_souscription_plan_allows_when_within_limits(monkeypatch):
-    app = _import_app_with_stubs(monkeypatch)
-    fake_stripe, _ = _stub_subscription_lifecycle_prereqs(monkeypatch, app)
-    fake_stripe.Subscription.retrieve.return_value = _FakeStripeSubscriptionObject(
-        {"items": {"data": [{"id": "si_123"}]}},
-        metadata=_FakeStripeMetadata({"userid": "u1", "abonnement": "old-plan"}),
-    )
-    fake_stripe.Subscription.modify.return_value = _FakeStripeObjectNoGet({"current_period_end": 1700000000})
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "gold", "name": "Gold", "price": 49.99, "max_social_account": 3, "stockage": 100.0}))
-    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={"facebook": 2}))
-    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"stockage": 50.0, "stockage_max": 100.0}))
-    monkeypatch.setattr(app, "supabase_insert_souscription", AsyncMock(return_value={"id": "sous-2"}))
-    monkeypatch.setattr(app, "_allocate_plan_resources", AsyncMock())
-
-    result = asyncio.run(app.change_souscription_plan(
+    asyncio.run(app.change_souscription_plan(
         payload=app.ChangeSubscriptionPlanRequest(plan_id="gold"), user_id="u1",
+        request=_FakeCheckoutRequest(headers={"X-User-Email": "user@example.com"}),
     ))
-    assert result == {"id": "sous-2"}
+
+    email_mock.assert_called_once()
+    args, kwargs = email_mock.call_args
+    assert args[0] == "user@example.com"
+    assert args[1] == "subscription_plan_changed"
+    assert kwargs["plan_name"] == "Gold"
 
 
 def test_change_souscription_plan_starts_fresh_checkout_for_non_recurring_subscription(monkeypatch):
     # A subscription with no stripe_subscription_id (see
     # _get_active_stripe_souscription's docstring) has no Stripe
-    # Subscription to modify in place -- changing plan must instead start
-    # a brand new recurring Checkout for the chosen plan, and must never
-    # touch stripe.Subscription.retrieve/modify.
+    # Subscription to modify in place -- an immediate upgrade must instead
+    # start a brand new recurring Checkout, and must never touch
+    # stripe.Subscription.retrieve/modify.
     app = _import_app_with_stubs(monkeypatch)
-    fake_stripe, update_mock = _stub_subscription_lifecycle_prereqs(
-        monkeypatch, app, subscription={"id": "sous-legacy", "stripe_subscription_id": None},
-    )
+    subscription = _plan_change_subscription(abonnement="silver", stripe_subscription_id=None)
+    fake_stripe, update_mock, *_ = _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
     fake_session = MagicMock(url="https://checkout.stripe.com/pay/cs_test_plan", id="cs_test_plan")
     fake_stripe.checkout.Session.create.return_value = fake_session
-    monkeypatch.setattr(app, "supabase_get_abonnement", AsyncMock(return_value={"id": "gold", "name": "Gold", "price": 49.99, "max_social_account": 3}))
-    monkeypatch.setattr(app, "_count_social_accounts_by_platform", AsyncMock(return_value={}))
-    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value=None))
     monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value=None))
 
     result = asyncio.run(app.change_souscription_plan(
@@ -5770,7 +7840,24 @@ def test_change_souscription_plan_starts_fresh_checkout_for_non_recurring_subscr
     _, kwargs = fake_stripe.checkout.Session.create.call_args
     assert kwargs["mode"] == "subscription"
     assert kwargs["metadata"]["abonnement"] == "gold"
-    assert kwargs["metadata"]["previous_souscription_id"] == "sous-legacy"
+    assert kwargs["metadata"]["previous_souscription_id"] == "sous-1"
+
+
+def test_change_souscription_plan_legacy_subscription_refuses_scheduled_change(monkeypatch):
+    # A legacy pre-recurring-billing subscription has no Stripe
+    # Subscription to attach a schedule to -- a downgrade/periodicity
+    # change can't be deferred automatically for it.
+    app = _import_app_with_stubs(monkeypatch)
+    subscription = _plan_change_subscription(abonnement="gold", stripe_subscription_id=None)
+    _stub_plan_change_prereqs(monkeypatch, app, subscription=subscription)
+
+    coro = app.change_souscription_plan(
+        payload=app.ChangeSubscriptionPlanRequest(plan_id="silver"), user_id="u1",
+    )
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "plan_change_requires_recurring_subscription"
 
 
 # ---------------------------------------------------------------------------
@@ -5925,10 +8012,57 @@ def test_upsert_social_account_rejects_new_account_over_plan_limit(monkeypatch):
     assert table.inserted == []
 
 
-def test_assert_user_has_active_subscription_for_publish_blocks_without_subscription(monkeypatch):
+def test_assert_user_has_active_subscription_for_publish_blocks_without_subscription_or_credit(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 0}))
+    monkeypatch.setattr(app, "supabase_list_active_promotional_credit_batches", AsyncMock(return_value=[]))
+
+    coro = app._assert_user_has_active_subscription_for_publish("u1")
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+
+    assert exc_info.value.status_code == 402
+
+
+def test_assert_user_has_active_subscription_for_publish_allows_with_bonus_credit_and_no_subscription(monkeypatch):
+    # A referred user with only a promotional bonus (or anyone whose
+    # subscription lapsed but still has unused promotional/purchased
+    # credit) keeps publish access until that bonus credit runs out --
+    # the subscription requirement is bypassed, not the other way around.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 0}))
+    monkeypatch.setattr(app, "supabase_list_active_promotional_credit_batches", AsyncMock(
+        return_value=[{"amount_remaining": 25.0, "tier": 1}],
+    ))
+
+    asyncio.run(app._assert_user_has_active_subscription_for_publish("u1"))
+
+
+def test_assert_user_has_active_subscription_for_publish_allows_with_standard_credit_and_no_subscription(monkeypatch):
+    # "peu importe la nature des credits" -- plain subscription credit
+    # left over after the subscription itself lapsed counts just as much
+    # as a promotional/purchased batch.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 10}))
+    monkeypatch.setattr(app, "supabase_list_active_promotional_credit_batches", AsyncMock(return_value=[]))
+
+    asyncio.run(app._assert_user_has_active_subscription_for_publish("u1"))
+
+
+def test_assert_user_has_active_subscription_for_publish_blocks_when_bonus_credit_exhausted(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 0}))
+    monkeypatch.setattr(app, "supabase_list_active_promotional_credit_batches", AsyncMock(
+        return_value=[{"amount_remaining": 0.0, "tier": 2}],
+    ))
 
     coro = app._assert_user_has_active_subscription_for_publish("u1")
     with pytest.raises(app.HTTPException) as exc_info:
@@ -5946,6 +8080,62 @@ def test_assert_user_has_active_subscription_for_publish_allows_with_zero_credit
     monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 0}))
 
     asyncio.run(app._assert_user_has_active_subscription_for_publish("u1"))
+
+
+def test_assert_user_can_publish_allows_under_quota(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_consume_publish_quota", AsyncMock(
+        return_value={"allowed": True, "max_daily": 5, "used_today": 3},
+    ))
+
+    asyncio.run(app._assert_user_can_publish("u1", 1))
+
+
+def test_assert_user_can_publish_blocks_with_quota_details(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_consume_publish_quota", AsyncMock(
+        return_value={"allowed": False, "max_daily": 5, "used_today": 5, "resets_at": "2026-01-02T00:00:00+00:00"},
+    ))
+
+    coro = app._assert_user_can_publish("u1", 1)
+    with pytest.raises(app.HTTPException) as exc_info:
+        asyncio.run(coro)
+
+    assert exc_info.value.status_code == 429
+    detail = exc_info.value.detail
+    assert detail["code"] == "publish_quota_exceeded"
+    assert detail["max_daily"] == 5
+    assert detail["used_today"] == 5
+    assert detail["resets_at"] == "2026-01-02T00:00:00+00:00"
+
+
+def test_post_to_socials_consumes_quota_for_every_account(monkeypatch):
+    # The quota is consumed once per account/platform target in the
+    # request, not once per API call.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    quota_mock = AsyncMock()
+    monkeypatch.setattr(app, "_assert_user_can_publish", quota_mock)
+    monkeypatch.setattr(app, "_resolve_accounts_for_publish", AsyncMock(return_value=[
+        {"id": "acct-1", "platform": "facebook"}, {"id": "acct-2", "platform": "instagram"},
+    ]))
+    monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
+    monkeypatch.setattr(app, "_resolve_clip_for_social_post", AsyncMock(return_value={"video_url": "https://x/video.mp4"}))
+    monkeypatch.setattr(app, "_resolve_local_video_path", lambda *a, **k: "/tmp/video.mp4")
+    monkeypatch.setattr(app, "_resolve_public_video_url", lambda *a, **k: "https://x/video.mp4")
+    monkeypatch.setattr(app, "_publish_reel_social_post_now", AsyncMock(return_value={"success": True}))
+
+    with TestClient(app.app) as client:
+        resp = client.post(
+            "/api/social/post",
+            json={"job_id": "job-1", "clip_index": 0, "account_ids": ["acct-1", "acct-2"]},
+            headers=_auth_headers("u1"),
+        )
+
+    assert resp.status_code == 200
+    quota_mock.assert_awaited_once_with("u1", 2)
 
 
 def test_get_user_max_social_accounts_defaults_to_one_without_active_plan(monkeypatch):
@@ -6235,6 +8425,424 @@ def test_upload_social_post_media_rejects_oversized_image(monkeypatch, tmp_path)
     assert "too large" in str(exc.value.detail).lower()
 
 
+# ---------------------------------------------------------------------------
+# Reel visuals (manual image split-screen overlays)
+# ---------------------------------------------------------------------------
+
+def test_validate_reel_visual_timing_rejects_negative_start(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    with pytest.raises(app.HTTPException) as exc:
+        app._validate_reel_visual_timing(-1.0, 5.0, 60.0, [])
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "invalid_visual_timing"
+
+
+def test_validate_reel_visual_timing_rejects_zero_or_negative_duration(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    with pytest.raises(app.HTTPException) as exc:
+        app._validate_reel_visual_timing(0.0, 0.0, 60.0, [])
+    assert exc.value.detail["code"] == "invalid_visual_timing"
+
+
+def test_validate_reel_visual_timing_rejects_exceeding_reel_duration(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    with pytest.raises(app.HTTPException) as exc:
+        app._validate_reel_visual_timing(55.0, 10.0, 60.0, [])
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "visual_exceeds_reel_duration"
+
+
+def test_validate_reel_visual_timing_allows_exactly_at_reel_duration(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    # 55 + 5 == 60, exactly at the boundary -- must be allowed.
+    end_time = app._validate_reel_visual_timing(55.0, 5.0, 60.0, [])
+    assert end_time == 60.0
+
+
+def test_validate_reel_visual_timing_rejects_overlap(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    existing = [{"id": "v1", "start_time": 10.0, "duration": 5.0}]  # [10,15)
+    with pytest.raises(app.HTTPException) as exc:
+        app._validate_reel_visual_timing(12.0, 5.0, 60.0, existing)  # [12,17) overlaps
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "visual_overlap"
+
+
+def test_validate_reel_visual_timing_allows_adjacent_non_overlapping(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    existing = [{"id": "v1", "start_time": 10.0, "duration": 5.0}]  # [10,15)
+    # [15,20) starts exactly where the other ends -- not an overlap.
+    end_time = app._validate_reel_visual_timing(15.0, 5.0, 60.0, existing)
+    assert end_time == 20.0
+
+
+def test_validate_reel_visual_timing_excludes_self_when_editing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    existing = [{"id": "v1", "start_time": 10.0, "duration": 5.0}]
+    # Editing v1's own timing must not collide with itself.
+    end_time = app._validate_reel_visual_timing(10.0, 5.0, 60.0, existing, exclude_visual_id="v1")
+    assert end_time == 15.0
+
+
+def test_create_reel_visual_happy_path(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("AWS_S3_BUCKET", "bucket")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1", "reel_duration": 60}))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[]))
+    upload_calls = []
+    monkeypatch.setattr(app, "upload_file_to_s3", lambda path, bucket, key: upload_calls.append((path, bucket, key)) or True)
+    insert_mock = AsyncMock(return_value={"id": "v1", "position": "TOP", "start_time": 5.0, "duration": 3.0, "image_s3_key": "reels/u1/job1/visual_0_v1.jpg"})
+    monkeypatch.setattr(app, "supabase_insert_reel_visual", insert_mock)
+    monkeypatch.setattr(app, "generate_presigned_url", lambda bucket, key, expiration=3600: f"https://s3.example/{key}")
+
+    result = asyncio.run(app.create_reel_visual(
+        "job1", 0, user_id="u1", file=_FakeCommentImageUpload(b"fake-image-bytes"),
+        position="top", start_time=5.0, duration=3.0,
+    ))
+
+    assert result["id"] == "v1"
+    assert result["image_url"] == "https://s3.example/reels/u1/job1/visual_0_v1.jpg"
+    assert result["end_time"] == 8.0
+    insert_mock.assert_awaited_once()
+    insert_args = insert_mock.await_args.args
+    assert insert_args[:5] == ("reel-1", "u1", "TOP", 5.0, 3.0)
+    assert insert_args[5].startswith("reels/u1/job1/visual_0_")
+    assert len(upload_calls) == 1
+    assert upload_calls[0][2].startswith("reels/u1/job1/visual_0_")
+
+
+def test_create_reel_visual_rejects_invalid_position(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1", "reel_duration": 60}))
+
+    coro = app.create_reel_visual(
+        "job1", 0, user_id="u1", file=_FakeCommentImageUpload(b"x"),
+        position="left", start_time=0.0, duration=1.0,
+    )
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "invalid_visual_position"
+
+
+def test_create_reel_visual_rejects_non_image_content_type(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1", "reel_duration": 60}))
+
+    coro = app.create_reel_visual(
+        "job1", 0, user_id="u1", file=_FakeCommentImageUpload(b"x", content_type="text/plain"),
+        position="top", start_time=0.0, duration=1.0,
+    )
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.detail["code"] == "invalid_image_format"
+
+
+def test_create_reel_visual_rejects_overlap_with_existing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1", "reel_duration": 60}))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[
+        {"id": "v1", "start_time": 10.0, "duration": 5.0},
+    ]))
+
+    coro = app.create_reel_visual(
+        "job1", 0, user_id="u1", file=_FakeCommentImageUpload(b"x"),
+        position="top", start_time=12.0, duration=5.0,
+    )
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "visual_overlap"
+
+
+def test_create_reel_visual_requires_bucket_configured(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.delenv("AWS_S3_BUCKET", raising=False)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1", "reel_duration": 60}))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[]))
+
+    coro = app.create_reel_visual(
+        "job1", 0, user_id="u1", file=_FakeCommentImageUpload(b"x"),
+        position="top", start_time=0.0, duration=1.0,
+    )
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 503
+
+
+def test_create_reel_visual_404_when_reel_not_found(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value=None))
+
+    coro = app.create_reel_visual(
+        "job1", 0, user_id="u1", file=_FakeCommentImageUpload(b"x"),
+        position="top", start_time=0.0, duration=1.0,
+    )
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 404
+
+
+def test_list_reel_visuals_endpoint_returns_normalized_items(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setenv("AWS_S3_BUCKET", "bucket")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1"}))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[
+        {"id": "v1", "start_time": 2.0, "duration": 3.0, "image_s3_key": "k1"},
+    ]))
+    monkeypatch.setattr(app, "generate_presigned_url", lambda bucket, key, expiration=3600: f"https://s3.example/{key}")
+
+    result = asyncio.run(app.list_reel_visuals_endpoint("job1", 0, user_id="u1"))
+
+    assert result["items"][0]["end_time"] == 5.0
+    assert result["items"][0]["image_url"] == "https://s3.example/k1"
+
+
+def test_update_reel_visual_endpoint_updates_timing(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1", "reel_duration": 60}))
+    monkeypatch.setattr(app, "supabase_get_reel_visual", AsyncMock(return_value={
+        "id": "v1", "reel_id": "reel-1", "position": "TOP", "start_time": 5.0, "duration": 3.0,
+    }))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[
+        {"id": "v1", "start_time": 5.0, "duration": 3.0},
+    ]))
+    update_mock = AsyncMock(return_value={"id": "v1", "position": "TOP", "start_time": 20.0, "duration": 3.0, "image_s3_key": "k1"})
+    monkeypatch.setattr(app, "supabase_update_reel_visual", update_mock)
+
+    result = asyncio.run(app.update_reel_visual_endpoint(
+        "job1", 0, "v1", app.UpdateReelVisualRequest(start_time=20.0), user_id="u1",
+    ))
+
+    assert result["start_time"] == 20.0
+    update_mock.assert_awaited_once()
+    args, kwargs = update_mock.await_args
+    assert args[0] == "v1"
+    assert args[2] == {"start_time": 20.0, "duration": 3.0}
+
+
+def test_update_reel_visual_endpoint_404_for_other_users_visual(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1", "reel_duration": 60}))
+    monkeypatch.setattr(app, "supabase_get_reel_visual", AsyncMock(return_value=None))
+
+    coro = app.update_reel_visual_endpoint("job1", 0, "v1", app.UpdateReelVisualRequest(start_time=1.0), user_id="u1")
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 404
+
+
+def test_update_reel_visual_endpoint_rejects_overlap(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1", "reel_duration": 60}))
+    monkeypatch.setattr(app, "supabase_get_reel_visual", AsyncMock(return_value={
+        "id": "v1", "reel_id": "reel-1", "position": "TOP", "start_time": 0.0, "duration": 3.0,
+    }))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[
+        {"id": "v1", "start_time": 0.0, "duration": 3.0},
+        {"id": "v2", "start_time": 10.0, "duration": 5.0},
+    ]))
+
+    coro = app.update_reel_visual_endpoint("job1", 0, "v1", app.UpdateReelVisualRequest(start_time=12.0), user_id="u1")
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 409
+
+
+def test_delete_reel_visual_endpoint_cleans_up_s3(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setenv("AWS_S3_BUCKET", "bucket")
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1"}))
+    monkeypatch.setattr(app, "supabase_get_reel_visual", AsyncMock(return_value={"id": "v1", "reel_id": "reel-1"}))
+    monkeypatch.setattr(app, "supabase_delete_reel_visual", AsyncMock(return_value={"id": "v1", "image_s3_key": "k1"}))
+    delete_calls = []
+    monkeypatch.setattr(app, "delete_s3_object", lambda bucket, key: delete_calls.append((bucket, key)) or True)
+
+    result = asyncio.run(app.delete_reel_visual_endpoint("job1", 0, "v1", user_id="u1"))
+
+    assert result == {"deleted": True}
+    assert delete_calls == [("bucket", "k1")]
+
+
+def test_delete_reel_visual_endpoint_404_when_not_found(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1"}))
+    monkeypatch.setattr(app, "supabase_get_reel_visual", AsyncMock(return_value=None))
+
+    coro = app.delete_reel_visual_endpoint("job1", 0, "v1", user_id="u1")
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 404
+
+
+def test_apply_reel_visuals_rejects_when_none_configured(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "_require_job_ownership", AsyncMock())
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1"}))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[]))
+
+    coro = app.apply_reel_visuals("job1", 0, app.ApplyReelVisualsRequest(), user_id="u1")
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(coro)
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "no_visuals_configured"
+
+
+def test_apply_reel_visuals_happy_path(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path / "output"))
+    monkeypatch.setenv("AWS_S3_BUCKET", "bucket")
+    monkeypatch.setattr(app, "_require_job_ownership", AsyncMock())
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1"}))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[
+        {"id": "v1", "position": "TOP", "start_time": 1.0, "duration": 2.0, "image_s3_key": "k1.jpg"},
+    ]))
+    monkeypatch.setattr(app, "jobs", {"job1": {"user_id": "u1"}})
+
+    output_dir = os.path.join(str(tmp_path / "output"), "job1")
+    os.makedirs(output_dir, exist_ok=True)
+    video_path = os.path.join(output_dir, "clip_1.mp4")
+    with open(video_path, "wb") as f:
+        f.write(b"fake video bytes")
+
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    clip_data = {"video_url": "clip_1.mp4", "start": 0, "end": 10}
+    data = {"shorts": [clip_data]}
+    monkeypatch.setattr(app, "_get_or_build_job_metadata", AsyncMock(return_value=(metadata_path, data)))
+    monkeypatch.setattr(app, "_probe_local_video_duration_seconds", lambda path: 10.0)
+    monkeypatch.setattr(app, "_estimate_reel_required_credits", lambda **kwargs: 5.0)
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+
+    def fake_download(bucket, key, local_path):
+        with open(local_path, "wb") as f:
+            f.write(b"fake image bytes")
+        return True
+    monkeypatch.setattr(app, "download_s3_object", fake_download)
+
+    apply_calls = []
+    def fake_apply(video_path, visuals, output_path):
+        apply_calls.append((video_path, visuals, output_path))
+        with open(output_path, "wb") as f:
+            f.write(b"fake output bytes")
+        return True
+    monkeypatch.setattr(app, "apply_visuals_to_video", fake_apply)
+
+    persist_calls = []
+    monkeypatch.setattr(app, "_persist_new_video_url_to_clip", lambda *a, **k: persist_calls.append(a))
+    monkeypatch.setattr(app, "supabase_deduct_user_credits", AsyncMock())
+    monkeypatch.setattr(app, "supabase_insert_user_data_history", AsyncMock())
+
+    result = asyncio.run(app.apply_reel_visuals("job1", 0, app.ApplyReelVisualsRequest(), user_id="u1"))
+
+    assert result["success"] is True
+    assert result["new_video_url"] == "/videos/job1/visuals_clip_1.mp4"
+    assert len(apply_calls) == 1
+    assert apply_calls[0][1][0]["position"] == "TOP"
+    assert len(persist_calls) == 1
+    # Downloaded visual image temp file is cleaned up afterwards.
+    assert not any(p.startswith("visual_src_") for p in os.listdir(output_dir) if os.path.isfile(os.path.join(output_dir, p)))
+
+
+def test_reel_visual_windows_for_job_clip_returns_shaped_windows(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value={"id": "reel-1"}))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[
+        {"position": "BOTTOM", "start_time": 2.0, "duration": 3.0},
+    ]))
+
+    result = asyncio.run(app._reel_visual_windows_for_job_clip("job1", 0, "u1"))
+
+    assert result == [{"position": "BOTTOM", "start": 2.0, "end": 5.0}]
+
+
+def test_reel_visual_windows_for_job_clip_empty_when_supabase_not_configured(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: False)
+    assert asyncio.run(app._reel_visual_windows_for_job_clip("job1", 0, "u1")) == []
+
+
+def test_reel_visual_windows_for_job_clip_empty_when_reel_not_found(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(return_value=None))
+    assert asyncio.run(app._reel_visual_windows_for_job_clip("job1", 0, "u1")) == []
+
+
+def test_reel_visual_windows_for_job_clip_swallows_lookup_errors(monkeypatch):
+    # A lookup failure must never block subtitle burning.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_reel_by_job_clip", AsyncMock(side_effect=RuntimeError("db down")))
+    assert asyncio.run(app._reel_visual_windows_for_job_clip("job1", 0, "u1")) == []
+
+
+def test_add_subtitles_passes_visual_windows_to_burn(monkeypatch, tmp_path):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_require_job_ownership", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_has_required_credits", AsyncMock())
+    monkeypatch.setattr(app, "jobs", {})
+    output_dir = str(tmp_path / "job1")
+    os.makedirs(output_dir, exist_ok=True)
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+
+    clip_data = {"video_url": "clip_1.mp4", "start": 0, "end": 10}
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    data = {"shorts": [clip_data], "transcript": {"segments": []}}
+    monkeypatch.setattr(app, "_get_or_build_job_metadata", AsyncMock(return_value=(metadata_path, data)))
+    monkeypatch.setattr(app, "_resolve_subtitle_source_video_history", AsyncMock(return_value=""))
+    monkeypatch.setattr(app, "_resolve_burn_source_input_path", AsyncMock(return_value=("in.mp4", "clip_1.mp4")))
+    monkeypatch.setattr(app, "_generate_subtitle_srt", AsyncMock(return_value=True))
+    monkeypatch.setattr(app, "_reel_visual_windows_for_job_clip", AsyncMock(return_value=[{"position": "BOTTOM", "start": 2.0, "end": 5.0}]))
+    burn_mock = MagicMock()
+    monkeypatch.setattr(app, "_burn_subtitles_for_request", burn_mock)
+    monkeypatch.setattr(app, "_upload_subtitled_video", lambda *a, **k: ("http://x/out.mp4", "k1"))
+    monkeypatch.setattr(app, "_sync_reel_after_subtitle_edit", AsyncMock())
+
+    req = app.SubtitleRequest(job_id="job1", clip_index=0)
+    asyncio.run(app.add_subtitles(req, user_id="u1"))
+
+    burn_mock.assert_called_once()
+    assert burn_mock.call_args.args[4] == [{"position": "BOTTOM", "start": 2.0, "end": 5.0}]
+
+
+def test_delete_project_reels_s3_files_also_cleans_up_visual_images(monkeypatch):
+    # reel_visuals rows cascade-delete at the DB level once the reel row
+    # is deleted, but their S3 images would be orphaned without this.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "supabase_get_reels_by_project", AsyncMock(return_value=[
+        {"id": "reel-1", "reel_s3_key": "reels/u1/job1/clip.mp4", "reel_thumbnail_url": "reels/u1/job1/thumbnail_0.jpg"},
+    ]))
+    monkeypatch.setattr(app, "supabase_list_reel_visuals", AsyncMock(return_value=[
+        {"id": "v1", "image_s3_key": "reels/u1/job1/visual_0_v1.jpg"},
+        {"id": "v2", "image_s3_key": "reels/u1/job1/visual_0_v2.jpg"},
+    ]))
+    deleted_keys = []
+    monkeypatch.setattr(app, "get_s3_object_size", lambda bucket, key: 100)
+    monkeypatch.setattr(app, "delete_s3_object", lambda bucket, key: deleted_keys.append(key) or True)
+
+    freed = asyncio.run(app._delete_project_reels_s3_files("proj-1", "bucket"))
+
+    assert freed == 400  # 4 files * 100 bytes each
+    assert "reels/u1/job1/visual_0_v1.jpg" in deleted_keys
+    assert "reels/u1/job1/visual_0_v2.jpg" in deleted_keys
+
+
 def test_post_facebook_comment_requires_object_id(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
 
@@ -6330,6 +8938,7 @@ def _social_post_account(platform="facebook"):
 def test_create_social_post_rejects_empty_text(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
 
     with TestClient(app.app) as client:
@@ -6344,6 +8953,7 @@ def test_create_social_post_rejects_empty_text(monkeypatch):
 def test_create_social_post_rejects_unsupported_platform_account(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={"id": "acct-1", "platform": "tiktok"}))
 
@@ -6359,6 +8969,7 @@ def test_create_social_post_rejects_unsupported_platform_account(monkeypatch):
 def test_create_social_post_publishes_now_and_posts_comments(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
@@ -6409,6 +9020,7 @@ def test_create_social_post_publishes_attached_photo(monkeypatch):
     # background can't be combined with media.
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
@@ -6456,6 +9068,7 @@ def test_create_social_post_allows_empty_text_with_attached_media(monkeypatch):
     # once media is attached.
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
@@ -6484,6 +9097,7 @@ def test_create_social_post_allows_empty_text_with_attached_media(monkeypatch):
 def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
@@ -6520,6 +9134,7 @@ def test_create_social_post_continues_after_one_comment_fails(monkeypatch):
 def test_create_social_post_schedules_job_without_publishing(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "_assert_user_has_active_subscription_for_publish", AsyncMock())
+    monkeypatch.setattr(app, "_assert_user_can_publish", AsyncMock())
     monkeypatch.setattr(app, "_get_user_max_comments_per_post", AsyncMock(return_value=99))
     monkeypatch.setattr(app, "_resolve_user_job_priority", AsyncMock(return_value=1))
     accounts_by_id = {
@@ -6848,6 +9463,7 @@ def test_get_user_credits_reports_has_analytics_access(monkeypatch):
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value={"priorite": 3, "abonnement": "ultimate-plan"}))
     monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 100, "stockage": 1}))
+    monkeypatch.setattr(app, "supabase_list_active_promotional_credit_batches", AsyncMock(return_value=[]))
 
     with TestClient(app.app) as client:
         resp = client.get("/api/user/credits", headers=_auth_headers("u1"))
@@ -6862,6 +9478,29 @@ def test_get_user_credits_reports_has_analytics_access(monkeypatch):
 
     assert resp.status_code == 200
     assert resp.json()["has_analytics_access"] is False
+
+
+def test_get_user_credits_splits_promotional_and_purchased_batches(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_latest_user_paid_subscription", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_get_user_data", AsyncMock(return_value={"credit": 10, "stockage": 1}))
+    monkeypatch.setattr(app, "supabase_list_active_promotional_credit_batches", AsyncMock(return_value=[
+        {"amount_remaining": 50.0, "expires_at": "2026-12-01T00:00:00+00:00", "tier": 1},
+        {"amount_remaining": 200.0, "expires_at": "2027-01-01T00:00:00+00:00", "tier": 2},
+    ]))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/user/credits", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["promotional_credit"] == 50.0
+    assert body["purchased_credit"] == 200.0
+    assert len(body["promotional_credit_expirations"]) == 1
+    assert len(body["purchased_credit_expirations"]) == 1
+    assert body["has_credits"] is True  # 10 (subscription) + 50 (promo) + 200 (purchased)
 
 
 # ---------------------------------------------------------------------------

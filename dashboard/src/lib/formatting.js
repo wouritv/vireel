@@ -65,6 +65,19 @@ export function formatDate(date) {
 }
 
 /**
+ * Number of whole days from now until an ISO date string, rounded up and
+ * clamped to 0 (never negative). Returns null for a missing/unparseable date.
+ * @param {string} isoDate
+ * @returns {number|null}
+ */
+export function daysUntilDate(isoDate) {
+    const target = Date.parse(isoDate);
+    if (!Number.isFinite(target)) return null;
+    const MS_PER_DAY = 24 * 60 * 60 * 1000;
+    return Math.max(0, Math.ceil((target - Date.now()) / MS_PER_DAY));
+}
+
+/**
  * Detect the browser timezone, falling back to "UTC" if not in the TIMEZONES list.
  * @returns {string} IANA timezone identifier
  */

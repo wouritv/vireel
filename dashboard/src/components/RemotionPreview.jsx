@@ -13,6 +13,7 @@ import { toBrowserSafeMediaUrl } from '../lib/clips';
  * @param {object|null} props.subtitles - SubtitleConfig or null
  * @param {object|null} props.hook - HookConfig or null
  * @param {object|null} props.effects - EffectsConfig or null
+ * @param {Array|null} [props.visuals] - VisualConfig[] or null (manual split-screen image overlays)
  * @param {string} [props.className] - Additional CSS classes
  */
 const RemotionPreview = forwardRef(function RemotionPreview({
@@ -21,6 +22,7 @@ const RemotionPreview = forwardRef(function RemotionPreview({
     subtitles = null,
     hook = null,
     effects = null,
+    visuals = null,
     className = '',
 }, ref) {
     const fps = 30;
@@ -38,8 +40,9 @@ const RemotionPreview = forwardRef(function RemotionPreview({
             subtitles,
             hook,
             effects,
+            visuals,
         }),
-        [browserSafeVideoUrl, durationInFrames, subtitles, hook, effects]
+        [browserSafeVideoUrl, durationInFrames, subtitles, hook, effects, visuals]
     );
 
     useImperativeHandle(ref, () => ({
@@ -53,7 +56,8 @@ const RemotionPreview = forwardRef(function RemotionPreview({
         durationInFrames,
         style: subtitles?.style || null,
         words: Array.isArray(subtitles?.captions) ? subtitles.captions.length : 0,
-    }), [durationInFrames, subtitles]);
+        visuals: Array.isArray(visuals) ? visuals.map((v) => `${v.id}:${v.startSec}:${v.durationSec}:${v.position}`) : null,
+    }), [durationInFrames, subtitles, visuals]);
 
     return (
         <div className={`w-full h-full ${className}`}>

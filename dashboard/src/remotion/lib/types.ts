@@ -99,6 +99,19 @@ export interface EffectsConfig {
   segments: EffectSegment[];
 }
 
+// --- Visuals config (manual split-screen image overlay) ---
+// Entirely manual -- the user picks the image, position, start time and
+// duration via VisualsModal; nothing here is inferred/auto-selected.
+export type VisualPosition = "TOP" | "BOTTOM";
+
+export interface VisualConfig {
+  id: string;
+  position: VisualPosition;
+  startSec: number;
+  durationSec: number;
+  imageUrl: string;
+}
+
 // --- Main composition props ---
 export interface ShortVideoProps {
   videoUrl: string;
@@ -109,6 +122,7 @@ export interface ShortVideoProps {
   subtitles: SubtitleConfig | null;
   hook: HookConfig | null;
   effects: EffectsConfig | null;
+  visuals?: VisualConfig[] | null;
 }
 
 // --- Zod schemas for validation (used by render service) ---
@@ -211,6 +225,14 @@ export const effectsConfigSchema = z.object({
   segments: z.array(effectSegmentSchema),
 });
 
+export const visualConfigSchema = z.object({
+  id: z.string(),
+  position: z.enum(["TOP", "BOTTOM"]),
+  startSec: z.number().min(0),
+  durationSec: z.number().positive(),
+  imageUrl: z.string(),
+});
+
 export const shortVideoPropsSchema = z.object({
   videoUrl: z.string(),
   durationInFrames: z.number().int().positive(),
@@ -220,4 +242,5 @@ export const shortVideoPropsSchema = z.object({
   subtitles: subtitleConfigSchema.nullable(),
   hook: hookConfigSchema.nullable(),
   effects: effectsConfigSchema.nullable(),
+  visuals: z.array(visualConfigSchema).nullable().optional(),
 });

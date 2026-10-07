@@ -702,7 +702,8 @@ def test_build_analysis_prompt_tolerates_unescaped_literal_braces(monkeypatch):
     result = main._build_analysis_prompt(transcript, video_duration=100)
 
     assert "Duration: 100" in result
-    assert "Transcript: " in result and "Test transcript" in result
+    assert "Transcript: " in result
+    assert "Test transcript" in result
     assert 'Bounds: {}-{}'.format(main.MIN_CLIP_DURATION_SECONDS, main.MAX_CLIP_DURATIONS_SECOND) in result
     assert '{\n  "w": "hello",\n  "s": 0,\n  "e": 1\n}' in result
 

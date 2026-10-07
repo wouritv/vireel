@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, CheckCircle2, Loader2, RefreshCw, Save } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Languages, Loader2, RefreshCw, RotateCcw, Save } from "lucide-react";
 import { getApiUrl } from "../config";
 import { getAuthHeaders } from "../lib/apiAuth";
 import { useTranslation } from "../state/LanguageContext";
-import { formatMsClock } from "../lib/filmSummary";
+import { formatMsClock, NARRATION_LANGUAGE_OPTIONS, translateFilmSummaryNarration } from "../lib/filmSummary";
 import FilmSummarySegmentCard from "./FilmSummarySegmentCard";
+import FilmSummaryAudioSubtitleSettings from "./FilmSummaryAudioSubtitleSettings";
+import FilmSummaryClipSwapPicker from "./FilmSummaryClipSwapPicker";
 
 // The "awaiting_review" editor: source video for reference, the edit plan's
 // segment timeline (editable narration for voice_over segments), the
@@ -12,11 +14,29 @@ import FilmSummarySegmentCard from "./FilmSummarySegmentCard";
 // component (like AnonymousStoryPublishModal was split out of
 // AnonymousStoryProjectDetailPage) since FilmSummaryProjectDetailPage
 // already carries the whole status state machine on top of this.
-export default function FilmSummaryReviewPanel({ filmSummary, projectId, user, allowedVoices, defaultVoice, onRefresh }) {
+//
+// This is the feature's only editing surface: editing a narrative block's
+// clips happens here, per-segment, via FilmSummaryClipSwapPicker (ranked
+// suggestions plus an "explore all scenes" tab), instead of a separate
+// full-film scene browser.
+export default function FilmSummaryReviewPanel({
+    filmSummary,
+    projectId,
+    user,
+    allowedVoices,
+    defaultVoice,
+    onRefresh,
+    onRegenerateAll,
+    regenerating,
+}) {
     const { t } = useTranslation();
     const [draftPlan, setDraftPlan] = useState(filmSummary.edit_plan || {});
     const [validationReport, setValidationReport] = useState(filmSummary.validation_report || {});
     const [voiceId, setVoiceId] = useState(filmSummary.voice_id || defaultVoice || "");
+    const [narrationLanguage, setNarrationLanguage] = useState(filmSummary.narration_language || "");
+    const [swapSegmentId, setSwapSegmentId] = useState(null);
+    const [translating, setTranslating] = useState(false);
+    const [translateError, setTranslateError] = useState("");
     const [sourceUrl, setSourceUrl] = useState("");
     const [sourceUrlLoading, setSourceUrlLoading] = useState(true);
     const [saving, setSaving] = useState(false);
@@ -34,6 +54,7 @@ export default function FilmSummaryReviewPanel({ filmSummary, projectId, user, a
         setDraftPlan(filmSummary.edit_plan || {});
         setValidationReport(filmSummary.validation_report || {});
         setVoiceId(filmSummary.voice_id || defaultVoice || "");
+        setNarrationLanguage(filmSummary.narration_language || "");
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [filmSummary.id]);
 
@@ -71,6 +92,15 @@ export default function FilmSummaryReviewPanel({ filmSummary, projectId, user, a
             segments: (prev.segments || []).map((seg) => (seg.id === segmentId ? { ...seg, narration: value } : seg)),
         }));
     };
+
+    const updateClips = (segmentId, clips) => {
+        setDraftPlan((prev) => ({
+            ...prev,
+            segments: (prev.segments || []).map((seg) => (seg.id === segmentId ? { ...seg, clips } : seg)),
+        }));
+    };
+
+    const swapSegment = swapSegmentId ? segments.find((seg) => seg.id === swapSegmentId) : null;
 
     const handleSaveDraft = async () => {
         if (!user?.id) return;
@@ -120,6 +150,20 @@ export default function FilmSummaryReviewPanel({ filmSummary, projectId, user, a
         }
     };
 
+    const handleTranslateNarration = async () => {
+        if (!user?.id || !narrationLanguage || narrationLanguage === filmSummary.narration_language) return;
+        setTranslating(true);
+        setTranslateError("");
+        try {
+            await translateFilmSummaryNarration(filmSummary.id, user.id, narrationLanguage);
+            await onRefresh?.();
+        } catch (err) {
+            setTranslateError(err.message || t("filmSummary.genericError", "Une erreur est survenue."));
+        } finally {
+            setTranslating(false);
+        }
+    };
+
     const handleRender = async () => {
         if (!user?.id) return;
         setRendering(true);
@@ -165,7 +209,7 @@ export default function FilmSummaryReviewPanel({ filmSummary, projectId, user, a
 
             {error ? <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div> : null}
 
-            <div className="grid gap-6 lg:grid-cols-[1fr_360px]">
+            <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
                 <section className="space-y-4">
                     <div className="space-y-2 rounded-2xl border border-slate-300 dark:border-white/10 bg-white/5 p-4 md:p-5">
                         <label className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-400 dark:text-zinc-500">
@@ -196,6 +240,7 @@ export default function FilmSummaryReviewPanel({ filmSummary, projectId, user, a
                                     key={segment.id}
                                     segment={segment}
                                     onNarrationChange={updateNarration}
+                                    onEditClips={setSwapSegmentId}
                                     onSeek={handleSeek}
                                     t={t}
                                 />
@@ -259,6 +304,22 @@ export default function FilmSummaryReviewPanel({ filmSummary, projectId, user, a
                             {validating ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
                             {t("filmSummary.revalidateButton", "Revalider")}
                         </button>
+
+                        <button
+                            type="button"
+                            onClick={onRegenerateAll}
+                            disabled={regenerating}
+                            className="flex w-full items-center justify-center gap-2 rounded-xl border border-amber-500/40 bg-amber-500/5 px-4 py-2.5 text-sm font-medium text-amber-300 shadow-sm hover:bg-amber-500/10 disabled:opacity-50"
+                        >
+                            {regenerating ? <Loader2 size={14} className="animate-spin" /> : <RotateCcw size={14} />}
+                            {t("filmSummary.regenerateAllButton", "Regenerer tout (automatique)")}
+                        </button>
+                        <p className="text-xs text-amber-300/80">
+                            {t(
+                                "filmSummary.regenerateAllHint",
+                                "Relance toute la generation depuis la video source -- a utiliser si le plan actuel ne te convient pas ou si la video generee a un probleme."
+                            )}
+                        </p>
                     </div>
 
                     <div className="space-y-3 rounded-2xl border border-slate-300 dark:border-white/10 bg-white/5 p-4 md:p-5">
@@ -270,7 +331,43 @@ export default function FilmSummaryReviewPanel({ filmSummary, projectId, user, a
                                 <option key={voice} value={voice}>{voice}</option>
                             ))}
                         </select>
+
+                        <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-400 dark:text-zinc-500">
+                            {t("filmSummary.narrationLanguageLabel", "Langue de la narration")}
+                        </label>
+                        {translateError ? <p className="text-xs text-red-300">{translateError}</p> : null}
+                        <div className="flex items-center gap-2">
+                            <select
+                                value={narrationLanguage}
+                                onChange={(e) => setNarrationLanguage(e.target.value)}
+                                className="input-field w-full dark:text-white"
+                            >
+                                {NARRATION_LANGUAGE_OPTIONS.map((option) => (
+                                    <option key={option.value} value={option.value}>{t(option.labelKey, option.fallback)}</option>
+                                ))}
+                            </select>
+                            <button
+                                type="button"
+                                onClick={handleTranslateNarration}
+                                disabled={translating || !narrationLanguage || narrationLanguage === filmSummary.narration_language}
+                                className="inline-flex shrink-0 items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-3 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10 disabled:opacity-50"
+                            >
+                                {translating ? <Loader2 size={14} className="animate-spin" /> : <Languages size={14} />}
+                                {t("filmSummary.retranslateButton", "Retraduire")}
+                            </button>
+                        </div>
+                        <p className="text-xs text-slate-500 dark:text-zinc-400">
+                            {t("filmSummary.retranslateHint", "Change la langue si une mauvaise selection a ete faite a la creation -- l'IA retraduit la narration existante.")}
+                        </p>
                     </div>
+
+                    <FilmSummaryAudioSubtitleSettings
+                        filmSummary={filmSummary}
+                        user={user}
+                        totalDurationMs={filmSummary.validation_report?.total_estimated_duration_ms || 300000}
+                        onUpdated={() => onRefresh?.()}
+                        t={t}
+                    />
 
                     <div className="flex flex-col gap-2">
                         <button
@@ -297,6 +394,21 @@ export default function FilmSummaryReviewPanel({ filmSummary, projectId, user, a
                     </div>
                 </aside>
             </div>
+
+            {swapSegment ? (
+                <FilmSummaryClipSwapPicker
+                    segment={swapSegment}
+                    sceneIndex={filmSummary.scene_index || []}
+                    allSegments={segments}
+                    sourceUrl={sourceUrl}
+                    onClose={() => setSwapSegmentId(null)}
+                    onConfirm={(clips) => {
+                        updateClips(swapSegment.id, clips);
+                        setSwapSegmentId(null);
+                    }}
+                    t={t}
+                />
+            ) : null}
         </div>
     );
 }

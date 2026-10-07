@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowLeft, Download, Loader2, Play, Plus, Search, Share2, Trash2, X } from "lucide-react";
+import { Download, Loader2, Play, Plus, Search, Share2, Trash2, X } from "lucide-react";
 import { fetchAppConfig, getApiUrl, getDefaultHideSocialPlatforms } from "../config";
 import { useAuth } from "../state/AuthContext";
 import { useUserCredits } from "../state/UserCreditsContext";
@@ -7,9 +7,13 @@ import { useNavigate } from "react-router-dom";
 import ResultCard from "../components/ResultCard";
 import SharePostModal from "../components/SharePostModal";
 import MobileFilterDropdown from "../components/MobileFilterDropdown";
+import GridThumbnail from "../components/GridThumbnail";
+import Breadcrumbs from "../components/Breadcrumbs";
 import { useTranslation } from "../state/LanguageContext";
 import { statusClass, statusLabel } from "../lib/status";
 import { getAuthHeaders } from "../lib/apiAuth";
+import { describePublishError } from "../lib/publishErrors";
+import { describeMediaAvailability } from "../lib/mediaAvailability";
 
 const CAPTION_STATUS_FALLBACK = "termine";
 
@@ -329,7 +333,7 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
                 let msg = t("reels.shareFailed", "Share failed");
                 try {
                     const parsed = JSON.parse(errText);
-                    msg = parsed?.detail || errText || msg;
+                    msg = describePublishError(t, parsed?.detail, errText || msg);
                 } catch {
                     msg = errText || msg;
                 }
@@ -352,29 +356,31 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
     const previewClip = previewItem ? toResultCardClipFromCaption(previewItem, previewUrl) : null;
     const previewClipIndex = Number.isFinite(Number(previewItem?.caption_clip_index)) ? Number(previewItem?.caption_clip_index) : 0;
     const previewJobId = typeof previewItem?.caption_job_id === "string" ? previewItem.caption_job_id : "";
+    const breadcrumbItems = projectId
+        ? [
+            { label: t("breadcrumbs.dashboard", "Dashboard"), href: "/dashboard" },
+            { label: t("breadcrumbs.captions", "Captions"), href: "/dashboard/captions" },
+            { label: projectMeta?.name || t("projects.captionProjectTitle", "Projet Sous-titres") },
+        ]
+        : [];
 
     return (
         <div className="captions-page-shell flex-1 overflow-y-auto overflow-x-hidden md:overflow-x-visible px-4 py-6 md:p-8 space-y-5 md:space-y-6">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-                <div>
-                    <h1 className="text-2xl md:text-3xl font-black tracking-tight">
-                        {projectId ? (projectMeta?.name || t("projects.captionProjectTitle", "Projet Sous-titres")) : t("common.subtitles", "Sous-titres")}
-                    </h1>
-                    <p className="mt-2 text-sm text-slate-500 dark:text-zinc-400">
-                        {projectId ? t("projects.captionProjectSubtitle", "Contenu genere pour ce projet.") : t("reels.subtitle2", "Search, filter, delete, share and download.")}
-                    </p>
+                <div className="min-w-0 space-y-2">
+                    {projectId ? (
+                        <Breadcrumbs items={breadcrumbItems} ariaLabel={t('breadcrumbs.ariaLabel', 'Breadcrumb')} />
+                    ) : (
+                        <h1 className="text-2xl md:text-3xl font-black tracking-tight">{t("common.subtitles", "Sous-titres")}</h1>
+                    )}
+                    {!projectId ? (
+                        <p className="mt-2 text-sm text-slate-500 dark:text-zinc-400">
+                            {t("reels.subtitle2", "Search, filter, delete, share and download.")}
+                        </p>
+                    ) : null}
                 </div>
 
-                {projectId ? (
-                    <button
-                        type="button"
-                        onClick={() => navigate("/dashboard/captions")}
-                        className="inline-flex items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
-                    >
-                        <ArrowLeft size={14} />
-                        {t("projects.backToProjects", "Retour aux projets")}
-                    </button>
-                ) : (
+                {projectId ? null : (
                     <button
                         type="button"
                         onClick={() => {
@@ -445,182 +451,86 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
                     </button>
                 </div>
 
-                <div className="space-y-3 md:hidden">
-                    {loading && (
-                        <div className="rounded-xl border border-slate-300 dark:border-white/10 bg-white/5 px-3 py-6 text-center text-slate-500 dark:text-zinc-400">
-                            <span className="inline-flex items-center gap-2"><Loader2 size={14} className="animate-spin" /> {t("reels.loading", "Loading...")}</span>
-                        </div>
-                    )}
+                {loading && (
+                    <div className="rounded-xl border border-slate-300 dark:border-white/10 bg-white/5 px-3 py-6 text-center text-slate-500 dark:text-zinc-400">
+                        <span className="inline-flex items-center gap-2"><Loader2 size={14} className="animate-spin" /> {t("reels.loading", "Loading...")}</span>
+                    </div>
+                )}
 
-                    {!loading && error && (
-                        <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-6 text-center text-red-300">{error}</div>
-                    )}
+                {!loading && error && (
+                    <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-6 text-center text-red-300">{error}</div>
+                )}
 
-                    {!loading && !error && items.length === 0 && (
-                        <div className="rounded-xl border border-slate-300 dark:border-white/10 bg-white/5 px-3 py-6 text-center text-slate-500 dark:text-zinc-400">{t("common.noItemsFound", "Aucun element trouve")}</div>
-                    )}
+                {!loading && !error && items.length === 0 && (
+                    <div className="rounded-xl border border-slate-300 dark:border-white/10 bg-white/5 px-3 py-6 text-center text-slate-500 dark:text-zinc-400">{t("common.noItemsFound", "Aucun element trouve")}</div>
+                )}
 
-                    {!loading && !error && items.map((item) => (
-                        <article key={item.id} className="rounded-xl border border-slate-300 dark:border-white/10 bg-white/5 p-3 space-y-3 overflow-hidden">
-                            <div className="space-y-1">
-                                <p className="font-semibold text-slate-900 dark:text-white line-clamp-2 break-words">{item.caption_title || t("generatedMedia.untitled", "Untitled")}</p>
-                                <p className="text-xs text-slate-500 dark:text-zinc-400 line-clamp-3 break-words">{item.caption_description || "-"}</p>
-                            </div>
-
-                            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-zinc-400">
-                                <span>{t("generatedMedia.tableDuration", "Duration")}: {item.caption_duration ? `${item.caption_duration}s` : "-"}</span>
-                                <span>•</span>
-                                <span className="break-all">{item.caption_created_at ? new Date(item.caption_created_at).toLocaleString() : "-"}</span>
-                            </div>
-
-                            <div>
-                                <span className={`inline-flex rounded-full border px-2 py-1 text-xs ${statusClass(item.caption_status || CAPTION_STATUS_FALLBACK)}`}>
-                                    {statusLabel(item.caption_status || CAPTION_STATUS_FALLBACK)}
-                                </span>
-                            </div>
-
-                            <div className="flex flex-wrap gap-2">
-                                <button
-                                    type="button"
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                    {!loading && !error && items.map((item) => {
+                        const media = describeMediaAvailability(item.media_status, item.media_expires_at);
+                        return (
+                            <div key={item.id} className="space-y-2">
+                                <GridThumbnail
+                                    imageUrl={item.caption_thumbnail_url}
+                                    aspect="video"
+                                    durationLabel={`${item.caption_duration}s`}
+                                    statusBadge={{ label: statusLabel(item.caption_status || CAPTION_STATUS_FALLBACK), className: statusClass(item.caption_status || CAPTION_STATUS_FALLBACK) }}
+                                    badgePosition="bottom"
                                     onClick={() => handlePreview(item)}
-                                    className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-sky-300 dark:border-white/10 bg-sky-100 dark:bg-white/5 text-sky-800 dark:text-zinc-200 shadow-sm hover:bg-sky-200 dark:hover:bg-white/10"
-                                    title={t("reels.preview", "Preview")}
-                                >
-                                    <Play size={14} />
-                                </button>
-
-                                <button
-                                    type="button"
-                                    onClick={() => handleDownload(item)}
-                                    className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-indigo-300 dark:border-white/10 bg-indigo-100 dark:bg-white/5 text-indigo-800 dark:text-zinc-200 shadow-sm hover:bg-indigo-200 dark:hover:bg-white/10"
-                                    title={t("reels.download", "Download")}
-                                >
-                                    <Download size={14} />
-                                </button>
-
-                                {!hideSocialPlatforms ? (
-                                    <button
-                                        type="button"
-                                        onClick={() => handleShare(item)}
-                                        disabled={sharingId === item.id || !canShareCaption}
-                                        className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-primary/30 bg-primary/10 text-primary hover:bg-primary/20 disabled:opacity-50"
-                                        title={t("reels.share", "Share")}
-                                    >
-                                        {sharingId === item.id ? <Loader2 size={14} className="animate-spin" /> : <Share2 size={14} />}
-                                    </button>
-                                ) : null}
-
-                                <button
-                                    type="button"
-                                    onClick={() => handleDelete(item.id)}
-                                    disabled={deletingId === item.id}
-                                    className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-red-500/30 bg-red-500/10 text-red-300 hover:bg-red-500/20 disabled:opacity-50"
-                                    title={t("reels.delete", "Delete")}
-                                >
-                                    {deletingId === item.id ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
-                                </button>
-                            </div>
-                        </article>
-                    ))}
-                </div>
-
-                <div className="hidden w-full overflow-x-auto md:block">
-                    <table className="min-w-full text-sm">
-                        <thead>
-                        <tr className="border-b border-slate-300 dark:border-white/10 text-left text-slate-500 dark:text-zinc-400 text-xs md:text-sm">
-                            <th className="px-2 md:px-3 py-3 font-medium">{t("common.subtitles", "Subtitles")}</th>
-                            <th className="hidden md:table-cell px-2 md:px-3 py-3 font-medium">{t("generatedMedia.tableDescription", "Description")}</th>
-                            <th className="hidden sm:table-cell px-2 md:px-3 py-3 font-medium">{t("generatedMedia.tableDuration", "Duration")}</th>
-                            <th className="px-2 md:px-3 py-3 font-medium">{t("generatedMedia.tableStatus", "Status")}</th>
-                            <th className="hidden lg:table-cell px-2 md:px-3 py-3 font-medium">{t("generatedMedia.tableCreatedAt", "Created at")}</th>
-                            <th className="px-2 md:px-3 py-3 font-medium text-right">{t("generatedMedia.tableActions", "Actions")}</th>
-                        </tr>
-                        </thead>
-                        <tbody>
-                        {loading && (
-                            <tr>
-                                <td colSpan={6} className="px-3 py-10 text-center text-slate-500 dark:text-zinc-400">
-                                    <span className="inline-flex items-center gap-2"><Loader2 size={14} className="animate-spin" /> {t("reels.loading", "Loading...")}</span>
-                                </td>
-                            </tr>
-                        )}
-
-                        {!loading && error && (
-                            <tr>
-                                <td colSpan={6} className="px-3 py-10 text-center text-red-300">{error}</td>
-                            </tr>
-                        )}
-
-                        {!loading && !error && items.length === 0 && (
-                            <tr>
-                                <td colSpan={6} className="px-3 py-10 text-center text-slate-500 dark:text-zinc-400">{t("common.noItemsFound", "Aucun element trouve")}</td>
-                            </tr>
-                        )}
-
-                        {!loading && !error && items.map((item) => (
-                            <tr key={item.id} className="border-b border-slate-200 dark:border-white/5 align-top">
-                                <td className="px-2 md:px-3 py-2 md:py-3">
-                                    <p className="font-semibold text-slate-900 dark:text-white line-clamp-2">{item.caption_title || t("generatedMedia.untitled", "Untitled")}</p>
-                                </td>
-                                <td className="hidden md:table-cell px-2 md:px-3 py-2 md:py-3 text-slate-700 dark:text-zinc-300 max-w-md">
-                                    <p className="line-clamp-3">{item.caption_description || "-"}</p>
-                                </td>
-                                <td className="hidden sm:table-cell px-2 md:px-3 py-2 md:py-3 text-slate-700 dark:text-zinc-300">{item.caption_duration ? `${item.caption_duration}s` : "-"}</td>
-                                <td className="px-2 md:px-3 py-2 md:py-3">
-                                    <span className={`inline-flex rounded-full border px-2 py-1 text-xs ${statusClass(item.caption_status || CAPTION_STATUS_FALLBACK)}`}>
-                                        {statusLabel(item.caption_status || CAPTION_STATUS_FALLBACK)}
-                                    </span>
-                                </td>
-                                <td className="hidden lg:table-cell px-2 md:px-3 py-2 md:py-3 text-slate-500 dark:text-zinc-400">
-                                    {item.caption_created_at ? new Date(item.caption_created_at).toLocaleString() : "-"}
-                                </td>
-                                <td className="px-2 md:px-3 py-2 md:py-3">
-                                    <div className="flex items-center justify-end gap-1 md:gap-2">
-                                        <button
-                                            type="button"
-                                            onClick={() => handlePreview(item)}
-                                            className="inline-flex h-7 w-7 md:h-8 md:w-8 items-center justify-center rounded-lg border border-sky-300 dark:border-white/10 bg-sky-100 dark:bg-white/5 text-sky-800 dark:text-zinc-200 shadow-sm hover:bg-sky-200 dark:hover:bg-white/10"
-                                            title={t("reels.preview", "Preview")}
-                                        >
-                                            <Play size={14} />
-                                        </button>
-
-                                        <button
-                                            type="button"
-                                            onClick={() => handleDownload(item)}
-                                            className="inline-flex h-7 w-7 md:h-8 md:w-8 items-center justify-center rounded-lg border border-indigo-300 dark:border-white/10 bg-indigo-100 dark:bg-white/5 text-indigo-800 dark:text-zinc-200 shadow-sm hover:bg-indigo-200 dark:hover:bg-white/10"
-                                            title={t("reels.download", "Download")}
-                                        >
-                                            <Download size={14} />
-                                        </button>
-
-                                        {!hideSocialPlatforms ? (
+                                    emptyLabel={t("generatedMedia.noPreview", "No preview available.")}
+                                    alt={item.caption_title || ""}
+                                    actions={
+                                        <>
                                             <button
                                                 type="button"
-                                                onClick={() => handleShare(item)}
-                                                disabled={sharingId === item.id || !canShareCaption}
-                                                className="inline-flex h-7 w-7 md:h-8 md:w-8 items-center justify-center rounded-lg border border-primary/30 bg-primary/10 text-primary hover:bg-primary/20 disabled:opacity-50"
-                                                title={t("reels.share", "Share")}
+                                                onClick={(e) => { e.stopPropagation(); handlePreview(item); }}
+                                                className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-white/90 text-slate-800 shadow-sm hover:bg-white"
+                                                title={t("reels.preview", "Preview")}
                                             >
-                                                {sharingId === item.id ? <Loader2 size={14} className="animate-spin" /> : <Share2 size={14} />}
+                                                <Play size={16} />
                                             </button>
-                                        ) : null}
 
-                                        <button
-                                            type="button"
-                                            onClick={() => handleDelete(item.id)}
-                                            disabled={deletingId === item.id}
-                                            className="inline-flex h-7 w-7 md:h-8 md:w-8 items-center justify-center rounded-lg border border-red-500/30 bg-red-500/10 text-red-300 hover:bg-red-500/20 disabled:opacity-50"
-                                            title={t("reels.delete", "Delete")}
-                                        >
-                                            {deletingId === item.id ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
-                                        </button>
-                                    </div>
-                                </td>
-                            </tr>
-                        ))}
-                        </tbody>
-                    </table>
+                                            <button
+                                                type="button"
+                                                onClick={(e) => { e.stopPropagation(); handleDownload(item); }}
+                                                disabled={media.disabled}
+                                                className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-white/90 text-slate-800 shadow-sm hover:bg-white disabled:opacity-50 disabled:cursor-not-allowed"
+                                                title={t("reels.download", "Download")}
+                                            >
+                                                <Download size={16} />
+                                            </button>
+
+                                            {!hideSocialPlatforms ? (
+                                                <button
+                                                    type="button"
+                                                    onClick={(e) => { e.stopPropagation(); handleShare(item); }}
+                                                    disabled={sharingId === item.id || !canShareCaption}
+                                                    className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-white/90 text-slate-800 shadow-sm hover:bg-white disabled:opacity-50"
+                                                    title={t("reels.share", "Share")}
+                                                >
+                                                    {sharingId === item.id ? <Loader2 size={16} className="animate-spin" /> : <Share2 size={16} />}
+                                                </button>
+                                            ) : null}
+
+                                            <button
+                                                type="button"
+                                                onClick={(e) => { e.stopPropagation(); handleDelete(item.id); }}
+                                                disabled={deletingId === item.id}
+                                                className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-white/90 text-red-600 shadow-sm hover:bg-white disabled:opacity-50"
+                                                title={t("reels.delete", "Delete")}
+                                            >
+                                                {deletingId === item.id ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />}
+                                            </button>
+                                        </>
+                                    }
+                                />
+                                <p className="text-sm font-semibold text-slate-900 dark:text-white line-clamp-2">{item.caption_title || t("generatedMedia.untitled", "Untitled")}</p>
+                                {media.translationKey ? (
+                                    <p className="text-xs text-slate-500 dark:text-zinc-400">{t(media.translationKey, media.translationKey, media.params)}</p>
+                                ) : null}
+                            </div>
+                        );
+                    })}
                 </div>
 
                 <div className="flex flex-col sm:flex-row items-center justify-between gap-2 sm:gap-0 border-t border-slate-300 dark:border-white/10 pt-4 text-sm">

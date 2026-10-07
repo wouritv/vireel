@@ -17,10 +17,11 @@ import re
 import ipaddress
 import socket
 import sys
+import types
 from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
-from typing import Dict, Optional, List, Any, Annotated, Tuple
+from typing import Dict, Optional, List, Any, Annotated, Tuple, Literal
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse, unquote, urlencode, quote
 from urllib.request import Request as UrlRequest, urlopen, HTTPRedirectHandler, build_opener
@@ -58,7 +59,13 @@ from supabase_request import (
 	get_reel as supabase_get_reel,
 	get_reel_by_job_clip as supabase_get_reel_by_job_clip,
 	update_reel_media_by_job_clip as supabase_update_reel_media_by_job_clip,
+  update_reel_base_media_by_job_clip as supabase_update_reel_base_media_by_job_clip,
 	soft_delete_reel as supabase_soft_delete_reel,
+	insert_reel_visual as supabase_insert_reel_visual,
+	list_reel_visuals as supabase_list_reel_visuals,
+	get_reel_visual as supabase_get_reel_visual,
+	update_reel_visual as supabase_update_reel_visual,
+	delete_reel_visual as supabase_delete_reel_visual,
 	insert_captions as supabase_insert_captions,
 	list_captions as supabase_list_captions,
 	get_caption as supabase_get_caption,
@@ -85,12 +92,18 @@ from supabase_request import (
 	get_user_data as supabase_get_user_data,
 	upsert_user_data_credits as supabase_upsert_user_data_credits,
 	set_user_data_balance as supabase_set_user_data_balance,
+	zero_subscription_credit as supabase_zero_subscription_credit,
+	set_user_max_daily_publications as supabase_set_user_max_daily_publications,
+	consume_publish_quota as supabase_consume_publish_quota,
 	deduct_user_credits as supabase_deduct_user_credits,
 	insert_user_data_history as supabase_insert_user_data_history,
+	upsert_user_data_history_entry as supabase_upsert_user_data_history_entry,
 	get_user_data_history as supabase_get_user_data_history,
 	get_latest_user_paid_subscription as supabase_get_latest_user_paid_subscription,
 	update_souscription_row as supabase_update_souscription_row,
 	list_user_souscriptions as supabase_list_user_souscriptions,
+	list_souscriptions_due_for_monthly_credit_allocation as supabase_list_souscriptions_due_for_monthly_credit_allocation,
+	add_one_month as supabase_add_one_month,
 	update_job_record as supabase_update_job_record,
 	get_job_record as supabase_get_job_record,
 	count_active_jobs_for_user as supabase_count_active_jobs_for_user,
@@ -123,6 +136,37 @@ from supabase_request import (
 	list_anonymous_story_dates_since as supabase_list_anonymous_story_dates_since,
 	list_film_summary_dates_since as supabase_list_film_summary_dates_since,
 	SUPABASE_USER_DATA_HISTORY_TABLE,
+	get_or_create_referral_code as supabase_get_or_create_referral_code,
+	get_referral_code_owner as supabase_get_referral_code_owner,
+	get_referral_by_referred_user as supabase_get_referral_by_referred_user,
+	insert_referral as supabase_insert_referral,
+	update_referral_row as supabase_update_referral_row,
+	claim_referral_subscription_reward as supabase_claim_referral_subscription_reward,
+	list_referrals_by_referrer as supabase_list_referrals_by_referrer,
+	invalidate_referral as supabase_invalidate_referral,
+	get_auth_user_created_at as supabase_get_auth_user_created_at,
+	insert_promotional_credit_batch as supabase_insert_promotional_credit_batch,
+	list_active_promotional_credit_batches as supabase_list_active_promotional_credit_batches,
+	CREDIT_BATCH_TIER_PROMOTIONAL,
+	CREDIT_BATCH_TIER_PURCHASED,
+	revoke_promotional_credit_batches_by_source_reference as supabase_revoke_promotional_credit_batches_by_source_reference,
+	insert_notification as supabase_insert_notification,
+	list_notifications as supabase_list_notifications,
+	mark_notification_read as supabase_mark_notification_read,
+	mark_all_notifications_read as supabase_mark_all_notifications_read,
+	insert_media_asset as supabase_insert_media_asset,
+	get_media_asset_by_content as supabase_get_media_asset_by_content,
+	list_media_assets_due_for_expiration as supabase_list_media_assets_due_for_expiration,
+	mark_media_asset_expired as supabase_mark_media_asset_expired,
+	mark_media_asset_deleted as supabase_mark_media_asset_deleted,
+	list_produced_media_due_for_notification as supabase_list_produced_media_due_for_notification,
+	list_media_assets_by_content_ids as supabase_list_media_assets_by_content_ids,
+	mark_media_asset_notified as supabase_mark_media_asset_notified,
+	CONTENT_KIND_PROJECT_SOURCE,
+	CONTENT_KIND_REEL,
+	CONTENT_KIND_CAPTION,
+	CONTENT_KIND_FILM_SUMMARY,
+	CONTENT_KIND_ANONYMOUS_STORY,
 )
 import anonymous_stories
 import email_templates
@@ -140,6 +184,15 @@ from billing import (
     DEFAULT_CAPTION_CREDITS,
     CREDIT_UNIT_PRICE_BY_DOLLAR,
     estimate_llm_usage_cost_usd,
+    add_retention_cost_to_breakdown,
+)
+from retention_config import (
+    resolve_retention_days,
+    MEDIA_TYPE_SOURCE,
+    MEDIA_TYPE_PRODUCED,
+    S3_STORAGE_COST_PER_GB_DAY,
+    RETENTION_TEMP_FILES_HOURS,
+    RETENTION_NOTIFICATION_HOURS_BEFORE,
 )
 from job_manager import JobManager, JobType, calc_elapsed_seconds
 from pipelines import ReelProcessingPipeline, CaptionProcessingPipeline
@@ -164,6 +217,9 @@ _DEFAULT_UPLOAD_FILENAME = "upload.mp4"
 _CLIP_INDEX_SUFFIX_PATTERN = r"_clip_(\d+)\.mp4$"
 _JOB_NOT_FOUND = "Job not found"
 _INVALID_INPUT_FILENAME = "Invalid input filename"
+_SUBSCRIPTION_PLAN_NOT_FOUND = "Subscription plan not found"
+_NO_ACTIVE_SUBSCRIPTION = "No active subscription"
+_VISUAL_NOT_FOUND = "Visual not found"
 _CLIP_NOT_FOUND = "Clip not found"
 _FACEBOOK_TOKEN_EXPIRED_OR_MISSING = "Facebook page access token expired or missing"
 _FACEBOOK_TARGET_ID_MISSING = "Connected Facebook target id is missing"
@@ -177,6 +233,7 @@ _STORY_NOT_FOUND = "Anonymous story not found"
 _STORIES_PREFIX = "anonymous_stories/"
 _ANONYMOUS_STORIES_DISABLED = "Anonymous stories are not enabled on this deployment."
 _FILM_SUMMARIES_PREFIX = "film_summaries/"
+_PROJECTS_PREFIX = "projects/"
 _FILM_SUMMARY_DISABLED = "Film summaries are not enabled on this deployment."
 _FILM_SUMMARY_NOT_FOUND = "Film summary not found"
 _SUPABASE_PROJECTS_NOT_CONFIGURED = "Supabase projects is not configured"
@@ -304,10 +361,48 @@ FILM_SUMMARY_VOICE_PREVIEW_TEXT = os.environ.get(
 )
 
 VIREEL_VIDEO_FORMAT = os.environ.get("VIREEL_VIDEO_FORMAT", "mp4,mov,avi")
-JOB_RETENTION_SECONDS = 3600  # 1 hour retention
+# How long a job's local temp artifacts (FFmpeg intermediates, extracted
+# frames/chunks, local uploads, finished-job output dirs) stick around
+# before cleanup -- see RETENTION_TEMP_FILES_HOURS / process_temp_file_
+# cleanup_jobs. This is the ONLY category RETENTION_TEMP_FILES_HOURS
+# governs: it's unrelated to the per-media S3 retention durations
+# (RETENTION_FREE_*/RETENTION_SUBSCRIBER_*), which apply only to the
+# user-facing, S3-persisted media the retention/expiration sweep manages.
+JOB_RETENTION_SECONDS = RETENTION_TEMP_FILES_HOURS * 3600
 OUTPUT_SWEEP_INTERVAL_SECONDS = int(os.environ.get("OUTPUT_SWEEP_INTERVAL_SECONDS", str(6 * 3600)))
 OUTPUT_SWEEP_MIN_AGE_SECONDS = int(os.environ.get("OUTPUT_SWEEP_MIN_AGE_SECONDS", "1800"))
 SOCIAL_PUBLISH_SCHEDULER_INTERVAL_SECONDS = int(os.environ.get("SOCIAL_PUBLISH_SCHEDULER_INTERVAL_SECONDS", "10"))
+# Granularity is a monthly anniversary, so polling once a day is plenty --
+# this only decides how late a refill can run past its due date, not
+# whether it runs at all (see process_annual_credit_refill_jobs).
+ANNUAL_CREDIT_REFILL_INTERVAL_SECONDS = int(os.environ.get("ANNUAL_CREDIT_REFILL_INTERVAL_SECONDS", str(24 * 3600)))
+# How often the two media-retention sweeps run -- NOT how long anything is
+# kept (that's RETENTION_FREE_*/RETENTION_SUBSCRIBER_*/RETENTION_NOTIFICATION_
+# HOURS_BEFORE in retention_config.py); this only decides how promptly an
+# already-due expiration/notification is acted on.
+MEDIA_EXPIRATION_SWEEP_INTERVAL_SECONDS = int(os.environ.get("MEDIA_EXPIRATION_SWEEP_INTERVAL_SECONDS", "300"))
+MEDIA_EXPIRY_NOTIFICATION_SWEEP_INTERVAL_SECONDS = int(os.environ.get("MEDIA_EXPIRY_NOTIFICATION_SWEEP_INTERVAL_SECONDS", str(3600)))
+# Referral program -- the backend is the sole source of truth for these
+# amounts (see /api/referrals/config); the frontend never hardcodes them.
+REFERRAL_SIGNUP_BONUS_CREDITS = float(os.environ.get("REFERRAL_SIGNUP_BONUS_CREDITS", "50") or "50")
+REFERRAL_MONTHLY_BONUS_CREDITS = float(os.environ.get("REFERRAL_MONTHLY_BONUS_CREDITS", "100") or "100")
+REFERRAL_ANNUAL_BONUS_CREDITS = float(os.environ.get("REFERRAL_ANNUAL_BONUS_CREDITS", "300") or "300")
+PROMOTIONAL_CREDITS_EXPIRATION_DAYS = int(os.environ.get("PROMOTIONAL_CREDITS_EXPIRATION_DAYS", "60") or "60")
+# A directly-purchased credit top-up (_handle_credit_purchase) -- unlike
+# subscription credit, which resets every billing cycle, a paid top-up
+# keeps its own validity window, independent of and typically much longer
+# than the promotional one above.
+PURCHASED_CREDITS_EXPIRATION_DAYS = int(os.environ.get("PURCHASED_CREDITS_EXPIRATION_DAYS", "365") or "365")
+# This codebase has no signup webhook/trigger on auth.users (accounts are
+# created directly by the frontend's Supabase Auth SDK call, never via a
+# backend endpoint) -- the referral-association endpoint instead verifies
+# "is this account genuinely brand new" by checking the Auth account's own
+# created_at against this grace window (see get_auth_user_created_at),
+# generous enough to cover an OAuth provider round-trip plus any page
+# reload, while still rejecting an existing account trying to retroactively
+# attach a referrer long after signing up.
+REFERRAL_ASSOCIATION_WINDOW_MINUTES = int(os.environ.get("REFERRAL_ASSOCIATION_WINDOW_MINUTES", "60") or "60")
+ADMIN_API_SECRET = os.environ.get("ADMIN_API_SECRET", "")
 DISABLE_YOUTUBE_URL = os.environ.get("DISABLE_YOUTUBE_URL", "false").lower() in ("1", "true", "yes")
 HIDE_SOCIAL_PLATFORMS = os.environ.get("HIDE_SOCIAL_PLATFORMS", "false").lower() in ("1", "true", "yes")
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
@@ -316,7 +411,6 @@ STRIPE_CURRENCY = os.environ.get("STRIPE_CURRENCY", "eur").lower()
 STRIPE_SUCCESS_URL = os.environ.get("STRIPE_SUCCESS_URL", "")
 STRIPE_CANCEL_URL = os.environ.get("STRIPE_CANCEL_URL", "")
 STORAGE_RETENTION_PERIODE_DAYS = max(0, int(os.environ.get("STORAGE_RETENTION_PERIODE", "7") or "7"))
-STORAGE_OVERAGE_TOLERANCE_PERCENT = max(0.0, float(os.environ.get("STORAGE_OVERAGE_TOLERANCE_PERCENT", "10") or "10"))
 MIN_OPERATION_START_CREDITS = float(os.environ.get("MIN_OPERATION_START_CREDITS", "1"))
 
 # Social publishing constants
@@ -1418,6 +1512,51 @@ def _reel_thumbnail_url_from_s3_key(s3_key: str) -> str:
     return generate_presigned_url(bucket, s3_key, expiration=7200) or ""
 
 
+def _project_thumbnail_url_from_s3_key(s3_key: str) -> str:
+    if not s3_key:
+        return ""
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket:
+        return ""
+    return generate_presigned_url(bucket, s3_key, expiration=7200) or ""
+
+
+def _project_thumbnail_url_from_ref(thumbnail_ref: str) -> str:
+    ref = str(thumbnail_ref or "").strip()
+    if not ref:
+        return ""
+    if ref.startswith(_HTTPS_SCHEME_PREFIX):
+        return ref
+    s3_key = _extract_s3_key_from_thumbnail_ref(ref)
+    if not s3_key and ref.startswith(_PROJECTS_PREFIX):
+        s3_key = ref
+    if not s3_key:
+        return ref
+    return _project_thumbnail_url_from_s3_key(s3_key) or ref
+
+
+def _generate_and_upload_project_thumbnail_from_source(source_video_path: str, bucket: str, user_id: str, project_ref_id: str) -> str:
+    if not source_video_path or not os.path.exists(source_video_path) or not bucket:
+        return ""
+
+    thumb_local = _generate_reel_thumbnail_from_video(
+        source_video_path,
+        OUTPUT_DIR,
+        f"project_{project_ref_id}",
+        0,
+    )
+    if not thumb_local or not os.path.exists(thumb_local):
+        return ""
+
+    thumbnail_s3_key = f"{_PROJECTS_PREFIX}{user_id}/{project_ref_id}/thumbnail_source.jpg"
+    uploaded = upload_file_to_s3(thumb_local, bucket, thumbnail_s3_key)
+    try:
+        os.remove(thumb_local)
+    except Exception:
+        pass
+    return thumbnail_s3_key if uploaded else ""
+
+
 def _cleanup_generated_clips_after_job(output_dir: str, base_name: str) -> None:
     """Remove generated clip files only after the reel job has fully completed."""
     if not output_dir or not base_name or not os.path.isdir(output_dir):
@@ -1958,7 +2097,7 @@ def _extract_s3_key_from_thumbnail_ref(thumbnail_ref: str) -> str:
         if len(parts) == 2:
             return parts[1]
         return ""
-    if ref.startswith("reels/"):
+    if ref.startswith(("reels/", _CAPTIONS_PREFIX, _PROJECTS_PREFIX, _STORIES_PREFIX, _FILM_SUMMARIES_PREFIX)):
         return ref
     return ""
 
@@ -2485,8 +2624,17 @@ async def _reconcile_orphaned_jobs_on_startup() -> None:
         print(f"🧹 Startup job reconciliation: closed {len(orphaned)} orphaned job(s) from a previous process.")
 
 
-async def cleanup_jobs():
-    """Background task to remove old jobs and files."""
+async def process_temp_file_cleanup_jobs():
+    """One of the 3 required retention background processes (see the
+    media lifecycle rework's module notes): cleans up local job temp
+    artifacts (FFmpeg intermediates, extracted frames/chunks, uploads,
+    finished job output dirs) -- a DIFFERENT category from the S3-persisted
+    media the other two retention sweeps manage, governed by its own
+    RETENTION_TEMP_FILES_HOURS (see JOB_RETENTION_SECONDS) rather than the
+    per-media-type RETENTION_FREE_*/RETENTION_SUBSCRIBER_* durations.
+    Idempotent: a file already gone by the time this runs is simply not
+    there to remove again (os.remove's OSError is caught per-file, see
+    _cleanup_expired_uploads), never a reason to fail the whole sweep."""
     import time
     print("🧹 Cleanup task started.")
     last_output_sweep = 0.0
@@ -2568,14 +2716,20 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(process_queue(f"worker-{idx + 1}"))
         for idx in range(max(1, QUEUE_WORKER_COUNT))
     ]
-    cleanup_task = asyncio.create_task(cleanup_jobs())
+    cleanup_task = asyncio.create_task(process_temp_file_cleanup_jobs())
     scheduler_task = asyncio.create_task(process_scheduled_social_publish_jobs())
+    annual_credit_refill_task = asyncio.create_task(process_annual_credit_refill_jobs())
+    media_expiration_task = asyncio.create_task(process_media_expiration_jobs())
+    media_expiry_notification_task = asyncio.create_task(process_media_expiry_notification_jobs())
     yield
     # Cleanup (optional: cancel worker)
     for task in worker_tasks:
         task.cancel()
     cleanup_task.cancel()
     scheduler_task.cancel()
+    annual_credit_refill_task.cancel()
+    media_expiration_task.cancel()
+    media_expiry_notification_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -2864,10 +3018,17 @@ def _enrich_clips_with_saved_rows(clips: List[Dict[str, Any]], saved_rows: List[
 async def _debit_auto_caption_credits_for_completed_job(job_id: str, user_id: Optional[str], saved_rows: List[Dict[str, Any]]) -> None:
     """Bills the per-clip auto-caption credit cost recorded on each saved
     reel row (see _burn_default_captions_for_clip) -- additive to the reel
-    generation charge in _finalize_completed_reel_billing, never folded
-    into it, since its storage side is already counted in that charge's
-    total_reel_size_bytes (reel_size_bytes is the post-burn, captioned
-    file size)."""
+    generation charge in _finalize_completed_reel_billing, but merged into
+    that same job_id's user_data_history row (same operation_id, via
+    upsert_user_data_history_entry) rather than its own separate line: to
+    the user this is one reel generation, so it should show up as one
+    history entry whose amount includes this cost and whose nature stays
+    "generation_reel" (the primary charge for this job_id is always billed
+    first -- see job_manager.debit_credits_for_job, called from
+    _finalize_completed_reel_billing before this function is). The storage
+    side is already counted in that charge's total_reel_size_bytes
+    (reel_size_bytes is the post-burn, captioned file size), so only credit
+    is added here."""
     auto_caption_credit_total = sum(
         float(((row.get("billing_details") or {}).get("auto_caption") or {}).get("credit_cost") or 0.0)
         for row in saved_rows
@@ -2877,13 +3038,13 @@ async def _debit_auto_caption_credits_for_completed_job(job_id: str, user_id: Op
     try:
         caption_debited = await supabase_deduct_user_credits(user_id, auto_caption_credit_total, 0.0)
         if caption_debited:
-            await supabase_insert_user_data_history(
+            await supabase_upsert_user_data_history_entry(
                 user_id=user_id,
                 credit=auto_caption_credit_total,
                 storage=0.0,
                 operation="output",
                 operation_type="sous_titre",
-                operation_id=f"{job_id}:auto_captions",
+                operation_id=job_id,
             )
     except Exception as caption_billing_error:
         logger.exception("Auto-caption billing update failed for job %s", job_id)
@@ -2903,6 +3064,27 @@ async def _finalize_completed_reel_billing(
         expected_clips=len(enriched_clips),
         storage_bytes=total_reel_size_bytes,
     )
+    retention = await _finalize_retention_billing_batch(job_id, user_id, [
+        {
+            "content_kind": CONTENT_KIND_REEL,
+            "content_id": row.get("id"),
+            "media_type": MEDIA_TYPE_PRODUCED,
+            "size_bytes": row.get("reel_size_bytes"),
+            "s3_bucket": os.environ.get("AWS_S3_BUCKET", "my-clips-bucket"),
+            "s3_key": row.get("reel_s3_key"),
+        }
+        for row in saved_rows
+    ])
+    if retention["retention_storage_cost_usd"] or retention["retention_storage_credit_cost"]:
+        billing["actual_cost_usd"] = round(billing["actual_cost_usd"] + retention["retention_storage_cost_usd"], 6)
+        billing["actual_credit"] = round(billing["actual_credit"] + retention["retention_storage_credit_cost"], 2)
+        billing["cost_breakdown"] = {
+            **billing["cost_breakdown"],
+            "retention_storage_cost_usd": retention["retention_storage_cost_usd"],
+            "retention_storage_credit_cost": retention["retention_storage_credit_cost"],
+            "media_assets": retention["media_assets"],
+        }
+
     debit_applied = False
     logger.info(f"Billing info for job {job_id}: {billing}")
     job_reserved_credits = float(job_data.get("reel_required_credits") or 0.0)
@@ -2970,11 +3152,6 @@ def _derive_reel_completion_summary_text(enriched_clips: List[Dict[str, Any]], s
 
 
 def _build_reel_completion_project_updates(job_data: Dict[str, Any], summary_text: str, saved_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    thumbnail_url = ""
-    if saved_rows:
-        first_row = saved_rows[0] if isinstance(saved_rows[0], dict) else {}
-        thumbnail_url = str(first_row.get("reel_thumbnail_url") or "")
-
     project_updates = {
         "description": _build_short_project_summary(summary_text),
         "output_count": len(saved_rows),
@@ -2982,8 +3159,6 @@ def _build_reel_completion_project_updates(job_data: Dict[str, Any], summary_tex
     source_duration_value = int(float((job_data or {}).get("source_duration_seconds") or 0.0))
     if source_duration_value > 0:
         project_updates["source_duration"] = source_duration_value
-    if thumbnail_url:
-        project_updates["thumbnail_url"] = thumbnail_url
     return project_updates
 
 
@@ -3029,9 +3204,17 @@ async def _upload_and_bill_preserved_source_video(job_id: str, user_id: Optional
     """Backs up the locally preserved source video to S3 and debits the
     storage it consumes from the user's quota, the same way every other
     reel artifact's storage is billed (see _build_reel_row_for_clip's
-    original_s3_key). Best-effort: the local copy is what actually powers
-    manual clipping (_resolve_preserved_source_video), so a failure here
-    never affects that -- it only means the backup/billing didn't happen."""
+    original_s3_key). Merged into this job_id's own user_data_history row
+    (same operation_id, via upsert_user_data_history_entry) instead of its
+    own separate line, same reasoning as
+    _debit_auto_caption_credits_for_completed_job -- this call can run
+    before or after that job's primary charge is billed (this function
+    runs earlier in the reel pipeline), but both already share
+    operation_type "generation_reel" so which one creates the row first
+    doesn't matter here. Best-effort: the local copy is what actually
+    powers manual clipping (_resolve_preserved_source_video), so a failure
+    here never affects that -- it only means the backup/billing didn't
+    happen."""
     if not user_id or not is_supabase_configured():
         return
     bucket = os.environ.get("AWS_S3_BUCKET", "")
@@ -3047,13 +3230,13 @@ async def _upload_and_bill_preserved_source_video(job_id: str, user_id: Optional
             return
         debited = await supabase_deduct_user_credits(user_id, 0.0, -storage_gb)
         if debited:
-            await supabase_insert_user_data_history(
+            await supabase_upsert_user_data_history_entry(
                 user_id=user_id,
                 credit=0.0,
                 storage=round(storage_gb, 6),
                 operation="output",
                 operation_type="generation_reel",
-                operation_id=f"{job_id}:source_video",
+                operation_id=job_id,
             )
     except Exception as exc:
         logger.warning("Failed to upload/bill preserved source video for job %s: %s", job_id, exc)
@@ -3420,21 +3603,38 @@ def _build_caption_row_payload(
 
 async def _save_caption_row_and_debit(
     row_payload: Dict[str, Any], job_id: str, user_id: Optional[str],
-    caption_required_credits: float, caption_storage_gb: float,
-) -> Dict[str, Any]:
+    caption_required_credits: float, caption_storage_gb: float, caption_size_bytes: float = 0.0,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     normalized_item = {"id": f"local-{job_id}", **row_payload}
+    retention: Dict[str, Any] = {"retention_storage_cost_usd": 0.0, "retention_storage_credit_cost": 0.0, "media_assets": []}
     if not is_supabase_configured():
-        return normalized_item
+        return normalized_item, retention
 
     saved = await supabase_insert_captions([row_payload])
     if saved:
         normalized_item = _normalize_caption_row(saved[0])
 
-    if user_id and (caption_required_credits > 0 or caption_storage_gb > 0):
+    # Retention is only computable once the caption's own id exists (its
+    # media_assets row links back via content_id) -- hence after insert,
+    # before the single combined debit below (additive, see
+    # _finalize_media_retention_billing).
+    retention = await _finalize_retention_billing_batch(job_id, user_id, [
+        {
+            "content_kind": CONTENT_KIND_CAPTION,
+            "content_id": normalized_item.get("id"),
+            "media_type": MEDIA_TYPE_PRODUCED,
+            "size_bytes": caption_size_bytes,
+            "s3_bucket": os.environ.get("AWS_S3_BUCKET", "my-clips-bucket"),
+            "s3_key": row_payload.get("caption_s3_key"),
+        }
+    ])
+    total_credits = round(caption_required_credits + retention["retention_storage_credit_cost"], 2)
+
+    if user_id and (total_credits > 0 or caption_storage_gb > 0):
         debit_ok = await reel_job_manager.debit_credits_for_job(
             job_id=job_id,
             user_id=user_id,
-            credits=caption_required_credits,
+            credits=total_credits,
             storage_delta=-caption_storage_gb,
             operation_type="sous_titre",
             reserved_credits=caption_required_credits,
@@ -3442,7 +3642,7 @@ async def _save_caption_row_and_debit(
         if not debit_ok:
             raise RuntimeError("Insufficient credit/storage balance to finalize caption job")
 
-    return normalized_item
+    return normalized_item, retention
 
 
 async def _update_project_on_caption_completion(job_data: Dict[str, Any], user_id: Optional[str], normalized_item: Dict[str, Any], local_duration: float) -> None:
@@ -3554,7 +3754,18 @@ async def _process_and_complete_caption_job(
         caption_s3_key, caption_required_credits, caption_storage_gb, caption_cost_breakdown,
         original_s3_key=original_s3_key,
     )
-    normalized_item = await _save_caption_row_and_debit(row_payload, job_id, user_id, caption_required_credits, caption_storage_gb)
+    caption_size_bytes = float(os.path.getsize(primary_path) if os.path.exists(primary_path) else 0)
+    normalized_item, retention = await _save_caption_row_and_debit(
+        row_payload, job_id, user_id, caption_required_credits, caption_storage_gb, caption_size_bytes,
+    )
+    total_caption_credits = round(caption_required_credits + retention["retention_storage_credit_cost"], 2)
+    if retention["retention_storage_cost_usd"] or retention["retention_storage_credit_cost"]:
+        caption_cost_breakdown = {
+            **caption_cost_breakdown,
+            "retention_storage_cost_usd": retention["retention_storage_cost_usd"],
+            "retention_storage_credit_cost": retention["retention_storage_credit_cost"],
+            "media_assets": retention["media_assets"],
+        }
 
     await pipeline.rendering()
     result_payload = {
@@ -3567,7 +3778,7 @@ async def _process_and_complete_caption_job(
     await reel_job_manager.complete_job(
         job_id,
         result_payload,
-        actual_credit=caption_required_credits,
+        actual_credit=total_caption_credits,
         actual_storage_gb=caption_storage_gb,
         consumed_quota=1.0,
         cost_breakdown=caption_cost_breakdown,
@@ -4014,17 +4225,50 @@ async def _assert_user_has_required_credits(user_id: str, required_credits: floa
 
 
 async def _assert_user_has_active_subscription_for_publish(user_id: str) -> None:
-    """Publishing to social networks is free of credit cost, but still
-    requires an active paid subscription: an account at 0 credits can still
-    publish as long as its subscription is active, while one with no active
-    subscription is blocked regardless of its credit balance."""
+    """Publishing to social networks never spends a credit, but still
+    requires EITHER an active paid subscription OR at least some valid
+    credit -- whatever its nature (subscription, promotional, or
+    purchased, all counted together): an active subscription alone is
+    always enough (even at 0 credit), and otherwise any positive total
+    across the three pools is enough on its own, with no subscription at
+    all. Only an account with neither is blocked."""
     if not is_supabase_configured():
         return
     subscription = await get_user_abonnement(user_id)
-    if not subscription:
-        raise HTTPException(
-            status_code=402,
-            detail="Un abonnement actif est requis pour publier sur les reseaux sociaux.",
+    if subscription:
+        return
+    user_data = await supabase_get_user_data(user_id)
+    standard_credit = float((user_data or {}).get("credit") or 0.0)
+    bonus_batches = await supabase_list_active_promotional_credit_batches(user_id)
+    bonus_credit = sum(float(batch.get("amount_remaining") or 0.0) for batch in bonus_batches)
+    if standard_credit + bonus_credit > 0:
+        return
+    raise HTTPException(
+        status_code=402,
+        detail="Un abonnement actif ou des credits valides sont requis pour publier sur les reseaux sociaux.",
+    )
+
+
+async def _assert_user_can_publish(user_id: str, count: int = 1) -> None:
+    """Enforces the per-user daily publication quota: how many
+    publications (one per account/platform target, counted at request
+    time whether the publish is immediate or scheduled for later) this
+    account may make today. The cap itself (abonnement.max_daily_
+    publications, 0 = unlimited) is snapshotted onto user_data.
+    max_daily_publications at allocation time (see _allocate_plan_
+    resources/_finalize_immediate_upgrade) -- this reads only that
+    snapshot, never a live plan lookup. Raises a coded 429 carrying
+    max_daily/used_today/resets_at so the frontend can tell the user
+    exactly when they'll be able to publish again."""
+    if not is_supabase_configured():
+        return
+    result = await supabase_consume_publish_quota(user_id, count)
+    if not result.get("allowed", True):
+        raise _coded_error(
+            429, "publish_quota_exceeded",
+            f"Quota de publications quotidien atteint ({result.get('max_daily')} par jour).",
+            max_daily=result.get("max_daily"), used_today=result.get("used_today"),
+            resets_at=result.get("resets_at"),
         )
 
 
@@ -4040,36 +4284,6 @@ async def _assert_user_can_access_analytics(user_id: str) -> None:
         raise HTTPException(
             status_code=403,
             detail="Les analyses sont reservees aux abonnements Gold et Ultimate.",
-        )
-
-
-async def _assert_user_has_storage_headroom(user_id: str) -> None:
-    """Reject new uploads once the user's aggregate storage quota is already
-    exhausted (audit finding P2-10).
-
-    Storage consumption is only ever settled against ``stockage``/
-    ``stockage_max`` at job completion (see deduct_user_credits'
-    storage_delta), once the actual output size is known. Nothing upstream
-    of that stopped an account already over its storage quota from starting
-    yet more jobs -- only the credit balance gated new work. This mirrors
-    the same overage tolerance used at settlement time so an account isn't
-    blocked here by a stricter rule than the one that will actually charge it.
-    """
-    if not is_supabase_configured():
-        return
-    user_data = await supabase_get_user_data(user_id)
-    if not user_data:
-        return
-    current_storage = float(user_data.get("stockage", 0) or 0.0)
-    storage_max = float(user_data.get("stockage_max", max(current_storage, 0.0)) or 0.0)
-    overage_limit = (storage_max * STORAGE_OVERAGE_TOLERANCE_PERCENT) / 100.0
-    if current_storage < -overage_limit:
-        raise HTTPException(
-            status_code=402,
-            detail=(
-                "Quota de stockage depasse. Liberez de l'espace ou mettez a "
-                "niveau votre abonnement avant de lancer un nouveau traitement."
-            ),
         )
 
 
@@ -4097,6 +4311,203 @@ async def _reserve_job_credits(user_id: str, required_credits: float) -> float:
             ),
         )
     return required
+
+
+async def _finalize_media_retention_billing(
+    *,
+    job_id: Optional[str],
+    user_id: Optional[str],
+    content_kind: str,
+    content_id: str,
+    media_type: str,
+    size_bytes: float,
+    s3_bucket: Optional[str] = None,
+    s3_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Fixes this media's retention policy FOREVER at the moment its
+    definitive size is known (see retention_config.resolve_retention_days
+    and the media_assets migration's module comment -- never recomputed
+    later, even if the user's subscription or the env vars change
+    afterward), persists its media_assets row, and returns a standalone
+    retention cost line item (own USD/credit conversion, via the exact
+    same billing.calculate_credits_for_operation engine already used for
+    AI/processing/S3-operation costs -- never a parallel one) for the
+    caller to ADD to its own actual_cost_usd/actual_credit, per the
+    additive billing model (credits = existing costs + this one, never a
+    replacement). Never raises: a persistence failure here must not block
+    the job's own billing/credit settlement, only skip its own retention
+    line item (logged) -- see also add_retention_cost_to_breakdown, which
+    this re-uses for its own USD->credits conversion.
+    """
+    has_active_subscription = False
+    if is_supabase_configured() and user_id:
+        try:
+            has_active_subscription = bool(await get_user_abonnement(user_id))
+        except Exception:
+            logger.exception("Failed to resolve subscription status for retention policy (job %s)", job_id)
+
+    retention_days = resolve_retention_days(media_type, has_active_subscription)
+    media_size_gb = _bytes_to_gb(size_bytes)
+    # A standalone retention-only breakdown ({"total_usd": 0.0} + retention)
+    # -- reuses add_retention_cost_to_breakdown/calculate_credits_for_operation
+    # exactly as tested in tests/test_billing.py, just scoped to this one
+    # additive component rather than merged into a ratio-adjusted breakdown.
+    retention_breakdown = add_retention_cost_to_breakdown({"total_usd": 0.0}, media_size_gb, retention_days)
+    retention_storage_cost_usd = float(retention_breakdown.get("retention_usd") or 0.0)
+    retention_storage_credit_cost = float(retention_breakdown.get("final_credits") or 0.0)
+
+    now = datetime.now(timezone.utc)
+    retention_expires_at = now + timedelta(days=retention_days)
+    subscription_status_at_creation = "active" if has_active_subscription else "free"
+
+    if is_supabase_configured() and user_id:
+        try:
+            await supabase_insert_media_asset(
+                user_id=user_id,
+                content_kind=content_kind,
+                content_id=content_id,
+                media_type=media_type,
+                subscription_status_at_creation=subscription_status_at_creation,
+                retention_days=retention_days,
+                retention_started_at=now,
+                retention_expires_at=retention_expires_at,
+                storage={
+                    "job_id": job_id,
+                    "s3_bucket": s3_bucket,
+                    "s3_key": s3_key,
+                    "size_bytes": int(size_bytes or 0),
+                },
+                billing={
+                    "s3_storage_cost_per_gb_day": S3_STORAGE_COST_PER_GB_DAY,
+                    "retention_storage_cost_usd": retention_storage_cost_usd,
+                    "retention_storage_credit_cost": retention_storage_credit_cost,
+                    "billing_created_at": now,
+                },
+            )
+        except Exception:
+            logger.exception("Failed to persist media_assets row for job %s / %s:%s", job_id, content_kind, content_id)
+
+    return {
+        "content_kind": content_kind,
+        "content_id": content_id,
+        "media_type": media_type,
+        "media_size_bytes": int(size_bytes or 0),
+        "media_size_gb": media_size_gb,
+        "subscription_status_at_creation": subscription_status_at_creation,
+        "retention_days": retention_days,
+        # ISO strings, not datetime objects -- this dict is folded into the
+        # job's cost_breakdown log (see _finalize_retention_billing_batch),
+        # which gets JSON-serialized for persistence.
+        "retention_started_at": now.isoformat(),
+        "retention_expires_at": retention_expires_at.isoformat(),
+        "s3_storage_cost_per_gb_day": S3_STORAGE_COST_PER_GB_DAY,
+        "retention_storage_cost_usd": retention_storage_cost_usd,
+        "retention_storage_credit_cost": retention_storage_credit_cost,
+    }
+
+
+async def _finalize_retention_billing_batch(
+    job_id: Optional[str], user_id: Optional[str], media_entries: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Runs _finalize_media_retention_billing once per produced/source
+    media file this job created (one call per entry -- e.g. one per saved
+    reel row for a multi-clip job), then sums the standalone retention
+    cost across all of them for the caller to ADD to its own
+    actual_cost_usd/actual_credit, plus the full per-media snapshot list
+    for the billing log's auditable decomposition."""
+    total_cost_usd = 0.0
+    total_credit_cost = 0.0
+    snapshots: List[Dict[str, Any]] = []
+    for entry in media_entries:
+        if not entry.get("content_id"):
+            continue
+        snapshot = await _finalize_media_retention_billing(
+            job_id=job_id,
+            user_id=user_id,
+            content_kind=entry["content_kind"],
+            content_id=entry["content_id"],
+            media_type=entry["media_type"],
+            size_bytes=entry.get("size_bytes") or 0,
+            s3_bucket=entry.get("s3_bucket"),
+            s3_key=entry.get("s3_key"),
+        )
+        total_cost_usd += snapshot["retention_storage_cost_usd"]
+        total_credit_cost += snapshot["retention_storage_credit_cost"]
+        snapshots.append(snapshot)
+    return {
+        "retention_storage_cost_usd": round(total_cost_usd, 6),
+        "retention_storage_credit_cost": round(total_credit_cost, 2),
+        "media_assets": snapshots,
+    }
+
+
+async def _finalize_source_media_retention(
+    job_id: Optional[str], user_id: Optional[str], project: Optional[Dict[str, Any]],
+    size_bytes: float, s3_bucket: Optional[str], s3_key: Optional[str],
+) -> None:
+    """The shared SOURCE-media retention entry point for every pipeline's
+    project/upload creation (reel, caption, anonymous story, film summary
+    all create a `projects` row for their source upload -- see
+    _create_process_endpoint_project/_create_caption_endpoint_project/
+    _create_anonymous_story_endpoint_project/_create_film_summary_endpoint_project).
+    Unlike produced media, no credits are reserved/debited for a source
+    upload elsewhere in the existing flow, so this is its own small,
+    standalone debit (reserved_credits=0.0) for just the retention line
+    item -- never blocks the upload/job itself on failure, only logs,
+    exactly like the other best-effort debit_ok checks in this file."""
+    if not project or not project.get("id"):
+        return
+    retention = await _finalize_retention_billing_batch(job_id, user_id, [
+        {
+            "content_kind": CONTENT_KIND_PROJECT_SOURCE,
+            "content_id": project.get("id"),
+            "media_type": MEDIA_TYPE_SOURCE,
+            "size_bytes": size_bytes,
+            "s3_bucket": s3_bucket,
+            "s3_key": s3_key,
+        }
+    ])
+    retention_credits = retention["retention_storage_credit_cost"]
+    if user_id and is_supabase_configured() and retention_credits > 0:
+        try:
+            debit_ok = await reel_job_manager.debit_credits_for_job(
+                job_id=job_id,
+                user_id=user_id,
+                credits=retention_credits,
+                storage_delta=0.0,
+                operation_type="retention_storage_source",
+                reserved_credits=0.0,
+            )
+            if not debit_ok:
+                logger.warning("Insufficient balance to settle source-media retention (job %s)", job_id)
+        except Exception:
+            logger.exception("Failed to debit source-media retention cost (job %s)", job_id)
+
+
+async def _attach_media_asset_fields(
+    rows: List[Dict[str, Any]], content_kind: str, id_field: str = "id",
+) -> List[Dict[str, Any]]:
+    """Enriches each row (in place) with media_status/media_expires_at from
+    its media_assets row -- one batched query for the whole page, never
+    one per row. Purely informational for the UI (see the spec's
+    "Disponible jusqu'au...", "Expire dans N jours", "Media expire" states
+    on ReelsPage/CaptionsPage/etc.) -- never raises, and a row with no
+    media_assets row at all (historical content predating this feature)
+    just gets media_status=None, which the frontend treats as "no
+    expiration info" rather than "unavailable"."""
+    if not is_supabase_configured() or not rows:
+        return rows
+    ids = [row.get(id_field) for row in rows if row.get(id_field)]
+    try:
+        assets_by_id = await supabase_list_media_assets_by_content_ids(content_kind, ids)
+    except Exception:
+        logger.exception("Failed to batch-fetch media_assets for content_kind=%s", content_kind)
+        return rows
+    for row in rows:
+        asset = assets_by_id.get(row.get(id_field))
+        row["media_status"] = asset.get("media_status") if asset else None
+        row["media_expires_at"] = asset.get("retention_expires_at") if asset else None
+    return rows
 
 
 def _allowed_video_formats() -> List[str]:
@@ -4887,6 +5298,12 @@ async def _create_process_endpoint_project(
 
         if input_path and os.path.exists(input_path):
             upload_file_to_s3(input_path, bucket_name, s3_source_key)
+        project_thumbnail_ref = _generate_and_upload_project_thumbnail_from_source(
+            input_path,
+            bucket_name,
+            user_id,
+            job_id,
+        )
 
         # Create project record
         project = await supabase_create_project(
@@ -4899,8 +5316,10 @@ async def _create_process_endpoint_project(
             source_size=source_size_bytes,
             source_url=url if url else None,
             source_duration=int(source_duration_seconds) if source_duration_seconds else None,
+            thumbnail_url=project_thumbnail_ref,
             status="processing",
         )
+        await _finalize_source_media_retention(job_id, user_id, project, source_size_bytes, bucket_name, s3_source_key)
         return project, source_duration_seconds
     except Exception as e:
         logger.warning(f"Failed to create project for job {job_id}: {str(e)}")
@@ -4980,7 +5399,6 @@ async def process_endpoint(
     _validate_process_endpoint_inputs(url, file, ack_flag)
 
     await _enforce_job_concurrency_limit(user_id)
-    await _assert_user_has_storage_headroom(user_id)
 
     attestation = _build_process_endpoint_attestation(request, url)
     job_priority = await _resolve_user_job_priority(user_id)
@@ -5092,6 +5510,7 @@ async def get_status(job_id: str, user_id: Annotated[str, Depends(get_user_id_he
 from editor import VideoEditor
 from subtitles import generate_srt, generate_highlighted_srt, burn_subtitles, generate_srt_from_video, SubtitleStyleOptions
 from hooks import add_hook_to_video
+from visuals import apply_visuals_to_video
 from thumbnail import analyze_video_for_titles, refine_titles, generate_thumbnail, generate_youtube_description
 
 class EditRequest(BaseModel):
@@ -5450,9 +5869,15 @@ async def _create_caption_endpoint_project(user_id: str, caption_job_id: str, so
 
         if os.path.exists(input_path):
             upload_file_to_s3(input_path, bucket_name, s3_source_key)
+        project_thumbnail_ref = _generate_and_upload_project_thumbnail_from_source(
+            input_path,
+            bucket_name,
+            user_id,
+            caption_job_id,
+        )
 
         # Create project record
-        return await supabase_create_project(
+        project = await supabase_create_project(
             user_id=user_id,
             name=project_name,
             description=project_description,
@@ -5461,8 +5886,11 @@ async def _create_caption_endpoint_project(user_id: str, caption_job_id: str, so
             source_s3_key=s3_source_key,
             source_size=size_bytes,
             source_duration=int(local_duration) if local_duration else None,
+            thumbnail_url=project_thumbnail_ref,
             status="processing",
         )
+        await _finalize_source_media_retention(caption_job_id, user_id, project, size_bytes, bucket_name, s3_source_key)
+        return project
     except Exception as e:
         logger.warning(f"Failed to create project for caption job {caption_job_id}: {str(e)}")
         return None
@@ -5531,7 +5959,6 @@ async def process_caption_endpoint(
         raise HTTPException(status_code=400, detail="You must confirm you own the content or have rights to process it.")
 
     await _enforce_job_concurrency_limit(user_id)
-    await _assert_user_has_storage_headroom(user_id)
 
     _validate_video_extension(file.filename if file else "", context_label="sous-titres")
 
@@ -5618,6 +6045,144 @@ def _extract_clip_captions_from_transcript(transcript: Dict[str, Any], clip_star
                     "endMs": int((max(0, word_info['end'] - clip_start)) * 1000),
                 })
     return captions
+
+
+def _saved_subtitle_captions_from_clip_data(clip_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not isinstance(clip_data, dict):
+        return []
+
+    subtitle_config = clip_data.get("subtitle_config")
+    if isinstance(subtitle_config, dict):
+        captions = subtitle_config.get("captions")
+        if isinstance(captions, list):
+            return captions
+
+    remotion_layers = clip_data.get("remotion_layers")
+    if isinstance(remotion_layers, dict):
+        for layer_key in ("captions", "subtitles"):
+            layer = remotion_layers.get(layer_key)
+            if isinstance(layer, dict) and isinstance(layer.get("captions"), list):
+                return layer.get("captions")
+
+    return []
+
+
+def _style_from_dict_field(container: Any, source_label: str) -> Tuple[Dict[str, Any], str]:
+    """One "does this dict carry a usable, non-empty style?" check, reused
+    by every candidate source in _style_from_clip_subtitle_state instead of
+    being duplicated per source (audit: SonarQube python:S3776 -- that
+    duplication was what pushed the caller's cognitive complexity over the
+    limit)."""
+    if isinstance(container, dict):
+        style = container.get("style")
+        if isinstance(style, dict) and style:
+            return style, source_label
+    return {}, ""
+
+
+def _style_from_clip_subtitle_state(clip_data: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    if not isinstance(clip_data, dict):
+        return {}, ""
+
+    style, source = _style_from_dict_field(clip_data.get("subtitle_config"), "clip_data.subtitle_config")
+    if style:
+        return style, source
+
+    remotion_layers = clip_data.get("remotion_layers")
+    if isinstance(remotion_layers, dict):
+        for layer_key in ("captions", "subtitles"):
+            style, source = _style_from_dict_field(
+                remotion_layers.get(layer_key), f"clip_data.remotion_layers.{layer_key}",
+            )
+            if style:
+                return style, source
+
+    return {}, ""
+
+
+async def _resolve_active_subtitle_style_for_clip(job_id: str, clip_index: int, user_id: str, clip_data: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    """Resolve subtitle style in explicit priority order for visuals re-burn:
+
+    1. The last persisted clip-local subtitle payload (`subtitle_config`)
+    2. Persisted Remotion layer style on the clip metadata
+    3. The latest Supabase style_edit_versions row for this clip
+    4. The user's saved global default (or factory default fallback)
+    """
+    clip_style, source = _style_from_clip_subtitle_state(clip_data)
+    if clip_style:
+        return {**_DEFAULT_AUTO_CAPTION_STYLE_KWARGS, **clip_style}, source
+
+    if is_supabase_configured():
+        try:
+            versions = await supabase_list_style_edit_versions(job_id, int(clip_index), user_id)
+            if versions:
+                style_config = versions[-1].get("style_config")
+                if isinstance(style_config, dict) and style_config:
+                    return {**_DEFAULT_AUTO_CAPTION_STYLE_KWARGS, **style_config}, "style_edit_versions.latest"
+        except Exception as exc:
+            logger.warning("Failed to resolve latest subtitle style for job %s clip %s: %s", job_id, clip_index, exc)
+
+    return await _get_user_default_caption_style(user_id), "user_default_or_factory_default"
+
+
+def _write_saved_captions_to_srt(captions: List[Dict[str, Any]], srt_path: str) -> bool:
+    lines: List[str] = []
+    index = 1
+    for caption in captions:
+        text = str((caption or {}).get("text") or "").strip()
+        start_ms = (caption or {}).get("startMs")
+        end_ms = (caption or {}).get("endMs")
+        if not text:
+            continue
+        try:
+            start_seconds = max(0.0, float(start_ms) / 1000.0)
+            end_seconds = max(start_seconds, float(end_ms) / 1000.0)
+        except (TypeError, ValueError):
+            continue
+        lines.extend([
+            str(index),
+            f"{_srt_timestamp(start_seconds)} --> {_srt_timestamp(end_seconds)}",
+            text,
+            "",
+        ])
+        index += 1
+
+    if index == 1:
+        return False
+
+    with open(srt_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+    return True
+
+
+async def _generate_subtitle_srt_from_clip_context(
+    input_path: str,
+    filename: str,
+    transcript: Optional[Dict[str, Any]],
+    clip_data: Dict[str, Any],
+    srt_path: str,
+    words_per_line: int,
+    animation: str = "none",
+) -> bool:
+    if transcript:
+        return await _generate_subtitle_srt(
+            input_path,
+            filename,
+            transcript,
+            clip_data,
+            srt_path,
+            words_per_line,
+            animation=animation,
+        )
+    saved_captions = _saved_subtitle_captions_from_clip_data(clip_data)
+    if saved_captions:
+        return _write_saved_captions_to_srt(saved_captions, srt_path)
+    return False
+
+
+def _build_subtitle_request_from_style(job_id: str, clip_index: int, style_config: Dict[str, Any]) -> SubtitleRequest:
+    merged_style = {**_DEFAULT_AUTO_CAPTION_STYLE_KWARGS, **(style_config or {})}
+    return SubtitleRequest(job_id=job_id, clip_index=clip_index, **merged_style)
 
 
 @app.get("/api/clip/{job_id}/{clip_index}/transcript", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 404: {"description": "Not Found"}})
@@ -6397,7 +6962,36 @@ async def _generate_subtitle_srt(input_path: str, filename: str, transcript: Dic
     )
 
 
-def _burn_subtitles_for_request(req: SubtitleRequest, input_path: str, srt_path: str, output_path: str) -> None:
+async def _reel_visual_windows_for_job_clip(job_id: str, clip_index: int, user_id: str) -> List[Dict[str, Any]]:
+    """The reel's currently-configured manual visuals (see the "Reel
+    visuals" section above), as the [{"position","start","end"}, ...]
+    shape burn_subtitles expects -- so a subtitle burned in AFTER visuals
+    are applied repositions lines away from the image (spec section 9).
+    Best-effort: returns [] on anything short of a clean lookup, since a
+    missing reel row must never block subtitle burning."""
+    if not is_supabase_configured():
+        return []
+    try:
+        reel = await supabase_get_reel_by_job_clip(job_id, clip_index, user_id=user_id)
+        if not reel:
+            return []
+        rows = await supabase_list_reel_visuals(str(reel["id"]))
+    except Exception:
+        return []
+    return [
+        {
+            "position": row.get("position"),
+            "start": float(row.get("start_time") or 0),
+            "end": float(row.get("start_time") or 0) + float(row.get("duration") or 0),
+        }
+        for row in rows
+    ]
+
+
+def _burn_subtitles_for_request(
+    req: SubtitleRequest, input_path: str, srt_path: str, output_path: str,
+    visual_windows: Optional[List[Dict[str, Any]]] = None,
+) -> None:
     style_options = SubtitleStyleOptions(
         font_name=req.font_name,
         font_color=req.font_color,
@@ -6421,6 +7015,7 @@ def _burn_subtitles_for_request(req: SubtitleRequest, input_path: str, srt_path:
         alignment=req.position,
         fontsize=req.font_size,
         style_options=style_options,
+        visual_windows=visual_windows,
     )
 
 
@@ -6581,8 +7176,10 @@ async def add_subtitles(req: SubtitleRequest, user_id: Annotated[str, Depends(ge
         if not success:
             raise HTTPException(status_code=400, detail="No words found for this clip range.")
 
+        visual_windows = await _reel_visual_windows_for_job_clip(req.job_id, req.clip_index, user_id)
+
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _burn_subtitles_for_request, req, input_path, srt_path, output_path)
+        await loop.run_in_executor(None, _burn_subtitles_for_request, req, input_path, srt_path, output_path, visual_windows)
 
     except HTTPException:
         raise
@@ -6909,6 +7506,17 @@ async def _finalize_custom_reel_clip_creation(
     billing_details = reel_row.get("billing_details") or {}
     total_credits = float(billing_details.get("final_credits") or 0.0) + float((billing_details.get("auto_caption") or {}).get("credit_cost") or 0.0)
     storage_gb = _bytes_to_gb(float(reel_row.get("reel_size_bytes") or 0))
+    retention = await _finalize_retention_billing_batch(job_id, user_id, [
+        {
+            "content_kind": CONTENT_KIND_REEL,
+            "content_id": saved_row.get("id"),
+            "media_type": MEDIA_TYPE_PRODUCED,
+            "size_bytes": reel_row.get("reel_size_bytes"),
+            "s3_bucket": os.environ.get("AWS_S3_BUCKET", "my-clips-bucket"),
+            "s3_key": reel_row.get("reel_s3_key"),
+        }
+    ])
+    total_credits = round(total_credits + retention["retention_storage_credit_cost"], 2)
     debit_ok = await reel_job_manager.debit_credits_for_job(
         job_id=job_id, user_id=user_id, credits=total_credits, storage_delta=-storage_gb,
         operation_type="generation_reel", reserved_credits=0.0,
@@ -7186,6 +7794,639 @@ async def add_hook(req: HookRequest, user_id: Annotated[str, Depends(get_user_id
         "success": True,
         "new_video_url": new_video_url,
     }
+
+
+# ---------------------------------------------------------------------------
+# Reel visuals (manual image split-screen overlays -- see visuals.py).
+# Entirely manual: no AI is ever involved in choosing the image, its
+# position, or its timing -- the user controls every one of those.
+# ---------------------------------------------------------------------------
+
+_REEL_VISUAL_ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
+# Shared across every place in this file that accepts a user-uploaded image
+# (reel visuals, comment attachments, scheduled-post media) -- defined once
+# so the extension list itself is never retyped (audit: SonarQube python:S1192).
+_STANDARD_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+_REEL_VISUAL_ALLOWED_EXTENSIONS = tuple(ext for ext in _STANDARD_IMAGE_EXTENSIONS if ext != ".gif")
+REEL_VISUAL_MAX_IMAGE_BYTES = int(os.environ.get("REEL_VISUAL_MAX_IMAGE_BYTES", str(8 * 1024 * 1024)))
+_REEL_VISUAL_POSITIONS = {"TOP", "BOTTOM"}
+
+
+def _validate_reel_visual_image_upload(file: Optional[UploadFile]) -> None:
+    if not file:
+        raise HTTPException(status_code=400, detail="Missing image file")
+    content_type = str(file.content_type or "").lower()
+    if content_type and content_type not in _REEL_VISUAL_ALLOWED_CONTENT_TYPES:
+        raise _coded_error(400, "invalid_image_format", "Only JPG, PNG and WebP images are supported")
+
+
+async def _save_reel_visual_image_upload(file: UploadFile, local_path: str) -> None:
+    async with aiofiles.open(local_path, "wb") as buffer:
+        total = 0
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > REEL_VISUAL_MAX_IMAGE_BYTES:
+                raise _coded_error(
+                    400, "image_too_large",
+                    f"Image is too large (max {REEL_VISUAL_MAX_IMAGE_BYTES // (1024 * 1024)} MB)",
+                )
+            await buffer.write(chunk)
+
+
+def _validate_reel_visual_timing(
+    start_time: float, duration: float, reel_duration_seconds: float,
+    existing_visuals: List[Dict[str, Any]], exclude_visual_id: Optional[str] = None,
+) -> float:
+    """Validates one visual's timing against the spec's hard rules
+    (section 10: startTime >= 0, duration > 0, startTime+duration <=
+    reel duration, no overlap with another visual on the same reel) and
+    returns its end_time. Raises a _coded_error on any violation.
+
+    Overlap check is a plain pairwise compare against `existing_visuals`
+    (not the sort+merge idiom used elsewhere in this codebase for an
+    unsorted incoming batch -- see _merge_overlapping_bad_take_candidates)
+    because `existing_visuals` is already known non-overlapping (enforced
+    by this same function at creation time), so only the ONE new/edited
+    interval needs checking against that already-valid set."""
+    if start_time < 0:
+        raise _coded_error(400, "invalid_visual_timing", "startTime must be >= 0")
+    if duration <= 0:
+        raise _coded_error(400, "invalid_visual_timing", "duration must be > 0")
+    end_time = start_time + duration
+    if reel_duration_seconds and end_time > reel_duration_seconds + 0.01:
+        raise _coded_error(
+            400, "visual_exceeds_reel_duration",
+            f"This visual would run until {end_time:.1f}s, past the reel's {reel_duration_seconds:.1f}s duration",
+        )
+
+    for existing in existing_visuals:
+        if exclude_visual_id and str(existing.get("id")) == str(exclude_visual_id):
+            continue
+        other_start = float(existing.get("start_time") or 0)
+        other_end = other_start + float(existing.get("duration") or 0)
+        if start_time < other_end and other_start < end_time:
+            raise _coded_error(
+                409, "visual_overlap",
+                "This visual's time window overlaps an existing visual -- visuals can never overlap",
+            )
+
+    return end_time
+
+
+async def _resolve_reel_for_visuals(job_id: str, clip_index: int, user_id: str) -> Dict[str, Any]:
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+    reel = await supabase_get_reel_by_job_clip(job_id, clip_index, user_id=user_id)
+    if not reel:
+        raise HTTPException(status_code=404, detail=_CLIP_NOT_FOUND)
+    return reel
+
+
+def _reel_visual_image_url(image_s3_key: str) -> str:
+    if not image_s3_key:
+        return ""
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket:
+        return ""
+    return generate_presigned_url(bucket, image_s3_key, expiration=7200) or ""
+
+
+def _normalize_reel_visual_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        **row,
+        "image_url": _reel_visual_image_url(row.get("image_s3_key") or ""),
+        "end_time": float(row.get("start_time") or 0) + float(row.get("duration") or 0),
+    }
+
+
+@app.get("/api/reels/{job_id}/{clip_index}/visuals", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def list_reel_visuals_endpoint(job_id: str, clip_index: int, user_id: Annotated[str, Depends(get_user_id_header)]):
+    reel = await _resolve_reel_for_visuals(job_id, clip_index, user_id)
+    rows = await supabase_list_reel_visuals(str(reel["id"]))
+    return {"items": [_normalize_reel_visual_row(row) for row in rows]}
+
+
+@app.post("/api/reels/{job_id}/{clip_index}/visuals", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 503: {"description": "Service Unavailable"}})
+async def create_reel_visual(
+    job_id: str, clip_index: int, user_id: Annotated[str, Depends(get_user_id_header)],
+    file: Annotated[UploadFile, File()],
+    position: Annotated[str, Form()],
+    start_time: Annotated[float, Form()],
+    duration: Annotated[float, Form()],
+):
+    """Adds one manual visual to a reel: uploads the image to S3 (the
+    same mechanism every other upload in this app uses, see
+    s3_uploader.py) and creates its reel_visuals row. Entirely manual --
+    the caller supplies the image, position and timing; nothing here
+    infers any of it."""
+    reel = await _resolve_reel_for_visuals(job_id, clip_index, user_id)
+
+    position = str(position or "").upper()
+    if position not in _REEL_VISUAL_POSITIONS:
+        raise _coded_error(400, "invalid_visual_position", "position must be TOP or BOTTOM")
+
+    _validate_reel_visual_image_upload(file)
+
+    reel_duration = float(reel.get("reel_duration") or 0)
+    existing = await supabase_list_reel_visuals(str(reel["id"]))
+    _validate_reel_visual_timing(float(start_time), float(duration), reel_duration, existing)
+
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    if not bucket:
+        raise HTTPException(status_code=503, detail="AWS_S3_BUCKET is required for image uploads")
+
+    safe_name = _sanitize_input_filename(file.filename) or "visual.jpg"
+    ext = os.path.splitext(safe_name)[1].lower()
+    if ext not in _REEL_VISUAL_ALLOWED_EXTENSIONS:
+        ext = ".jpg"
+
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    visual_id = uuid.uuid4().hex
+    local_path = os.path.join(UPLOAD_DIR, f"reel_visual_{visual_id}{ext}")
+    try:
+        await _save_reel_visual_image_upload(file, local_path)
+        s3_key = f"reels/{user_id}/{job_id}/visual_{clip_index}_{visual_id}{ext}"
+        if not upload_file_to_s3(local_path, bucket, s3_key):
+            raise HTTPException(status_code=503, detail="Failed to upload image")
+    finally:
+        try:
+            if os.path.exists(local_path):
+                os.remove(local_path)
+        except Exception:
+            pass
+
+    row = await supabase_insert_reel_visual(
+        str(reel["id"]), user_id, position, float(start_time), float(duration), s3_key,
+    )
+    return _normalize_reel_visual_row(row)
+
+
+class UpdateReelVisualRequest(BaseModel):
+    position: Optional[str] = None
+    start_time: Optional[float] = None
+    duration: Optional[float] = None
+
+
+async def _build_reel_visual_updates(
+    payload: UpdateReelVisualRequest, existing_visual: Dict[str, Any], reel: Dict[str, Any], visual_id: str,
+) -> Dict[str, Any]:
+    """Validates and assembles the partial-update dict for
+    update_reel_visual_endpoint -- isolated so that endpoint's own
+    cognitive complexity stays under this codebase's limit (audit:
+    SonarQube python:S3776)."""
+    updates: Dict[str, Any] = {}
+    if payload.position is not None:
+        position = str(payload.position).upper()
+        if position not in _REEL_VISUAL_POSITIONS:
+            raise _coded_error(400, "invalid_visual_position", "position must be TOP or BOTTOM")
+        updates["position"] = position
+
+    if payload.start_time is not None or payload.duration is not None:
+        start_time = payload.start_time if payload.start_time is not None else float(existing_visual.get("start_time") or 0)
+        duration = payload.duration if payload.duration is not None else float(existing_visual.get("duration") or 0)
+        reel_duration = float(reel.get("reel_duration") or 0)
+        other_visuals = await supabase_list_reel_visuals(str(reel["id"]))
+        _validate_reel_visual_timing(float(start_time), float(duration), reel_duration, other_visuals, exclude_visual_id=visual_id)
+        updates["start_time"] = float(start_time)
+        updates["duration"] = float(duration)
+
+    return updates
+
+
+@app.patch("/api/reels/{job_id}/{clip_index}/visuals/{visual_id}", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 503: {"description": "Service Unavailable"}})
+async def update_reel_visual_endpoint(
+    job_id: str, clip_index: int, visual_id: str, payload: UpdateReelVisualRequest,
+    user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Updates a visual's position and/or timing -- never its image (swap
+    the image by deleting and re-adding the visual instead)."""
+    reel = await _resolve_reel_for_visuals(job_id, clip_index, user_id)
+    existing_visual = await supabase_get_reel_visual(visual_id, user_id)
+    if not existing_visual or str(existing_visual.get("reel_id")) != str(reel["id"]):
+        raise _coded_error(404, "visual_not_found", _VISUAL_NOT_FOUND)
+
+    updates = await _build_reel_visual_updates(payload, existing_visual, reel, visual_id)
+    if not updates:
+        return _normalize_reel_visual_row(existing_visual)
+
+    row = await supabase_update_reel_visual(visual_id, user_id, updates)
+    if not row:
+        raise _coded_error(404, "visual_not_found", _VISUAL_NOT_FOUND)
+    return _normalize_reel_visual_row(row)
+
+
+@app.delete("/api/reels/{job_id}/{clip_index}/visuals/{visual_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def delete_reel_visual_endpoint(
+    job_id: str, clip_index: int, visual_id: str, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    reel = await _resolve_reel_for_visuals(job_id, clip_index, user_id)
+    existing_visual = await supabase_get_reel_visual(visual_id, user_id)
+    if not existing_visual or str(existing_visual.get("reel_id")) != str(reel["id"]):
+        raise _coded_error(404, "visual_not_found", _VISUAL_NOT_FOUND)
+
+    deleted = await supabase_delete_reel_visual(visual_id, user_id)
+    if not deleted:
+        raise _coded_error(404, "visual_not_found", _VISUAL_NOT_FOUND)
+
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    image_s3_key = deleted.get("image_s3_key")
+    if bucket and image_s3_key:
+        try:
+            delete_s3_object(bucket, image_s3_key)
+        except Exception:
+            logger.warning("Failed to delete reel visual image %s from S3", image_s3_key, exc_info=True)
+
+    return {"deleted": True}
+
+
+class ApplyReelVisualsRequest(BaseModel):
+    input_filename: Optional[str] = None
+    input_url: Optional[str] = None
+
+
+def _download_visuals_for_burn(
+    rows: List[Dict[str, Any]], output_dir: str, bucket: str, local_image_paths: List[str],
+) -> List[Dict[str, Any]]:
+    """Downloads every configured visual's source image to local disk so
+    apply_visuals_to_video can read them -- isolated out of
+    _burn_reel_visuals to cut that function's cognitive complexity
+    further (audit: SonarQube python:S3776). Appends to the caller's own
+    `local_image_paths` list (rather than building and returning its own)
+    so a mid-loop failure still leaves every already-downloaded path
+    where the caller's cleanup will find and remove it."""
+    burn_visuals: List[Dict[str, Any]] = []
+    for row in rows:
+        image_s3_key = row.get("image_s3_key")
+        ext = os.path.splitext(image_s3_key or "")[1] or ".jpg"
+        local_image_path = os.path.join(output_dir, f"visual_src_{row['id']}{ext}")
+        if not bucket or not image_s3_key or not download_s3_object(bucket, image_s3_key, local_image_path):
+            raise HTTPException(status_code=503, detail="Failed to download a visual's image")
+        local_image_paths.append(local_image_path)
+        burn_visuals.append({
+            "image_path": local_image_path,
+            "position": row.get("position"),
+            "start_time": float(row.get("start_time") or 0),
+            "duration": float(row.get("duration") or 0),
+        })
+    return burn_visuals
+
+
+async def _reburn_subtitles_onto_visuals_stage(
+    *, job_id: str, clip_index: int, user_id: str, filename: str, output_dir: str,
+    visuals_stage_path: str, output_path: str, transcript: Optional[Dict[str, Any]],
+    clip_data: Dict[str, Any], subtitle_style_config: Any, loop: asyncio.AbstractEventLoop,
+) -> Tuple[str, bool]:
+    """Re-burns subtitles on top of the just-burned visuals stage, using
+    the clip's active subtitle style -- isolated out of _burn_reel_visuals
+    to cut that function's cognitive complexity further (audit:
+    SonarQube python:S3776). Returns (srt_path, whether subtitles were
+    actually reapplied) so the caller can still clean up the temp SRT
+    file even when generation comes back empty."""
+    subtitle_req = _build_subtitle_request_from_style(job_id, clip_index, subtitle_style_config)
+    words_per_line = max(2, min(8, int(subtitle_req.words_per_line or 4)))
+    srt_path = os.path.join(output_dir, f"visuals_subs_{clip_index}_{int(time.time())}.srt")
+    has_srt = await _generate_subtitle_srt_from_clip_context(
+        visuals_stage_path,
+        filename,
+        transcript,
+        clip_data,
+        srt_path,
+        words_per_line,
+        animation=subtitle_req.animation,
+    )
+    if not has_srt:
+        return srt_path, False
+
+    visual_windows = await _reel_visual_windows_for_job_clip(job_id, clip_index, user_id)
+    await loop.run_in_executor(
+        None,
+        _burn_subtitles_for_request,
+        subtitle_req,
+        visuals_stage_path,
+        srt_path,
+        output_path,
+        visual_windows,
+    )
+    return srt_path, True
+
+
+async def _burn_reel_visuals(
+    *, job_id: str, clip_index: int, user_id: str, rows: List[Dict[str, Any]],
+    input_path: str, filename: str, output_dir: str,
+    has_subtitle_material: bool, transcript: Optional[Dict[str, Any]],
+    clip_data: Dict[str, Any], subtitle_style_config: Any,
+) -> Tuple[str, str, bool]:
+    """Downloads every configured visual's image, burns them onto the clip
+    (re-burning subtitles on top when the clip has any), and cleans up every
+    temp file it creates along the way -- the self-contained "do the burn"
+    step apply_reel_visuals used to inline, which pushed its own cognitive
+    complexity well past this codebase's limit (audit: SonarQube
+    python:S3776)."""
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    local_image_paths: List[str] = []
+    visuals_stage_path = os.path.join(output_dir, f"visuals_stage_{filename}")
+    output_filename = f"visuals_{filename}"
+    output_path = os.path.join(output_dir, output_filename)
+    srt_path = ""
+    subtitle_reapplied = False
+    try:
+        burn_visuals = _download_visuals_for_burn(rows, output_dir, bucket, local_image_paths)
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, apply_visuals_to_video, input_path, burn_visuals, visuals_stage_path)
+
+        if has_subtitle_material:
+            srt_path, subtitle_reapplied = await _reburn_subtitles_onto_visuals_stage(
+                job_id=job_id, clip_index=clip_index, user_id=user_id, filename=filename, output_dir=output_dir,
+                visuals_stage_path=visuals_stage_path, output_path=output_path, transcript=transcript,
+                clip_data=clip_data, subtitle_style_config=subtitle_style_config, loop=loop,
+            )
+
+        if not subtitle_reapplied:
+            shutil.move(visuals_stage_path, output_path)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _generic_error("Visuals Error", e)
+    finally:
+        for path in local_image_paths:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+        try:
+            if srt_path and os.path.exists(srt_path):
+                os.remove(srt_path)
+        except Exception:
+            pass
+        try:
+            if visuals_stage_path and os.path.exists(visuals_stage_path):
+                os.remove(visuals_stage_path)
+        except Exception:
+            pass
+
+    return output_path, output_filename, subtitle_reapplied
+
+
+async def _persist_visuals_reset_baseline_if_needed(
+    reel: Dict[str, Any], job_id: str, clip_index: int, user_id: str,
+) -> Tuple[str, str]:
+    """The first time visuals are applied to a clip, its pre-visuals media
+    becomes the "reset baseline" that /visuals/reset later restores -- a
+    no-op once a baseline already exists."""
+    existing_reel_base_url = str(reel.get("reel_base_url") or "").strip()
+    existing_reel_base_s3_key = str(reel.get("reel_base_s3_key") or "").strip()
+    if not is_supabase_configured() or existing_reel_base_url:
+        return existing_reel_base_url, existing_reel_base_s3_key
+
+    current_reel_s3_key = str(reel.get("reel_s3_key") or "").strip()
+    baseline_video_url = _reel_media_url_from_s3_key(current_reel_s3_key) or str(reel.get("reel_url") or "").strip()
+    if not baseline_video_url:
+        return existing_reel_base_url, existing_reel_base_s3_key
+
+    try:
+        await supabase_update_reel_base_media_by_job_clip(
+            job_id=job_id,
+            clip_index=clip_index,
+            reel_base_url=baseline_video_url,
+            reel_base_s3_key=current_reel_s3_key or None,
+            user_id=user_id,
+        )
+        return baseline_video_url, current_reel_s3_key
+    except Exception as e:
+        print(f"⚠️ Failed to persist visuals reset baseline: {e}")
+        return existing_reel_base_url, existing_reel_base_s3_key
+
+
+async def _upload_and_sync_visuals_output(
+    *, job_id: str, clip_index: int, user_id: str, job: Any, clips: List[Any], data: Dict[str, Any],
+    metadata_path: str, output_path: str, output_filename: str, bucket: str,
+    existing_reel_base_url: str, existing_reel_base_s3_key: str,
+) -> str:
+    """Uploads the just-burned video (when S3 is configured), persists its
+    new URL onto the local job metadata, and syncs it to Supabase -- keeping
+    the reset baseline sticky once one exists."""
+    new_video_url = f"/videos/{job_id}/{output_filename}"
+    persisted_video_url = new_video_url
+    visuals_s3_key = ""
+    if bucket and os.path.exists(output_path):
+        visuals_s3_key = f"reels/{user_id}/{job_id}/{output_filename}"
+        if upload_file_to_s3(output_path, bucket, visuals_s3_key):
+            persisted_video_url = _reel_media_url_from_s3_key(visuals_s3_key) or new_video_url
+
+    _persist_new_video_url_to_clip(job, clip_index, clips, data, metadata_path, persisted_video_url, "visuals")
+
+    if is_supabase_configured() and persisted_video_url:
+        try:
+            await supabase_update_reel_media_by_job_clip(
+                job_id=job_id,
+                clip_index=clip_index,
+                reel_url=persisted_video_url,
+                reel_s3_key=visuals_s3_key or None,
+                user_id=user_id,
+            )
+            # Keep baseline sticky once initialized so reset consistently
+            # restores the pre-visuals media.
+            if existing_reel_base_url:
+                await supabase_update_reel_base_media_by_job_clip(
+                    job_id=job_id,
+                    clip_index=clip_index,
+                    reel_base_url=existing_reel_base_url,
+                    reel_base_s3_key=existing_reel_base_s3_key or None,
+                    user_id=user_id,
+                )
+        except Exception as e:
+            print(f"⚠️ Failed to sync reel URL after visuals apply: {e}")
+
+    return persisted_video_url
+
+
+@app.post("/api/reels/{job_id}/{clip_index}/visuals/apply", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def apply_reel_visuals(
+    job_id: str, clip_index: int, payload: ApplyReelVisualsRequest,
+    user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Burns every currently-configured visual for this clip into its
+    current video (see visuals.py) -- the explicit, deliberate "Générer"
+    step after the user has finished previewing their visuals, matching
+    how /api/hook and /api/subtitle already work (configure in a modal,
+    then burn via a separate call)."""
+    await _require_job_ownership(job_id, user_id)
+    reel = await _resolve_reel_for_visuals(job_id, clip_index, user_id)
+
+    rows = await supabase_list_reel_visuals(str(reel["id"]))
+    if not rows:
+        raise _coded_error(400, "no_visuals_configured", "No visuals are configured for this reel")
+
+    job = jobs.get(job_id)
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    metadata_path, data = await _get_or_build_job_metadata(job_id, clip_index, payload.input_url)
+    if not metadata_path or not data:
+        raise HTTPException(status_code=404, detail=_METADATA_NOT_FOUND)
+
+    clips = data.get('shorts', [])
+    if clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail=_CLIP_NOT_FOUND)
+    clip_data = clips[clip_index]
+
+    transcript = data.get('transcript') if isinstance(data.get('transcript'), dict) else None
+    subtitle_style_config, subtitle_style_source = await _resolve_active_subtitle_style_for_clip(
+        job_id,
+        clip_index,
+        user_id,
+        clip_data,
+    )
+    has_subtitle_material = bool(transcript) or bool(_saved_subtitle_captions_from_clip_data(clip_data))
+
+    # _resolve_burn_source_input_path already resolves the clean, pre-caption
+    # source when one exists, so visuals render onto clean pixels first and
+    # subtitles can be re-burned afterward with the persisted style.
+    resolve_req = types.SimpleNamespace(
+        job_id=job_id, clip_index=clip_index,
+        input_filename=payload.input_filename, input_url=payload.input_url,
+    )
+    input_path, filename = await _resolve_burn_source_input_path(resolve_req, output_dir, clip_data, metadata_path, user_id)
+
+    input_size_bytes = float(os.path.getsize(input_path) if os.path.exists(input_path) else 0)
+    input_duration_seconds = _probe_local_video_duration_seconds(input_path)
+    visuals_required_credits = _estimate_reel_required_credits(
+        duration_seconds=input_duration_seconds,
+        size_bytes=input_size_bytes,
+        uses_youtube_source=False,
+        uses_openai=False,
+        uses_assembly=False,
+        uses_gemini=False,
+    )
+    await _assert_user_has_required_credits(user_id, visuals_required_credits)
+
+    output_path, output_filename, subtitle_reapplied = await _burn_reel_visuals(
+        job_id=job_id, clip_index=clip_index, user_id=user_id, rows=rows,
+        input_path=input_path, filename=filename, output_dir=output_dir,
+        has_subtitle_material=has_subtitle_material, transcript=transcript,
+        clip_data=clip_data, subtitle_style_config=subtitle_style_config,
+    )
+
+    if subtitle_reapplied:
+        logger.info(
+            "Visuals apply re-burned subtitles for job %s clip %s using style source %s",
+            job_id,
+            clip_index,
+            subtitle_style_source,
+        )
+
+    existing_reel_base_url, existing_reel_base_s3_key = await _persist_visuals_reset_baseline_if_needed(
+        reel, job_id, clip_index, user_id,
+    )
+
+    persisted_video_url = await _upload_and_sync_visuals_output(
+        job_id=job_id, clip_index=clip_index, user_id=user_id, job=job, clips=clips, data=data,
+        metadata_path=metadata_path, output_path=output_path, output_filename=output_filename,
+        bucket=os.environ.get("AWS_S3_BUCKET", ""),
+        existing_reel_base_url=existing_reel_base_url, existing_reel_base_s3_key=existing_reel_base_s3_key,
+    )
+
+    if is_supabase_configured() and visuals_required_credits > 0:
+        await supabase_deduct_user_credits(user_id, visuals_required_credits)
+        await supabase_insert_user_data_history(
+            user_id=user_id,
+            credit=visuals_required_credits,
+            storage=0.0,
+            operation="output",
+            operation_type="reel_visuals",
+            operation_id=f"{job_id}:visuals:{clip_index}",
+        )
+
+    return {
+        "success": True,
+        "new_video_url": persisted_video_url,
+    }
+
+
+def _resolve_visuals_reset_video_url(reel: Dict[str, Any], clip_data: Dict[str, Any]) -> str:
+    """A reset restores a clip to its stored visuals baseline when one
+    exists, otherwise to its original pre-processing video."""
+    base_s3_key = str(reel.get("reel_base_s3_key") or "").strip()
+    reset_video_url = _reel_media_url_from_s3_key(base_s3_key) or str(reel.get("reel_base_url") or "").strip()
+    if reset_video_url:
+        return reset_video_url
+    return str(clip_data.get("original_video_url") or "").strip()
+
+
+async def _delete_reel_visuals_and_images(rows: List[Dict[str, Any]], user_id: str, bucket: str) -> int:
+    """Deletes every visual row for a reel and its S3 image, used by
+    reset_reel_visuals -- isolated so that endpoint's own cognitive
+    complexity stays under this codebase's limit (audit: SonarQube
+    python:S3776)."""
+    deleted_count = 0
+    for row in rows:
+        visual_id = str(row.get("id") or "")
+        if visual_id:
+            deleted = await supabase_delete_reel_visual(visual_id, user_id)
+            if deleted:
+                deleted_count += 1
+
+        image_s3_key = str(row.get("image_s3_key") or "").strip()
+        if bucket and image_s3_key:
+            try:
+                delete_s3_object(bucket, image_s3_key)
+            except Exception:
+                logger.warning("Failed to delete reel visual image %s from S3", image_s3_key, exc_info=True)
+
+    return deleted_count
+
+
+@app.post("/api/reels/{job_id}/{clip_index}/visuals/reset", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def reset_reel_visuals(
+    job_id: str,
+    clip_index: int,
+    user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    await _require_job_ownership(job_id, user_id)
+    reel = await _resolve_reel_for_visuals(job_id, clip_index, user_id)
+
+    metadata_path, data = await _get_or_build_job_metadata(job_id, clip_index)
+    if not metadata_path or not data:
+        raise HTTPException(status_code=404, detail=_METADATA_NOT_FOUND)
+
+    clips = data.get("shorts") or []
+    if clip_index < 0 or clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail=_CLIP_NOT_FOUND)
+
+    clip_data = clips[clip_index] if isinstance(clips[clip_index], dict) else {}
+    reset_video_url = _resolve_visuals_reset_video_url(reel, clip_data)
+    if not reset_video_url:
+        raise _coded_error(400, "missing_visuals_reset_source", "No baseline video reference found for visuals reset")
+
+    rows = await supabase_list_reel_visuals(str(reel["id"]))
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    deleted_count = await _delete_reel_visuals_and_images(rows, user_id, bucket)
+
+    job = jobs.get(job_id)
+    _persist_new_video_url_to_clip(job, clip_index, clips, data, metadata_path, reset_video_url, "visuals reset")
+
+    if is_supabase_configured():
+        try:
+            base_s3_key = str(reel.get("reel_base_s3_key") or "").strip()
+            await supabase_update_reel_media_by_job_clip(
+                job_id=job_id,
+                clip_index=clip_index,
+                reel_url=reset_video_url,
+                reel_s3_key=base_s3_key or None,
+                user_id=user_id,
+            )
+        except Exception as e:
+            print(f"⚠️ Failed to sync reel URL after visuals reset: {e}")
+
+    return {
+        "success": True,
+        "new_video_url": reset_video_url,
+        "deleted_visuals": deleted_count,
+    }
+
 
 # --- Translation (subtitles-only, keep original voice) ---
 
@@ -8099,6 +9340,7 @@ async def post_to_socials(req: SocialPostRequest, request: Request, user_id_head
     user_id = _resolve_request_user_id(req.user_id, user_id_header)
     await _assert_user_has_active_subscription_for_publish(user_id)
     accounts = await _resolve_accounts_for_publish(user_id, req.account_ids, _SHARE_PLATFORMS)
+    await _assert_user_can_publish(user_id, len(accounts))
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(req.scheduled_date, req.timezone)
     if req.scheduled_date and not scheduled_for:
@@ -8588,6 +9830,7 @@ class StripeCheckoutRequest(BaseModel):
     plan_id: str
     success_url: Optional[str] = None
     cancel_url: Optional[str] = None
+    billing_interval: Literal["month", "year"] = "month"
 
 
 def _require_stripe_ready() -> None:
@@ -8636,9 +9879,26 @@ async def _existing_stripe_customer_id(user_id: str) -> Optional[str]:
     return previous_subscription.get("stripe_customer_id") if previous_subscription else None
 
 
+def _annual_price_for_plan(plan: Dict[str, Any]) -> float:
+    """annual_price = monthly_price * 12 * (1 - reduction_annuelle/100).
+
+    `reduction_annuelle` is stored as an integer percentage on the plan
+    (5 => 5%). During rollout we still accept legacy fractional values
+    strictly between 0 and 1 (0.05 => 5%) so older rows keep pricing
+    correctly until the migration is applied everywhere.
+    """
+    monthly_price = float(plan.get("price") or 0)
+    raw_discount = float(plan.get("reduction_annuelle") or 0)
+    if 0 < raw_discount < 1:
+        raw_discount *= 100.0
+    discount_rate = min(1.0, max(0.0, raw_discount / 100.0))
+    return round(monthly_price * 12 * (1 - discount_rate), 2)
+
+
 async def _create_recurring_subscription_checkout(
     request: Request, user_id: str, plan: Dict[str, Any], *,
     success_url: str, cancel_url: str, previous_souscription_id: Optional[str] = None,
+    billing_interval: str = "month",
 ) -> Dict[str, Any]:
     """Creates a mode="subscription" Checkout Session for `plan`, reusing
     the user's existing Stripe Customer when there is one (see
@@ -8649,9 +9909,15 @@ async def _create_recurring_subscription_checkout(
     a brand new Stripe subscription because the current one isn't
     Stripe-recurring (see change_souscription_plan). Never closes the old
     row itself: an abandoned Checkout must leave the current plan
-    untouched."""
+    untouched.
+
+    billing_interval selects Stripe's own recurring.interval ("month" or
+    "year") and, for "year", the discounted annual price (see
+    _annual_price_for_plan) instead of the plain monthly price."""
+    billing_interval = billing_interval if billing_interval == "year" else "month"
+    price_amount = _annual_price_for_plan(plan) if billing_interval == "year" else float(plan.get("price") or 0)
     try:
-        unit_amount = int(round(float(plan.get("price") or 0) * 100))
+        unit_amount = int(round(price_amount * 100))
     except (TypeError, ValueError):
         raise _coded_error(400, "invalid_plan_price", _INVALID_PLAN_PRICE)
 
@@ -8663,11 +9929,18 @@ async def _create_recurring_subscription_checkout(
         "abonnement": str(plan.get("id")),
         "plan_name": str(plan.get("name") or ""),
         "payment_mode": "stripe",
+        "billing_interval": billing_interval,
     }
     if previous_souscription_id:
         metadata["previous_souscription_id"] = previous_souscription_id
 
     existing_customer_id = await _existing_stripe_customer_id(user_id)
+
+    description = (
+        "Abonnement annuel, renouvele automatiquement chaque annee"
+        if billing_interval == "year"
+        else "Abonnement mensuel, renouvele automatiquement chaque mois"
+    )
 
     try:
         session = stripe.checkout.Session.create(
@@ -8685,10 +9958,10 @@ async def _create_recurring_subscription_checkout(
                     "price_data": {
                         "currency": STRIPE_CURRENCY,
                         "unit_amount": unit_amount,
-                        "recurring": {"interval": "month"},
+                        "recurring": {"interval": billing_interval},
                         "product_data": {
                             "name": str(plan.get("name") or "Abonnement"),
-                            "description": "Abonnement mensuel, renouvele automatiquement chaque mois",
+                            "description": description,
                             "tax_code": "txcd_10103001",
                         },
                     },
@@ -8721,7 +9994,7 @@ async def create_stripe_checkout_session(
 
     plan = await supabase_get_abonnement(payload.plan_id)
     if not plan:
-        raise _coded_error(404, "plan_not_found", "Subscription plan not found")
+        raise _coded_error(404, "plan_not_found", _SUBSCRIPTION_PLAN_NOT_FOUND)
 
     default_base_url = _frontend_base_url(request)
     success_url = (payload.success_url or STRIPE_SUCCESS_URL or f"{default_base_url}/dashboard/abonnement?payment=success").strip()
@@ -8729,6 +10002,7 @@ async def create_stripe_checkout_session(
 
     return await _create_recurring_subscription_checkout(
         request, user_id, plan, success_url=success_url, cancel_url=cancel_url,
+        billing_interval=payload.billing_interval,
     )
 
 
@@ -8753,6 +10027,7 @@ def _extract_session_context(session: "stripe.checkout.Session") -> dict:
         "metadata": metadata,
         "user_id": metadata.get("userid"),
         "payment_mode": metadata.get("payment_mode", "stripe"),
+        "billing_interval": metadata.get("billing_interval", "month"),
         "amount_total": (session.amount_total or 0) / 100,
         "payment_reference": session.payment_intent or session.id or "",
         "payment_date": (
@@ -8809,7 +10084,20 @@ def _send_transactional_email(to_email: str, template_key: str, **context: Any) 
 
 
 async def _handle_credit_purchase(ctx: dict) -> dict:
-    """Handle a one-off credit purchase (payment_mode == 'stripe_credits')."""
+    """Handle a one-off credit purchase (payment_mode == 'stripe_credits').
+    Granted as its own expiring tier-2 batch (CREDIT_BATCH_TIER_PURCHASED,
+    in promotional_credit_batches -- see the credit-tiers migration)
+    rather than a plain delta into user_data.credit: that used to leave a
+    purchased top-up indistinguishable from subscription credit, with no
+    expiration of its own, and silently WIPED by the next subscription
+    renewal's reset-to-allowance (_reset_user_plan_balance always
+    overwrites user_data.credit wholesale rather than adding to it). As
+    its own batch it gets a configurable validity window
+    (PURCHASED_CREDITS_EXPIRATION_DAYS) and is consumed after promotional
+    credit but before subscription credit (see consume_promotional_credits'
+    tier ordering), and is revocable on refund/chargeback the same way a
+    referral reward batch already is (source_reference = this souscription
+    row's id -- see _handle_charge_refund_or_dispute)."""
     if await supabase_get_souscription_by_reference(ctx["payment_reference"]):
         return {"received": True, "duplicate": True}
 
@@ -8825,7 +10113,7 @@ async def _handle_credit_purchase(ctx: dict) -> dict:
     if credits_to_add <= 0:
         credits_to_add = usd_to_credits(ctx["amount_total"])
 
-    await supabase_insert_souscription(
+    new_souscription = await supabase_insert_souscription(
         user_id=ctx["user_id"],
         abonnement=None,
         payment_mode="stripe_credits",
@@ -8835,12 +10123,11 @@ async def _handle_credit_purchase(ctx: dict) -> dict:
         payment_comment=f"Credit purchase {credits_to_add} credits",
         payment_date=ctx["payment_date"],
     )
-    await supabase_upsert_user_data_credits(
-        user_id=ctx["user_id"],
-        credit_delta=credits_to_add,
-        update_credit_max=True,
-        operation_type="credit_purchase",
-        operation_id=ctx["payment_reference"],
+    souscription_id = str(new_souscription.get("id") or ctx["payment_reference"])
+
+    await supabase_insert_promotional_credit_batch(
+        ctx["user_id"], credits_to_add, "CREDIT_PURCHASE", PURCHASED_CREDITS_EXPIRATION_DAYS,
+        source_reference=souscription_id, tier=CREDIT_BATCH_TIER_PURCHASED,
     )
     await supabase_insert_user_data_history(
         user_id=ctx["user_id"],
@@ -8857,8 +10144,47 @@ async def _handle_credit_purchase(ctx: dict) -> dict:
     return {"received": True, "credits_added": credits_to_add}
 
 
-async def _allocate_plan_resources(user_id: str, abonnement: str, payment_reference: str, souscription_id: str) -> None:
-    """Credit the user's account with whatever the plan grants (credits + storage)."""
+async def _reset_user_plan_balance(user_id: str, credit: float, storage: float, operation_id: str) -> None:
+    """Reset a user's credit/storage balance (and their maxima) to exactly
+    `credit`/`storage` -- the actual Supabase write shared by a fresh plan
+    allocation (_allocate_plan_resources, using the live plan's values) and
+    an annual subscription's monthly refill (process_annual_credit_refill_jobs,
+    using that subscription's own snapshotted values instead)."""
+    await supabase_set_user_data_balance(
+        user_id=user_id,
+        credit=credit,
+        storage=storage,
+        credit_max=credit,
+        storage_max=storage,
+        operation_type="subscription",
+        operation_id=operation_id,
+    )
+    await supabase_insert_user_data_history(
+        user_id=user_id,
+        credit=credit,
+        storage=storage,
+        operation="input",
+        operation_type="subscription",
+        operation_id=operation_id,
+    )
+
+
+async def _allocate_plan_resources(
+    user_id: str, abonnement: str, payment_reference: str, souscription_id: str, *,
+    billing_interval: str = "month", period_start: Optional[datetime] = None,
+) -> None:
+    """Credit the user's account with whatever the plan grants (credits +
+    storage), and snapshot those exact values onto the souscription row
+    (plan_credit/plan_stockage) -- used instead of a live plan lookup
+    anywhere credits/storage need to be granted again for this same
+    subscription later, so a future change to the plan catalog never
+    retroactively changes what an already-in-progress subscription grants.
+
+    For an annual subscription (billing_interval == "year"), also schedules
+    the next monthly credit/storage refill (next_credit_allocation_at):
+    Stripe only raises this subscription's renewal invoice once a year, so
+    process_annual_credit_refill_jobs is what actually applies that
+    monthly-anniversary refill in between, straight off this snapshot."""
     plan = await supabase_get_abonnement(abonnement)
     if not plan:
         return
@@ -8867,23 +10193,18 @@ async def _allocate_plan_resources(user_id: str, abonnement: str, payment_refere
     plan_storage = float(plan.get("stockage") or 0)
 
     # A new/changed plan resets monthly allowances and their maxima to the plan limits.
-    await supabase_set_user_data_balance(
-        user_id=user_id,
-        credit=plan_credit,
-        storage=plan_storage,
-        credit_max=plan_credit,
-        storage_max=plan_storage,
-        operation_type="subscription",
-        operation_id=souscription_id or payment_reference,
-    )
-    await supabase_insert_user_data_history(
-        user_id=user_id,
-        credit=plan_credit,
-        storage=plan_storage,
-        operation="input",
-        operation_type="subscription",
-        operation_id=souscription_id or payment_reference,
-    )
+    await _reset_user_plan_balance(user_id, plan_credit, plan_storage, souscription_id or payment_reference)
+    # The daily publish-quota cap is snapshotted onto user_data itself
+    # (depends on the user, never re-derived live from abonnement -- see
+    # consume_publish_quota) rather than onto this souscription row.
+    await supabase_set_user_max_daily_publications(user_id, plan.get("max_daily_publications") or 0)
+
+    if souscription_id:
+        snapshot_updates: Dict[str, Any] = {"plan_credit": plan_credit, "plan_stockage": plan_storage}
+        if billing_interval == "year":
+            anchor = period_start or datetime.now(timezone.utc)
+            snapshot_updates["next_credit_allocation_at"] = supabase_add_one_month(anchor).isoformat()
+        await supabase_update_souscription_row(souscription_id, snapshot_updates)
 
 
 def _handle_payment_method_setup(session: "stripe.checkout.Session") -> dict:
@@ -8945,6 +10266,59 @@ def _sync_customer_default_payment_method(stripe_subscription_id: Optional[str],
         logger.warning("Failed to sync default payment method for customer %s", stripe_customer_id)
 
 
+async def _create_notification(
+    user_id: str, type_: str, title: str, body: str = "", data: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Best-effort in-app notification -- must never fail the business
+    operation that triggered it (signup association, reward grant, ...)."""
+    try:
+        await supabase_insert_notification(user_id, type_, title, body, data or {})
+    except Exception:
+        logger.warning("Failed to create notification %s for user %s", type_, user_id, exc_info=True)
+
+
+async def _maybe_reward_referrer_for_first_subscription(
+    referred_user_id: str, billing_interval: str, souscription_id: str,
+) -> None:
+    """Grants the referrer's reward the first time (and only the first
+    time -- see claim_referral_subscription_reward's conditional-update
+    idempotency guard, the same compare-and-swap pattern already used
+    elsewhere in this file for debit concurrency) their referee pays for a
+    plan. Only ever called from _handle_subscription_purchase for a
+    confirmed first-ever paid subscription -- never on a renewal or plan
+    change, and never on a failed/pending payment."""
+    referral = await supabase_get_referral_by_referred_user(referred_user_id)
+    if not referral or referral.get("status") == "invalid":
+        return
+
+    subscription_type = "year" if billing_interval == "year" else "month"
+    reward_amount = REFERRAL_ANNUAL_BONUS_CREDITS if subscription_type == "year" else REFERRAL_MONTHLY_BONUS_CREDITS
+    source = "REFERRAL_ANNUAL_SUBSCRIPTION" if subscription_type == "year" else "REFERRAL_MONTHLY_SUBSCRIPTION"
+
+    claimed = await supabase_claim_referral_subscription_reward(referral["id"], subscription_type, souscription_id)
+    if not claimed:
+        return
+
+    referrer_user_id = referral["referrer_user_id"]
+    batch = await supabase_insert_promotional_credit_batch(
+        referrer_user_id, reward_amount, source, PROMOTIONAL_CREDITS_EXPIRATION_DAYS,
+        source_reference=souscription_id,
+    )
+    await supabase_update_referral_row(referral["id"], {"subscription_reward_batch_id": batch.get("id")})
+
+    label = "annuel" if subscription_type == "year" else "mensuel"
+    await _create_notification(
+        referrer_user_id, "referral_reward_granted", "Ton ami s'est abonné !",
+        f"Tu as reçu {reward_amount:.0f} crédits promotionnels car ton ami a choisi un abonnement {label}.",
+        {"amount": reward_amount, "subscription_type": subscription_type},
+    )
+    await _create_notification(
+        referred_user_id, "referral_referrer_rewarded", "Merci pour ton abonnement !",
+        "Grâce à toi, ton parrain vient de recevoir une récompense.",
+        {},
+    )
+
+
 async def _handle_subscription_purchase(ctx: dict) -> dict:
     """Handle a standard plan subscription checkout."""
     abonnement = ctx["metadata"].get("abonnement")
@@ -8954,8 +10328,20 @@ async def _handle_subscription_purchase(ctx: dict) -> dict:
     if await supabase_get_souscription_by_reference(ctx["payment_reference"]):
         return {"received": True, "duplicate": True}
 
+    previous_souscription_id = ctx["metadata"].get("previous_souscription_id")
+    # Must be resolved BEFORE inserting the new souscription row below,
+    # which would otherwise make this user look like they already have a
+    # prior subscription (themselves). A plan change via a fresh Checkout
+    # (previous_souscription_id set) is never a first subscription either
+    # -- that path only exists for a user who already has one.
+    is_first_subscription = False
+    if not previous_souscription_id:
+        prior_paid_subscription = await supabase_get_latest_user_paid_subscription(ctx["user_id"])
+        is_first_subscription = not prior_paid_subscription
+
     _sync_customer_default_payment_method(ctx.get("stripe_subscription_id"), ctx.get("stripe_customer_id"))
 
+    billing_interval = ctx.get("billing_interval", "month")
     new_souscription = await supabase_insert_souscription(
         user_id=ctx["user_id"],
         abonnement=abonnement,
@@ -8965,11 +10351,13 @@ async def _handle_subscription_purchase(ctx: dict) -> dict:
         payment_status="completed",
         payment_comment=f"Stripe checkout session {ctx['session_id']}".strip(),
         payment_date=ctx["payment_date"],
-        stripe_subscription_id=ctx.get("stripe_subscription_id"),
-        stripe_customer_id=ctx.get("stripe_customer_id"),
+        billing={
+            "stripe_subscription_id": ctx.get("stripe_subscription_id"),
+            "stripe_customer_id": ctx.get("stripe_customer_id"),
+            "billing_interval": billing_interval,
+        },
     )
 
-    previous_souscription_id = ctx["metadata"].get("previous_souscription_id")
     if previous_souscription_id:
         # Changing plan from a non-Stripe-recurring subscription goes
         # through a fresh Checkout (see change_souscription_plan /
@@ -8990,7 +10378,15 @@ async def _handle_subscription_purchase(ctx: dict) -> dict:
         abonnement=abonnement,
         payment_reference=ctx["payment_reference"],
         souscription_id=str(new_souscription.get("id") or ctx["payment_reference"]),
+        billing_interval=billing_interval,
+        period_start=ctx["payment_date"],
     )
+
+    if is_first_subscription:
+        await _maybe_reward_referrer_for_first_subscription(
+            ctx["user_id"], billing_interval, str(new_souscription.get("id") or ctx["payment_reference"]),
+        )
+
     _send_transactional_email(
         ctx["customer_email"], "subscription_purchase",
         amount=ctx["amount_total"], plan_name=ctx["metadata"].get("plan_name") or abonnement,
@@ -9014,12 +10410,14 @@ def _invoice_line_period(invoice: "stripe.Invoice") -> Tuple[Optional[datetime],
 
 
 async def _handle_subscription_renewal_invoice(invoice: "stripe.Invoice") -> dict:
-    """Credit a subscription's automatic monthly renewal. Stripe raises this
-    invoice itself on the subscription's billing anniversary -- the first
-    invoice (billing_reason "subscription_create") is instead handled by
-    checkout.session.completed, which has already run by the time it fires,
-    so only "subscription_cycle" reaches here (see the dispatch in
-    stripe_webhook)."""
+    """Credit a subscription's automatic renewal -- monthly for a monthly
+    plan, once a year for an annual one (see _allocate_plan_resources for
+    how an annual plan's credits/storage still get refilled every month in
+    between). Stripe raises this invoice itself on the subscription's
+    billing anniversary -- the first invoice (billing_reason
+    "subscription_create") is instead handled by checkout.session.completed,
+    which has already run by the time it fires, so only "subscription_cycle"
+    reaches here (see the dispatch in stripe_webhook)."""
     subscription_id = invoice.subscription
     if not subscription_id:
         return {"received": True, "ignored": "no_subscription_on_invoice"}
@@ -9039,6 +10437,7 @@ async def _handle_subscription_renewal_invoice(invoice: "stripe.Invoice") -> dic
     period_start, period_end = _invoice_line_period(invoice)
     payment_date = period_start or datetime.fromtimestamp(invoice.created, tz=timezone.utc)
     amount_total = (invoice.amount_paid or 0) / 100
+    billing_interval = metadata.get("billing_interval", "month")
 
     new_souscription = await supabase_insert_souscription(
         user_id=user_id,
@@ -9049,15 +10448,20 @@ async def _handle_subscription_renewal_invoice(invoice: "stripe.Invoice") -> dic
         payment_status="completed",
         payment_comment=f"Stripe subscription renewal {subscription_id}",
         payment_date=payment_date,
-        period_end_date=period_end,
-        stripe_subscription_id=subscription_id,
-        stripe_customer_id=invoice.customer or None,
+        billing={
+            "period_end_date": period_end,
+            "stripe_subscription_id": subscription_id,
+            "stripe_customer_id": invoice.customer or None,
+            "billing_interval": billing_interval,
+        },
     )
     await _allocate_plan_resources(
         user_id=user_id,
         abonnement=abonnement,
         payment_reference=payment_reference,
         souscription_id=str(new_souscription.get("id") or payment_reference),
+        billing_interval=billing_interval,
+        period_start=payment_date,
     )
     _send_transactional_email(
         invoice.customer_email, "subscription_renewal",
@@ -9066,15 +10470,19 @@ async def _handle_subscription_renewal_invoice(invoice: "stripe.Invoice") -> dic
     return {"received": True}
 
 
-def _handle_subscription_payment_failed(invoice: "stripe.Invoice") -> dict:
-    """Notify the customer when Stripe's automatic monthly renewal charge
-    fails (expired/declined card, insufficient funds, ...). Stripe keeps
-    retrying the charge on its own schedule (Smart Retries) independently
-    of this handler -- it only sends the heads-up email; it never touches
-    local credit/storage/subscription state, since nothing actually
-    changes here until Stripe gives up retrying (customer.subscription.
-    deleted or .updated to past_due/canceled, not handled by this webhook
-    today)."""
+async def _handle_subscription_payment_failed(invoice: "stripe.Invoice") -> dict:
+    """Notify the customer when Stripe's automatic monthly/annual renewal
+    charge fails (expired/declined card, insufficient funds, ...). Stripe
+    keeps retrying the charge on its own schedule (Smart Retries)
+    independently of this handler -- invoice.payment_failed fires again
+    on each attempt, with invoice.next_payment_attempt set to the next
+    scheduled retry. Only once Stripe gives up for good (this is the
+    LAST attempt, next_payment_attempt is now null/None) does this zero
+    the account's pure subscription credit (supabase_zero_subscription_credit
+    -- never the promotional/purchased credit batches, which stay usable
+    on their own terms regardless of the subscription's payment state).
+    A subsequent successful renewal resets it back to the plan's full
+    allowance as usual."""
     subscription_id = invoice.subscription
     if not subscription_id:
         return {"received": True, "ignored": "no_subscription_on_invoice"}
@@ -9082,15 +10490,19 @@ def _handle_subscription_payment_failed(invoice: "stripe.Invoice") -> dict:
     subscription = stripe.Subscription.retrieve(subscription_id)
     metadata = subscription.metadata.to_dict() if subscription.metadata else {}
     plan_name = metadata.get("plan_name") or metadata.get("abonnement") or "Vireel"
+    user_id = metadata.get("userid")
 
-    if invoice.next_payment_attempt:
-        retry_date = datetime.fromtimestamp(invoice.next_payment_attempt, tz=timezone.utc).strftime("%d/%m/%Y")
-        retry_message = f"Une nouvelle tentative de prélèvement aura lieu automatiquement le {retry_date}."
-    else:
+    is_final_attempt = not invoice.next_payment_attempt
+    if is_final_attempt:
         retry_message = (
             "Aucune nouvelle tentative automatique n'est prévue -- merci de mettre à jour votre "
             "moyen de paiement dès que possible pour conserver l'accès à votre abonnement."
         )
+        if user_id:
+            await supabase_zero_subscription_credit(user_id, operation_id=str(invoice.id or subscription_id))
+    else:
+        retry_date = datetime.fromtimestamp(invoice.next_payment_attempt, tz=timezone.utc).strftime("%d/%m/%Y")
+        retry_message = f"Une nouvelle tentative de prélèvement aura lieu automatiquement le {retry_date}."
 
     _send_transactional_email(
         invoice.customer_email, "payment_failed",
@@ -9100,6 +10512,28 @@ def _handle_subscription_payment_failed(invoice: "stripe.Invoice") -> dict:
     return {"received": True}
 
 
+async def _handle_charge_refund_or_dispute(stripe_object: Any, reason: str) -> dict:
+    """A refund or chargeback landing on the exact charge that funded a
+    subscription payment -- revoke whatever's still available in any
+    promotional-credit batch a referral reward created from that payment
+    (see section 11 -- never claws back credits already spent, see
+    revoke_promotional_credit_batches_by_source_reference). A charge/
+    dispute unrelated to any referral reward is a no-op here (there's
+    simply nothing in promotional_credit_batches to match it)."""
+    payment_intent_id = _stripe_field(stripe_object, "payment_intent")
+    if not payment_intent_id:
+        return {"received": True, "ignored": "no_payment_intent"}
+
+    souscription = await supabase_get_souscription_by_reference(str(payment_intent_id))
+    if not souscription:
+        return {"received": True, "ignored": "no_matching_souscription"}
+
+    revoked = await supabase_revoke_promotional_credit_batches_by_source_reference(
+        str(souscription["id"]), reason,
+    )
+    return {"received": True, "revoked_batches": revoked}
+
+
 # ---------------------------------------------------------------------------
 # Route
 # ---------------------------------------------------------------------------
@@ -9107,8 +10541,9 @@ def _handle_subscription_payment_failed(invoice: "stripe.Invoice") -> dict:
 @app.post("/api/stripe/webhook", responses={400: {"description": "Bad Request"}, 503: {"description": "Service Unavailable"}})
 async def stripe_webhook(request: Request):
     """Handle Stripe checkout.session.completed (new purchase/subscription),
-    invoice.paid (automatic subscription renewal) and invoice.payment_failed
-    (failed automatic renewal charge) events."""
+    invoice.paid (automatic subscription renewal), invoice.payment_failed
+    (failed automatic renewal charge), charge.refunded and
+    charge.dispute.created (referral-reward clawback) events."""
     _require_stripe_ready()
     if not STRIPE_WEBHOOK_SECRET:
         raise HTTPException(status_code=503, detail="Stripe webhook secret is not configured")
@@ -9121,15 +10556,29 @@ async def stripe_webhook(request: Request):
 
     if event.type == "invoice.paid":
         invoice = event.data.object
-        if invoice.billing_reason != "subscription_cycle":
-            # "subscription_create" (the very first invoice) is handled by
-            # checkout.session.completed instead; anything else (a manual
-            # invoice, a one-off proration, ...) isn't a renewal.
+        # "subscription_create" (the very first invoice) is handled by
+        # checkout.session.completed instead. "subscription_update" is
+        # the invoice Stripe raises when a Subscription Schedule's phase
+        # 2 takes over at the scheduled boundary (see
+        # _create_or_replace_plan_change_schedule) -- it's a genuine
+        # recurring charge on the subscription, same as "subscription_cycle",
+        # just tagged differently because the price changed with it.
+        # Never matches the custom one-off proration invoice this app
+        # creates itself for an immediate upgrade (_charge_plan_change_
+        # proration): that one has no `subscription` attached at all and
+        # gets billing_reason "manual".
+        if invoice.billing_reason not in ("subscription_cycle", "subscription_update"):
             return {"received": True, "ignored": f"invoice.paid:{invoice.billing_reason}"}
         return await _handle_subscription_renewal_invoice(invoice)
 
     if event.type == "invoice.payment_failed":
-        return _handle_subscription_payment_failed(event.data.object)
+        return await _handle_subscription_payment_failed(event.data.object)
+
+    if event.type == "charge.refunded":
+        return await _handle_charge_refund_or_dispute(event.data.object, "refund")
+
+    if event.type == "charge.dispute.created":
+        return await _handle_charge_refund_or_dispute(event.data.object, "chargeback")
 
     if event.type != "checkout.session.completed":
         return {"received": True, "ignored": event.type}
@@ -9170,7 +10619,10 @@ async def get_current_souscription(
     request: Request,
     user_id: Annotated[str, Depends(get_user_id_header)],
 ) -> Optional[Dict[str, Any]]:
-    """Get the current active subscription for a user."""
+    """Get the current active subscription for a user -- also the data
+    source for the subscription-management view (spec section 8): active
+    plan, next billing/allocation dates, and any pending scheduled change
+    with what it would switch to."""
     await _enforce_subscription_retention_policy(user_id)
     subscription = await get_user_abonnement(user_id)
     if not subscription:
@@ -9184,8 +10636,20 @@ async def get_current_souscription(
                 **subscription,
                 "abonnement_name": plan.get("name") or abonnement_id,
                 "abonnement_credit": float(plan.get("credit") or 0.0),
-                "abonnement_stockage": float(plan.get("stockage") or 0.0),
             }
+
+    billing_interval = subscription.get("billing_interval") or "month"
+    subscription["next_billing_date"] = subscription.get("payment_end_date")
+    subscription["next_credit_allocation_date"] = (
+        subscription.get("next_credit_allocation_at") if billing_interval == "year"
+        else subscription.get("payment_end_date")
+    )
+
+    scheduled_abonnement_id = str(subscription.get("scheduled_abonnement_id") or "").strip()
+    if scheduled_abonnement_id:
+        scheduled_plan = await supabase_get_abonnement(scheduled_abonnement_id)
+        subscription["scheduled_abonnement_name"] = (scheduled_plan or {}).get("name") or scheduled_abonnement_id
+
     return subscription
 
 
@@ -9238,7 +10702,7 @@ async def _get_active_stripe_souscription(user_id: str) -> Dict[str, Any]:
     the time this raises, changing plan is the only way out for the user."""
     subscription = await get_user_abonnement(user_id)
     if not subscription:
-        raise _coded_error(404, "no_active_subscription", "No active subscription")
+        raise _coded_error(404, "no_active_subscription", _NO_ACTIVE_SUBSCRIPTION)
     if not subscription.get("stripe_subscription_id"):
         raise _coded_error(
             400,
@@ -9499,14 +10963,211 @@ async def replace_souscription_payment_method(
     return {"checkout_url": session.url}
 
 
-async def _assert_plan_change_within_limits(user_id: str, new_plan: Dict[str, Any]) -> None:
+# ---------------------------------------------------------------------------
+# Plan change classification + proration (plan-change rework spec, sections
+# 1, 2, 3 and 6)
+#
+# Required Stripe account/dashboard configuration for this section:
+#
+#  - Stripe Billing must be enabled (Subscriptions + Subscription
+#    Schedules -- both are part of the base Billing product, no separate
+#    opt-in). Nothing here uses Stripe Tax; "tax_code": "txcd_10103001"
+#    on every Price.create/product_data call is only there because
+#    Subscription.modify/SubscriptionSchedule.modify reject an item with
+#    "the product tax code is missing" once Stripe Tax or Managed
+#    Payments is active on the account -- it's a defensive no-op on an
+#    account that never turns Tax on, and the actual tax calculation (if
+#    any) is entirely Stripe's own, outside this code's control.
+#  - Managed Payments must stay OFF for mode="subscription"/"setup"
+#    Checkout Sessions the way the rest of this file already disables it
+#    (see create_recurring_subscription_checkout/replace_souscription_
+#    payment_method) -- unrelated to this rework, called out here only
+#    because a newer Stripe account may have it on by default.
+#  - Webhook endpoint: no NEW event type is required beyond what this
+#    app already subscribes to. invoice.paid is now dispatched for
+#    BOTH billing_reason "subscription_cycle" (the pre-existing ordinary
+#    monthly/annual renewal) AND "subscription_update" (the invoice
+#    Stripe raises when a Subscription Schedule's phase 2 -- a deferred
+#    downgrade/periodicity change, see _create_or_replace_plan_change_
+#    schedule -- takes over at its start_date) -- see stripe_webhook's
+#    dispatch. Make sure the webhook endpoint configured in the Stripe
+#    Dashboard is subscribed to invoice.paid (already required before
+#    this rework) with no event-type filtering narrower than that.
+#  - Nothing here needs a Stripe-side "Customer portal" configuration --
+#    every action (immediate upgrade, scheduling, cancelling a scheduled
+#    change) is driven by this app's own endpoints, never a redirect to
+#    Stripe's hosted portal.
+#  - The off-session charge for an immediate upgrade's custom proration
+#    (_charge_plan_change_proration: InvoiceItem + Invoice, collection_
+#    method="charge_automatically") requires the customer to already
+#    have a default_payment_method on file (set by a prior Checkout
+#    Session or the explicit replace-card flow) -- an account with 3D
+#    Secure (SCA) enforcement may still require the cardholder to
+#    authenticate; Invoice.pay raises in that case same as a decline,
+#    which this code already treats as a failed payment (spec section 3:
+#    the current plan is left untouched).
+# ---------------------------------------------------------------------------
+PLAN_CHANGE_NOOP = "noop"
+PLAN_CHANGE_UPGRADE_IMMEDIATE = "upgrade_immediate"
+PLAN_CHANGE_DOWNGRADE_SCHEDULED = "downgrade_scheduled"
+PLAN_CHANGE_PERIODICITY_SCHEDULED = "periodicity_scheduled"
+PLAN_CHANGE_LATERAL_UNSUPPORTED = "lateral_unsupported"
+PLAN_CHANGE_INVALID = "invalid"
+
+# operation_type for the upgrade credit/storage supplement's user_data_history
+# entry -- added to the standard credit/storage ledger via a plain delta (see
+# _apply_immediate_upgrade), never a separate expiring batch: section 6 of
+# the spec says this supplement shares "the normal lot of the current
+# monthly cycle"'s own expiration, which in this codebase is simply "wiped
+# at the next reset", exactly like the base monthly allocation already is
+# (_reset_user_plan_balance) -- no new expiration mechanism to build.
+PLAN_CHANGE_UPGRADE_OPERATION_TYPE = "plan_change_upgrade"
+
+
+def _plan_change_ordre(plan: Dict[str, Any]) -> Optional[int]:
+    """The plan's growth-order value (abonnement.ordre), used EXCLUSIVELY
+    to classify a plan change -- never name, price or credit quota (spec
+    section 1). None when absent or not a valid integer, which
+    _classify_plan_change treats as a hard refusal: ordre is nullable by
+    design (a plan retired from sale keeps its row but clears ordre --
+    see the ordre migration), so a subscriber still on such a plan, or a
+    target plan missing it, can't be safely auto-classified."""
+    raw = plan.get("ordre")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _classify_plan_change(
+    current_plan: Dict[str, Any], new_plan: Dict[str, Any],
+    current_interval: str, new_interval: str,
+) -> str:
+    """Centralizes the one piece of logic the whole plan-change rework
+    hinges on (spec section 1), reused by both the preview and the real
+    change endpoint so their classification can never disagree. Adding a
+    new plan only ever requires giving it the right abonnement.ordre --
+    nothing here is a hardcoded list of plan ids."""
+    same_plan = str(current_plan.get("id")) == str(new_plan.get("id"))
+    interval_changed = current_interval != new_interval
+
+    if same_plan and not interval_changed:
+        return PLAN_CHANGE_NOOP
+
+    current_ordre = _plan_change_ordre(current_plan)
+    new_ordre = _plan_change_ordre(new_plan)
+    if current_ordre is None or new_ordre is None:
+        return PLAN_CHANGE_INVALID
+
+    if not same_plan and current_ordre == new_ordre:
+        return PLAN_CHANGE_LATERAL_UNSUPPORTED
+
+    # A periodicity change always defers to the end of the already-paid
+    # period, whatever the ordre direction -- even when the target plan
+    # also outranks the current one (spec section 5) -- so this is
+    # checked before the upgrade/downgrade split below.
+    if interval_changed:
+        return PLAN_CHANGE_PERIODICITY_SCHEDULED
+
+    return PLAN_CHANGE_UPGRADE_IMMEDIATE if new_ordre > current_ordre else PLAN_CHANGE_DOWNGRADE_SCHEDULED
+
+
+def _remaining_ratio(period_start: Optional[datetime], period_end: Optional[datetime], now: datetime) -> float:
+    """Fraction of [period_start, period_end) still remaining at `now`,
+    clamped to [0, 1] -- the one time-based ratio every proration formula
+    below multiplies by."""
+    if not period_start or not period_end:
+        return 0.0
+    total = (period_end - period_start).total_seconds()
+    if total <= 0:
+        return 0.0
+    remaining = (period_end - now).total_seconds()
+    return max(0.0, min(1.0, remaining / total))
+
+
+def _round_credits(amount: float) -> int:
+    """Floor to a whole credit (the spec requires "crédits entiers") --
+    always rounding DOWN, never up, so a chain of successive upgrades/
+    downgrades can never accumulate extra credits purely from rounding.
+    The epsilon absorbs float representation error (e.g. 499.9999994 for
+    an exact 500) without ever rounding a genuine fraction up."""
+    return int(math.floor(float(amount) + 1e-6))
+
+
+def _round_price(amount: float) -> float:
+    """Floor to the cent, for the same determinism reason as
+    _round_credits -- the displayed preview and the amount actually
+    charged are always computed by this same function, so they can never
+    disagree (spec section 3: "le montant présenté doit correspondre au
+    montant réellement facturé")."""
+    return math.floor(float(amount) * 100 + 1e-6) / 100.0
+
+
+def _compute_monthly_upgrade_proration(
+    *, current_plan_credit: float, current_plan_price: float, new_plan: Dict[str, Any],
+    period_start: Optional[datetime], period_end: Optional[datetime], now: datetime,
+) -> Dict[str, Any]:
+    """Monthly same-periodicity upgrade (spec section 3): both the price
+    difference and the credit-quota difference are prorated by the same
+    ratio -- time remaining in the paid monthly period. Matches the
+    spec's own worked example: Silver 10€/500 credits -> Gold 25€/1500
+    credits at mid-cycle (ratio 0.5) charges 7.50€ and adds 500 credits."""
+    ratio = _remaining_ratio(period_start, period_end, now)
+    price_diff = float(new_plan.get("price") or 0) - float(current_plan_price or 0)
+    credit_diff = float(new_plan.get("credit") or 0) - float(current_plan_credit or 0)
+    return {
+        "amount_due_today": _round_price(price_diff * ratio),
+        "credits_to_add": _round_credits(credit_diff * ratio),
+        "remaining_ratio": ratio,
+    }
+
+
+def _compute_annual_upgrade_proration(
+    *, current_plan_credit: float, current_annual_price: float, new_plan: Dict[str, Any],
+    annual_period_start: Optional[datetime], annual_period_end: Optional[datetime],
+    credit_cycle_start: Optional[datetime], credit_cycle_end: Optional[datetime], now: datetime,
+) -> Dict[str, Any]:
+    """Annual same-periodicity upgrade (spec section 3): the ANNUAL price
+    difference is prorated against time remaining in the paid annual
+    period, but the credit difference is prorated against time remaining
+    in the CURRENT MONTHLY allocation sub-cycle -- two distinct ratios,
+    per the spec's explicit "deux calculs distincts" instruction."""
+    price_ratio = _remaining_ratio(annual_period_start, annual_period_end, now)
+    credit_ratio = _remaining_ratio(credit_cycle_start, credit_cycle_end, now)
+    price_diff = _annual_price_for_plan(new_plan) - float(current_annual_price or 0)
+    credit_diff = float(new_plan.get("credit") or 0) - float(current_plan_credit or 0)
+    return {
+        "amount_due_today": _round_price(price_diff * price_ratio),
+        "credits_to_add": _round_credits(credit_diff * credit_ratio),
+        "remaining_ratio": price_ratio,
+        "credit_remaining_ratio": credit_ratio,
+    }
+
+
+def _assert_upgrade_amounts_are_consistent(amount_due_today: float, credits_to_add: int) -> None:
+    """ordre says this is an upgrade -- if the resulting price or credit
+    delta computes negative anyway, the catalog is misconfigured (ordre
+    direction disagreeing with actual price/credit). Refuse outright
+    rather than silently charging/crediting a negative amount or
+    reinterpreting the request as a downgrade (spec section 3)."""
+    if amount_due_today < 0 or credits_to_add < 0:
+        raise _coded_error(
+            409, "plan_change_inconsistent_configuration",
+            "Cette offre est classee comme une montee en gamme, mais son prix ou son quota de "
+            "credits calcule est inferieur a l'offre actuelle. Contactez le support.",
+            amount_due_today=amount_due_today, credits_to_add=credits_to_add,
+        )
+
+
+async def _assert_plan_change_social_accounts_within_limits(user_id: str, new_plan: Dict[str, Any]) -> None:
     """Blocks a plan change that would leave the account over the new
-    plan's allowances. The new plan's resources aren't allocated until
-    this passes (see _allocate_plan_resources) -- without this check a
-    downgrade would silently leave, say, 5 connected Facebook accounts
-    against a plan that only allows 1, or more storage in use than the
-    new plan grants, with no way for the user to know until something
-    mysteriously stops working."""
+    plan's connected-account allowance -- there's no generic "block new
+    social account connections over limit" enforcement elsewhere, so this
+    is the only safety net available and applies to every classification,
+    including a SCHEDULED downgrade (it would be too late to catch this
+    once the schedule fires on its own, unattended)."""
     new_max_social = max(1, int(new_plan.get("max_social_account") or 1))
     counts = await _count_social_accounts_by_platform(user_id)
     over_limit_platforms = {platform: count for platform, count in counts.items() if count > new_max_social}
@@ -9517,22 +11178,6 @@ async def _assert_plan_change_within_limits(user_id: str, new_plan: Dict[str, An
             f"Cette offre autorise au maximum {new_max_social} compte(s) par reseau social. "
             f"Supprimez les comptes en surplus avant de changer d'offre : {details}.",
             max=new_max_social, details=details,
-        )
-
-    user_data = await supabase_get_user_data(user_id)
-    if not user_data:
-        return
-    storage_max = float(user_data.get("stockage_max") or 0.0)
-    storage_left = float(user_data.get("stockage") or 0.0)
-    storage_used = max(0.0, storage_max - storage_left)
-    new_storage_allowance = float(new_plan.get("stockage") or 0.0)
-    if storage_used > new_storage_allowance:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Cette offre inclut {new_storage_allowance:.1f} Go de stockage, mais vous utilisez "
-                f"actuellement {storage_used:.1f} Go. Supprimez du contenu avant de changer d'offre."
-            ),
         )
 
 
@@ -9569,17 +11214,30 @@ async def _change_plan_via_fresh_checkout(
         success_url=f"{default_base_url}/dashboard/settings?plan_change=success",
         cancel_url=f"{default_base_url}/dashboard/settings?plan_change=cancel",
         previous_souscription_id=str(subscription["id"]),
+        billing_interval=subscription.get("billing_interval") or "month",
     )
 
 
 def _apply_recurring_plan_change(
     subscription: Dict[str, Any], new_plan: Dict[str, Any],
 ) -> "stripe.Subscription":
-    """Swaps an already-recurring subscription's price in place, with
-    proration -- the counterpart of _change_plan_via_fresh_checkout for a
-    subscription that already has a real Stripe Subscription to modify."""
+    """Swaps an already-recurring subscription's price in place for an
+    IMMEDIATE upgrade -- the counterpart of _change_plan_via_fresh_checkout
+    for a subscription that already has a real Stripe Subscription to
+    modify. proration_behavior="none": the custom-computed proration
+    (_compute_monthly_upgrade_proration/_compute_annual_upgrade_proration)
+    is charged separately as its own exact invoice
+    (_charge_plan_change_proration) -- letting Stripe ALSO auto-generate
+    its own proration invoice item here would double-charge the
+    difference and could disagree with the amount already shown to the
+    user. Changing plan never changes billing_interval here -- the new
+    price keeps whichever cadence (monthly/annual) the current
+    subscription already bills on, re-priced for new_plan at that cadence
+    (see _annual_price_for_plan)."""
+    billing_interval = subscription.get("billing_interval") or "month"
+    price_amount = _annual_price_for_plan(new_plan) if billing_interval == "year" else float(new_plan.get("price") or 0)
     try:
-        unit_amount = int(round(float(new_plan.get("price") or 0) * 100))
+        unit_amount = int(round(price_amount * 100))
     except (TypeError, ValueError):
         raise _coded_error(400, "invalid_plan_price", _INVALID_PLAN_PRICE)
     if unit_amount <= 0:
@@ -9597,6 +11255,7 @@ def _apply_recurring_plan_change(
             **existing_metadata,
             "abonnement": str(new_plan.get("id")),
             "plan_name": str(new_plan.get("name") or ""),
+            "billing_interval": billing_interval,
         }
         # Subscription items only accept an existing product id in
         # price_data (unlike Checkout Session line items, which allow
@@ -9607,7 +11266,7 @@ def _apply_recurring_plan_change(
         new_price = stripe.Price.create(
             currency=STRIPE_CURRENCY,
             unit_amount=unit_amount,
-            recurring={"interval": "month"},
+            recurring={"interval": billing_interval},
             product_data={
                 "name": str(new_plan.get("name") or "Abonnement"),
                 # Unlike Checkout Session's line_items[].price_data.product_data
@@ -9623,97 +11282,575 @@ def _apply_recurring_plan_change(
         return stripe.Subscription.modify(
             subscription["stripe_subscription_id"],
             items=[{"id": item_id, "price": new_price.id}],
-            proration_behavior="create_prorations",
+            proration_behavior="none",
             metadata=new_metadata,
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
 
 
-async def _finalize_plan_change(
-    user_id: str, request: Optional[Request], subscription: Dict[str, Any], new_plan: Dict[str, Any],
-    updated_stripe_subscription: "stripe.Subscription",
+def _compute_plan_change_proration(
+    subscription: Dict[str, Any], current_plan: Dict[str, Any], new_plan: Dict[str, Any],
+    billing_interval: str, now: datetime,
 ) -> Dict[str, Any]:
-    """Persists an in-place Stripe plan swap: retires the old row, records
-    the new one, resets plan resources, and notifies the user -- the
-    bookkeeping half of _apply_recurring_plan_change's Stripe call."""
-    current_period_end = _extract_subscription_period_end(updated_stripe_subscription)
-    period_end = datetime.fromtimestamp(current_period_end, tz=timezone.utc) if current_period_end else None
+    """Dispatches to the monthly or annual upgrade-proration formula
+    (spec section 3) using this subscription's own stored dates --
+    payment_start_date/payment_end_date for the paid period, and (for an
+    annual subscription only) credit_cycle_start_at/credit_cycle_end_at
+    for the current monthly credit sub-cycle. current_plan is read live
+    from the catalog (its nominal price never needs its own snapshot,
+    unlike plan_credit, since _assert_upgrade_amounts_are_consistent
+    would catch a stale/misconfigured price anyway)."""
+    current_plan_credit = float(subscription.get("plan_credit") or 0.0)
+    period_start = _parse_iso_datetime(subscription.get("payment_start_date"))
+    period_end = _parse_iso_datetime(subscription.get("payment_end_date"))
+    if billing_interval == "year":
+        credit_cycle_start = _parse_iso_datetime(subscription.get("credit_cycle_start_at")) or period_start
+        credit_cycle_end = _parse_iso_datetime(subscription.get("credit_cycle_end_at")) or period_end
+        return _compute_annual_upgrade_proration(
+            current_plan_credit=current_plan_credit,
+            current_annual_price=_annual_price_for_plan(current_plan),
+            new_plan=new_plan,
+            annual_period_start=period_start, annual_period_end=period_end,
+            credit_cycle_start=credit_cycle_start, credit_cycle_end=credit_cycle_end, now=now,
+        )
+    return _compute_monthly_upgrade_proration(
+        current_plan_credit=current_plan_credit, current_plan_price=float(current_plan.get("price") or 0),
+        new_plan=new_plan, period_start=period_start, period_end=period_end, now=now,
+    )
 
-    # With proration, Stripe keeps the same billing-cycle end for the
-    # underlying subscription -- the new row below gets (essentially) the
-    # same payment_end_date as the old one, so both would otherwise match
-    # get_user_abonnement's "active" filter (payment_end_date >= now) at
-    # once, and which one it returns is unordered/arbitrary. Close the old
-    # row out now so only the new plan's row is "active" going forward.
+
+def _charge_plan_change_proration(
+    customer_id: Optional[str], amount_due_today: float, description: str, idempotency_key: Optional[str] = None,
+) -> None:
+    """Charges exactly `amount_due_today` -- the custom proration
+    computed by _compute_plan_change_proration, never Stripe's own
+    proration engine -- off-session against the customer's card on file,
+    via a one-off invoice. A no-op when there's nothing to charge (0,
+    e.g. a plan with an identical price but more credits). Raises before
+    anything else about the plan change is touched, so a declined card
+    or any other payment failure leaves the current plan fully in place
+    (spec section 3: "en cas d'echec de paiement... conserve l'offre
+    actuelle"); there is no browser redirect step here to be fooled by a
+    bare "return" from one -- this entire path is a synchronous
+    server-side call.
+
+    idempotency_key, when given, is suffixed per Stripe call (each needs
+    its own) so a retried request for the SAME upgrade (double-submit, a
+    client retry after a timeout, ...) reuses the same Stripe objects
+    instead of charging the card twice -- this only protects the Stripe
+    side; see change_souscription_plan's docstring for the remaining
+    crash window between a successful charge and the local bookkeeping
+    that follows it."""
+    if amount_due_today <= 0:
+        return
+    if not customer_id:
+        raise _coded_error(409, "plan_change_missing_payment_method", "Aucun moyen de paiement enregistre pour ce compte.")
+    unit_amount = int(round(amount_due_today * 100))
+    item_kwargs = {"idempotency_key": f"{idempotency_key}_item"} if idempotency_key else {}
+    invoice_kwargs = {"idempotency_key": f"{idempotency_key}_invoice"} if idempotency_key else {}
+    pay_kwargs = {"idempotency_key": f"{idempotency_key}_pay"} if idempotency_key else {}
+    try:
+        stripe.InvoiceItem.create(
+            customer=customer_id, amount=unit_amount, currency=STRIPE_CURRENCY, description=description, **item_kwargs,
+        )
+        invoice = stripe.Invoice.create(
+            customer=customer_id, auto_advance=True, collection_method="charge_automatically", description=description,
+            **invoice_kwargs,
+        )
+        invoice = stripe.Invoice.finalize_invoice(invoice.id)
+        stripe.Invoice.pay(invoice.id, **pay_kwargs)
+    except stripe.error.CardError as exc:
+        raise _coded_error(402, "plan_change_payment_failed", f"Paiement refuse : {getattr(exc, 'user_message', None) or exc}")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
+
+
+async def _cancel_scheduled_plan_change(user_id: str, subscription: Dict[str, Any]) -> None:
+    """Releases the Stripe Subscription Schedule driving a pending
+    downgrade/periodicity change (see _create_or_replace_plan_change_
+    schedule) and clears its local mirror columns -- the subscription
+    reverts to auto-renewing on its current (unchanged) terms, exactly as
+    if the change had never been scheduled."""
+    schedule_id = subscription.get("stripe_schedule_id")
+    if schedule_id:
+        try:
+            stripe.SubscriptionSchedule.release(schedule_id)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
     await supabase_update_souscription_row(
         str(subscription["id"]),
-        {"payment_end_date": datetime.now(timezone.utc).isoformat()},
+        {
+            "scheduled_abonnement_id": None, "scheduled_billing_interval": None,
+            "scheduled_effective_at": None, "scheduled_created_at": None,
+            "stripe_schedule_id": None,
+        },
         user_id=user_id,
     )
+
+
+def _create_or_replace_plan_change_schedule(
+    subscription: Dict[str, Any], new_plan: Dict[str, Any], new_interval: str,
+) -> Tuple[str, datetime]:
+    """Creates (replacing one already pending, if any) the Stripe
+    Subscription Schedule that defers a downgrade or periodicity change
+    to the end of the already-paid period (spec sections 4/5): phase 1 is
+    the subscription exactly as it is today, ending at its own current
+    Stripe period end; phase 2 starts there with the new plan's price and
+    metadata. Stripe raises the normal renewal invoice for phase 2 itself
+    -- the EXISTING _handle_subscription_renewal_invoice webhook applies
+    it unmodified, so there is no second, parallel billing path and the
+    underlying Subscription object (and its id) never changes. Returns
+    (schedule_id, effective_at)."""
+    stripe_subscription_id = subscription["stripe_subscription_id"]
+    try:
+        stripe_subscription = stripe.Subscription.retrieve(stripe_subscription_id)
+        current_period_end = _extract_subscription_period_end(stripe_subscription)
+        if not current_period_end:
+            raise _coded_error(502, "plan_change_schedule_failed", "Impossible de determiner la date de fin de periode en cours.")
+
+        existing_metadata = stripe_subscription.metadata.to_dict() if stripe_subscription.metadata else {}
+        current_item = stripe_subscription["items"]["data"][0]
+        current_price_id = current_item["price"]["id"]
+
+        price_amount = _annual_price_for_plan(new_plan) if new_interval == "year" else float(new_plan.get("price") or 0)
+        unit_amount = int(round(price_amount * 100))
+        if unit_amount <= 0:
+            raise _coded_error(400, "invalid_plan_price", _INVALID_PLAN_PRICE)
+        new_price = stripe.Price.create(
+            currency=STRIPE_CURRENCY, unit_amount=unit_amount, recurring={"interval": new_interval},
+            product_data={"name": str(new_plan.get("name") or "Abonnement"), "tax_code": "txcd_10103001"},
+        )
+        new_metadata = {
+            **existing_metadata,
+            "abonnement": str(new_plan.get("id")),
+            "plan_name": str(new_plan.get("name") or ""),
+            "billing_interval": new_interval,
+        }
+
+        # A subscription already governed by a schedule can't be adopted
+        # into a new one -- release whichever one this row was already
+        # pending on (replacing it) before attaching the fresh pair of
+        # phases below.
+        existing_schedule_id = subscription.get("stripe_schedule_id")
+        if existing_schedule_id:
+            try:
+                stripe.SubscriptionSchedule.release(existing_schedule_id)
+            except Exception:
+                logger.warning("Failed to release previous schedule %s before replacing it", existing_schedule_id, exc_info=True)
+
+        schedule = stripe.SubscriptionSchedule.create(from_subscription=stripe_subscription_id)
+        phase_zero_start = schedule["phases"][0]["start_date"]
+        schedule = stripe.SubscriptionSchedule.modify(
+            schedule.id,
+            end_behavior="release",
+            phases=[
+                {
+                    "items": [{"price": current_price_id, "quantity": 1}],
+                    "start_date": phase_zero_start,
+                    "end_date": current_period_end,
+                    "metadata": existing_metadata,
+                },
+                {
+                    "items": [{"price": new_price.id, "quantity": 1}],
+                    "start_date": current_period_end,
+                    "iterations": 1,
+                    "proration_behavior": "none",
+                    "metadata": new_metadata,
+                },
+            ],
+        )
+        return schedule.id, datetime.fromtimestamp(current_period_end, tz=timezone.utc)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}")
+
+
+async def _apply_scheduled_plan_change(
+    user_id: str, subscription: Dict[str, Any], new_plan: Dict[str, Any], new_interval: str, classification: str,
+) -> Dict[str, Any]:
+    """Schedules a downgrade or periodicity change (classifications
+    PLAN_CHANGE_DOWNGRADE_SCHEDULED / PLAN_CHANGE_PERIODICITY_SCHEDULED).
+    No charge, no credit/storage change now -- current_plan/features keep
+    running unchanged until Stripe's own renewal invoice applies the new
+    plan at the correct boundary (spec sections 4/5: next monthly renewal
+    for a monthly subscription, next ANNUAL renewal -- never the monthly
+    credit-allocation anniversary -- for an annual one)."""
+    if not subscription.get("stripe_subscription_id"):
+        raise _coded_error(
+            409, "plan_change_requires_recurring_subscription",
+            "Cet abonnement ne peut pas etre programme automatiquement. Contactez le support.",
+        )
+    if subscription.get("auto_renew") is False:
+        raise _coded_error(
+            409, "plan_change_subscription_cancelled",
+            "Cet abonnement est deja resilie en fin de periode -- reactivez-le avant de programmer un changement d'offre.",
+        )
+
+    schedule_id, effective_at = _create_or_replace_plan_change_schedule(subscription, new_plan, new_interval)
+    await supabase_update_souscription_row(
+        str(subscription["id"]),
+        {
+            "scheduled_abonnement_id": str(new_plan.get("id")),
+            "scheduled_billing_interval": new_interval,
+            "scheduled_effective_at": effective_at.isoformat(),
+            "scheduled_created_at": datetime.now(timezone.utc).isoformat(),
+            "stripe_schedule_id": schedule_id,
+        },
+        user_id=user_id,
+    )
+    return {
+        "classification": classification,
+        "scheduled_abonnement_id": str(new_plan.get("id")),
+        "scheduled_abonnement_name": str(new_plan.get("name") or ""),
+        "scheduled_billing_interval": new_interval,
+        "scheduled_effective_at": effective_at.isoformat(),
+    }
+
+
+async def _finalize_immediate_upgrade(
+    user_id: str, request: Optional[Request], subscription: Dict[str, Any], new_plan: Dict[str, Any],
+    updated_stripe_subscription: "stripe.Subscription", proration: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Persists an immediate upgrade once its custom-prorated charge has
+    already succeeded (_charge_plan_change_proration): retires the old
+    row, records the new one carrying the SAME renewal/credit-cycle
+    dates forward (spec section 3: "conserve les dates... existantes"),
+    and tops up credit/storage by a DELTA on top of the current balance
+    -- never a reset, so neither the existing balance nor its own
+    expiration is touched (spec section 6)."""
+    now = datetime.now(timezone.utc)
+    billing_interval = subscription.get("billing_interval") or "month"
+
+    current_period_end_ts = _extract_subscription_period_end(updated_stripe_subscription)
+    period_end = (
+        datetime.fromtimestamp(current_period_end_ts, tz=timezone.utc)
+        if current_period_end_ts else _parse_iso_datetime(subscription.get("payment_end_date"))
+    )
+    credit_cycle_start = _parse_iso_datetime(subscription.get("credit_cycle_start_at")) or _parse_iso_datetime(subscription.get("payment_start_date")) or now
+    credit_cycle_end = _parse_iso_datetime(subscription.get("credit_cycle_end_at")) or period_end
+    next_allocation = _parse_iso_datetime(subscription.get("next_credit_allocation_at"))
+
+    # Same "close the superseded row out" reasoning as before: both rows
+    # would otherwise carry the same payment_end_date and both match
+    # get_user_abonnement's "active" filter at once.
+    await supabase_update_souscription_row(
+        str(subscription["id"]), {"payment_end_date": now.isoformat()}, user_id=user_id,
+    )
+
+    new_plan_credit = float(new_plan.get("credit") or 0)
+    new_plan_storage = float(new_plan.get("stockage") or 0)
+    plan_amount = proration["amount_due_today"]
 
     new_souscription = await supabase_insert_souscription(
         user_id=user_id,
         abonnement=str(new_plan.get("id")),
         payment_mode="stripe",
-        payment_amount=float(new_plan.get("price") or 0),
-        payment_reference=f"planchange_{subscription['stripe_subscription_id']}_{int(datetime.now(timezone.utc).timestamp())}",
+        payment_amount=plan_amount,
+        payment_reference=f"planchange_{subscription['stripe_subscription_id']}_{int(now.timestamp())}",
         payment_status="completed",
-        payment_comment=f"Plan changed to {new_plan.get('name')}",
-        period_end_date=period_end,
-        stripe_subscription_id=subscription["stripe_subscription_id"],
-        stripe_customer_id=subscription.get("stripe_customer_id"),
+        payment_comment=f"Plan upgraded to {new_plan.get('name')} (prorated)",
+        payment_date=now,
+        billing={
+            "period_end_date": period_end,
+            "stripe_subscription_id": subscription["stripe_subscription_id"],
+            "stripe_customer_id": subscription.get("stripe_customer_id"),
+            "billing_interval": billing_interval,
+        },
+        allocation={
+            "plan_credit": new_plan_credit,
+            "plan_stockage": new_plan_storage,
+            "next_credit_allocation_at": next_allocation,
+            "credit_cycle_start_at": credit_cycle_start,
+            "credit_cycle_end_at": credit_cycle_end,
+        },
     )
-    await _allocate_plan_resources(
+    new_souscription_id = str(new_souscription.get("id") or "")
+
+    storage_delta = new_plan_storage - float(subscription.get("plan_stockage") or 0.0)
+    await supabase_upsert_user_data_credits(
         user_id=user_id,
-        abonnement=str(new_plan.get("id")),
-        payment_reference=str(new_souscription.get("id") or ""),
-        souscription_id=str(new_souscription.get("id") or ""),
+        credit_delta=float(proration["credits_to_add"]),
+        storage_delta=storage_delta,
+        update_credit_max=True,
+        update_stockage_max=True,
+        operation_type=PLAN_CHANGE_UPGRADE_OPERATION_TYPE,
+        operation_id=new_souscription_id,
     )
+    await supabase_insert_user_data_history(
+        user_id=user_id,
+        credit=float(proration["credits_to_add"]),
+        storage=storage_delta,
+        operation="input",
+        operation_type=PLAN_CHANGE_UPGRADE_OPERATION_TYPE,
+        operation_id=new_souscription_id,
+    )
+    await supabase_set_user_max_daily_publications(user_id, new_plan.get("max_daily_publications") or 0)
+
     _send_transactional_email(
         _user_email_from_request(request), "subscription_plan_changed",
-        plan_name=str(new_plan.get("name") or "Vireel"), amount=float(new_plan.get("price") or 0),
+        plan_name=str(new_plan.get("name") or "Vireel"), amount=plan_amount,
     )
     return new_souscription
 
 
-@app.post("/api/souscription/change-plan", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def _apply_immediate_upgrade(
+    user_id: str, request: Optional[Request], subscription: Dict[str, Any],
+    current_plan: Dict[str, Any], new_plan: Dict[str, Any], confirm_cancel_scheduled: bool,
+) -> Dict[str, Any]:
+    """Applies classification PLAN_CHANGE_UPGRADE_IMMEDIATE (spec section
+    3): computes the custom proration, refuses an internally-inconsistent
+    catalog, requires explicit confirmation to proceed if it would cancel
+    an already-scheduled change (spec section 4's last sentence), charges
+    that exact amount, and only then mutates anything local or on Stripe."""
+    billing_interval = subscription.get("billing_interval") or "month"
+    now = datetime.now(timezone.utc)
+
+    if not subscription.get("stripe_subscription_id"):
+        raise _coded_error(
+            409, "plan_change_requires_recurring_subscription",
+            "Cet abonnement ne peut pas etre mis a niveau automatiquement. Contactez le support.",
+        )
+
+    proration = _compute_plan_change_proration(subscription, current_plan, new_plan, billing_interval, now)
+    _assert_upgrade_amounts_are_consistent(proration["amount_due_today"], proration["credits_to_add"])
+
+    has_scheduled_change = bool(subscription.get("scheduled_abonnement_id"))
+    if has_scheduled_change and not confirm_cancel_scheduled:
+        scheduled_plan = await supabase_get_abonnement(str(subscription.get("scheduled_abonnement_id")))
+        raise _coded_error(
+            409, "plan_change_scheduled_change_exists",
+            "Un changement est deja programme sur cet abonnement. Confirmez pour l'annuler et appliquer "
+            "cette montee immediatement.",
+            scheduled_abonnement_name=(scheduled_plan or {}).get("name") or subscription.get("scheduled_abonnement_id"),
+        )
+
+    description = f"Montee vers {new_plan.get('name')} (prorata)"
+    # Stable for as long as this exact upgrade (same subscription, same
+    # target plan, same already-paid period) could be retried -- a
+    # second attempt reuses the same Stripe objects instead of charging
+    # twice (see _charge_plan_change_proration's docstring).
+    idempotency_key = f"planchange_{subscription['stripe_subscription_id']}_{new_plan.get('id')}_{subscription.get('payment_end_date')}"
+    _charge_plan_change_proration(
+        subscription.get("stripe_customer_id"), proration["amount_due_today"], description, idempotency_key=idempotency_key,
+    )
+
+    if has_scheduled_change:
+        await _cancel_scheduled_plan_change(user_id, subscription)
+
+    updated_stripe_subscription = _apply_recurring_plan_change(subscription, new_plan)
+    return await _finalize_immediate_upgrade(user_id, request, subscription, new_plan, updated_stripe_subscription, proration)
+
+
+class ChangeSubscriptionPlanRequest(BaseModel):
+    plan_id: str
+    billing_interval: Optional[str] = None
+    confirm_cancel_scheduled: bool = False
+
+
+@app.post("/api/souscription/change-plan", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
 async def change_souscription_plan(
     payload: ChangeSubscriptionPlanRequest, user_id: Annotated[str, Depends(get_user_id_header)],
     request: Request = None,
 ):
-    """Swap the subscription's price for a different plan's, effective
-    immediately (with Stripe proration), and reset credit/storage to the
-    new plan's allowance the same way a fresh purchase would -- mirrors
-    _allocate_plan_resources's existing "a changed plan resets monthly
-    allowances" behavior, just triggered synchronously here instead of via
-    a webhook. A subscription with no stripe_subscription_id goes through
-    _change_plan_via_fresh_checkout instead (see
-    _get_active_stripe_souscription's docstring for why)."""
+    """Centralized plan-change entry point (plan-change rework spec).
+    Classifies the request using ONLY abonnement.ordre (_classify_plan_change)
+    and dispatches: an upgrade at the same periodicity applies immediately
+    with custom proration (_apply_immediate_upgrade); a downgrade or a
+    periodicity change is deferred to the end of the already-paid period
+    via a Stripe Subscription Schedule (_apply_scheduled_plan_change); the
+    same plan+periodicity is a no-op; a lateral or unclassifiable (ordre
+    absent/invalid) change is refused outright, with nothing touched."""
     _require_stripe_ready()
     if not is_supabase_configured():
         raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
 
     subscription = await get_user_abonnement(user_id)
     if not subscription:
-        raise _coded_error(404, "no_active_subscription", "No active subscription")
+        raise _coded_error(404, "no_active_subscription", _NO_ACTIVE_SUBSCRIPTION)
+
+    current_plan = await supabase_get_abonnement(str(subscription.get("abonnement") or ""))
+    if not current_plan:
+        raise _coded_error(409, "plan_change_invalid_order", "L'offre actuelle n'est plus disponible pour evaluer ce changement.")
 
     new_plan = await supabase_get_abonnement(payload.plan_id)
     if not new_plan:
-        raise _coded_error(404, "plan_not_found", "Subscription plan not found")
+        raise _coded_error(404, "plan_not_found", _SUBSCRIPTION_PLAN_NOT_FOUND)
 
-    await _assert_plan_change_within_limits(user_id, new_plan)
+    current_interval = subscription.get("billing_interval") or "month"
+    new_interval = payload.billing_interval or current_interval
+    if new_interval not in ("month", "year"):
+        raise _coded_error(400, "invalid_billing_interval", "billing_interval doit etre 'month' ou 'year'.")
+
+    classification = _classify_plan_change(current_plan, new_plan, current_interval, new_interval)
+
+    if classification == PLAN_CHANGE_NOOP:
+        return {"classification": PLAN_CHANGE_NOOP, "changed": False}
+    if classification == PLAN_CHANGE_INVALID:
+        raise _coded_error(409, "plan_change_invalid_order", "Cette offre ne peut pas etre evaluee (ordre manquant ou invalide).")
+    if classification == PLAN_CHANGE_LATERAL_UNSUPPORTED:
+        raise _coded_error(409, "plan_change_lateral_unsupported", "Le changement vers une offre de meme rang n'est pas pris en charge.")
+
+    await _assert_plan_change_social_accounts_within_limits(user_id, new_plan)
 
     if not subscription.get("stripe_subscription_id"):
-        return await _change_plan_via_fresh_checkout(request, user_id, subscription, new_plan)
+        # Legacy pre-recurring-billing subscription (see
+        # _get_active_stripe_souscription's docstring) -- there is no
+        # Stripe Subscription to modify or schedule. Only a same-
+        # periodicity upgrade can still go through a fresh Checkout;
+        # a deferred change has no recurring object to attach to.
+        if classification == PLAN_CHANGE_UPGRADE_IMMEDIATE:
+            return await _change_plan_via_fresh_checkout(request, user_id, subscription, new_plan)
+        raise _coded_error(
+            409, "plan_change_requires_recurring_subscription",
+            "Cet abonnement ne peut pas etre programme automatiquement. Contactez le support.",
+        )
 
-    updated_stripe_subscription = _apply_recurring_plan_change(subscription, new_plan)
-    return await _finalize_plan_change(user_id, request, subscription, new_plan, updated_stripe_subscription)
+    if classification == PLAN_CHANGE_UPGRADE_IMMEDIATE:
+        return await _apply_immediate_upgrade(user_id, request, subscription, current_plan, new_plan, payload.confirm_cancel_scheduled)
+
+    return await _apply_scheduled_plan_change(user_id, subscription, new_plan, new_interval, classification)
+
+
+@app.post("/api/souscription/change-plan/cancel-scheduled", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 502: {"description": "Bad Gateway"}, 503: {"description": "Service Unavailable"}})
+async def cancel_scheduled_plan_change(user_id: Annotated[str, Depends(get_user_id_header)]):
+    """Cancels this subscription's single pending scheduled change (spec
+    section 4), reverting it to auto-renew on its current, unchanged
+    terms."""
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+    subscription = await get_user_abonnement(user_id)
+    if not subscription:
+        raise _coded_error(404, "no_active_subscription", _NO_ACTIVE_SUBSCRIPTION)
+    if not subscription.get("scheduled_abonnement_id"):
+        raise _coded_error(404, "no_scheduled_change", "Aucun changement programme sur cet abonnement.")
+    await _cancel_scheduled_plan_change(user_id, subscription)
+    return {"cancelled": True}
+
+
+async def _preview_immediate_upgrade_summary(
+    subscription: Dict[str, Any], current_plan: Dict[str, Any], new_plan: Dict[str, Any],
+    current_interval: str, user_id: str, now: datetime,
+) -> Dict[str, Any]:
+    """The PLAN_CHANGE_UPGRADE_IMMEDIATE branch of
+    preview_souscription_plan_change's summary -- isolated out since it
+    alone (proration math + wallet lookups) made up most of that endpoint's
+    cognitive complexity (audit: SonarQube python:S3776)."""
+    proration = _compute_plan_change_proration(subscription, current_plan, new_plan, current_interval, now)
+    amount_due_today = proration["amount_due_today"]
+    credits_to_add = proration["credits_to_add"]
+    inconsistent = amount_due_today < 0 or credits_to_add < 0
+
+    user_data = await supabase_get_user_data(user_id)
+    current_credit = float((user_data or {}).get("credit") or 0.0)
+    promotional_batches = await supabase_list_active_promotional_credit_batches(user_id)
+    promotional_credit = sum(float(b.get("amount_remaining") or 0.0) for b in promotional_batches)
+
+    next_price = _annual_price_for_plan(new_plan) if current_interval == "year" else float(new_plan.get("price") or 0)
+    return {
+        "effective_at": now.isoformat(),
+        "amount_due_today": amount_due_today,
+        "inconsistent_configuration": inconsistent,
+        "credits_added_now": credits_to_add,
+        "credits_added_expires_at": subscription.get("credit_cycle_end_at") or subscription.get("payment_end_date"),
+        "resulting_credit_balance": current_credit + promotional_credit + (credits_to_add if not inconsistent else 0),
+        "future_monthly_credit_quota": float(new_plan.get("credit") or 0),
+        "next_amount": next_price,
+        "next_billing_date": subscription.get("payment_end_date"),
+    }
+
+
+@app.get("/api/souscription/change-plan/preview", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def preview_souscription_plan_change(
+    user_id: Annotated[str, Depends(get_user_id_header)],
+    plan_id: str,
+    billing_interval: Optional[str] = None,
+):
+    """Backend-computed pre-confirmation summary (spec section 8) -- uses
+    the EXACT same classification and proration functions as the real
+    change endpoint, so the amount shown here can never disagree with
+    what actually gets charged."""
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    subscription = await get_user_abonnement(user_id)
+    if not subscription:
+        raise _coded_error(404, "no_active_subscription", _NO_ACTIVE_SUBSCRIPTION)
+
+    current_plan = await supabase_get_abonnement(str(subscription.get("abonnement") or ""))
+    if not current_plan:
+        raise _coded_error(409, "plan_change_invalid_order", "L'offre actuelle n'est plus disponible pour evaluer ce changement.")
+
+    new_plan = await supabase_get_abonnement(plan_id)
+    if not new_plan:
+        raise _coded_error(404, "plan_not_found", _SUBSCRIPTION_PLAN_NOT_FOUND)
+
+    current_interval = subscription.get("billing_interval") or "month"
+    new_interval = billing_interval or current_interval
+    if new_interval not in ("month", "year"):
+        raise _coded_error(400, "invalid_billing_interval", "billing_interval doit etre 'month' ou 'year'.")
+
+    classification = _classify_plan_change(current_plan, new_plan, current_interval, new_interval)
+    now = datetime.now(timezone.utc)
+
+    summary: Dict[str, Any] = {
+        "classification": classification,
+        "current_plan_name": current_plan.get("name"),
+        "current_billing_interval": current_interval,
+        "new_plan_name": new_plan.get("name"),
+        "new_billing_interval": new_interval,
+        "will_cancel_scheduled_change": bool(subscription.get("scheduled_abonnement_id")),
+        "annual_billing_copy_required": new_interval == "year",
+    }
+
+    if classification == PLAN_CHANGE_UPGRADE_IMMEDIATE:
+        summary.update(await _preview_immediate_upgrade_summary(
+            subscription, current_plan, new_plan, current_interval, user_id, now,
+        ))
+    elif classification in (PLAN_CHANGE_DOWNGRADE_SCHEDULED, PLAN_CHANGE_PERIODICITY_SCHEDULED):
+        effective_at = subscription.get("payment_end_date")
+        summary.update({
+            "effective_at": effective_at,
+            "amount_due_today": 0.0,
+            "credits_added_now": 0,
+            "future_monthly_credit_quota": float(new_plan.get("credit") or 0),
+            "next_amount": _annual_price_for_plan(new_plan) if new_interval == "year" else float(new_plan.get("price") or 0),
+            "next_billing_date": effective_at,
+        })
+    else:
+        summary.update({"effective_at": None, "amount_due_today": 0.0, "credits_added_now": 0})
+
+    return summary
 
 
 # ---------------------------------------------------------------------------
 # User credits & history
 # ---------------------------------------------------------------------------
+
+def _bonus_credit_summary(bonus_batches: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Splits a user's active promotional-credit batches into the two
+    independently-expiring pools (see the credit-tiers migration) and
+    summarizes each, soonest-expiry-first (matching their own FEFO
+    consumption order) -- isolated out of get_user_credits to keep that
+    endpoint's cognitive complexity under this codebase's limit (audit:
+    SonarQube python:S3776). Never summed into one "bonus_credit" so the
+    wallet UI can label each pool correctly."""
+    promotional_batches = [b for b in bonus_batches if int(b.get("tier") or CREDIT_BATCH_TIER_PROMOTIONAL) == CREDIT_BATCH_TIER_PROMOTIONAL]
+    purchased_batches = [b for b in bonus_batches if int(b.get("tier") or CREDIT_BATCH_TIER_PROMOTIONAL) == CREDIT_BATCH_TIER_PURCHASED]
+    return {
+        "promotional_credit": sum(float(b.get("amount_remaining") or 0.0) for b in promotional_batches),
+        "promotional_credit_expirations": [
+            {"amount": float(b.get("amount_remaining") or 0.0), "expires_at": b.get("expires_at")}
+            for b in promotional_batches
+        ],
+        "purchased_credit": sum(float(b.get("amount_remaining") or 0.0) for b in purchased_batches),
+        "purchased_credit_expirations": [
+            {"amount": float(b.get("amount_remaining") or 0.0), "expires_at": b.get("expires_at")}
+            for b in purchased_batches
+        ],
+    }
+
 
 @app.get("/api/user/credits", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
 async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get_user_id_header)]):
@@ -9727,19 +11864,21 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
     has_active_subscription = bool(abonnement)
 
     data = await supabase_get_user_data(user_id)
+    bonus_batches = await supabase_list_active_promotional_credit_batches(user_id)
+    bonus_summary = _bonus_credit_summary(bonus_batches)
+    promotional_credit = bonus_summary["promotional_credit"]
+    purchased_credit = bonus_summary["purchased_credit"]
+
     if not data:
         return {
             "credit":   0.0,
-            "stockage": 0.0,
             "credit_max": 0.0,
-            "stockage_max": 0.0,
-            "storage_overage_tolerance_percent": STORAGE_OVERAGE_TOLERANCE_PERCENT,
-            "has_credits": False,
+            **bonus_summary,
+            "has_credits": (promotional_credit + purchased_credit) > 0,
             "has_active_subscription": has_active_subscription,
             "has_analytics_access": bool(abonnement) and int(abonnement.get("priorite") or 1) >= 2,
             "abo_costs": {
                 "credit":  0.0,
-                "storage": 0.0,
             },
             "default_costs": {
                 "reel":        DEFAULT_REEL_CREDITS,
@@ -9749,28 +11888,22 @@ async def get_user_credits(request: Request, user_id: Annotated[str, Depends(get
         }
 
     credit = float(data.get("credit", 0) or 0.0)
-    storage = float(data.get("stockage", 0) or 0.0)
     credit_max = float(data.get("credit_max", credit) or 0.0)
-    storage_max = float(data.get("stockage_max", max(storage, 0.0)) or 0.0)
 
     if not abonnement:
         abo_costs = {
             "credit":  0.0,
-            "storage": 0.0,
         }
     else:
         abo_costs = {
             "credit":  float(abonnement.get("credit",   0)),
-            "storage": float(abonnement.get("stockage", 0)),
         }
 
     return {
         "credit":   credit,
-        "stockage": storage,
         "credit_max": credit_max,
-        "stockage_max": storage_max,
-        "storage_overage_tolerance_percent": STORAGE_OVERAGE_TOLERANCE_PERCENT,
-        "has_credits": credit > 0,
+        **bonus_summary,
+        "has_credits": (credit + promotional_credit + purchased_credit) > 0,
         "has_active_subscription": has_active_subscription,
         "has_analytics_access": bool(abonnement) and int(abonnement.get("priorite") or 1) >= 2,
         "abo_costs": abo_costs,
@@ -9800,6 +11933,220 @@ async def get_user_history(
         "page":      page,
         "page_size": page_size,
     }
+
+
+# ---------------------------------------------------------------------------
+# Referral program
+# ---------------------------------------------------------------------------
+
+class AssociateReferralRequest(BaseModel):
+    referral_code: str
+
+
+@app.get("/api/referrals/config")
+async def get_referral_config():
+    """Public reward configuration -- the frontend must never hardcode
+    these amounts (see spec section 3): it always reads them from here so
+    the "invite a friend" copy stays in sync with whatever the backend
+    actually grants. A later env var change only ever affects REWARDS
+    GRANTED AFTER that change -- see insert_promotional_credit_batch,
+    which always fixes amount_initial/expires_at at grant time."""
+    return {
+        "signup_bonus_credits": REFERRAL_SIGNUP_BONUS_CREDITS,
+        "monthly_bonus_credits": REFERRAL_MONTHLY_BONUS_CREDITS,
+        "annual_bonus_credits": REFERRAL_ANNUAL_BONUS_CREDITS,
+        "expiration_days": PROMOTIONAL_CREDITS_EXPIRATION_DAYS,
+    }
+
+
+@app.get("/api/referrals/me", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
+async def get_my_referrals(request: Request, user_id: Annotated[str, Depends(get_user_id_header)]):
+    """The authenticated user's own referral link, plus a privacy-minded
+    summary of who they've referred (section 14: ordinal labels only, no
+    referee email/name -- see dashboard/src/pages/ParrainagePage.jsx)."""
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    code = await supabase_get_or_create_referral_code(user_id)
+    default_base_url = _frontend_base_url(request)
+
+    rows = await supabase_list_referrals_by_referrer(user_id)
+    referrals = [
+        {
+            "label": f"Filleul #{index}",
+            "created_at": row.get("created_at"),
+            "status": row.get("status"),
+            "first_subscription_type": row.get("first_subscription_type"),
+            "subscription_reward_granted_at": row.get("subscription_reward_granted_at"),
+        }
+        for index, row in enumerate(rows, start=1)
+    ]
+
+    return {
+        "code": code,
+        "link": f"{default_base_url}/r/{code}",
+        "referred_count": len(rows),
+        "rewarded_count": sum(1 for row in rows if row.get("subscription_reward_granted_at")),
+        "referrals": referrals,
+    }
+
+
+def _get_client_ip(request: Request) -> str:
+    client_ip = request.client.host if request.client else "unknown"
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        client_ip = fwd.split(",")[0].strip()
+    return client_ip
+
+
+@app.post("/api/referrals/associate", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def associate_referral(
+    request: Request, payload: AssociateReferralRequest, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Associates the authenticated user with a referrer and grants the
+    referee's signup bonus -- exactly once per user, ever. Called by the
+    frontend right after a genuinely new signup (email/password or
+    OAuth) completes; the association itself is still verified
+    server-side (see get_auth_user_created_at) rather than trusted from
+    the frontend's own "is this a new account" guess, since the frontend
+    is never authoritative for a reward (section 12).
+
+    Idempotent and deliberately unrevealing: a repeat call, a call for an
+    already-referred account, or a self-referral attempt all come back as
+    {"associated": false} rather than a distinct error that would let a
+    caller probe whether a code/account exists. Every grant and every
+    suspicious rejection (self-referral, stale account) is logged with
+    the caller's IP/user-agent -- not to block in real time, but so a
+    later audit pass (mass account creation, the same IP farming many
+    referred accounts, ...) has something to look at (section 12)."""
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    code = (payload.referral_code or "").strip()
+    client_ip = _get_client_ip(request)
+    user_agent = request.headers.get("user-agent", "")
+    if not code:
+        raise _coded_error(400, "invalid_referral_code", "Invalid referral code")
+
+    referrer_user_id = await supabase_get_referral_code_owner(code)
+    if not referrer_user_id:
+        raise _coded_error(404, "referral_code_not_found", "Referral code not found")
+
+    if referrer_user_id == user_id:
+        logger.warning(
+            "Self-referral attempt blocked for user %s (code=%s, ip=%s, ua=%s)",
+            user_id, code, client_ip, user_agent,
+        )
+        return {"associated": False}
+
+    if await supabase_get_referral_by_referred_user(user_id):
+        return {"associated": False}
+
+    created_at = await supabase_get_auth_user_created_at(user_id)
+    if created_at is None or (datetime.now(timezone.utc) - created_at) > timedelta(minutes=REFERRAL_ASSOCIATION_WINDOW_MINUTES):
+        logger.warning(
+            "Referral association rejected for user %s: account not new enough "
+            "(created_at=%s, ip=%s, ua=%s)",
+            user_id, created_at, client_ip, user_agent,
+        )
+        return {"associated": False}
+
+    referral, created = await supabase_insert_referral(referrer_user_id, user_id, code)
+    if not created or not referral:
+        return {"associated": False}
+
+    logger.info(
+        "Referral signup bonus granted: referrer=%s referee=%s code=%s ip=%s ua=%s",
+        referrer_user_id, user_id, code, client_ip, user_agent,
+    )
+
+    batch = await supabase_insert_promotional_credit_batch(
+        user_id, REFERRAL_SIGNUP_BONUS_CREDITS, "REFERRAL_SIGNUP", PROMOTIONAL_CREDITS_EXPIRATION_DAYS,
+        source_reference=str(referral["id"]),
+    )
+    await supabase_update_referral_row(referral["id"], {
+        "signup_reward_granted_at": datetime.now(timezone.utc).isoformat(),
+        "signup_reward_batch_id": batch.get("id"),
+    })
+
+    await _create_notification(
+        user_id, "referral_signup_bonus", "Bienvenue sur Vireel !",
+        f"Tu as reçu {REFERRAL_SIGNUP_BONUS_CREDITS:.0f} crédits promotionnels de bienvenue.",
+        {"amount": REFERRAL_SIGNUP_BONUS_CREDITS},
+    )
+    await _create_notification(
+        referrer_user_id, "referral_referee_joined", "Un ami a rejoint Vireel !",
+        "Quelqu'un vient de s'inscrire grâce à ton lien de parrainage.",
+        {},
+    )
+
+    return {"associated": True, "signup_bonus_credits": REFERRAL_SIGNUP_BONUS_CREDITS}
+
+
+def _require_admin_secret(x_admin_secret: Annotated[Optional[str], Header()] = None) -> None:
+    """Minimal shared-secret gate for the handful of administrative
+    endpoints this app has (see section 12: a referral can be
+    invalidated administratively) -- consistent with this codebase's
+    other secret-based protections (e.g. the Stripe webhook signature)
+    rather than a new RBAC system for one endpoint."""
+    if not ADMIN_API_SECRET or not x_admin_secret or not secrets.compare_digest(x_admin_secret, ADMIN_API_SECRET):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+class InvalidateReferralRequest(BaseModel):
+    reason: str
+
+
+@app.post("/api/admin/referrals/{referral_id}/invalidate", responses={403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def invalidate_referral_endpoint(
+    referral_id: str, payload: InvalidateReferralRequest, _admin: Annotated[None, Depends(_require_admin_secret)],
+):
+    """Administrative kill switch for a fraudulent/abusive referral --
+    never reachable by a normal user; see _require_admin_secret."""
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+
+    row = await supabase_invalidate_referral(referral_id, payload.reason)
+    if not row:
+        raise _coded_error(404, "referral_not_found", "Referral not found")
+    return row
+
+
+# ---------------------------------------------------------------------------
+# In-app notifications (generic, not email -- referrals are the first
+# source of these, not the only one)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/notifications", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
+async def list_notifications_endpoint(
+    user_id: Annotated[str, Depends(get_user_id_header)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    unread_only: bool = False,
+):
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+    items, unread_count = await supabase_list_notifications(user_id, limit=limit, unread_only=unread_only)
+    return {"items": items, "unread_count": unread_count}
+
+
+@app.post("/api/notifications/{notification_id}/read", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
+async def mark_notification_read_endpoint(
+    notification_id: str, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+    row = await supabase_mark_notification_read(notification_id, user_id)
+    if not row:
+        raise _coded_error(404, "notification_not_found", "Notification not found")
+    return row
+
+
+@app.post("/api/notifications/read-all", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
+async def mark_all_notifications_read_endpoint(user_id: Annotated[str, Depends(get_user_id_header)]):
+    if not is_supabase_configured():
+        raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
+    count = await supabase_mark_all_notifications_read(user_id)
+    return {"marked_read": count}
 
 
 # ---------------------------------------------------------------------------
@@ -10113,8 +12460,10 @@ async def list_captions(
         raise HTTPException(status_code=503, detail="Supabase captions is not configured")
 
     rows, total = await supabase_list_captions(user_id=user_id, page=page, page_size=page_size, status=status, query=q)
+    items = [_normalize_caption_row(row) for row in rows]
+    await _attach_media_asset_fields(items, CONTENT_KIND_CAPTION)
     return {
-        "items": [_normalize_caption_row(row) for row in rows],
+        "items": items,
         "total": total,
         "page": max(page, 1),
         "page_size": min(max(page_size, 1), 100),
@@ -10210,8 +12559,14 @@ async def _create_anonymous_story_endpoint_project(
 
         if os.path.exists(input_path):
             upload_file_to_s3(input_path, bucket_name, s3_source_key)
+        project_thumbnail_ref = _generate_and_upload_project_thumbnail_from_source(
+            input_path,
+            bucket_name,
+            user_id,
+            story_job_id,
+        )
 
-        return await supabase_create_project(
+        project = await supabase_create_project(
             user_id=user_id,
             name=story_title,
             description=project_description,
@@ -10221,8 +12576,11 @@ async def _create_anonymous_story_endpoint_project(
             source_s3_key=s3_source_key,
             source_size=size_bytes,
             source_duration=int(local_duration) if local_duration else None,
+            thumbnail_url=project_thumbnail_ref,
             status="processing",
         )
+        await _finalize_source_media_retention(story_job_id, user_id, project, size_bytes, bucket_name, s3_source_key)
+        return project
     except Exception as e:
         logger.warning(f"Failed to create project for anonymous story job {story_job_id}: {str(e)}")
         return None
@@ -10312,7 +12670,6 @@ async def create_anonymous_story(
     page_name, target_language = await _resolve_anonymous_story_page_context(request, page_name, target_language)
 
     await _enforce_job_concurrency_limit(user_id)
-    await _assert_user_has_storage_headroom(user_id)
 
     story_job_id = str(uuid.uuid4())
     output_dir = os.path.join(OUTPUT_DIR, story_job_id)
@@ -10617,8 +12974,10 @@ async def list_anonymous_stories_endpoint(
         raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
 
     rows, total = await supabase_list_anonymous_stories(user_id=user_id, page=page, page_size=page_size, status=status, query=q)
+    items = [_normalize_anonymous_story_row(row) for row in rows]
+    await _attach_media_asset_fields(items, CONTENT_KIND_ANONYMOUS_STORY)
     return {
-        "items": [_normalize_anonymous_story_row(row) for row in rows],
+        "items": items,
         "total": total,
         "page": max(page, 1),
         "page_size": min(max(page_size, 1), 100),
@@ -10920,6 +13279,7 @@ async def publish_anonymous_story_endpoint(
         raise HTTPException(status_code=400, detail="Story has no generated text to publish yet")
 
     accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SOCIAL_POST_PLATFORMS)
+    await _assert_user_can_publish(user_id, len(accounts))
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for, is_scheduled = _resolve_anonymous_story_schedule(payload)
     background_id = payload.background_id or anonymous_stories.BACKGROUND_PRESETS[0]["id"]
@@ -11280,6 +13640,7 @@ async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotate
         raise HTTPException(status_code=400, detail="text is required when no media is attached")
 
     accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SOCIAL_POST_PLATFORMS)
+    await _assert_user_can_publish(user_id, len(accounts))
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
     if payload.scheduled_date and not scheduled_for:
@@ -11312,7 +13673,7 @@ async def create_social_post(payload: CreateSocialPostRequest, user_id: Annotate
     }
 
 
-_COMMENT_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+_COMMENT_IMAGE_EXTENSIONS = _STANDARD_IMAGE_EXTENSIONS
 _COMMENT_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 # Longest a presigned S3 URL signed with static IAM credentials (SigV4) can
 # live -- AWS's own hard cap, not a choice made here. A comment's image_url
@@ -11386,7 +13747,7 @@ async def upload_social_comment_image(
     return {"image_url": image_url}
 
 
-_POST_MEDIA_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+_POST_MEDIA_IMAGE_EXTENSIONS = _STANDARD_IMAGE_EXTENSIONS
 _POST_MEDIA_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 _POST_MEDIA_VIDEO_MAX_BYTES = 200 * 1024 * 1024
 # Matches _COMMENT_IMAGE_URL_EXPIRATION_SECONDS: a scheduled post's
@@ -11535,6 +13896,7 @@ async def share_caption(caption_id: str, payload: ReelShareRequest, user_id: Ann
     final_title = payload.title or row.get("caption_title") or "Sous-titres"
     final_description = payload.description or row.get("caption_description") or ""
     accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SHARE_PLATFORMS)
+    await _assert_user_can_publish(user_id, len(accounts))
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
     if payload.scheduled_date and not scheduled_for:
@@ -11579,6 +13941,36 @@ class FilmSummaryRenderRequest(BaseModel):
     voice_id: Optional[str] = None
 
 
+class FilmSummaryAudioSettingsUpdateRequest(BaseModel):
+    subtitles_enabled: Optional[bool] = None
+    subtitle_style: Optional[Dict[str, Any]] = None
+
+
+class FilmSummaryTranslateNarrationRequest(BaseModel):
+    narration_language: str
+
+
+def _film_summary_media_urls(row: Dict[str, Any], bucket_name: str) -> Dict[str, str]:
+    """The review panel's video preview and clip-swap picker need the
+    original source video (not just the preview/final render) to let the
+    user see and seek through the whole film -- source_s3_key is always
+    populated by the time analysis finishes (even for a youtube source,
+    see _run_film_summary_analysis_pipeline) and only cleared once the
+    final render completes (_finalize_film_summary_render), so it's
+    reliably available throughout the awaiting_review window. Isolated
+    out of _normalize_film_summary_row to keep that function's cognitive
+    complexity under this codebase's limit (audit: SonarQube
+    python:S3776)."""
+    urls: Dict[str, str] = {}
+    if row.get("source_s3_key"):
+        urls["source_url"] = generate_presigned_url(bucket_name, row["source_s3_key"], expiration=3600)
+    if row.get("preview_s3_key"):
+        urls["preview_url"] = generate_presigned_url(bucket_name, row["preview_s3_key"], expiration=3600)
+    if row.get("final_s3_key"):
+        urls["final_url"] = generate_presigned_url(bucket_name, row["final_s3_key"], expiration=3600)
+    return urls
+
+
 def _normalize_film_summary_row(row: Dict[str, Any], *, include_content: bool = False) -> Dict[str, Any]:
     item = {
         "id": row.get("id"),
@@ -11600,17 +13992,18 @@ def _normalize_film_summary_row(row: Dict[str, Any], *, include_content: bool = 
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
         "completed_at": row.get("completed_at"),
+        "edit_mode": row.get("edit_mode") or "automatic",
+        "subtitles_enabled": bool(row.get("subtitles_enabled") or False),
+        "subtitle_style": row.get("subtitle_style") or None,
     }
     if include_content:
         item["classification"] = row.get("classification") or {}
         item["scene_index"] = row.get("scene_index") or []
         item["edit_plan"] = row.get("edit_plan") or {}
         item["validation_report"] = row.get("validation_report") or {}
+        item["manual_selection"] = row.get("manual_selection") or []
         bucket_name = os.environ.get("AWS_S3_BUCKET", "my-clips-bucket")
-        if row.get("preview_s3_key"):
-            item["preview_url"] = generate_presigned_url(bucket_name, row["preview_s3_key"], expiration=3600)
-        if row.get("final_s3_key"):
-            item["final_url"] = generate_presigned_url(bucket_name, row["final_s3_key"], expiration=3600)
+        item.update(_film_summary_media_urls(row, bucket_name))
     return item
 
 
@@ -11670,8 +14063,14 @@ async def _create_film_summary_endpoint_project(
 
         if os.path.exists(input_path):
             upload_file_to_s3(input_path, bucket_name, s3_source_key)
+        project_thumbnail_ref = _generate_and_upload_project_thumbnail_from_source(
+            input_path,
+            bucket_name,
+            user_id,
+            film_job_id,
+        )
 
-        return await supabase_create_project(
+        project = await supabase_create_project(
             user_id=user_id,
             name=film_title,
             description=project_description,
@@ -11681,8 +14080,11 @@ async def _create_film_summary_endpoint_project(
             source_s3_key=s3_source_key,
             source_size=size_bytes,
             source_duration=int(local_duration) if local_duration else None,
+            thumbnail_url=project_thumbnail_ref,
             status="processing",
         )
+        await _finalize_source_media_retention(film_job_id, user_id, project, size_bytes, bucket_name, s3_source_key)
+        return project
     except Exception as e:
         logger.warning(f"Failed to create project for film summary job {film_job_id}: {str(e)}")
         return None
@@ -11876,7 +14278,6 @@ async def create_film_summary(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     await _enforce_job_concurrency_limit(user_id)
-    await _assert_user_has_storage_headroom(user_id)
 
     film_job_id = str(uuid.uuid4())
     output_dir = os.path.join(OUTPUT_DIR, film_job_id)
@@ -11947,6 +14348,7 @@ async def create_film_summary(
         target_duration_seconds=resolved_target_duration,
         narration_language=resolved_narration_language,
         narration_style=resolved_narration_style,
+        source_language=source_language,
     ))
 
     return {
@@ -11988,14 +14390,14 @@ async def _run_film_summary_analysis_job(
     job_id: str, user_id: str, film_summary_id: Optional[str], project_id: Optional[str],
     input_path: str, output_dir: str, local_duration: float,
     size_bytes: float, analysis_required_credits: float, target_duration_seconds: float,
-    narration_language: str, narration_style: str,
+    narration_language: str, narration_style: str, source_language: Optional[str] = None,
 ) -> None:
     try:
         await reel_job_manager.start_job(job_id)
         await _run_film_summary_analysis_pipeline_stages(
             job_id, user_id, film_summary_id, project_id, input_path,
             local_duration, size_bytes, analysis_required_credits, target_duration_seconds,
-            narration_language, narration_style,
+            narration_language, narration_style, source_language=source_language,
         )
     except film_summary.FilmSummaryValidationError as exc:
         await _handle_film_summary_validation_failure(exc, job_id, user_id, film_summary_id, project_id, analysis_required_credits)
@@ -12009,18 +14411,28 @@ async def _run_film_summary_analysis_job(
             shutil.rmtree(output_dir, ignore_errors=True)
 
 
+async def _update_film_summary_if_tracked(film_summary_id: Optional[str], user_id: str, updates: Dict[str, Any]) -> None:
+    """Persists progress-tracking fields onto the film_summary row, when
+    one is actually being tracked for this job (Supabase configured and a
+    row id was given) -- the same two-part gate repeated at each stage of
+    _run_transcription_and_scene_detection_stages, extracted to cut that
+    function's cognitive complexity (audit: SonarQube python:S3776)."""
+    if film_summary_id and is_supabase_configured():
+        await supabase_update_film_summary(film_summary_id, user_id, updates)
+
+
 async def _run_transcription_and_scene_detection_stages(
     job_id: str, user_id: str, film_summary_id: Optional[str], input_path: str,
+    source_language: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
-    if film_summary_id and is_supabase_configured():
-        await supabase_update_film_summary(film_summary_id, user_id, {
-            "status": film_summary.FilmSummaryStatus.PROCESSING,
-            "stage": film_summary.FilmSummaryStage.TRANSCRIBING,
-        })
+    await _update_film_summary_if_tracked(film_summary_id, user_id, {
+        "status": film_summary.FilmSummaryStatus.PROCESSING,
+        "stage": film_summary.FilmSummaryStage.TRANSCRIBING,
+    })
     await reel_job_manager.update_progress(job_id, 20, film_summary.FilmSummaryStage.TRANSCRIBING)
 
     try:
-        transcript = await film_summary.transcribe_video_with_timecodes(input_path)
+        transcript = await film_summary.transcribe_video_with_timecodes(input_path, language_hint=source_language)
     except Exception as exc:
         raise film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.TRANSCRIPTION_FAILED, str(exc)) from exc
 
@@ -12029,6 +14441,12 @@ async def _run_transcription_and_scene_detection_stages(
     if not transcript_text or not transcript_segments:
         raise film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.TRANSCRIPTION_FAILED, "Empty transcript")
 
+    # The user's own choice always wins -- only fall back to whatever
+    # AssemblyAI reports when they left source_language on auto-detect, so
+    # an explicit choice can never be silently stomped by a (mis)detected
+    # value.
+    effective_source_language = source_language or transcript.get("language")
+
     if is_supabase_configured():
         await supabase_upsert_transcription({
             "user_id": user_id,
@@ -12036,16 +14454,15 @@ async def _run_transcription_and_scene_detection_stages(
             "clip_index": 0,
             "source_type": "video",
             "transcript_provider": "assemblyai",
-            "transcript_language": transcript.get("language"),
+            "transcript_language": effective_source_language,
             "transcript_text": transcript_text,
         })
 
-    if film_summary_id and is_supabase_configured():
-        await supabase_update_film_summary(film_summary_id, user_id, {
-            "stage": film_summary.FilmSummaryStage.DETECTING_SCENES,
-            "transcript_segments": transcript_segments,
-            "source_language": transcript.get("language"),
-        })
+    await _update_film_summary_if_tracked(film_summary_id, user_id, {
+        "stage": film_summary.FilmSummaryStage.DETECTING_SCENES,
+        "transcript_segments": transcript_segments,
+        "source_language": effective_source_language,
+    })
     await reel_job_manager.update_progress(job_id, 40, film_summary.FilmSummaryStage.DETECTING_SCENES)
 
     try:
@@ -12062,8 +14479,7 @@ async def _run_transcription_and_scene_detection_stages(
         raise film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.SCENE_DETECTION_FAILED, str(exc)) from exc
 
     scene_index = film_summary.build_scene_index(scenes, transcript_segments)
-    if film_summary_id and is_supabase_configured():
-        await supabase_update_film_summary(film_summary_id, user_id, {"scene_index": scene_index})
+    await _update_film_summary_if_tracked(film_summary_id, user_id, {"scene_index": scene_index})
 
     return transcript_segments, scene_index, str(transcript.get("language") or "")
 
@@ -12158,7 +14574,7 @@ async def _run_planning_and_validation_stages(
 async def _run_film_summary_analysis_pipeline_stages(
     job_id: str, user_id: str, film_summary_id: Optional[str], project_id: Optional[str], input_path: str,
     local_duration: float, size_bytes: float, analysis_required_credits: float, target_duration_seconds: float,
-    narration_language: str, narration_style: str,
+    narration_language: str, narration_style: str, source_language: Optional[str] = None,
 ) -> None:
     # Niveau 1 technical validation already ran synchronously in
     # create_film_summary, before the job/credits reservation even
@@ -12170,7 +14586,7 @@ async def _run_film_summary_analysis_pipeline_stages(
     # "processing continues only if validation succeeds" for the one stage
     # that actually dominates cost.
     transcript_segments, scene_index, detected_language = await _run_transcription_and_scene_detection_stages(
-        job_id, user_id, film_summary_id, input_path,
+        job_id, user_id, film_summary_id, input_path, source_language=source_language,
     )
     classification_usage = await _run_classification_gate(
         job_id, user_id, film_summary_id, local_duration, narration_language or detected_language,
@@ -12263,8 +14679,10 @@ async def list_film_summaries_endpoint(
         raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
 
     rows, total = await supabase_list_film_summaries(user_id=user_id, page=page, page_size=page_size, status=status, query=q)
+    items = [_normalize_film_summary_row(row) for row in rows]
+    await _attach_media_asset_fields(items, CONTENT_KIND_FILM_SUMMARY)
     return {
-        "items": [_normalize_film_summary_row(row) for row in rows],
+        "items": items,
         "total": total,
         "page": max(page, 1),
         "page_size": min(max(page_size, 1), 100),
@@ -12353,6 +14771,75 @@ async def update_film_summary_plan_endpoint(
     updated = await supabase_update_film_summary(film_summary_id, user_id, {
         "edit_plan": normalized_plan, "validation_report": validation_report,
         "target_duration_seconds": _plan_target_duration_seconds(normalized_plan),
+    })
+    return _normalize_film_summary_row(updated, include_content=True)
+
+
+@app.patch("/api/film-summaries/{film_summary_id}/audio-settings", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
+async def update_film_summary_audio_settings_endpoint(
+    film_summary_id: str, payload: FilmSummaryAudioSettingsUpdateRequest, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Persists the user's subtitle toggle/style -- applied at render time
+    (see render_edit_plan / _run_film_summary_render_pipeline_stages).
+    Editable up to the same point as the plan itself."""
+    row = await supabase_get_film_summary(film_summary_id, user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
+    if row.get("status") != film_summary.FilmSummaryStatus.AWAITING_REVIEW:
+        raise HTTPException(status_code=409, detail="Audio/subtitle settings can only be edited while awaiting review")
+
+    updates = payload.model_dump(exclude_unset=True)
+
+    if not updates:
+        return _normalize_film_summary_row(row, include_content=True)
+
+    updated = await supabase_update_film_summary(film_summary_id, user_id, updates)
+    return _normalize_film_summary_row(updated, include_content=True)
+
+
+@app.post("/api/film-summaries/{film_summary_id}/translate-narration", responses={400: {"description": "Bad Request"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}, 502: {"description": "Bad Gateway"}})
+async def translate_film_summary_narration_endpoint(
+    film_summary_id: str, payload: FilmSummaryTranslateNarrationRequest, user_id: Annotated[str, Depends(get_user_id_header)],
+):
+    """Lets the user fix a wrong narration-language choice on an already-
+    generated plan after the fact (see film_summary.translate_edit_plan_
+    narration's docstring): footage, timing and segment structure are
+    untouched, only each voice_over segment's narration text is
+    retranslated. Persists the translated plan plus the row's own
+    narration_language (so any later TTS/regeneration reflects the
+    correction too), same 404/409/502 conventions as the sibling
+    generate_film_summary_narration_endpoint."""
+    row = await supabase_get_film_summary(film_summary_id, user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
+    if row.get("status") != film_summary.FilmSummaryStatus.AWAITING_REVIEW:
+        raise HTTPException(status_code=409, detail="Narration language can only be edited while awaiting review")
+
+    resolved_language, _ = _resolve_film_summary_narration_settings(payload.narration_language, row.get("narration_style"))
+    if not resolved_language:
+        raise HTTPException(status_code=400, detail="narration_language is required")
+
+    movie_metadata = {
+        "title": row.get("title") or "",
+        "source_duration_ms": int((row.get("source_duration_seconds") or 0) * 1000),
+        "narration_style": row.get("narration_style") or "",
+    }
+    try:
+        result = await film_summary.translate_edit_plan_narration(
+            plan=row.get("edit_plan") or {}, target_language=resolved_language, movie_metadata=movie_metadata,
+            duration_tolerance_ratio=FILM_SUMMARY_DURATION_TOLERANCE_RATIO,
+        )
+    except Exception as exc:
+        # Same 502 convention as generate_film_summary_narration_endpoint's
+        # own try/except: any failure here (OpenAI transport/config error,
+        # malformed JSON after exhausting the retry, or the model breaking
+        # the translation invariant) is a planning failure, never the
+        # user's fault.
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    plan, validation_report = result["plan"], result["validation_report"]
+    updated = await supabase_update_film_summary(film_summary_id, user_id, {
+        "edit_plan": plan, "validation_report": validation_report, "narration_language": resolved_language,
     })
     return _normalize_film_summary_row(updated, include_content=True)
 
@@ -12453,6 +14940,8 @@ async def render_film_summary_endpoint(
         voice_id=voice_id,
         render_required_credits=render_required_credits,
         narration_language=row.get("narration_language") or "",
+        subtitles_enabled=bool(row.get("subtitles_enabled")),
+        subtitle_style=row.get("subtitle_style"),
     ))
 
     return {"job_id": render_job_id, "film_summary_id": film_summary_id, "status": "rendering"}
@@ -12461,11 +14950,13 @@ async def render_film_summary_endpoint(
 async def _run_film_summary_render_job(
     job_id: str, user_id: str, film_summary_id: str, project_id: Optional[str], source_s3_key: Optional[str],
     output_dir: str, plan: Dict[str, Any], voice_id: str, render_required_credits: float, narration_language: str,
+    subtitles_enabled: bool = False, subtitle_style: Optional[Dict[str, Any]] = None,
 ) -> None:
     try:
         await reel_job_manager.start_job(job_id)
         await _run_film_summary_render_pipeline_stages(
             job_id, user_id, film_summary_id, project_id, source_s3_key, output_dir, plan, voice_id, narration_language,
+            subtitles_enabled=subtitles_enabled, subtitle_style=subtitle_style,
         )
     except film_summary.FilmSummaryValidationError as exc:
         await reel_job_manager.fail_job(job_id, str(exc), error_code=exc.code)
@@ -12487,9 +14978,133 @@ async def _run_film_summary_render_job(
             shutil.rmtree(output_dir, ignore_errors=True)
 
 
+# Maps a film_summaries row's camelCase subtitle_style snapshot (the shape
+# CaptionsModal.jsx's DEFAULT_STYLE / caption_style_themes.style uses) to the
+# snake_case keys _DEFAULT_AUTO_CAPTION_STYLE_KWARGS/SubtitleRequest use.
+# Mirrors CaptionsModal.jsx's handleSetAsDefaultStyle mapping exactly -- copy
+# it, don't invent a new one -- except that `position` itself is hardcoded
+# to "bottom" below rather than read from the row, the same established
+# convention that call site uses.
+_FILM_SUMMARY_SUBTITLE_STYLE_FIELD_MAP: Dict[str, str] = {
+    "position_x": "positionX",
+    "position_y": "positionY",
+    "font_size": "fontSize",
+    "font_name": "fontFamily",
+    "font_color": "fontColor",
+    "highlight_color": "highlightColor",
+    "border_color": "borderColor",
+    "border_width": "borderWidth",
+    "text_shadow_color": "textShadowColor",
+    "shadow_blur": "shadowBlur",
+    "shadow_offset_x": "shadowOffsetX",
+    "shadow_offset_y": "shadowOffsetY",
+    "bg_color": "bgColor",
+    "bg_opacity": "bgOpacity",
+    "text_case": "textCase",
+    "bold": "bold",
+    "italic": "italic",
+    "words_per_line": "wordsPerLine",
+    "animation": "animation",
+}
+
+
+def _map_film_summary_subtitle_style(subtitle_style: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Resolves a film_summaries row's subtitle_style into the same
+    snake_case kwargs shape _DEFAULT_AUTO_CAPTION_STYLE_KWARGS has, falling
+    back to that factory default's own values for any key the row's
+    subtitle_style is missing (including when it is None/empty, e.g.
+    subtitles_enabled was turned on without ever opening the style
+    editor)."""
+    camel_style = subtitle_style if isinstance(subtitle_style, dict) else {}
+    kwargs = {"position": "bottom"}
+    for snake_key, camel_key in _FILM_SUMMARY_SUBTITLE_STYLE_FIELD_MAP.items():
+        kwargs[snake_key] = camel_style.get(camel_key, _DEFAULT_AUTO_CAPTION_STYLE_KWARGS[snake_key])
+    return kwargs
+
+
+def _build_film_summary_subtitle_style(subtitle_style: Optional[Dict[str, Any]]) -> SubtitleStyleOptions:
+    """Builds the subtitles.SubtitleStyleOptions burn_subtitles needs from a
+    film_summaries row's camelCase subtitle_style snapshot (see
+    _map_film_summary_subtitle_style for the field mapping)."""
+    kwargs = _map_film_summary_subtitle_style(subtitle_style)
+    return SubtitleStyleOptions(
+        font_name=kwargs["font_name"],
+        font_color=kwargs["font_color"],
+        border_color=kwargs["border_color"],
+        border_width=kwargs["border_width"],
+        bg_color=kwargs["bg_color"],
+        bg_opacity=kwargs["bg_opacity"],
+        text_shadow_color=kwargs["text_shadow_color"],
+        shadow_blur=kwargs["shadow_blur"],
+        shadow_offset_x=kwargs["shadow_offset_x"],
+        shadow_offset_y=kwargs["shadow_offset_y"],
+        bold=kwargs["bold"],
+        italic=kwargs["italic"],
+        text_case=kwargs["text_case"],
+        highlight_color=kwargs["highlight_color"],
+    )
+
+
+async def _apply_film_summary_subtitle_burn_in(
+    output_dir: str, final_path: str, subtitles_enabled: bool, subtitle_style: Optional[Dict[str, Any]],
+) -> str:
+    """Phase 3 post-processing: if subtitles_enabled, transcribes
+    final_path fresh -- generate_srt_from_video
+    is the same "no pre-existing transcript matches this exact audio"
+    codepath _generate_subtitle_srt's is_dubbed branch already uses for a
+    produced video whose exact spoken timing cannot be assumed to match any
+    existing transcript -- and burns it in with the row's mapped style.
+    Returns final_path unchanged when subtitles_enabled is false, so the
+    pipeline behaves exactly as today for any film summary without this
+    setting. Temporary .srt/.ass files are cleaned up before returning,
+    mirroring _burn_default_captions_for_clip's own cleanup.
+
+    "s'assurer qu'une transcription existe pour la video finale et baser
+    les sous titres sur cela": generate_srt_from_video's own return value
+    (previously discarded here) is checked explicitly -- when it comes
+    back False (no transcript/no speech detected), this raises
+    TRANSCRIPTION_FAILED instead of calling burn_subtitles against a
+    .srt file that was never written, which otherwise either crashed on
+    a confusing "no such file" or, if the video genuinely had no
+    duration to transcribe against, silently shipped the final video
+    with no subtitles burned in at all."""
+    if not subtitles_enabled:
+        return final_path
+    style_kwargs = _map_film_summary_subtitle_style(subtitle_style)
+    srt_path = os.path.join(output_dir, "film_summary_subtitles.srt")
+    new_path = os.path.join(output_dir, "final_with_subtitles.mp4")
+    try:
+        transcribed = await asyncio.to_thread(
+            generate_srt_from_video, final_path, srt_path, max_words_per_line=style_kwargs["words_per_line"],
+        )
+        if not transcribed:
+            raise film_summary.FilmSummaryValidationError(
+                film_summary.FilmSummaryErrorCode.TRANSCRIPTION_FAILED,
+                "La transcription de la video finale n'a produit aucun sous-titre",
+            )
+        style_options = _build_film_summary_subtitle_style(subtitle_style)
+        await asyncio.to_thread(
+            burn_subtitles, final_path, srt_path, new_path,
+            alignment=style_kwargs["position"], fontsize=style_kwargs["font_size"], style_options=style_options,
+        )
+    except film_summary.FilmSummaryValidationError:
+        raise
+    except Exception as exc:
+        raise film_summary.FilmSummaryValidationError(film_summary.FilmSummaryErrorCode.RENDER_FAILED, f"Subtitle burn-in failed: {exc}") from exc
+    finally:
+        for temp_path in (srt_path, f"{os.path.splitext(srt_path)[0]}.ass"):
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+    return new_path
+
+
 async def _run_film_summary_render_pipeline_stages(
     job_id: str, user_id: str, film_summary_id: str, project_id: Optional[str], source_s3_key: Optional[str],
     output_dir: str, plan: Dict[str, Any], voice_id: str, narration_language: str,
+    subtitles_enabled: bool = False, subtitle_style: Optional[Dict[str, Any]] = None,
 ) -> None:
     bucket_name = os.environ.get("AWS_S3_BUCKET", "my-clips-bucket")
     source_path = os.path.join(output_dir, "source.mp4")
@@ -12560,6 +15175,24 @@ async def _run_film_summary_render_pipeline_stages(
 
     await reel_job_manager.update_progress(job_id, 90, film_summary.FilmSummaryStage.RENDERING_FINAL)
 
+    # Subtitle burn-in over the final video is the last content-producing
+    # step before upload, and -- only when the user actually enabled
+    # subtitles -- gets its own dedicated, user-visible progress stage
+    # rather than being silently folded into RENDERING_FINAL ("il dois y a
+    # voir une etape dans la generation du resume dediee a l'ajout du sous
+    # titres... l'etape finale devrait etre l'ajout du sous titre"). When
+    # subtitles_enabled is false, final_path is untouched and the preview
+    # render_edit_plan already built stays valid as-is -- no extra stage is
+    # reported, since nothing happens here in that case.
+    if subtitles_enabled:
+        await reel_job_manager.update_progress(job_id, 95, film_summary.FilmSummaryStage.ADDING_SUBTITLES)
+    path_before_post_processing = final_path
+    final_path = await _apply_film_summary_subtitle_burn_in(
+        output_dir, final_path, subtitles_enabled, subtitle_style,
+    )
+    if final_path != path_before_post_processing:
+        await asyncio.to_thread(film_summary_render.encode_preview, final_path, preview_path)
+
     preview_s3_key = f"{_FILM_SUMMARIES_PREFIX}{user_id}/{film_summary_id}/preview.mp4"
     final_s3_key = f"{_FILM_SUMMARIES_PREFIX}{user_id}/{film_summary_id}/final.mp4"
     # Read before upload, while both files still exist locally -- output_dir
@@ -12577,6 +15210,78 @@ async def _run_film_summary_render_pipeline_stages(
         preview_s3_key, final_s3_key, render_result, output_storage_bytes,
         source_s3_key=source_s3_key, bucket_name=bucket_name,
     )
+
+
+async def _cleanup_film_summary_source_media(
+    job_id: str, source_s3_key: Optional[str], bucket_name: str, project_id: Optional[str],
+) -> None:
+    """Deletes the source video from S3 once its film summary is complete
+    (neither /render nor /retry can reach it again past this point) and
+    marks its own media_assets row DELETED (volitional), never EXPIRED
+    (that status is reserved for the retention sweep itself, see
+    process_media_expiration_jobs) -- isolated out of
+    _finalize_film_summary_render to cut that function's cognitive
+    complexity (audit: SonarQube python:S3776)."""
+    if not source_s3_key or not bucket_name:
+        return
+    delete_s3_object(bucket_name, source_s3_key)
+    if not project_id:
+        return
+    try:
+        source_media_asset = await supabase_get_media_asset_by_content(CONTENT_KIND_PROJECT_SOURCE, project_id)
+        if source_media_asset and source_media_asset.get("id"):
+            await supabase_mark_media_asset_deleted(source_media_asset["id"])
+    except Exception:
+        logger.exception("Failed to mark film summary source media_asset deleted (job %s)", job_id)
+
+
+async def _settle_film_summary_render_credits(
+    *, job_id: str, user_id: str, film_summary_id: str, bucket_name: str, final_s3_key: str,
+    output_storage_bytes: float, final_credits: float, cost_breakdown: Dict[str, Any], reserved_credits: float,
+) -> Tuple[float, Dict[str, Any]]:
+    """Bills the produced media's retention storage (preview + final share
+    one combined media_assets row, since they're always deleted/expired
+    together, so size_bytes is their combined total), folds that line into
+    the cost breakdown, and debits the job's final credits -- isolated out
+    of _finalize_film_summary_render (audit: SonarQube python:S3776)."""
+    retention = await _finalize_retention_billing_batch(job_id, user_id, [
+        {
+            "content_kind": CONTENT_KIND_FILM_SUMMARY,
+            "content_id": film_summary_id,
+            "media_type": MEDIA_TYPE_PRODUCED,
+            "size_bytes": output_storage_bytes,
+            "s3_bucket": bucket_name,
+            "s3_key": final_s3_key,
+        }
+    ])
+    final_credits = round(final_credits + retention["retention_storage_credit_cost"], 2)
+    if retention["retention_storage_cost_usd"] or retention["retention_storage_credit_cost"]:
+        cost_breakdown = {
+            **cost_breakdown,
+            "retention_storage_cost_usd": retention["retention_storage_cost_usd"],
+            "retention_storage_credit_cost": retention["retention_storage_credit_cost"],
+            "media_assets": retention["media_assets"],
+        }
+
+    debit_ok = await reel_job_manager.debit_credits_for_job(
+        job_id=job_id, user_id=user_id, credits=final_credits,
+        storage_delta=-_bytes_to_gb(float(output_storage_bytes or 0.0)),
+        operation_type=film_summary.CREDIT_OPERATION_TYPE, reserved_credits=reserved_credits,
+    )
+    if not debit_ok:
+        logger.warning(f"Insufficient balance to settle film summary render job {job_id}")
+
+    return final_credits, cost_breakdown
+
+
+async def _mark_film_summary_project_completed(project_id: Optional[str], user_id: str) -> None:
+    if not project_id or not is_supabase_configured():
+        return
+    try:
+        await supabase_update_project_status(project_id, "completed", user_id=user_id)
+        await supabase_update_project(project_id, user_id, {"output_count": 1})
+    except Exception as e:
+        logger.warning(f"Failed to mark project {project_id} completed: {str(e)}")
 
 
 async def _finalize_film_summary_render(
@@ -12611,22 +15316,14 @@ async def _finalize_film_summary_render(
             # keep does (billed below).
             "source_s3_key": None,
         })
-        if source_s3_key and bucket_name:
-            delete_s3_object(bucket_name, source_s3_key)
-        debit_ok = await reel_job_manager.debit_credits_for_job(
-            job_id=job_id, user_id=user_id, credits=final_credits,
-            storage_delta=-_bytes_to_gb(float(output_storage_bytes or 0.0)),
-            operation_type=film_summary.CREDIT_OPERATION_TYPE, reserved_credits=reserved_credits,
+        await _cleanup_film_summary_source_media(job_id, source_s3_key, bucket_name, project_id)
+        final_credits, cost_breakdown = await _settle_film_summary_render_credits(
+            job_id=job_id, user_id=user_id, film_summary_id=film_summary_id, bucket_name=bucket_name,
+            final_s3_key=final_s3_key, output_storage_bytes=output_storage_bytes,
+            final_credits=final_credits, cost_breakdown=cost_breakdown, reserved_credits=reserved_credits,
         )
-        if not debit_ok:
-            logger.warning(f"Insufficient balance to settle film summary render job {job_id}")
 
-    if project_id and is_supabase_configured():
-        try:
-            await supabase_update_project_status(project_id, "completed", user_id=user_id)
-            await supabase_update_project(project_id, user_id, {"output_count": 1})
-        except Exception as e:
-            logger.warning(f"Failed to mark project {project_id} completed: {str(e)}")
+    await _mark_film_summary_project_completed(project_id, user_id)
 
     await reel_job_manager.complete_job(
         job_id,
@@ -12668,6 +15365,27 @@ async def cancel_film_summary_endpoint(film_summary_id: str, user_id: Annotated[
     return {"cancelled": True}
 
 
+def _retry_film_summary_status_updates(previous_status: str, retry_job_id: str) -> Dict[str, Any]:
+    """Status/stage reset applied by retry_film_summary_endpoint on every
+    retry (automatic or failed/failed resubmission), plus -- only when
+    retriggered from awaiting_review -- clearing any stale manual-editor
+    state, since a full automatic regenerate makes it meaningless against
+    the brand-new plan about to replace it. subtitles_enabled/
+    subtitle_style are independent user preferences and are left
+    untouched here."""
+    updates: Dict[str, Any] = {
+        "status": film_summary.FilmSummaryStatus.QUEUED,
+        "stage": film_summary.FilmSummaryStage.UPLOADING,
+        "job_id": retry_job_id,
+        "error_code": None,
+        "error_message": None,
+    }
+    if previous_status == film_summary.FilmSummaryStatus.AWAITING_REVIEW:
+        updates["manual_selection"] = None
+        updates["edit_mode"] = "automatic"
+    return updates
+
+
 @app.post("/api/film-summaries/{film_summary_id}/retry", responses={401: {"description": "Unauthorized"}, 402: {"description": "Payment Required"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 409: {"description": "Conflict"}})
 async def retry_film_summary_endpoint(film_summary_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
     if not FILM_SUMMARY_ENABLED:
@@ -12676,8 +15394,8 @@ async def retry_film_summary_endpoint(film_summary_id: str, user_id: Annotated[s
     row = await supabase_get_film_summary(film_summary_id, user_id)
     if not row:
         raise HTTPException(status_code=404, detail=_FILM_SUMMARY_NOT_FOUND)
-    if row.get("status") != film_summary.FilmSummaryStatus.FAILED:
-        raise HTTPException(status_code=409, detail="Only a failed film summary can be retried")
+    if row.get("status") not in (film_summary.FilmSummaryStatus.FAILED, film_summary.FilmSummaryStatus.AWAITING_REVIEW):
+        raise HTTPException(status_code=409, detail="Only a failed or awaiting-review film summary can be retried")
 
     await _enforce_job_concurrency_limit(user_id)
 
@@ -12703,13 +15421,9 @@ async def retry_film_summary_endpoint(film_summary_id: str, user_id: Annotated[s
     )
     await reel_job_manager.enqueue_job(retry_job_id)
 
-    await supabase_update_film_summary(film_summary_id, user_id, {
-        "status": film_summary.FilmSummaryStatus.QUEUED,
-        "stage": film_summary.FilmSummaryStage.UPLOADING,
-        "job_id": retry_job_id,
-        "error_code": None,
-        "error_message": None,
-    })
+    await supabase_update_film_summary(
+        film_summary_id, user_id, _retry_film_summary_status_updates(row.get("status"), retry_job_id),
+    )
 
     _spawn_background_task(_run_film_summary_retry_job(
         job_id=retry_job_id,
@@ -12787,7 +15501,7 @@ async def _resume_film_summary_analysis_from_cache(
         transcript_segments, scene_index = cached_transcript_segments, cached_scene_index
     else:
         transcript_segments, scene_index, detected_language = await _run_transcription_and_scene_detection_stages(
-            job_id, user_id, film_summary_id, input_path,
+            job_id, user_id, film_summary_id, input_path, source_language=source_language,
         )
         source_language = source_language or detected_language
 
@@ -12922,6 +15636,7 @@ async def share_film_summary(film_summary_id: str, payload: ReelShareRequest, us
     final_title = payload.title or row.get("title") or "Resume de film"
     final_description = payload.description or ""
     accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SHARE_PLATFORMS)
+    await _assert_user_can_publish(user_id, len(accounts))
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
     if payload.scheduled_date and not scheduled_for:
@@ -12954,44 +15669,117 @@ async def share_film_summary(film_summary_id: str, payload: ReelShareRequest, us
 # Projects Endpoints
 # --------------------------------------------------------------------------
 
+def _normalize_project_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    thumbnail_ref = str((row or {}).get("thumbnail_url") or "").strip()
+    return {
+        **(row or {}),
+        "thumbnail_url": _project_thumbnail_url_from_ref(thumbnail_ref),
+    }
+
+
+async def _generate_and_persist_project_thumbnail(
+    bucket: str, source_s3_key: str, source_local_path: str, project_id: str, user_id: str, project: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Downloads the project's source video, generates its thumbnail, and
+    persists it -- the try-block body of _ensure_project_thumbnail_for_row,
+    isolated to cut that function's cognitive complexity (audit: SonarQube
+    python:S3776). Any failure here just means no thumbnail -- never
+    raised, since the caller's own try/except already treats this the
+    same as a deliberate early return."""
+    if not download_s3_object(bucket, source_s3_key, source_local_path):
+        return project
+
+    thumbnail_s3_key = _generate_and_upload_project_thumbnail_from_source(
+        source_local_path,
+        bucket,
+        user_id,
+        project_id,
+    )
+    if not thumbnail_s3_key:
+        return project
+
+    updated = await supabase_update_project(project_id, user_id, {"thumbnail_url": thumbnail_s3_key})
+    return updated or {**project, "thumbnail_url": thumbnail_s3_key}
+
+
+async def _ensure_project_thumbnail_for_row(row: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    project = dict(row or {})
+    if not project:
+        return project
+
+    if str(project.get("thumbnail_url") or "").strip():
+        return project
+
+    if not is_supabase_configured():
+        return project
+
+    bucket = os.environ.get("AWS_S3_BUCKET", "")
+    source_s3_key = str(project.get("source_s3_key") or "").strip()
+    project_id = str(project.get("id") or "").strip()
+    if not (bucket and source_s3_key and project_id):
+        return project
+
+    tmp_dir = os.path.join(OUTPUT_DIR, "project_thumbnails")
+    os.makedirs(tmp_dir, exist_ok=True)
+    ext = os.path.splitext(source_s3_key)[1] or ".mp4"
+    source_local_path = os.path.join(tmp_dir, f"{project_id}_source{ext}")
+
+    try:
+        return await _generate_and_persist_project_thumbnail(
+            bucket, source_s3_key, source_local_path, project_id, user_id, project,
+        )
+    except Exception:
+        return project
+    finally:
+        try:
+            if os.path.exists(source_local_path):
+                os.remove(source_local_path)
+        except Exception:
+            pass
+
 @app.get("/api/projects", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
 async def list_projects(
-	user_id: Annotated[str, Depends(get_user_id_header)],
-	page: Annotated[int, Query(ge=1)] = 1,
-	page_size: Annotated[int, Query(ge=1, le=100)] = 20,
-	project_type: Annotated[Optional[str], Query()] = None,
-	status: Annotated[Optional[str], Query()] = None,
-	q: Optional[str] = None,
+  user_id: Annotated[str, Depends(get_user_id_header)],
+  page: Annotated[int, Query(ge=1)] = 1,
+  page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+  project_type: Annotated[Optional[str], Query()] = None,
+  status: Annotated[Optional[str], Query()] = None,
+  q: Optional[str] = None,
 ):
-	if not is_supabase_configured():
-		raise HTTPException(status_code=503, detail=_SUPABASE_PROJECTS_NOT_CONFIGURED)
+  if not is_supabase_configured():
+    raise HTTPException(status_code=503, detail=_SUPABASE_PROJECTS_NOT_CONFIGURED)
 
-	rows, total = await supabase_list_projects(
-		user_id=user_id,
-		page=page,
-		page_size=page_size,
-		project_type=project_type,
-		status=status,
-		query=q,
-	)
-	return {
-		"items": rows,
-		"total": total,
-		"page": max(page, 1),
-		"page_size": min(max(page_size, 1), 100),
-	}
+  rows, total = await supabase_list_projects(
+    user_id=user_id,
+    page=page,
+    page_size=page_size,
+    project_type=project_type,
+    status=status,
+    query=q,
+  )
+  normalized_rows: List[Dict[str, Any]] = []
+  for row in rows:
+    ensured = await _ensure_project_thumbnail_for_row(row, user_id)
+    normalized_rows.append(_normalize_project_row(ensured))
+  return {
+    "items": normalized_rows,
+    "total": total,
+    "page": max(page, 1),
+    "page_size": min(max(page_size, 1), 100),
+  }
 
 
 @app.get("/api/projects/{project_id}", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 404: {"description": "Not Found"}, 503: {"description": "Service Unavailable"}})
 async def get_project_endpoint(project_id: str, user_id: Annotated[str, Depends(get_user_id_header)]):
-	if not is_supabase_configured():
-		raise HTTPException(status_code=503, detail=_SUPABASE_PROJECTS_NOT_CONFIGURED)
+  if not is_supabase_configured():
+    raise HTTPException(status_code=503, detail=_SUPABASE_PROJECTS_NOT_CONFIGURED)
 
-	project = await supabase_get_project(project_id, user_id)
-	if not project:
-		raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND)
+  project = await supabase_get_project(project_id, user_id)
+  if not project:
+    raise HTTPException(status_code=404, detail=_PROJECT_NOT_FOUND)
 
-	return project
+  project = await _ensure_project_thumbnail_for_row(project, user_id)
+  return _normalize_project_row(project)
 
 
 class ProjectUpdateRequest(BaseModel):
@@ -13043,6 +15831,25 @@ def _delete_project_source_s3_file(project: Dict[str, Any], bucket_name: str) ->
     return _delete_s3_and_get_freed_bytes(bucket_name, source_s3_key, "project source S3 file")
 
 
+async def _delete_reel_visuals_s3_images(reel_id: str, bucket_name: str) -> int:
+    """reel_visuals rows cascade-delete at the DB level (FK ON DELETE
+    CASCADE) once the reel row itself is deleted by the caller, but that
+    would leave their S3 images orphaned -- clean those up here too, same
+    as every other reel asset. Isolated out of
+    _delete_project_reels_s3_files to cut that function's cognitive
+    complexity (audit: SonarQube python:S3776)."""
+    freed = 0
+    try:
+        visuals = await supabase_list_reel_visuals(reel_id)
+        for visual in visuals:
+            image_s3_key = visual.get("image_s3_key")
+            if image_s3_key:
+                freed += _delete_s3_and_get_freed_bytes(bucket_name, image_s3_key, "reel visual image S3 file")
+    except Exception as e:
+        logger.warning(f"Failed to retrieve or delete visuals for reel {reel_id}: {str(e)}")
+    return freed
+
+
 async def _delete_project_reels_s3_files(project_id: str, bucket_name: str) -> int:
     freed = 0
     try:
@@ -13055,6 +15862,8 @@ async def _delete_project_reels_s3_files(project_id: str, bucket_name: str) -> i
             reel_thumbnail_url = reel.get("reel_thumbnail_url") or reel.get("reel_thumbnail_s3_key")
             if reel_thumbnail_url and reel_thumbnail_url.startswith("reels/"):
                 freed += _delete_s3_and_get_freed_bytes(bucket_name, reel_thumbnail_url, "reel thumbnail S3 file")
+
+            freed += await _delete_reel_visuals_s3_images(str(reel.get("id") or ""), bucket_name)
     except Exception as e:
         logger.warning(f"Failed to retrieve or delete reels for project {project_id}: {str(e)}")
     return freed
@@ -13275,8 +16084,10 @@ async def list_reels(user_id: Annotated[str, Depends(get_user_id_header)], page:
         raise HTTPException(status_code=503, detail="Supabase reels is not configured")
 
     rows, total = await supabase_list_reels(user_id=user_id, page=page, page_size=page_size, status=status, query=q)
+    items = [_normalize_reel_row(row) for row in rows]
+    await _attach_media_asset_fields(items, CONTENT_KIND_REEL)
     return {
-        "items": [_normalize_reel_row(row) for row in rows],
+        "items": items,
         "total": total,
         "page": max(page, 1),
         "page_size": min(max(page_size, 1), 100),
@@ -13375,6 +16186,7 @@ async def share_reel(reel_id: str, payload: ReelShareRequest, user_id: Annotated
     final_title = payload.title or row.get("reel_title") or "Vireel"
     final_description = payload.description or row.get("reel_description") or ""
     accounts = await _resolve_accounts_for_publish(user_id, payload.account_ids, _SHARE_PLATFORMS)
+    await _assert_user_can_publish(user_id, len(accounts))
     publish_priority = await _resolve_user_job_priority(user_id)
     scheduled_for = _resolve_scheduled_datetime(payload.scheduled_date, payload.timezone)
     if payload.scheduled_date and not scheduled_for:
@@ -13894,6 +16706,166 @@ async def _execute_scheduled_publish_job(job_row: Dict[str, Any]) -> None:
         await _update_publish_job_status(job_id, "done", external_id=external_id, post_url=post_url, error_message=None)
     except Exception as exc:
         await _update_publish_job_status(job_id, "failed", error_message=str(exc))
+
+
+async def _process_due_annual_credit_refills() -> None:
+    """One sweep: reset credit/storage for every annual subscription whose
+    monthly anniversary is due, using each row's own snapshotted
+    plan_credit/plan_stockage (see _allocate_plan_resources) -- never a
+    live plan lookup, so a later change to the plan catalog never
+    retroactively changes an already-in-progress annual subscription's
+    monthly allowance. Resetting (not adding) to the snapshot value is
+    exactly what already enforces the storage ceiling for a monthly plan
+    (_reset_user_plan_balance), so no extra check is needed here."""
+    due_rows = await supabase_list_souscriptions_due_for_monthly_credit_allocation()
+    for row in due_rows:
+        user_id = row.get("userid")
+        souscription_id = str(row.get("id") or "")
+        if not user_id or not souscription_id:
+            continue
+
+        plan_credit = float(row.get("plan_credit") or 0.0)
+        plan_storage = float(row.get("plan_stockage") or 0.0)
+        await _reset_user_plan_balance(user_id, plan_credit, plan_storage, souscription_id)
+
+        previous_due_raw = row.get("next_credit_allocation_at")
+        try:
+            previous_due = datetime.fromisoformat(previous_due_raw) if previous_due_raw else datetime.now(timezone.utc)
+        except ValueError:
+            previous_due = datetime.now(timezone.utc)
+        if previous_due.tzinfo is None:
+            previous_due = previous_due.replace(tzinfo=timezone.utc)
+        # Anchored to the previous due date (not "now") so the monthly
+        # cadence stays tied to the original payment anniversary instead of
+        # drifting later every time a sweep runs a bit behind schedule.
+        next_due = supabase_add_one_month(previous_due)
+        await supabase_update_souscription_row(souscription_id, {
+            "next_credit_allocation_at": next_due.isoformat(),
+            # The credit cycle (used by the upgrade-proration math in
+            # _compute_annual_upgrade_proration) is this one-month
+            # sub-window, not the whole paid year -- advance it in lockstep
+            # with next_credit_allocation_at so a mid-sub-cycle upgrade
+            # always prorates against the CURRENT window.
+            "credit_cycle_start_at": previous_due.isoformat(),
+            "credit_cycle_end_at": next_due.isoformat(),
+        })
+
+
+async def process_annual_credit_refill_jobs() -> None:
+    while True:
+        try:
+            if is_supabase_configured():
+                await _process_due_annual_credit_refills()
+        except Exception as exc:
+            logger.warning("Annual credit refill worker error: %s", exc, exc_info=True)
+
+        await asyncio.sleep(max(300, ANNUAL_CREDIT_REFILL_INTERVAL_SECONDS))
+
+
+async def _expire_one_media_asset(asset: Dict[str, Any]) -> None:
+    """Deletes the physical S3 object, then marks the row EXPIRED -- in
+    that order, and only on confirmed delete success, so an S3 failure
+    (delete_s3_object returns False) leaves the row AVAILABLE for the next
+    sweep to retry rather than ever marking EXPIRED for a file that's
+    still actually there (or whose deletion we can't confirm)."""
+    media_id = asset.get("id")
+    if not media_id:
+        return
+    bucket = asset.get("s3_bucket")
+    key = asset.get("s3_key")
+    if bucket and key:
+        deleted = delete_s3_object(bucket, key)
+        if not deleted:
+            logger.warning(
+                "Failed to delete S3 object for media_asset %s (bucket=%s key=%s); leaving AVAILABLE for retry",
+                media_id, bucket, key,
+            )
+            return
+    # No bucket/key on this row (e.g. a legacy row created without one) --
+    # nothing physical to delete, so there's nothing that can fail either.
+    await supabase_mark_media_asset_expired(media_id)
+
+
+async def _run_media_expiration_sweep() -> None:
+    due = await supabase_list_media_assets_due_for_expiration(limit=100)
+    for asset in due:
+        try:
+            await _expire_one_media_asset(asset)
+        except Exception:
+            logger.exception("Failed to expire media_asset %s", asset.get("id"))
+
+
+async def process_media_expiration_jobs() -> None:
+    """Required retention background process #1: physically deletes every
+    AVAILABLE media past its retention_expires_at (see the media_assets
+    migration and retention_config.py) -- the business row (reel/caption/
+    film_summary/anonymous_story/project) is never touched, only this
+    lifecycle row's own status/media_deleted_at."""
+    while True:
+        try:
+            if is_supabase_configured():
+                await _run_media_expiration_sweep()
+        except Exception as exc:
+            logger.warning("Media expiration worker error: %s", exc, exc_info=True)
+
+        await asyncio.sleep(max(60, MEDIA_EXPIRATION_SWEEP_INTERVAL_SECONDS))
+
+
+async def _notify_one_media_asset_expiring(asset: Dict[str, Any]) -> None:
+    """Marks notified_before_expiry_at BEFORE sending the notification
+    (not after): supabase_mark_media_asset_notified only succeeds while
+    that column is still null, so this is the idempotency guard -- a
+    second sweep (or a retry after a crash right after this one) that
+    finds the column already set simply sends nothing, rather than racing
+    on "did I already notify this?" after the fact."""
+    media_id = asset.get("id")
+    user_id = asset.get("user_id")
+    if not media_id or not user_id:
+        return
+    newly_marked = await supabase_mark_media_asset_notified(media_id)
+    if not newly_marked:
+        return
+    await supabase_insert_notification(
+        user_id=user_id,
+        type_="media_expiring_soon",
+        title="Un media va etre supprime prochainement",
+        body=(
+            "Ce media sera supprime automatiquement le "
+            f"{asset.get('retention_expires_at')}. Telechargez-le avant cette date pour le conserver."
+        ),
+        data={
+            "media_asset_id": media_id,
+            "content_kind": asset.get("content_kind"),
+            "content_id": asset.get("content_id"),
+            "retention_expires_at": asset.get("retention_expires_at"),
+        },
+    )
+
+
+async def _run_media_expiry_notification_sweep() -> None:
+    notify_before_time = datetime.now(timezone.utc) + timedelta(hours=RETENTION_NOTIFICATION_HOURS_BEFORE)
+    due = await supabase_list_produced_media_due_for_notification(notify_before_time, limit=100)
+    for asset in due:
+        try:
+            await _notify_one_media_asset_expiring(asset)
+        except Exception:
+            logger.exception("Failed to notify expiring media_asset %s", asset.get("id"))
+
+
+async def process_media_expiry_notification_jobs() -> None:
+    """Required retention background process #2: warns the user
+    RETENTION_NOTIFICATION_HOURS_BEFORE ahead of a PRODUCED media's
+    deletion (source media is never notified, per the spec's "avoid
+    notification overload" rule -- see
+    list_produced_media_due_for_notification's media_type filter)."""
+    while True:
+        try:
+            if is_supabase_configured():
+                await _run_media_expiry_notification_sweep()
+        except Exception as exc:
+            logger.warning("Media expiry notification worker error: %s", exc, exc_info=True)
+
+        await asyncio.sleep(max(60, MEDIA_EXPIRY_NOTIFICATION_SWEEP_INTERVAL_SECONDS))
 
 
 async def process_scheduled_social_publish_jobs() -> None:

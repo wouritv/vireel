@@ -1,14 +1,17 @@
 import { useEffect, useState } from "react";
-import { AlertCircle, ArrowLeft, Ban, Download, Loader2, RefreshCw, Share2, Trash2 } from "lucide-react";
+import { AlertCircle, Ban, Download, Loader2, RefreshCw, Share2, Trash2 } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
 import { getApiUrl, fetchAppConfig } from "../config";
 import { getAuthHeaders } from "../lib/apiAuth";
 import { useAuth } from "../state/AuthContext";
 import { useTranslation } from "../state/LanguageContext";
 import { errorMessageForCode } from "../lib/filmSummary";
+import { describePublishError } from "../lib/publishErrors";
+import { describeMediaAvailability } from "../lib/mediaAvailability";
 import FilmSummaryProcessingPanel from "../components/FilmSummaryProcessingPanel";
 import FilmSummaryReviewPanel from "../components/FilmSummaryReviewPanel";
 import SharePostModal from "../components/SharePostModal";
+import Breadcrumbs from "../components/Breadcrumbs";
 
 // Statuses for which the film summary's own job_id is still meaningful to
 // poll via the generic /api/status/{job_id} endpoint -- "rendering" reuses
@@ -176,6 +179,15 @@ export default function FilmSummaryProjectDetailPage() {
 
     const handleRetry = async () => {
         if (!filmSummary?.id || !user?.id) return;
+        if (
+            !globalThis.confirm(
+                t(
+                    "filmSummary.confirmRegenerateAll",
+                    "Relancer toute la generation depuis la video source ? Le plan de montage actuel et toutes les modifications (narration, selection manuelle des plans) seront perdus."
+                )
+            )
+        )
+            return;
         setRetrying(true);
         setError("");
         try {
@@ -265,7 +277,10 @@ export default function FilmSummaryProjectDetailPage() {
             });
             const data = await response.json().catch(() => ({}));
             if (!response.ok) {
-                setShareResult({ success: false, msg: typeof data?.detail === "string" ? data.detail : t("filmSummary.genericError", "Une erreur est survenue.") });
+                setShareResult({
+                    success: false,
+                    msg: describePublishError(t, data?.detail, t("filmSummary.genericError", "Une erreur est survenue.")),
+                });
                 return;
             }
             setShareResult({
@@ -292,6 +307,12 @@ export default function FilmSummaryProjectDetailPage() {
             </div>
         );
     }
+
+    const breadcrumbItems = [
+        { label: t("breadcrumbs.dashboard", "Dashboard"), href: "/dashboard" },
+        { label: t("breadcrumbs.filmSummaries", "Film summaries"), href: "/dashboard/film-summaries" },
+        { label: filmSummary?.title || t("filmSummary.untitled", "Resume de film sans titre") },
+    ];
 
     const status = filmSummary?.status;
     const cancelButton = (
@@ -320,17 +341,10 @@ export default function FilmSummaryProjectDetailPage() {
     return (
         <div className="flex-1 overflow-y-auto p-8 space-y-6">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-                <div className="min-w-0">
-                    <h1 className="truncate text-3xl font-black tracking-tight">{filmSummary?.title || t("filmSummary.untitled", "Resume de film sans titre")}</h1>
+                <div className="min-w-0 space-y-2">
+                    <Breadcrumbs items={breadcrumbItems} ariaLabel={t('breadcrumbs.ariaLabel', 'Breadcrumb')} />
                 </div>
-                <button
-                    type="button"
-                    onClick={() => navigate("/dashboard/film-summaries")}
-                    className="inline-flex shrink-0 items-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
-                >
-                    <ArrowLeft size={14} />
-                    {t("filmSummary.backToList", "Retour aux resumes de film")}
-                </button>
+                <div className="flex shrink-0 flex-wrap items-center gap-2" />
             </div>
 
             {error ? (
@@ -416,30 +430,45 @@ export default function FilmSummaryProjectDetailPage() {
                     ) : null}
 
                     {status === "awaiting_review" ? (
-                        <FilmSummaryReviewPanel
-                            filmSummary={filmSummary}
-                            projectId={projectId}
-                            user={user}
-                            allowedVoices={allowedVoices}
-                            defaultVoice={defaultVoice}
-                            onRefresh={loadFilmSummary}
-                        />
+                        <div className="space-y-4">
+                            <FilmSummaryReviewPanel
+                                filmSummary={filmSummary}
+                                projectId={projectId}
+                                user={user}
+                                allowedVoices={allowedVoices}
+                                defaultVoice={defaultVoice}
+                                onRefresh={loadFilmSummary}
+                                onRegenerateAll={handleRetry}
+                                regenerating={retrying}
+                            />
+                        </div>
                     ) : null}
 
-                    {status === "completed" ? (
+                    {status === "completed" ? (() => {
+                        const media = describeMediaAvailability(filmSummary.media_status, filmSummary.media_expires_at);
+                        return (
                         <div className="space-y-4">
                             <h3 className="text-lg font-bold text-white">{t("filmSummary.completedTitle", "Ton resume de film est pret")}</h3>
                             {filmSummary.final_url ? (
                                 <div className="grid gap-4 md:grid-cols-[7fr_3fr]">
                                     <video src={filmSummary.final_url} controls preload="metadata" className="w-full rounded-xl bg-black" />
                                     <div className="flex flex-row flex-wrap gap-2 md:flex-col md:items-stretch">
-                                        <a
-                                            href={filmSummary.final_url}
-                                            download
-                                            className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
-                                        >
-                                            <Download size={14} /> {t("filmSummary.downloadButton", "Telecharger")}
-                                        </a>
+                                        {media.disabled ? (
+                                            <span
+                                                aria-disabled="true"
+                                                className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-400 dark:text-zinc-500 opacity-50 cursor-not-allowed"
+                                            >
+                                                <Download size={14} /> {t("filmSummary.downloadButton", "Telecharger")}
+                                            </span>
+                                        ) : (
+                                            <a
+                                                href={filmSummary.final_url}
+                                                download
+                                                className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 dark:border-white/10 bg-slate-100 dark:bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-800 dark:text-zinc-200 shadow-sm hover:bg-slate-200 dark:hover:bg-white/10"
+                                            >
+                                                <Download size={14} /> {t("filmSummary.downloadButton", "Telecharger")}
+                                            </a>
+                                        )}
                                         <button
                                             type="button"
                                             onClick={handleOpenShare}
@@ -450,8 +479,12 @@ export default function FilmSummaryProjectDetailPage() {
                                     </div>
                                 </div>
                             ) : null}
+                            {media.translationKey ? (
+                                <p className="text-xs text-slate-500 dark:text-zinc-400">{t(media.translationKey, media.translationKey, media.params)}</p>
+                            ) : null}
                         </div>
-                    ) : null}
+                        );
+                    })() : null}
                 </>
             )}
 

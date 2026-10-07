@@ -67,6 +67,7 @@ class FilmSummaryStage:
     GENERATING_VOICE = "generating_voice"
     RENDERING_PREVIEW = "rendering_preview"
     RENDERING_FINAL = "rendering_final"
+    ADDING_SUBTITLES = "adding_subtitles"
     COMPLETED = "completed"
     REJECTED = "rejected"
     FAILED = "failed"
@@ -104,17 +105,22 @@ class FilmSummaryErrorCode:
 CREDIT_OPERATION_TYPE = "resume_film"
 
 SEGMENT_TYPE_VOICE_OVER = "voice_over"
-SEGMENT_TYPE_ORIGINAL_DIALOGUE = "original_dialogue"
-SEGMENT_TYPE_BREATHING = "breathing"
-SEGMENT_TYPES = (SEGMENT_TYPE_VOICE_OVER, SEGMENT_TYPE_ORIGINAL_DIALOGUE, SEGMENT_TYPE_BREATHING)
+# "il ne dois y avoir aucune parole du film originale, uniquement les
+# sequences videos + voix off de narration" -- voice_over is the only
+# segment type a plan may ever contain; every clip's own audio is always
+# fully replaced by the narration (see film_summary_render.duck_and_mix_
+# narration), so no original film dialogue or audio is ever heard.
+SEGMENT_TYPES = (SEGMENT_TYPE_VOICE_OVER,)
 
-# Dominant mood for the whole film, used only to pick an optional
-# instrumental background bed mixed under narration (voice_over) segments --
-# see PLANNING_SYSTEM_PROMPT's BACKGROUND MUSIC MOOD section and
-# film_summary_render.resolve_background_music_track. Never affects
-# original_dialogue/breathing segments, where the film's own audio plays.
-MUSIC_MOODS = ("tense", "dark", "hopeful", "romantic", "melancholic", "triumphant", "comedic", "neutral")
-DEFAULT_MUSIC_MOOD = "neutral"
+# Ideal ceiling on a film summary's total runtime: "dans l'ideal le resume
+# dois etre de moins de 5mn, mais jamais cela deborde il ne dois pas y
+# avoir de bloquant" -- kept as a changeable env-configurable constant,
+# same convention as FILM_SUMMARY_PLANNING_MODEL below, but deliberately
+# non-blocking: going over it only ever adds a warning in
+# validate_edit_plan_content (every caller -- generate_edit_plan, and the
+# /validate and /render endpoints that re-run that same validator -- still
+# accepts the plan).
+FILM_SUMMARY_MAX_PLAN_DURATION_MS = int(os.environ.get("FILM_SUMMARY_MAX_PLAN_DURATION_MS", str(5 * 60 * 1000)))
 
 EDIT_PLAN_SCHEMA_VERSION = "1.0"
 
@@ -318,8 +324,6 @@ def build_generation_constraints(
         "hook_max_seconds": 35,
         "conclusion_min_seconds": 25,
         "conclusion_max_seconds": 45,
-        "min_original_dialogue_segments": 3,
-        "max_original_dialogue_segments": 6,
         "words_per_minute_low": 125,
         "words_per_minute_high": 150,
         # A concrete sizing anchor for the model: tracking a running total
@@ -376,26 +380,18 @@ def _normalize_segment(raw: Any, *, recompute_narration_estimates: bool = False)
     if seg_type not in SEGMENT_TYPES:
         raise FilmSummaryValidationError(FilmSummaryErrorCode.PLAN_INVALID, f"Unknown segment type: {seg_type}")
 
-    segment: Dict[str, Any] = {
+    narration = str(raw.get("narration") or "").strip()
+    return {
         "id": str(raw.get("id") or f"seg_{uuid.uuid4().hex[:8]}"),
         "sequence": _safe_int(raw.get("sequence")),
         "type": seg_type,
         "approval_status": str(raw.get("approval_status") or "pending"),
+        "narration": narration,
+        "estimated_duration_ms": _resolve_voice_over_estimated_duration_ms(raw, narration, recompute_narration_estimates),
+        "actual_duration_ms": _safe_int(raw.get("actual_duration_ms")) or None,
+        "clips": [_normalize_clip(c) for c in (raw.get("clips") or []) if isinstance(c, dict)],
+        "source_event_ids": [str(e) for e in (raw.get("source_event_ids") or [])],
     }
-    if seg_type == SEGMENT_TYPE_VOICE_OVER:
-        segment["narration"] = str(raw.get("narration") or "").strip()
-        segment["estimated_duration_ms"] = _resolve_voice_over_estimated_duration_ms(
-            raw, segment["narration"], recompute_narration_estimates,
-        )
-        segment["actual_duration_ms"] = _safe_int(raw.get("actual_duration_ms")) or None
-        segment["clips"] = [_normalize_clip(c) for c in (raw.get("clips") or []) if isinstance(c, dict)]
-        segment["source_event_ids"] = [str(e) for e in (raw.get("source_event_ids") or [])]
-    else:
-        segment["start_ms"] = _safe_int(raw.get("start_ms"))
-        segment["end_ms"] = _safe_int(raw.get("end_ms"))
-        segment["transcript_excerpt"] = str(raw.get("transcript_excerpt") or "").strip()
-        segment["speaker_ids"] = [str(s) for s in (raw.get("speaker_ids") or [])]
-    return segment
 
 
 def validate_edit_plan_schema(
@@ -434,8 +430,6 @@ def validate_edit_plan_schema(
         "role": str(c.get("role") or "").strip(),
     } for i, c in enumerate(characters)]
 
-    requested_mood = str(raw.get("music_mood") or "").strip().lower()
-
     plan = {
         "schema_version": EDIT_PLAN_SCHEMA_VERSION,
         "movie": dict(movie_metadata),
@@ -444,21 +438,12 @@ def validate_edit_plan_schema(
         "segments": segments,
         "total_estimated_duration_ms": compute_total_estimated_duration_ms(segments),
         "unresolved_ambiguities": [str(a) for a in (raw.get("unresolved_ambiguities") or [])],
-        # Non-blocking: an unknown/missing mood just means no music, never a
-        # plan failure -- see MUSIC_MOODS.
-        "music_mood": requested_mood if requested_mood in MUSIC_MOODS else DEFAULT_MUSIC_MOOD,
     }
     return plan
 
 
 def compute_total_estimated_duration_ms(segments: List[Dict[str, Any]]) -> int:
-    total = 0
-    for seg in segments:
-        if seg.get("type") == SEGMENT_TYPE_VOICE_OVER:
-            total += _safe_int(seg.get("actual_duration_ms") or seg.get("estimated_duration_ms"))
-        else:
-            total += max(0, _safe_int(seg.get("end_ms")) - _safe_int(seg.get("start_ms")))
-    return total
+    return sum(_safe_int(seg.get("actual_duration_ms") or seg.get("estimated_duration_ms")) for seg in segments)
 
 
 def _validate_segment_sequence_numbers(segments: List[Dict[str, Any]]) -> List[str]:
@@ -470,9 +455,17 @@ def _validate_segment_sequence_numbers(segments: List[Dict[str, Any]]) -> List[s
 
 def _validate_voice_over_segment(
     seg: Dict[str, Any], source_duration_ms: int, known_scene_ids: set,
-    clip_signatures: Dict[Tuple[Any, int, int], int],
 ) -> List[str]:
     errors = []
+    if not str(seg.get("narration") or "").strip():
+        # app.py's render pipeline skips the TTS call outright for blank
+        # text (nothing to synthesize), so an empty narration never
+        # becomes an audio file -- the segment's clip then keeps the
+        # source video's own raw audio instead of the narrator's voice,
+        # a stretch of the final video where "le son de narration ne
+        # s'ecoute plus". Blocking (not a warning): every voice_over
+        # segment must carry real narration before it can reach render.
+        errors.append(f"Le segment {seg.get('id')} n'a aucune narration -- la voix off ne serait pas audible a cet endroit de la video")
     for clip in seg.get("clips") or []:
         start_ms, end_ms = clip.get("start_ms"), clip.get("end_ms")
         if start_ms is None or end_ms is None or start_ms < 0 or end_ms <= start_ms or end_ms > source_duration_ms:
@@ -480,91 +473,27 @@ def _validate_voice_over_segment(
             continue
         if known_scene_ids and clip.get("scene_id") not in known_scene_ids:
             errors.append(f"Le segment {seg.get('id')} reference un scene_id inconnu {clip.get('scene_id')}")
-        signature = (clip.get("scene_id"), start_ms, end_ms)
-        clip_signatures[signature] = clip_signatures.get(signature, 0) + 1
     return errors
 
 
-def _validate_timed_segment(
-    seg: Dict[str, Any], source_duration_ms: int, known_character_ids: set,
-) -> Tuple[List[str], List[str], Optional[Tuple[int, int, str]]]:
-    errors: List[str] = []
-    warnings: List[str] = []
-    start_ms, end_ms = seg.get("start_ms"), seg.get("end_ms")
-    valid_range = None
-    if start_ms is None or end_ms is None or start_ms < 0 or end_ms <= start_ms or end_ms > source_duration_ms:
-        errors.append(f"Le segment {seg.get('id')} a un timecode hors limites")
-    else:
-        valid_range = (start_ms, end_ms, str(seg.get("id")))
-    for speaker_id in seg.get("speaker_ids") or []:
-        if known_character_ids and speaker_id not in known_character_ids:
-            warnings.append(f"Le segment {seg.get('id')} reference un personnage inconnu {speaker_id}")
-    return errors, warnings, valid_range
-
-
 def _validate_segments(
-    segments: List[Dict[str, Any]], source_duration_ms: int, known_scene_ids: set, known_character_ids: set,
-) -> Tuple[List[str], List[str], List[Tuple[int, int, str]], Dict[Tuple[Any, int, int], int]]:
-    """Per-segment checks (type, clip/timecode bounds, scene/character
-    references), collecting the shared state (dialogue ranges, clip
-    signatures) the overlap/repetition checks need afterwards. Split out
-    of validate_edit_plan_content -- a single loop mixing every one of
-    these concerns was the bulk of that function's cognitive complexity."""
+    segments: List[Dict[str, Any]], source_duration_ms: int, known_scene_ids: set,
+) -> List[str]:
+    """Per-segment checks (type, narration presence, clip/timecode bounds,
+    scene references). Split out of validate_edit_plan_content to keep
+    that function's own cognitive complexity low. A segment whose type
+    isn't voice_over (e.g. a pre-existing plan's original_dialogue/
+    breathing segment, from before those types were retired -- "il ne
+    dois y avoir aucune parole du film originale") is flagged as an
+    unknown type rather than silently accepted."""
     errors: List[str] = []
-    warnings: List[str] = []
-    dialogue_ranges: List[Tuple[int, int, str]] = []
-    clip_signatures: Dict[Tuple[Any, int, int], int] = {}
-
     for seg in segments:
         seg_type = seg.get("type")
         if seg_type not in SEGMENT_TYPES:
             errors.append(f"Le segment {seg.get('id')} a un type inconnu {seg_type}")
-        elif seg_type == SEGMENT_TYPE_VOICE_OVER:
-            errors.extend(_validate_voice_over_segment(seg, source_duration_ms, known_scene_ids, clip_signatures))
         else:
-            seg_errors, seg_warnings, valid_range = _validate_timed_segment(seg, source_duration_ms, known_character_ids)
-            errors.extend(seg_errors)
-            warnings.extend(seg_warnings)
-            if valid_range:
-                dialogue_ranges.append(valid_range)
-
-    return errors, warnings, dialogue_ranges, clip_signatures
-
-
-def _validate_dialogue_overlap(dialogue_ranges: List[Tuple[int, int, str]]) -> List[str]:
-    """Named after the pair of segment ids and their exact timecodes,
-    instead of a bare generic message -- this is fed back verbatim to the
-    planning model as corrective context on a retry (see generate_edit_
-    plan), and a model can only fix the specific pair it's told about."""
-    ranges = sorted(dialogue_ranges)
-    for i in range(1, len(ranges)):
-        prev_start, prev_end, prev_id = ranges[i - 1]
-        cur_start, cur_end, cur_id = ranges[i]
-        if cur_start < prev_end:
-            return [
-                f"Les segments {prev_id} ({prev_start}-{prev_end}ms) et {cur_id} ({cur_start}-{cur_end}ms) "
-                "sont tous les deux de type original_dialogue/breathing et se chevauchent dans le temps source "
-                "-- chaque plage temporelle source ne peut etre utilisee que par un seul segment de ce type ; "
-                "conservez un seul des deux, ou deplacez le plus tardif vers une plage non chevauchante"
-            ]
-    return []
-
-
-def _validate_repeated_clips(clip_signatures: Dict[Tuple[Any, int, int], int]) -> List[str]:
-    """Named after the exact repeated (scene_id, start_ms, end_ms) triples,
-    instead of a bare count, in case this is ever surfaced as corrective
-    context on a retry the way _validate_dialogue_overlap's message is.
-    Deliberately a warning, not a blocking error: the planning prompt asks
-    the model to avoid reusing a clip, but the user must never be stuck
-    unable to generate their video over something this cosmetic."""
-    repeated = sorted(sig for sig, count in clip_signatures.items() if count > 1)
-    if not repeated:
-        return []
-    named = ", ".join(f"{scene_id} ({start_ms}-{end_ms}ms)" for scene_id, start_ms, end_ms in repeated)
-    return [
-        f"Le(s) clip(s) suivant(s) sont utilises plus d'une fois : {named} -- chaque extrait de la "
-        "video source ne doit illustrer qu'un seul segment du plan"
-    ]
+            errors.extend(_validate_voice_over_segment(seg, source_duration_ms, known_scene_ids))
+    return errors
 
 
 def _validate_duration_tolerance(total_ms: int, target_ms: int, duration_tolerance_ratio: float) -> List[str]:
@@ -576,6 +505,21 @@ def _validate_duration_tolerance(total_ms: int, target_ms: int, duration_toleran
     return [
         f"La duree totale estimee de {total_ms}ms est en dehors de la tolerance de {duration_tolerance_ratio:.0%} "
         f"autour de la cible de {target_ms}ms"
+    ]
+
+
+def _validate_max_plan_duration(total_ms: int) -> List[str]:
+    """Non-blocking: FILM_SUMMARY_MAX_PLAN_DURATION_MS is the ideal ceiling
+    for a film summary's total runtime (automatic or manual), independent
+    of -- and checked in addition to -- the target-duration tolerance
+    above, but going over it must never block generation/validation ("il
+    ne dois pas y avoir de bloquant") -- it's surfaced as a warning only,
+    never added to `errors`."""
+    if total_ms <= FILM_SUMMARY_MAX_PLAN_DURATION_MS:
+        return []
+    return [
+        f"La duree totale estimee de {total_ms}ms depasse la duree ideale de "
+        f"{FILM_SUMMARY_MAX_PLAN_DURATION_MS}ms pour un resume de film"
     ]
 
 
@@ -592,23 +536,16 @@ def validate_edit_plan_content(
     above; this function only orchestrates and merges their results, to
     keep its own cognitive complexity low."""
     known_scene_ids = set(valid_scene_ids or [])
-    known_character_ids = {c.get("id") for c in (plan.get("characters") or [])}
     segments = plan.get("segments") or []
 
     errors: List[str] = [] if segments else ["Le plan ne contient aucun segment"]
     errors.extend(_validate_segment_sequence_numbers(segments))
-
-    segment_errors, warnings, dialogue_ranges, clip_signatures = _validate_segments(
-        segments, source_duration_ms, known_scene_ids, known_character_ids,
-    )
-    errors.extend(segment_errors)
-
-    errors.extend(_validate_dialogue_overlap(dialogue_ranges))
-    warnings.extend(_validate_repeated_clips(clip_signatures))
+    errors.extend(_validate_segments(segments, source_duration_ms, known_scene_ids))
 
     total_ms = compute_total_estimated_duration_ms(segments)
     target_ms = int(plan.get("target_duration_ms") or 0)
     errors.extend(_validate_duration_tolerance(total_ms, target_ms, duration_tolerance_ratio))
+    warnings: List[str] = list(_validate_max_plan_duration(total_ms))
 
     return {
         "valid": not errors,
@@ -660,16 +597,10 @@ def _clamp_legacy_duration_truncation_overage(
     fixed_segments = []
     for seg in segments:
         seg = dict(seg)
-        if seg.get("type") == SEGMENT_TYPE_VOICE_OVER:
-            seg["clips"], clips_changed = _clamp_voice_over_clips_overage(
-                seg.get("clips") or [], source_duration_ms, max_overage_ms,
-            )
-            changed = changed or clips_changed
-        else:
-            clamped = _clamped_legacy_end_ms(seg.get("end_ms"), source_duration_ms, max_overage_ms)
-            if clamped is not None:
-                seg["end_ms"] = clamped
-                changed = True
+        seg["clips"], clips_changed = _clamp_voice_over_clips_overage(
+            seg.get("clips") or [], source_duration_ms, max_overage_ms,
+        )
+        changed = changed or clips_changed
         fixed_segments.append(seg)
     return fixed_segments, changed
 
@@ -719,6 +650,53 @@ def validate_edited_plan_patch(raw: Any, *, movie_metadata: Dict[str, Any], targ
     return validate_edit_plan_schema(
         raw, movie_metadata=movie_metadata, target_duration_ms=target_duration_ms, recompute_narration_estimates=True,
     )
+
+
+def _clip_signature(clip: Dict[str, Any]) -> Tuple[Any, Any, Any]:
+    return (clip.get("scene_id"), clip.get("start_ms"), clip.get("end_ms"))
+
+
+_NARRATION_TRANSLATION_INVARIANT_SEGMENT_FIELDS = ("id", "type", "sequence", "estimated_duration_ms", "source_event_ids")
+
+
+def _narration_translation_segment_signature(seg: Dict[str, Any]) -> Dict[str, Any]:
+    """The subset of a segment's fields a narration translation must never
+    touch (see validate_narration_translation_structure) -- everything
+    except `narration` itself (`actual_duration_ms`, which the translation
+    call never sets, is excluded too)."""
+    signature = {field: seg.get(field) for field in _NARRATION_TRANSLATION_INVARIANT_SEGMENT_FIELDS}
+    signature["clips"] = [_clip_signature(c) for c in (seg.get("clips") or [])]
+    return signature
+
+
+def validate_narration_translation_structure(original_plan: Dict[str, Any], translated_plan: Dict[str, Any]) -> None:
+    """The one invariant translate_edit_plan_narration's model must never
+    violate: the translated plan has exactly the same segments, in the
+    same order -- same id/type/sequence/clips/estimated_duration_ms/
+    source_event_ids as the original plan -- only each segment's
+    `narration` text may differ (total_estimated_duration_ms/unresolved_
+    ambiguities may be recomputed from it).
+
+    Raises FilmSummaryValidationError(PLAN_INVALID, ...) on any violation;
+    returns None when the invariant holds."""
+    original_segments = original_plan.get("segments") or []
+    translated_segments = translated_plan.get("segments") or []
+    if len(original_segments) != len(translated_segments):
+        raise FilmSummaryValidationError(
+            FilmSummaryErrorCode.PLAN_INVALID,
+            f"Translated plan has {len(translated_segments)} segments, expected exactly "
+            f"{len(original_segments)} (same count, same order, as the original plan)",
+        )
+
+    for original_seg, translated_seg in zip(original_segments, translated_segments):
+        original_signature = _narration_translation_segment_signature(original_seg)
+        translated_signature = _narration_translation_segment_signature(translated_seg)
+        if original_signature != translated_signature:
+            raise FilmSummaryValidationError(
+                FilmSummaryErrorCode.PLAN_INVALID,
+                f"Translated segment {translated_seg.get('id')} must keep every field unchanged except "
+                f"narration -- expected {original_signature}, got {translated_signature}",
+            )
 
 
 def tts_cache_key(text: str, model: str, voice: str, instructions: str) -> str:
@@ -787,19 +765,19 @@ INPUTS
 - narration_style: requested storytelling style
 - scene_index: every usable scene with scene_id, start_ms, end_ms, keyframe descriptions, visible characters, actions, locations, emotions, transcript overlap and quality flags
 - transcript_segments: exact transcript text with start_ms, end_ms and speaker identifiers where available
-- generation_constraints: segment, clip, dialogue, duration and safety limits
+- generation_constraints: segment, clip, duration and safety limits
 
 PRIMARY GOAL
 Create a condensed version of the movie that plays like a real editor's recap cut, not a flat synopsis or a plot-point checklist. The audience must understand the plot, relationships, motivations, conflicts, major reversals, climax, resolution and meaningful character evolution -- through specific, named, evidence-backed particulars (who, where, what exact stakes), never through generic or interchangeable phrasing that could describe almost any movie. If a sentence you drafted could be pasted into a summary of a completely different film without anyone noticing, rewrite it with the actual confirmed detail that makes it true of THIS movie and no other. Respect the original movie and never mock its characters.
 
 NARRATIVE RULES
-1. Start with a compelling 20-to-35-second hook based on a confirmed paradox, conflict, transformation, impossible relationship, betrayal, dramatic consequence or extraordinary situation. Intrigue the viewer without needlessly exposing the ending.
+1. Always open with a brief narrative introduction (roughly 10-to-20 seconds) that orients the viewer before any plot action is narrated: state the film's setting (time period, place, world or milieu) and introduce its central character(s) by canonical name and role, in plain scene-setting narration -- the way a storyteller frames "this is the story of NAME, a ROLE in PLACE" before diving in. Only after this orientation, continue into a compelling 20-to-35-second hook based on a confirmed paradox, conflict, transformation, impossible relationship, betrayal, dramatic consequence or extraordinary situation, intriguing the viewer without needlessly exposing the ending. The introduction and the hook may be written as one combined opening voice-over block or as two consecutive blocks, whichever reads more naturally -- but the setting/character orientation must always come first, never the hook or plot action alone.
 2. Be concrete, never generic. Anchor every segment in specific, evidence-backed particulars: characters by their canonical name (never "the man," "someone," "a woman"), specific places, specific objects, specific numbers (ages, amounts of money, elapsed time, counts) and the specific stakes of that moment. A line that only asserts a generic escalation ("things get complicated," "the situation gets worse," "everything changes") is incomplete on its own -- it must be paired, in the same or the very next sentence, with the specific confirmed fact that makes it true. Write like an editor who actually watched this movie and is telling a friend exactly what happens in it, not like someone paraphrasing a synopsis they skimmed.
 3. Select only events required to understand the story, preserve its main emotional progression and reach the resolution naturally.
 4. Remove repetition, inconsequential conversations, unnecessary travel, redundant explanations and secondary plots that do not affect the main story.
 5. Never remove an event required to understand a later event.
 6. Write natural, cinematic, emotionally precise narration suitable for AI speech. Never say “in this scene,” “we can see,” “the transcript says,” or similar analytical phrases.
-7. Map the summary onto a real story structure, not a flat chronological list of things that happen: an opening status quo, the inciting incident that sets the real story in motion, two to four rising complications that escalate in stakes (not just in number), a midpoint turn where the situation changes in kind rather than merely in degree, the climax, and the resolution. Every segment should serve one identifiable beat in this structure -- if you cannot say which beat a segment serves, cut it or fold it into an adjacent one.
+7. Map the summary onto a real story structure, not a flat chronological list of things that happen: the opening setting/character introduction and hook (NARRATIVE RULE 1), an opening status quo, the inciting incident that sets the real story in motion, two to four rising complications that escalate in stakes (not just in number), a midpoint turn where the situation changes in kind rather than merely in degree, the climax, and the resolution. Every segment should serve one identifiable beat in this structure -- if you cannot say which beat a segment serves, cut it or fold it into an adjacent one.
 8. Voice-over blocks average around 27 seconds, but do not force every block to the same length -- vary it with the story's own rhythm the way an editor would: a fast run of escalating complications can use a few shorter ~12-to-20-second blocks back to back, while a pivotal emotional beat can justify a longer ~30-to-40-second block. Contain enough words for the declared duration; estimate speech at 125 to 150 words per minute, while recognizing that the backend will replace estimates with actual TTS durations.
 9. Each voice-over block must advance the story and should end with a useful transition, question, tension point or new information when this arises naturally.
 10. End with a 25-to-45-second reflection grounded in the movie's confirmed character evolution and theme. Do not impose an unsupported moral.
@@ -810,24 +788,18 @@ VISUAL MATCHING RULES
 3. Match images to the narrated action, reaction, relationship, location or consequence. A generic shot of a mentioned character is not sufficient when a more specific confirmed scene exists.
 4. Prefer several short, relevant clips over one excessively long range. Avoid black frames, credits, slates, blurred frames and transition frames when quality flags identify them.
 5. Preserve source chronology unless a clearly justified hook briefly previews a later confirmed event. After the hook, return to the natural beginning.
-6. Never reuse the same exact clip (same scene_id and start_ms/end_ms) in more than one segment, even when it feels narratively essential -- pick a different confirmed moment from the same scene, or a different scene entirely, instead.
+6. Never reuse the same exact clip (same scene_id and start_ms/end_ms) in more than one segment, except in a genuine case of absolute necessity where no other confirmed footage exists to illustrate that moment -- in every other situation, pick a different confirmed moment from the same scene, or a different scene entirely, instead.
 7. The cumulative clip duration for a voice-over block must be compatible with that block's estimated narration duration. Small backend-adjustable differences are acceptable.
 8. Never fabricate visual information based only on transcript dialogue. Use keyframe and scene evidence to confirm visual claims.
 
-ORIGINAL DIALOGUE RULES
-Use original movie dialogue selectively for declarations, revelations, breakups, confrontations, confessions, memorable comic lines, reunions, highly emotional moments and essential resolution lines. Voice-over must stop during original dialogue. Prefer approximately 3 to 6 original-dialogue moments in an 8-to-12-minute summary, but choose fewer or more when the evidence justifies it. The quoted transcript excerpt must match the supplied transcript. Each source time range (start_ms-end_ms) may be used by at most one original_dialogue or breathing segment in the whole plan -- never select the same or an overlapping source range twice, even to preview it early in the hook. If a later event must be foreshadowed in the hook, narrate it instead (a voice_over segment referencing the confirmed event) rather than replaying its exact original_dialogue/breathing range twice.
-
-CINEMATIC BREATHING RULES
-You may select short original-audio or silent visual moments for meaningful looks, crying, embraces, arrivals, departures, reactions, musical passages or silence after a revelation. Voice-over must stop during these segments. Use them sparingly, and never reuse or overlap a source time range already used by another original_dialogue or breathing segment (see ORIGINAL DIALOGUE RULES).
+NO ORIGINAL AUDIO RULE
+The final video must never play any of the original film's own dialogue, speech or audio -- only the narrated footage (video + voice-over). There is no "original dialogue" or "breathing" segment type: every segment is "voice_over", and its clips' own audio is always fully replaced by the narration. Never write narration that merely describes a line of dialogue happening off-screen as a substitute for quoting it -- paraphrase the confirmed content and meaning of the moment instead, in your own narration.
 
 DURATION RULES
-The total duration includes voice-over, original dialogue and breathing segments. Keep total_estimated_duration_ms within the tolerance supplied in generation_constraints. Do not pretend that a short sentence lasts 30 seconds. Never solve a duration deficit by selecting irrelevant footage or repeating information. Before writing segments, use generation_constraints.approximate_total_segment_count_hint as your sizing anchor: it is roughly target_duration_ms divided by a typical ~27-second voice-over block, so plan for approximately that many segments in total (voice-over blocks plus however many original-dialogue/breathing moments you add on top). Individual blocks may run shorter or longer than that average per NARRATIVE RULE 8, but producing far fewer segments than the hint, or making most voice-over blocks much shorter than average to compensate, is the most common way plans miss the duration tolerance -- if your draft segment count is well below the hint, add more voice-over blocks covering additional confirmed plot points rather than inflating estimated_duration_ms on existing ones.
+The total duration is the sum of every voice-over block's estimated_duration_ms. Keep total_estimated_duration_ms within the tolerance supplied in generation_constraints. Do not pretend that a short sentence lasts 30 seconds. Never solve a duration deficit by selecting irrelevant footage or repeating information. Before writing segments, use generation_constraints.approximate_total_segment_count_hint as your sizing anchor: it is roughly target_duration_ms divided by a typical ~27-second voice-over block, so plan for approximately that many segments. Individual blocks may run shorter or longer than that average per NARRATIVE RULE 8, but producing far fewer segments than the hint, or making most voice-over blocks much shorter than average to compensate, is the most common way plans miss the duration tolerance -- if your draft segment count is well below the hint, add more voice-over blocks covering additional confirmed plot points rather than inflating estimated_duration_ms on existing ones.
 
 EVIDENCE AND UNCERTAINTY
 Every narrated segment must include source_event_ids. Every clip must reference a valid scene_id. When names are uncertain, use the canonical identity from character_bible or neutral wording. Add unresolved issues to unresolved_ambiguities. If the evidence cannot support a coherent summary, return status="insufficient_evidence" and explain the blocking evidence gaps without generating fake content.
-
-BACKGROUND MUSIC MOOD
-An optional, low-volume instrumental music bed (no lyrics) may be mixed under voice-over narration -- never under original_dialogue or breathing segments, where the film's own audio must remain the only thing heard. Pick exactly one dominant mood for the whole film from: tense, dark, hopeful, romantic, melancholic, triumphant, comedic, neutral. Base it on the film's actual confirmed tone, not a guess -- a thriller with a betrayal at its core is "tense" or "dark," a story ending in reconciliation is "hopeful," and so on. Use "neutral" only when no other mood clearly fits. This choice only selects which instrumental track (if any is available) may play under narration; it has no effect on the narration text or segment selection.
 
 OUTPUT SCHEMA
 Return exactly this JSON shape -- every field below is required unless marked optional, and no other top-level or segment field names are read:
@@ -837,41 +809,35 @@ Return exactly this JSON shape -- every field below is required unless marked op
   "characters": [ { "id": string, "canonical_name": string, "aliases": [string], "role": string } ],
   "segments": [ <segment, see below> ],
   "total_estimated_duration_ms": integer   (your own best-effort sum, backend recomputes the authoritative value),
-  "music_mood": "tense" | "dark" | "hopeful" | "romantic" | "melancholic" | "triumphant" | "comedic" | "neutral"   (optional, default "neutral", see BACKGROUND MUSIC MOOD),
   "unresolved_ambiguities": [string]
 }
 Every segment is a JSON object with these fields:
 - "id": a stable unique string you invent (e.g. "seg_01").
 - "sequence": REQUIRED integer. Segments MUST be numbered 1, 2, 3, ... with no gaps and no repeats, strictly in playback order -- segment N's sequence is always exactly N. This is validated mechanically; a missing, duplicated, non-integer or out-of-order sequence value fails the plan outright.
-- "type": exactly one of "voice_over", "original_dialogue", "breathing".
-When "type" is "voice_over", also include:
+- "type": always "voice_over" -- this is the only segment type (see NO ORIGINAL AUDIO RULE).
 - "narration": string, the spoken voice-over text.
 - "estimated_duration_ms": integer, your best estimate of this block's spoken duration.
 - "source_event_ids": [string], the story events/evidence this narration is based on.
 - "clips": [ { "scene_id": string (must exist in scene_index), "start_ms": integer, "end_ms": integer, "description": string, "match_score": number 0-1 } ].
-When "type" is "original_dialogue" or "breathing", instead include:
-- "start_ms": integer, "end_ms": integer -- the exact source timecodes played verbatim (must exist within scene_index/transcript_segments bounds).
-- "transcript_excerpt": string, the verbatim quoted transcript for this range (empty string for a silent "breathing" moment).
-- "speaker_ids": [string], referencing characters[].id.
 
 OUTPUT CONTRACT
-Return JSON only. Do not use Markdown. Do not include commentary before or after the JSON. The output must validate against the OUTPUT SCHEMA above exactly -- do not add, rename or omit fields. Use integer milliseconds for all durations and timecodes. Segment types are exactly: voice_over, original_dialogue, or breathing. Keep segments in playback order with contiguous 1-based sequence numbers and stable unique IDs.
+Return JSON only. Do not use Markdown. Do not include commentary before or after the JSON. The output must validate against the OUTPUT SCHEMA above exactly -- do not add, rename or omit fields. Use integer milliseconds for all durations and timecodes. Every segment's type is exactly "voice_over". Keep segments in playback order with contiguous 1-based sequence numbers and stable unique IDs.
 
 Before returning the JSON, silently verify:
 - every segment has an integer "sequence" field, and the full list is exactly 1, 2, 3, ... with no gaps, duplicates or reordering;
+- every segment's "type" is "voice_over" -- the final video must never play any of the original film's own dialogue or audio, only narrated footage;
 - all important story claims are supported;
 - every scene_id and timecode exists and remains within bounds;
 - chronology is coherent;
-- no two original_dialogue/breathing segments reuse or overlap the same source time range;
 - no clips overlap incompatibly;
 - narration length agrees with estimated duration;
-- original dialogue and breathing contain no simultaneous voice-over;
-- no clip (same scene_id and start_ms/end_ms) is used in more than one segment, and repeated facts are minimized;
+- no clip (same scene_id and start_ms/end_ms) is used in more than one segment unless genuinely unavoidable, and repeated facts are minimized;
 - the target duration tolerance is respected;
+- every voice_over segment's "narration" is non-empty -- an empty one never reaches the audience as speech, leaving that stretch of the video with no narration audible at all;
+- the opening introduces the film's setting and principal characters by name before any hook or plot action is narrated (NARRATIVE RULE 1);
 - the hook, main progression, climax, resolution and conclusion are present when supported by the movie;
 - the setup, inciting incident, rising complications, midpoint turn, climax and resolution are each identifiable in at least one segment;
 - every segment names its characters, places and objects specifically rather than generically, and no segment is a generic sentence that could describe almost any movie;
-- music_mood is one of the listed moods and genuinely reflects the film's confirmed tone;
 - the result can be executed by an automated FFmpeg pipeline."""
 
 
@@ -888,6 +854,41 @@ PLANNING_CONSOLIDATION_NOTE = (
 )
 
 
+# Narrower than PLANNING_SYSTEM_PROMPT (see translate_edit_plan_narration):
+# the plan -- footage, timing, segment structure -- is already final and
+# approved; the only thing wrong with it is the narration's language ("il
+# arrive qu'on ait fait une mauvaise selection au debut"). The model's only
+# job is to translate text, never to re-edit.
+NARRATION_TRANSLATION_SYSTEM_PROMPT = """You are Vireel's Film Summary Narration Translation Engine. An edit plan for a film summary already exists -- its footage, timing and segment structure are final and approved. The only problem is that its narration was written in the wrong language. Your ONLY job is to translate the spoken narration text of each voice_over segment into the requested target_language. You do not edit, re-cut, re-order, re-group, add, remove or re-time anything else.
+
+You have no permission to change any field other than a voice_over segment's "narration". Every other field -- "id", "type", "sequence", "clips" (and every clip's "scene_id", "start_ms", "end_ms"), "estimated_duration_ms", "source_event_ids" and "characters" -- must be copied byte-for-byte identical to the input, in the same order, same count.
+
+INPUTS
+- movie_metadata: title, source duration, source language and technical metadata
+- target_language: the language to translate every voice_over segment's narration into
+- characters, segments: the existing plan's own fields, to copy through (segments' narration aside) exactly as given
+
+TRANSLATION RULES
+1. Translate only the "narration" string of each voice_over segment into target_language. Preserve its meaning, tone and register -- a natural, cinematic, emotionally precise translation suitable for AI speech, not a literal word-for-word rendering.
+2. Never shorten, lengthen, embellish, summarize or otherwise rewrite the narration's content beyond what translation requires. Keep roughly the same information density and pacing.
+3. Leave "estimated_duration_ms" exactly as given, even though the translated text's natural spoken length may differ slightly -- the backend recomputes real durations from actual TTS output, not from this estimate.
+
+OUTPUT SCHEMA
+Return exactly this JSON shape -- every field required unless marked optional:
+{
+  "status": "ok"   (optional, default "ok"),
+  "characters": [ <copied through unchanged> ],
+  "segments": [ <segment, see below -- same count and order as the input> ],
+  "total_estimated_duration_ms": integer   (your own best-effort sum, backend recomputes the authoritative value),
+  "unresolved_ambiguities": [string]   (may be empty)
+}
+Each segment object must have exactly the same shape and field values as the corresponding input segment, with this single exception: "narration" holds the translated text instead of the original. "id", "sequence", "type", "estimated_duration_ms", "source_event_ids" and "clips" are all copied through unchanged.
+
+OUTPUT CONTRACT
+Return JSON only. Do not use Markdown. Do not include commentary before or after the JSON.
+Before returning the JSON, silently verify: the segment count, order, types, sequence numbers, clips, timecodes, estimated_duration_ms, source_event_ids and characters are all byte-for-byte identical to the input; only each voice_over segment's narration text has changed, and it is a faithful translation into target_language."""
+
+
 TTS_INSTRUCTIONS_TEMPLATE = (
     "Speak in fluent {{LANGUAGE}} as a cinematic film narrator. Use a natural, controlled and "
     "emotionally responsive delivery. Maintain clarity at approximately 135 words per minute. "
@@ -895,9 +896,25 @@ TTS_INSTRUCTIONS_TEMPLATE = (
     "add, omit or paraphrase any words. Do not read stage directions, identifiers or timecodes."
 )
 
+# The ISO 639-1 codes this app's own language pickers use (dashboard's
+# NARRATION_LANGUAGE_OPTIONS / FilmSummaryCreatePage's source-language
+# select), mapped to the full English name a natural-language instruction
+# sentence actually needs. A raw code dropped straight into the template
+# ("Speak in fluent fr as a cinematic film narrator...") is meaningless to
+# the TTS engine and was silently steering it toward English regardless of
+# the narration_language the user chose.
+_TTS_LANGUAGE_CODE_TO_NAME = {
+    "fr": "French", "en": "English", "es": "Spanish",
+    "de": "German", "it": "Italian", "pt": "Portuguese",
+}
+
+
+def _resolve_tts_language_name(language: str) -> str:
+    return _TTS_LANGUAGE_CODE_TO_NAME.get((language or "").strip().lower(), language or "the narration language")
+
 
 def build_tts_instructions(language: str) -> str:
-    return TTS_INSTRUCTIONS_TEMPLATE.replace("{{LANGUAGE}}", language or "the narration language")
+    return TTS_INSTRUCTIONS_TEMPLATE.replace("{{LANGUAGE}}", _resolve_tts_language_name(language))
 
 
 # ---------------------------------------------------------------------------
@@ -1004,8 +1021,75 @@ def _describe_duration_gap(plan: Dict[str, Any], target_duration_ms: int) -> str
     )
 
 
+def _voice_over_clip_signature(clip: Dict[str, Any]) -> Tuple[Any, Any, Any]:
+    return (clip.get("scene_id"), clip.get("start_ms"), clip.get("end_ms"))
+
+
+def _find_repeated_voice_over_clips(segments: List[Dict[str, Any]]) -> List[Tuple[str, Tuple[Any, Any, Any]]]:
+    """Internal-only signal used exclusively by generate_edit_plan's own
+    corrective retry below -- deliberately NOT part of
+    validate_edit_plan_content/the user-facing validation report (clip
+    reuse must never surface as an error or warning the user has to act
+    on, see that function's docstring). Returns one (segment_id,
+    signature) pair per voice_over clip whose exact (scene_id, start_ms,
+    end_ms) signature already appeared earlier in plan order, so the
+    corrective message can name exactly which repeats to fix."""
+    seen: set = set()
+    repeats: List[Tuple[str, Tuple[Any, Any, Any]]] = []
+    for seg in segments:
+        if seg.get("type") != SEGMENT_TYPE_VOICE_OVER:
+            continue
+        for clip in seg.get("clips") or []:
+            signature = _voice_over_clip_signature(clip)
+            if signature in seen:
+                repeats.append((seg.get("id"), signature))
+            else:
+                seen.add(signature)
+    return repeats
+
+
+def _describe_repeated_voice_over_clips(repeats: List[Tuple[str, Tuple[Any, Any, Any]]]) -> str:
+    return "; ".join(
+        f"segment {seg_id} reuses the exact same clip (scene_id={scene_id}, start_ms={start_ms}, end_ms={end_ms}) "
+        "already used earlier in the plan"
+        for seg_id, (scene_id, start_ms, end_ms) in repeats
+    )
+
+
+def _deduplicate_voice_over_clips(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Final, unconditional guarantee that no exact clip (scene_id,
+    start_ms, end_ms) ever reaches more than one segment in the plan
+    generate_edit_plan returns -- "ne jamais utiliser la meme scene 2
+    fois ... l'utilisateur ne dois pas intervenir": this must hold by
+    construction, not merely by prompt instruction (VISUAL MATCHING RULE
+    6) or by the best-effort corrective retry above, and it must never
+    surface as an error/warning. Drops only the later duplicate
+    occurrence's clip entry, keeping the first use and every other
+    distinct clip in that segment untouched. A voice_over segment left
+    with no clips at all falls back to render's existing blank-segment
+    behavior (film_summary_render._build_voice_over_segment_clip) -- the
+    same graceful path already used whenever a segment has no usable
+    footage, instead of ever shipping a duplicate."""
+    seen: set = set()
+    deduped_segments = []
+    for seg in segments:
+        if seg.get("type") != SEGMENT_TYPE_VOICE_OVER or not seg.get("clips"):
+            deduped_segments.append(seg)
+            continue
+        kept_clips = []
+        for clip in seg["clips"]:
+            signature = _voice_over_clip_signature(clip)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            kept_clips.append(clip)
+        deduped_segments.append({**seg, "clips": kept_clips})
+    return deduped_segments
+
+
 def _build_planning_correction_message(
     validation_report: Dict[str, Any], plan: Dict[str, Any], target_duration_ms: int, duration_tolerance_ratio: float,
+    repeated_clips: Optional[List[Tuple[str, Tuple[Any, Any, Any]]]] = None,
 ) -> Dict[str, str]:
     errors = "; ".join(validation_report.get("errors") or [])
     warnings = "; ".join(validation_report.get("warnings") or [])
@@ -1017,16 +1101,22 @@ def _build_planning_correction_message(
         target_duration_ms > 0 and abs(total_ms - target_duration_ms) > target_duration_ms * duration_tolerance_ratio
     )
     duration_hint = _describe_duration_gap(plan, target_duration_ms) if duration_out_of_tolerance else ""
+    repeated_clips_text = _describe_repeated_voice_over_clips(repeated_clips or [])
 
     sentences = []
     if errors:
         sentences.append(f"Your previous plan failed automated validation with these blocking errors: {errors}.")
     if warnings:
-        # Repeated-clip reuse (and similar) never blocks validation -- see
-        # _validate_repeated_clips -- but is still worth one corrective shot
-        # here, the same mechanism already used for blocking errors, instead
-        # of relying only on the planning prompt's best-effort instruction.
+        # Non-blocking issues (e.g. an unknown character reference) are
+        # still worth one corrective shot here, the same mechanism already
+        # used for blocking errors, instead of relying only on the planning
+        # prompt's own best-effort instructions.
         sentences.append(f"It also has these quality issues you should fix even though they did not block validation: {warnings}.")
+    if repeated_clips_text:
+        sentences.append(
+            f"It also violates VISUAL MATCHING RULE 6 (never reuse the same exact clip unless genuinely "
+            f"unavoidable): {repeated_clips_text}. Replace each of these with a different confirmed moment."
+        )
 
     return {
         "role": "user",
@@ -1035,6 +1125,37 @@ def _build_planning_correction_message(
             "that fixes every one of these issues while preserving everything else that was already correct."
         ),
     }
+
+
+def _parse_planning_json_with_retry(
+    raw_text: str, *, attempt: int, max_attempts: int, messages: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Shared JSON-parse-with-one-retry-on-truncation step used by every
+    planning loop (generate_edit_plan, generate_narration_for_selected_
+    clips): a long response can get cut off mid-string by max_tokens (see
+    _call_planning_model), and json.loads then raises "Unterminated
+    string ..." -- worth one corrective retry instead of failing the whole
+    request outright, same mechanism as a validation-error retry.
+
+    Returns the parsed dict on success. On a parse failure before the last
+    attempt, appends the model's raw response plus a corrective follow-up
+    onto `messages` (in place) and returns None -- the caller should
+    `continue` its loop. Raises FilmSummaryValidationError once attempts
+    are exhausted."""
+    try:
+        return json.loads(raw_text)
+    except (TypeError, ValueError) as exc:
+        if attempt == max_attempts - 1:
+            raise FilmSummaryValidationError(FilmSummaryErrorCode.PLAN_INVALID, f"Invalid JSON from planning model: {exc}") from exc
+        messages.append({"role": "assistant", "content": raw_text})
+        messages.append({
+            "role": "user",
+            "content": (
+                f"Your previous response was not valid, complete JSON ({exc}). Return the complete "
+                "corrected plan as a single valid JSON object (same OUTPUT SCHEMA, JSON only), nothing else."
+            ),
+        })
+        return None
 
 
 async def generate_edit_plan(
@@ -1054,19 +1175,31 @@ async def generate_edit_plan(
 
     Self-corrects once on a blocking validation failure (duration outside
     tolerance, non-contiguous sequence numbers, overlapping dialogue, ...)
-    or a non-blocking warning (a clip reused across segments, an unknown
-    character reference, ...): LLM-produced plans occasionally violate a
-    numeric/structural constraint, or ignore a softer instruction like
-    "never reuse a clip", even when the prompt states it clearly, since
-    keeping a running total (or a set of already-used clips) consistent
-    across many segments is a self-consistency task models don't reliably
-    get right in one pass. Feeding the exact validation errors/warnings
-    back as a corrective follow-up turn (keeping the model's own prior
-    answer in context, rather than starting over) converges far more often
-    than a fresh independent attempt would, at the cost of a second call
-    only when the first one actually had something to fix. A warning that
+    or a non-blocking warning (an unknown character reference, ...):
+    LLM-produced plans occasionally violate a numeric/structural
+    constraint, since keeping a running total consistent across many
+    segments is a self-consistency task models don't reliably get right in
+    one pass. Feeding the exact validation errors/warnings back as a
+    corrective follow-up turn (keeping the model's own prior answer in
+    context, rather than starting over) converges far more often than a
+    fresh independent attempt would, at the cost of a second call only
+    when the first one actually had something to fix. A warning that
     still isn't resolved after the retry is never blocking -- the user
-    must always be able to render, see _validate_repeated_clips."""
+    must always be able to render.
+
+    Clip reuse (the same exact scene_id/start_ms/end_ms used in more than
+    one voice_over segment) is never surfaced as an error or warning
+    ("ne plus mettre d'avertissement pour cela") -- VISUAL MATCHING RULE 6
+    in PLANNING_SYSTEM_PROMPT discourages it in the first place, and a
+    repeat still present after a model response is also fed back as a
+    silent corrective nudge (see _find_repeated_voice_over_clips/
+    _build_planning_correction_message) the same way a validation warning
+    is. But unlike every other check here, this one must never ship
+    unresolved either ("ne jamais utiliser la meme scene 2 fois ...
+    l'utilisateur ne dois pas intervenir") -- so after the loop below,
+    _deduplicate_voice_over_clips deterministically strips any repeat
+    still present in the returned plan, by construction, with no further
+    model call and nothing for the user to notice or act on."""
     client = _get_openai_client()
     model_name = os.environ.get("FILM_SUMMARY_PLANNING_MODEL", os.environ.get("OPENAI_MODEL", "gpt-4o"))
     max_attempts = int(os.environ.get("FILM_SUMMARY_PLANNING_MAX_ATTEMPTS", "2"))
@@ -1091,7 +1224,6 @@ async def generate_edit_plan(
 
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
     plan: Dict[str, Any] = {}
-    validation_report: Dict[str, Any] = {"valid": False, "errors": [], "warnings": []}
 
     for attempt in range(max(1, max_attempts)):
         response = await asyncio.to_thread(_call_planning_model, client, model_name, messages)
@@ -1100,24 +1232,8 @@ async def generate_edit_plan(
         total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
         total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
 
-        try:
-            raw = json.loads(raw_text)
-        except (TypeError, ValueError) as exc:
-            if attempt == max_attempts - 1:
-                raise FilmSummaryValidationError(FilmSummaryErrorCode.PLAN_INVALID, f"Invalid JSON from planning model: {exc}") from exc
-            # Most often a response truncated by hitting max_tokens on a
-            # long plan (see _call_planning_model) rather than the model
-            # getting the syntax wrong -- worth one retry instead of
-            # failing the whole request outright, same self-correction
-            # mechanism used below for validation errors/warnings.
-            messages.append({"role": "assistant", "content": raw_text})
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"Your previous response was not valid, complete JSON ({exc}). Return the complete "
-                    "corrected plan as a single valid JSON object (same OUTPUT SCHEMA, JSON only), nothing else."
-                ),
-            })
+        raw = _parse_planning_json_with_retry(raw_text, attempt=attempt, max_attempts=max_attempts, messages=messages)
+        if raw is None:
             continue
 
         plan = validate_edit_plan_schema(raw, movie_metadata=movie_metadata, target_duration_ms=target_duration_ms)
@@ -1126,13 +1242,144 @@ async def generate_edit_plan(
             plan, source_duration_ms=source_duration_ms, valid_scene_ids=valid_scene_ids,
             duration_tolerance_ratio=duration_tolerance_ratio,
         )
-        has_fixable_issue = not validation_report["valid"] or bool(validation_report["warnings"])
+        repeated_clips = _find_repeated_voice_over_clips(plan.get("segments") or [])
+        has_fixable_issue = not validation_report["valid"] or bool(validation_report["warnings"]) or bool(repeated_clips)
         if not has_fixable_issue or attempt == max_attempts - 1:
             break
         messages.append({"role": "assistant", "content": raw_text})
-        messages.append(_build_planning_correction_message(validation_report, plan, target_duration_ms, duration_tolerance_ratio))
+        messages.append(_build_planning_correction_message(
+            validation_report, plan, target_duration_ms, duration_tolerance_ratio, repeated_clips,
+        ))
+
+    if plan.get("segments"):
+        plan["segments"] = _deduplicate_voice_over_clips(plan["segments"])
 
     return {"plan": plan, "usage": total_usage}
+
+
+# ---------------------------------------------------------------------------
+# Narration (re)translation (see NARRATION_TRANSLATION_SYSTEM_PROMPT /
+# translate_edit_plan_narration): lets the user fix a wrong narration
+# language choice on an already-approved plan -- footage, timing and
+# segment structure are untouched, only the voice_over text is rewritten in
+# the newly chosen language.
+# ---------------------------------------------------------------------------
+
+def _build_narration_translation_payload(
+    *, plan: Dict[str, Any], target_language: str, movie_metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Only the fields the translation model actually needs: the existing
+    plan's own characters/segments (to copy through verbatim, translating
+    only each voice_over segment's narration) plus the requested
+    target_language and movie_metadata for context."""
+    return {
+        "movie_metadata": movie_metadata,
+        "target_language": target_language,
+        "characters": plan.get("characters") or [],
+        "segments": plan.get("segments") or [],
+    }
+
+
+def _build_narration_translation_correction_message(
+    validation_report: Dict[str, Any], structure_error: Optional["FilmSummaryValidationError"],
+) -> Dict[str, str]:
+    """Same spirit as _build_planning_correction_message, plus the one
+    extra failure mode specific to this mode: the model altered, reordered,
+    dropped or added a segment/clip instead of merely translating
+    narration text (see validate_narration_translation_structure)."""
+    errors = "; ".join(validation_report.get("errors") or [])
+    warnings = "; ".join(validation_report.get("warnings") or [])
+
+    sentences = []
+    if structure_error is not None:
+        sentences.append(f"Your previous response violated the translation invariant: {structure_error}.")
+    if errors:
+        sentences.append(f"Your previous plan failed automated validation with these blocking errors: {errors}.")
+    if warnings:
+        sentences.append(f"It also has these quality issues you should fix even though they did not block validation: {warnings}.")
+
+    return {
+        "role": "user",
+        "content": (
+            f"{' '.join(sentences)} Return a corrected full plan (same OUTPUT SCHEMA, JSON only) that keeps "
+            "every field byte-for-byte identical to your previous response except each voice_over segment's "
+            "narration, translated into the requested target_language, while fixing every issue above."
+        ),
+    }
+
+
+async def translate_edit_plan_narration(
+    *, plan: Dict[str, Any], target_language: str, movie_metadata: Dict[str, Any],
+    duration_tolerance_ratio: float = 0.15,
+) -> Dict[str, Any]:
+    """AI-driven retranslation of an already-approved edit plan's narration
+    into a newly chosen target_language, keeping every clip, timecode and
+    segment exactly as-is (see validate_narration_translation_structure) --
+    lets the user correct a wrong narration-language choice after the fact
+    without regenerating or re-matching any footage ("l'IA va retraduire
+    dans la langue qu'on va choisir car il arrive qu'on ait fait une
+    mauvaise selection au debut").
+
+    Returns {"plan", "validation_report", "usage"}. Raises
+    FilmSummaryValidationError when plan has no segments, when every
+    attempt still produces malformed JSON (see
+    _parse_planning_json_with_retry), or when the model's response still
+    violates validate_narration_translation_structure after exhausting
+    every retry -- a translation must never be allowed to silently alter
+    the approved footage or timing."""
+    segments = plan.get("segments") or []
+    if not segments:
+        raise FilmSummaryValidationError(FilmSummaryErrorCode.PLAN_INVALID, "plan has no segments to translate")
+
+    client = _get_openai_client()
+    model_name = os.environ.get("FILM_SUMMARY_PLANNING_MODEL", os.environ.get("OPENAI_MODEL", "gpt-4o"))
+    max_attempts = int(os.environ.get("FILM_SUMMARY_PLANNING_MAX_ATTEMPTS", "2"))
+
+    target_duration_ms = int(plan.get("target_duration_ms") or compute_total_estimated_duration_ms(segments))
+    payload = _build_narration_translation_payload(plan=plan, target_language=target_language, movie_metadata=movie_metadata)
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": NARRATION_TRANSLATION_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(payload)},
+    ]
+    source_duration_ms = int(movie_metadata.get("source_duration_ms") or 0)
+
+    total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    translated_plan: Dict[str, Any] = {}
+    validation_report: Dict[str, Any] = {"valid": False, "errors": [], "warnings": []}
+    structure_error: Optional[FilmSummaryValidationError] = None
+
+    for attempt in range(max(1, max_attempts)):
+        response = await asyncio.to_thread(_call_planning_model, client, model_name, messages)
+        raw_text = response.choices[0].message.content
+        usage = _usage_dict(response, model_name)
+        total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
+        total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+
+        raw = _parse_planning_json_with_retry(raw_text, attempt=attempt, max_attempts=max_attempts, messages=messages)
+        if raw is None:
+            continue
+
+        translated_plan = validate_edit_plan_schema(raw, movie_metadata=movie_metadata, target_duration_ms=target_duration_ms)
+
+        structure_error = None
+        try:
+            validate_narration_translation_structure(plan, translated_plan)
+        except FilmSummaryValidationError as exc:
+            structure_error = exc
+
+        validation_report = validate_edit_plan_content(
+            translated_plan, source_duration_ms=source_duration_ms, duration_tolerance_ratio=duration_tolerance_ratio,
+        )
+        has_fixable_issue = structure_error is not None or not validation_report["valid"] or bool(validation_report["warnings"])
+        if not has_fixable_issue or attempt == max_attempts - 1:
+            break
+        messages.append({"role": "assistant", "content": raw_text})
+        messages.append(_build_narration_translation_correction_message(validation_report, structure_error))
+
+    if structure_error is not None:
+        raise structure_error
+
+    return {"plan": translated_plan, "validation_report": validation_report, "usage": total_usage}
 
 
 def _build_utterance_segments(transcript: Any) -> List[Dict[str, Any]]:
@@ -1157,34 +1404,53 @@ def _build_utterance_segments(transcript: Any) -> List[Dict[str, Any]]:
     return [{"start_ms": 0, "end_ms": audio_ms, "speaker": "", "text": text}]
 
 
-def _transcribe_with_assemblyai(video_path: str, api_key: str) -> Dict[str, Any]:
+def _transcribe_with_assemblyai(video_path: str, api_key: str, language_hint: Optional[str] = None) -> Dict[str, Any]:
     import assemblyai as aai
 
     aai.settings.api_key = api_key
-    config = aai.TranscriptionConfig(punctuate=True, format_text=True, speaker_labels=True)
+    config_kwargs = {"punctuate": True, "format_text": True, "speaker_labels": True}
+    normalized_hint = (language_hint or "").strip().lower()
+    if normalized_hint:
+        # The user already told us the language (or a prior pass on this
+        # same film already resolved it) -- transcribe directly in it
+        # instead of guessing, which is both faster and more accurate.
+        config_kwargs["language_code"] = normalized_hint
+    else:
+        # Without language_detection, AssemblyAI's TranscriptionConfig
+        # silently assumes English rather than actually detecting anything
+        # -- a French film with no language override would come back
+        # language_code="en" every time, not because detection got it
+        # wrong, but because no detection ever ran.
+        config_kwargs["language_detection"] = True
+    config = aai.TranscriptionConfig(**config_kwargs)
     transcript = aai.Transcriber(config=config).transcribe(video_path)
     if transcript.status == aai.TranscriptStatus.error:
         raise RuntimeError(transcript.error or "AssemblyAI transcription failed")
 
     return {
         "text": transcript.text or "",
-        "language": transcript.language_code or "unknown",
+        "language": transcript.language_code or normalized_hint or "unknown",
         "segments": _build_utterance_segments(transcript),
     }
 
 
-async def transcribe_video_with_timecodes(video_path: str) -> Dict[str, Any]:
+async def transcribe_video_with_timecodes(video_path: str, language_hint: Optional[str] = None) -> Dict[str, Any]:
     """Transcribe a local video with AssemblyAI, keeping per-utterance
     timecodes (ms) and speaker labels -- unlike anonymous_stories.
     transcribe_video, this feature needs timecodes to cite transcript
     evidence and quote original dialogue verbatim with real bounds. The
     actual call runs in _transcribe_with_assemblyai (a plain, non-nested
     function) rather than a closure here, since a nested function's body
-    counts against *this* function's cognitive complexity."""
+    counts against *this* function's cognitive complexity.
+
+    `language_hint`, when given (the user's own source_language choice,
+    see app.py's callers), is passed straight through as AssemblyAI's
+    language_code rather than relying on auto-detection -- see
+    _transcribe_with_assemblyai for why detection alone isn't reliable."""
     api_key = os.environ.get("ASSEMBLYAI_API_KEY")
     if not api_key:
         raise RuntimeError("ASSEMBLYAI_API_KEY is not configured")
-    return await asyncio.to_thread(_transcribe_with_assemblyai, video_path, api_key)
+    return await asyncio.to_thread(_transcribe_with_assemblyai, video_path, api_key, language_hint)
 
 
 def download_youtube_source(url: str, output_dir: str) -> Dict[str, str]:

@@ -1,4 +1,8 @@
 {
+  "publishQuota": {
+    "exceeded": "Daily limit of {{max}} publications reached. You can publish again at {{time}}.",
+    "genericError": "Something went wrong."
+  },
   "app": {
     "loading": "Loading...",
     "reelGenerator": "Reels Generator",
@@ -51,6 +55,17 @@
     "cleanAudio": "Clean audio",
     "removeBadTakes": "Remove bad takes"
   },
+  "nav": {
+    "abonnements": "Subscription plan",
+    "parrainage": "Referrals",
+    "documents": "Documents"
+  },
+  "header": {
+    "notifications": "Notifications",
+    "account": "Account",
+    "noNotifications": "No notifications yet.",
+    "markAllRead": "Mark all as read"
+  },
   "mediaInput": {
     "youtubeUrl": "YouTube URL",
     "uploadFile": "Upload a file",
@@ -78,6 +93,9 @@
     "active": "Active",
     "inactive": "Inactive",
     "periodEnd": "End of period",
+    "billingInterval": "Billing",
+    "billingYearly": "Yearly",
+    "billingMonthly": "Monthly",
     "retentionUntil": "Content retention until",
     "cancelRenewal": "Cancel renewal",
     "reactivate": "Reactivate",
@@ -127,8 +145,38 @@
     "type": "Type",
     "operation": "Operation",
     "credits": "Credits",
-    "storage": "Storage (GB)",
     "historic": "Operation history",
+    "nextBillingDate": "Next billing date",
+    "nextCreditAllocationDate": "Next credit allocation",
+    "scheduledChangePanel": "Scheduled change: {{plan}} ({{interval}}) starting {{date}}.",
+    "cancelScheduledChange": "Cancel scheduled change",
+    "scheduledChangeCancelled": "Scheduled change cancelled.",
+    "billingIntervalLabel": "Billing interval",
+    "confirmChangePlan": "Confirm change",
+    "loadingPlanPreview": "Calculating preview...",
+    "planPreviewError": "Unable to load the change preview.",
+    "classificationUpgradeImmediate": "Immediate upgrade",
+    "classificationDowngradeScheduled": "Scheduled change",
+    "classificationPeriodicityScheduled": "Scheduled billing interval change",
+    "classificationLateralUnsupported": "This change isn't supported",
+    "classificationNoop": "No change",
+    "classificationInvalid": "Invalid change",
+    "inconsistentConfiguration": "This plan is misconfigured and can't be applied. Please contact support.",
+    "willCancelScheduledChange": "This will cancel your currently scheduled change.",
+    "annualBillingCopy": "Billed annually; credits are granted every month on your anniversary date.",
+    "planChangeEffectiveAt": "Takes effect on {{date}}",
+    "amountDueToday": "Amount due today",
+    "creditsAddedNow": "Credits added now",
+    "expiresOn": "expires on",
+    "resultingCreditBalance": "Resulting credit balance",
+    "futureMonthlyQuota": "Future monthly credit quota",
+    "nextAmountLabel": "Next amount",
+    "onDate": "on",
+    "planChangeNoop": "You're already on this plan and billing interval.",
+    "planChangeAppliedSuccess": "Plan updated successfully.",
+    "planChangeScheduledSuccess": "Scheduled change: {{plan}} ({{interval}}) starting {{date}}.",
+    "confirmCancelScheduledChange": "Confirming this will cancel {{scheduled}} and apply this change instead. Continue?",
+    "yourScheduledChange": "your currently scheduled change",
     "errors": {
       "no_active_subscription": "No active subscription.",
       "no_stripe_subscription": "This subscription isn't a recurring Stripe subscription. Change plan to create a recurring subscription before using this action.",
@@ -136,7 +184,16 @@
       "no_payment_method": "No card on file.",
       "plan_not_found": "This plan no longer exists.",
       "invalid_plan_price": "This plan's price is invalid. Please contact support.",
-      "plan_change_over_limit": "This plan allows at most {{max}} account(s) per social network. Remove the extra accounts before changing plan: {{details}}."
+      "plan_change_over_limit": "This plan allows at most {{max}} account(s) per social network. Remove the extra accounts before changing plan: {{details}}.",
+      "plan_change_invalid_order": "This plan change isn't valid for your current plan.",
+      "plan_change_lateral_unsupported": "Switching between these plans isn't supported.",
+      "plan_change_inconsistent_configuration": "This plan is misconfigured and can't be applied. Please contact support.",
+      "plan_change_payment_failed": "Payment failed. Please check your card and try again.",
+      "plan_change_scheduled_change_exists": "You already have a different scheduled change pending.",
+      "plan_change_missing_payment_method": "Please add a payment method before changing plan.",
+      "plan_change_requires_recurring_subscription": "This action requires a recurring subscription.",
+      "plan_change_subscription_cancelled": "This subscription is cancelled and can no longer change plan.",
+      "no_scheduled_change": "There's no scheduled change to cancel."
     }
   },
   "reels": {
@@ -271,8 +328,9 @@
     "autoEdit": "Auto-edit",
     "adding": "Adding...",
     "captions": "Captions",
-    "subtitles": "Subtitles generation",
+    "subtitles": "Subtitles",
     "viralhook": "Viral hooks",
+    "visuals": "Visuals",
     "post": "Post",
     "titleYoutube": "YouTube Title",
     "caption": "Caption",
@@ -429,6 +487,45 @@
     "generating": "Generating...",
     "addHook": "Add Hook"
   },
+  "visualsModal": {
+    "title": "Visuals (split-screen)",
+    "noPreview": "No preview available.",
+    "timeline": "Timeline",
+    "resizeHandle": "Resize",
+    "newVisualDraft": "New visual (draft)",
+    "editVisual": "Selected visual",
+    "deselect": "New visual",
+    "position": {
+      "label": "Position",
+      "top": "Top",
+      "bottom": "Bottom"
+    },
+    "startTime": "Start (s)",
+    "duration": "Duration (s)",
+    "saving": "Saving...",
+    "delete": "Delete",
+    "addVisual": "Add a visual",
+    "chooseImage": "Choose an image (JPG, PNG, WebP)",
+    "uploading": "Uploading...",
+    "add": "Add",
+    "hint": "Each visual takes up about 35% of the screen (image) during its time window, the video keeping the rest. Visuals can never overlap.",
+    "insufficientCredits": "Insufficient credits.",
+    "applying": "Applying...",
+    "apply": "Apply visuals",
+    "loadFailed": "Unable to load this clip's visuals.",
+    "genericError": "Something went wrong.",
+    "errors": {
+      "invalid_visual_timing": "Invalid timing: start time must be >= 0 and duration > 0.",
+      "visual_exceeds_reel_duration": "This visual would run past the reel's duration.",
+      "visual_overlap": "This visual's time window overlaps another one -- visuals can never overlap.",
+      "invalid_visual_position": "Position must be Top or Bottom.",
+      "invalid_image_format": "Unsupported image format (JPG, PNG or WebP only).",
+      "image_too_large": "Image is too large.",
+      "visual_not_found": "This visual no longer exists.",
+      "no_visuals_configured": "No visuals are configured for this reel.",
+      "missing_file": "Please choose an image."
+    }
+  },
   "subtitleModal": {
     "title": "Auto Subtitles",
     "loadingPreview": "Loading preview...",
@@ -468,6 +565,16 @@
     "transparent": "Transparent",
     "generating": "Generating...",
     "generate": "Generate Subtitles"
+  },
+  "breadcrumbs": {
+    "ariaLabel": "Breadcrumb",
+    "dashboard": "Dashboard",
+    "reels": "Reels",
+    "captions": "Captions",
+    "filmSummaries": "Film summaries",
+    "anonymousStories": "Anonymous stories",
+    "projects": "Projects",
+    "create": "Create"
   },
   "dashboard": {
     "welcomeBack": "Welcome back",
@@ -567,6 +674,11 @@
     "loadingSubscription": "Loading subscription...",
     "populaire": "Popular",
     "mois": "month",
+    "an": "year",
+    "billingMonthly": "Monthly",
+    "billingAnnual": "Annual",
+    "annualDiscountBadge": "up to -{{percent}}%",
+    "annualSavings": "Save {{amount}}€ per year",
     "fillCredit": "Top up credits",
     "creditRate": "credits · current balance ",
     "redirection": "Redirecting...",
@@ -575,12 +687,41 @@
     "offre1": "Reels generation",
     "offre2": "Caption generation",
     "offre3": "Social media posting and monitoring",
-    "offre4": "Subtitle and viral hook generation",
+    "offre4": "Anonymous story generation",
     "offre5": "Text and subtitle translation",
+    "offre6": "Film summary generation",
     "commentsPerPost": "comments / post",
     "statsIncluded": "Social stats on the home page",
     "statsExcluded": "No social stats on the home page",
-    "aiFeaturesHeading": "AI features included in the credits"
+    "aiFeaturesHeading": "AI features included in the credits",
+    "creditsBreakdown": "{{standard}} standard credits · {{promo}} promotional credits",
+    "expiringBatch": "{{amount}} promotional credits expire in {{days}} day(s)",
+    "creditsBreakdown3": "{{standard}} subscription credits · {{purchased}} purchased credits · {{promo}} promotional credits",
+    "expiringPurchasedBatch": "{{amount}} purchased credits expire in {{days}} day(s)"
+  },
+  "serviceUsage": {
+    "totalAvailable": "{{total}} credits available",
+    "creditsBreakdown": "{{standard}} standard credits · {{promo}} promotional credits",
+    "expiringBatch": "{{amount}} promotional credits expire in {{days}} day(s)",
+    "creditsBreakdown3": "{{standard}} subscription credits · {{purchased}} purchased credits · {{promo}} promotional credits",
+    "expiringPurchasedBatch": "{{amount}} purchased credits expire in {{days}} day(s)"
+  },
+  "parrainage": {
+    "title": "Referrals",
+    "subtitle": "Invite your friends to Vireel and you'll both earn promotional credits.",
+    "loadError": "Unable to load your referral information.",
+    "yourLink": "Your referral link",
+    "copy": "Copy",
+    "copied": "Copied!",
+    "rewardsTitle": "How it works",
+    "rewardsCopy": "Your friend gets {{signupBonus}} promotional credits when they sign up. You get {{monthlyBonus}} credits if they choose a monthly plan, {{annualBonus}} credits if they choose annual. No referral limit.",
+    "referredCount": "Referrals",
+    "rewardedCount": "Rewards earned",
+    "referralsListTitle": "Your referrals",
+    "noReferrals": "No referrals yet. Share your link to get started!",
+    "statusPending": "Awaiting subscription",
+    "statusRewarded": "Reward granted",
+    "statusInvalid": "Invalid"
   },
   "landing": {
     "feature": "Features",
@@ -621,7 +762,6 @@
     "gold": "GOLD",
     "ultimate": "ULTIMATE",
     "credits": "Monthly AI credits",
-    "storage": "Storage (GB)",
     "export": "Export in format",
     "viral": "Detection of viral moments via AI",
     "shorts": "Generation of vertical format reels",
@@ -847,11 +987,8 @@
     "sourceVideoLabel": "Source video",
     "segmentsLabel": "Edit plan segments",
     "segmentVoiceOver": "Voice-over",
-    "segmentOriginalDialogue": "Original dialogue",
-    "segmentBreathing": "Breathing room",
     "narrationFieldLabel": "Narration",
     "clipsLabel": "Clips used",
-    "speakersLabel": "Speakers",
     "estimatedDurationLabel": "Estimated",
     "actualDurationLabel": "Actual",
     "saveDraftButton": "Save draft",
@@ -890,5 +1027,10 @@
     "errorJobCancelled": "The operation was cancelled.",
     "sessionExpired": "Your session has expired. Please sign in again and come back to this page to keep tracking progress.",
     "genericError": "Something went wrong. Please try again."
+  },
+  "media": {
+    "availableUntil": "Available until {{date}}",
+    "expiresInDays": "Expires in {{days}} day(s) · Download",
+    "expired": "Media expired — This file was automatically deleted per the retention policy."
   }
 }

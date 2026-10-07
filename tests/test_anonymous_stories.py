@@ -240,8 +240,9 @@ def test_build_story_prompt_never_uses_str_format_so_the_json_example_survives()
 
 def test_generate_story_from_transcript_raises_when_api_key_missing(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    coro = stories.generate_story_from_transcript("some transcript")
     with pytest.raises(RuntimeError):
-        asyncio.run(stories.generate_story_from_transcript("some transcript"))
+        asyncio.run(coro)
 
 
 def test_generate_story_from_transcript_validates_and_attaches_usage(monkeypatch):
@@ -305,8 +306,9 @@ def test_generate_story_from_transcript_raises_validation_error_on_bad_json(monk
     fake_client.chat.completions.create.return_value = fake_response
     monkeypatch.setattr(stories, "_get_openai_client", lambda: fake_client)
 
+    coro = stories.generate_story_from_transcript("A transcript")
     with pytest.raises(stories.StoryValidationError) as exc_info:
-        asyncio.run(stories.generate_story_from_transcript("A transcript"))
+        asyncio.run(coro)
     assert exc_info.value.code == stories.AnonymousStoryErrorCode.GENERATION_INVALID
 
 
@@ -316,8 +318,9 @@ def test_generate_story_from_transcript_raises_validation_error_on_bad_json(monk
 
 def test_transcribe_video_raises_when_api_key_missing(monkeypatch):
     monkeypatch.delenv("ASSEMBLYAI_API_KEY", raising=False)
+    coro = stories.transcribe_video("/tmp/does-not-matter.mp4")
     with pytest.raises(RuntimeError):
-        asyncio.run(stories.transcribe_video("/tmp/does-not-matter.mp4"))
+        asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +368,8 @@ def test_background_presets_are_well_formed():
         assert preset["id"] not in seen_ids
         seen_ids.add(preset["id"])
         assert preset["name"]
-        assert isinstance(preset["colors"], list) and preset["colors"]
+        assert isinstance(preset["colors"], list)
+        assert preset["colors"]
         assert preset["text_color"].startswith("#")
 
 

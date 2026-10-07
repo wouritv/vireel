@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   User, Mail, Copy, Check, Moon, Sun, Monitor, Linkedin, Twitch, Youtube, Facebook, Instagram,
   CreditCardIcon, History, Plus, Minus, Loader2, AlertTriangle, Coins, PauseCircle, PlayCircle, RefreshCw,
-  ChevronDown, Trash2,
+  ChevronDown, Trash2, Clock, XCircle,
 } from 'lucide-react';
 import { useAuth } from '../state/AuthContext';
 import { useTheme } from '../state/ThemeContext';
@@ -58,6 +58,101 @@ const SOCIAL_NETWORKS = [
   },
 ];
 
+// Renders the backend-computed /change-plan/preview summary. Pure
+// presentation only -- every figure it shows comes straight from the API,
+// never recomputed here.
+function PlanChangePreviewCard({ preview, loading, error, classificationLabel, t }) {
+  if (loading) {
+    return (
+      <div className="mt-3 text-xs text-slate-500 dark:text-zinc-400 inline-flex items-center gap-2">
+        <Loader2 size={12} className="animate-spin" /> {t('settings.loadingPlanPreview', "Calcul de l'aperçu...")}
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+        {error}
+      </div>
+    );
+  }
+  if (!preview) return null;
+
+  const fmtDate = (iso) => (iso ? new Date(iso).toLocaleDateString('fr-FR') : '');
+  const blocked = preview.inconsistent_configuration
+    || preview.classification === 'lateral_unsupported'
+    || preview.classification === 'invalid';
+
+  return (
+    <div className="mt-3 rounded-lg border border-slate-300 dark:border-white/10 bg-white dark:bg-black/20 p-3 text-xs space-y-1.5">
+      <p className="text-slate-700 dark:text-zinc-300">
+        {preview.current_plan_name} ({preview.current_billing_interval === 'year' ? t('settings.billingYearly', 'Annuelle') : t('settings.billingMonthly', 'Mensuelle')})
+        {' -> '}
+        <span className="font-semibold text-slate-900 dark:text-white">
+          {preview.new_plan_name} ({preview.new_billing_interval === 'year' ? t('settings.billingYearly', 'Annuelle') : t('settings.billingMonthly', 'Mensuelle')})
+        </span>
+      </p>
+
+      <p className={`font-medium ${blocked ? 'text-amber-700 dark:text-amber-300' : 'text-slate-700 dark:text-zinc-300'}`}>
+        {classificationLabel}
+      </p>
+
+      {blocked ? (
+        preview.inconsistent_configuration ? (
+          <p className="text-amber-700 dark:text-amber-300">
+            {t('settings.inconsistentConfiguration', 'Cette formule est mal configurée et ne peut pas être appliquée. Merci de contacter le support.')}
+          </p>
+        ) : null
+      ) : (
+        <>
+          {preview.will_cancel_scheduled_change ? (
+            <p className="text-amber-700 dark:text-amber-300">
+              {t('settings.willCancelScheduledChange', 'Cela annulera votre changement programmé en cours.')}
+            </p>
+          ) : null}
+
+          {preview.annual_billing_copy_required ? (
+            <p className="text-slate-600 dark:text-zinc-400">
+              {t('settings.annualBillingCopy', 'Facturé annuellement ; crédits attribués chaque mois à votre date anniversaire.')}
+            </p>
+          ) : null}
+
+          {preview.classification !== 'noop' && preview.effective_at ? (
+            <p className="text-slate-600 dark:text-zinc-400">
+              {t('settings.planChangeEffectiveAt', 'Prend effet le {{date}}', { date: fmtDate(preview.effective_at) })}
+            </p>
+          ) : null}
+
+          {typeof preview.amount_due_today === 'number' ? (
+            <p className="text-slate-600 dark:text-zinc-400">
+              {t('settings.amountDueToday', "Montant dû aujourd'hui")}: <span className="font-medium text-slate-900 dark:text-white">{preview.amount_due_today}</span>
+            </p>
+          ) : null}
+
+          {preview.classification === 'upgrade_immediate' ? (
+            <>
+              <p className="text-slate-600 dark:text-zinc-400">
+                {t('settings.creditsAddedNow', 'Crédits ajoutés immédiatement')}: {preview.credits_added_now}
+                {preview.credits_added_expires_at ? ` (${t('settings.expiresOn', 'expire le')} ${fmtDate(preview.credits_added_expires_at)})` : ''}
+              </p>
+              <p className="text-slate-600 dark:text-zinc-400">
+                {t('settings.resultingCreditBalance', 'Solde de crédits résultant')}: {preview.resulting_credit_balance}
+              </p>
+            </>
+          ) : null}
+
+          <p className="text-slate-600 dark:text-zinc-400">
+            {t('settings.futureMonthlyQuota', 'Futur quota mensuel de crédits')}: {preview.future_monthly_credit_quota}
+          </p>
+          <p className="text-slate-600 dark:text-zinc-400">
+            {t('settings.nextAmountLabel', 'Prochain montant')}: {preview.next_amount} {t('settings.onDate', 'le')} {fmtDate(preview.next_billing_date)}
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function SettingsPage() {
   const { t } = useTranslation();
   const { user } = useAuth();
@@ -97,10 +192,17 @@ export default function SettingsPage() {
   const [subscriptionHistory, setSubscriptionHistory] = useState([]);
   const [subPlans, setSubPlans] = useState([]);
   const [selectedPlan, setSelectedPlan] = useState('');
+  const [selectedInterval, setSelectedInterval] = useState('');
   const [subLoading, setSubLoading] = useState(false);
   const [subActionLoading, setSubActionLoading] = useState('');
   const [subError, setSubError] = useState('');
   const [subMessage, setSubMessage] = useState('');
+
+  // Plan-change preview (GET .../change-plan/preview) -- backend-computed
+  // summary shown before the user can confirm a plan/interval change.
+  const [planPreview, setPlanPreview] = useState(null);
+  const [planPreviewLoading, setPlanPreviewLoading] = useState(false);
+  const [planPreviewError, setPlanPreviewError] = useState('');
 
   // Payment method (card on file) state
   const [paymentMethod, setPaymentMethod] = useState(null);
@@ -322,6 +424,183 @@ export default function SettingsPage() {
       await refreshCredits();
     } catch (err) {
       setSubError(err.message || t("settings.aboError","Erreur abonnement"));
+    } finally {
+      setSubActionLoading('');
+    }
+  };
+
+  // Default the interval picker to the subscription's current interval,
+  // once, without overriding a choice the user already made.
+  useEffect(() => {
+    if (subscription?.billing_interval && !selectedInterval) {
+      setSelectedInterval(subscription.billing_interval);
+    }
+  }, [subscription?.billing_interval, selectedInterval]);
+
+  const effectiveInterval = selectedInterval || subscription?.billing_interval || 'month';
+
+  const resetPlanChangeSelection = () => {
+    setSelectedPlan('');
+    setPlanPreview(null);
+    setPlanPreviewError('');
+  };
+
+  // Backend-computed pre-confirmation summary -- refetched whenever the
+  // chosen plan or interval changes. Numbers here are authoritative and
+  // never recomputed client-side.
+  useEffect(() => {
+    if (!user?.id || !selectedPlan) {
+      setPlanPreview(null);
+      setPlanPreviewError('');
+      return;
+    }
+    let cancelled = false;
+    const fetchPreview = async () => {
+      setPlanPreviewLoading(true);
+      setPlanPreviewError('');
+      try {
+        const qs = new URLSearchParams({ plan_id: selectedPlan, billing_interval: effectiveInterval });
+        const res = await fetch(getApiUrl(`/api/souscription/change-plan/preview?${qs.toString()}`), {
+          headers: getAuthHeaders(user.id),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!res.ok) {
+          setPlanPreview(null);
+          setPlanPreviewError(translateApiError(data, 'settings.planPreviewError', "Impossible de charger l'aperçu du changement."));
+          return;
+        }
+        setPlanPreview(data);
+      } catch (err) {
+        if (!cancelled) {
+          setPlanPreview(null);
+          setPlanPreviewError(err.message || t('settings.planPreviewError', "Impossible de charger l'aperçu du changement."));
+        }
+      } finally {
+        if (!cancelled) setPlanPreviewLoading(false);
+      }
+    };
+    fetchPreview();
+    return () => { cancelled = true; };
+  }, [user?.id, selectedPlan, effectiveInterval]);
+
+  const planPreviewIsConfirmable = Boolean(
+    planPreview
+    && !planPreviewLoading
+    && !planPreview.inconsistent_configuration
+    && ['upgrade_immediate', 'downgrade_scheduled', 'periodicity_scheduled'].includes(planPreview.classification)
+  );
+
+  const planChangeClassificationLabel = (classification) => {
+    switch (classification) {
+      case 'upgrade_immediate': return t('settings.classificationUpgradeImmediate', 'Mise à niveau immédiate');
+      case 'downgrade_scheduled': return t('settings.classificationDowngradeScheduled', 'Changement programmé');
+      case 'periodicity_scheduled': return t('settings.classificationPeriodicityScheduled', 'Changement de périodicité programmé');
+      case 'lateral_unsupported': return t('settings.classificationLateralUnsupported', 'Changement non supporté');
+      case 'noop': return t('settings.classificationNoop', 'Aucun changement');
+      case 'invalid': return t('settings.classificationInvalid', 'Changement invalide');
+      default: return classification || '';
+    }
+  };
+
+  // Posts the actual change. On the 409 "a different scheduled change
+  // already exists" error, asks for confirmation then resubmits the same
+  // request with confirm_cancel_scheduled: true, per the backend contract.
+  const submitPlanChange = async (confirmCancelScheduled = false) => {
+    if (!user?.id || !selectedPlan) return;
+    setSubActionLoading('change-plan');
+    setSubError('');
+    setSubMessage('');
+    try {
+      const body = { plan_id: selectedPlan, billing_interval: effectiveInterval };
+      if (confirmCancelScheduled) body.confirm_cancel_scheduled = true;
+      const res = await fetch(getApiUrl('/api/souscription/change-plan'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(user.id),
+          ...(user?.email ? { 'X-User-Email': user.email } : {}),
+        },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        const code = data?.detail?.code;
+        if (code === 'plan_change_scheduled_change_exists' && !confirmCancelScheduled) {
+          const scheduledLabel = data?.detail?.scheduled_abonnement_name
+            || data?.detail?.message
+            || t('settings.yourScheduledChange', 'votre changement programmé en cours');
+          const confirmMsg = t(
+            'settings.confirmCancelScheduledChange',
+            'Confirmer annulera {{scheduled}} et appliquera ce changement à la place. Continuer ?',
+            { scheduled: scheduledLabel }
+          );
+          if (window.confirm(confirmMsg)) {
+            await submitPlanChange(true);
+            return;
+          }
+          setSubActionLoading('');
+          return;
+        }
+        throw new Error(translateApiError(data, 'settings.erreurAbo', 'Action abonnement impossible'));
+      }
+
+      if (data?.checkout_url) {
+        window.location.href = data.checkout_url;
+        return;
+      }
+
+      if (data?.classification === 'noop') {
+        setSubMessage(t('settings.planChangeNoop', 'Vous êtes déjà sur cette formule et cette périodicité.'));
+      } else if (data?.classification === 'downgrade_scheduled' || data?.classification === 'periodicity_scheduled') {
+        const effectiveDate = data?.scheduled_effective_at
+          ? new Date(data.scheduled_effective_at).toLocaleDateString('fr-FR')
+          : '';
+        setSubMessage(t(
+          'settings.planChangeScheduledSuccess',
+          'Changement programmé : {{plan}} ({{interval}}) à partir du {{date}}.',
+          {
+            plan: data.scheduled_abonnement_name,
+            interval: data.scheduled_billing_interval === 'year' ? t('settings.billingYearly', 'Annuelle') : t('settings.billingMonthly', 'Mensuelle'),
+            date: effectiveDate,
+          }
+        ));
+        await loadSubscriptionState();
+      } else {
+        setSubMessage(t('settings.planChangeAppliedSuccess', 'Formule mise à jour avec succès.'));
+        await loadSubscriptionState();
+        await refreshCredits();
+      }
+      resetPlanChangeSelection();
+    } catch (err) {
+      setSubError(err.message || t('settings.aboError', 'Erreur abonnement'));
+    } finally {
+      setSubActionLoading('');
+    }
+  };
+
+  const cancelScheduledPlanChange = async () => {
+    if (!user?.id) return;
+    setSubActionLoading('cancel-scheduled');
+    setSubError('');
+    setSubMessage('');
+    try {
+      const res = await fetch(getApiUrl('/api/souscription/change-plan/cancel-scheduled'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(user.id),
+          ...(user?.email ? { 'X-User-Email': user.email } : {}),
+        },
+        body: JSON.stringify({}),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(translateApiError(data, 'settings.erreurAbo', 'Action abonnement impossible'));
+      setSubMessage(t('settings.scheduledChangeCancelled', 'Changement programmé annulé.'));
+      await loadSubscriptionState();
+    } catch (err) {
+      setSubError(err.message || t('settings.aboError', 'Erreur abonnement'));
     } finally {
       setSubActionLoading('');
     }
@@ -919,12 +1198,53 @@ export default function SettingsPage() {
                   {t('settings.periodEnd', 'Period end')}: {new Date(subscription.payment_end_date).toLocaleDateString('fr-FR')}
                 </p>
               ) : null}
+              {subscription ? (
+                <p className="text-slate-600 dark:text-zinc-400 mt-1">
+                  {t('settings.billingInterval', 'Facturation')}: {subscription?.billing_interval === 'year' ? t('settings.billingYearly', 'Annuelle') : t('settings.billingMonthly', 'Mensuelle')}
+                </p>
+              ) : null}
+              {subscription?.next_billing_date ? (
+                <p className="text-slate-600 dark:text-zinc-400 mt-1">
+                  {t('settings.nextBillingDate', 'Prochaine facturation')}: {new Date(subscription.next_billing_date).toLocaleDateString('fr-FR')}
+                </p>
+              ) : null}
+              {subscription?.next_credit_allocation_date ? (
+                <p className="text-slate-600 dark:text-zinc-400 mt-1">
+                  {t('settings.nextCreditAllocationDate', 'Prochaine attribution de crédits')}: {new Date(subscription.next_credit_allocation_date).toLocaleString('fr-FR', {
+                    day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit',
+                  })}
+                </p>
+              ) : null}
               {subscription?.retention_deadline_at ? (
                 <p className="text-amber-700 dark:text-amber-300 mt-1">
                   {t('settings.retentionUntil', 'Content retention until')}: {new Date(subscription.retention_deadline_at).toLocaleDateString('fr-FR')}
                 </p>
               ) : null}
             </div>
+
+            {subscription?.scheduled_abonnement_id ? (
+              <div className="rounded-lg border border-blue-300 dark:border-blue-500/30 bg-blue-50 dark:bg-blue-500/10 p-4 mb-4 text-sm">
+                <p className="text-blue-900 dark:text-blue-200 inline-flex items-center gap-1.5">
+                  <Clock size={14} />
+                  {t(
+                    'settings.scheduledChangePanel',
+                    'Changement programmé : {{plan}} ({{interval}}) à partir du {{date}}.',
+                    {
+                      plan: subscription.scheduled_abonnement_name,
+                      interval: subscription.scheduled_billing_interval === 'year' ? t('settings.billingYearly', 'Annuelle') : t('settings.billingMonthly', 'Mensuelle'),
+                      date: subscription.scheduled_effective_at ? new Date(subscription.scheduled_effective_at).toLocaleDateString('fr-FR') : '',
+                    }
+                  )}
+                </p>
+                <button
+                  onClick={cancelScheduledPlanChange}
+                  disabled={subActionLoading === 'cancel-scheduled'}
+                  className="mt-2 rounded-lg border border-rose-300 dark:border-red-500/30 bg-rose-100 dark:bg-red-500/10 px-3 py-1.5 text-xs text-rose-800 dark:text-red-300 hover:bg-rose-200 dark:hover:bg-red-500/20 disabled:opacity-40"
+                >
+                  <span className="inline-flex items-center gap-1"><XCircle size={12} /> {subActionLoading === 'cancel-scheduled' ? '...' : t('settings.cancelScheduledChange', 'Annuler le changement programmé')}</span>
+                </button>
+              </div>
+            ) : null}
 
             <div className="flex flex-wrap gap-2 mb-4">
               <button
@@ -959,7 +1279,7 @@ export default function SettingsPage() {
 
             <div className="rounded-lg border border-slate-300 dark:border-white/10 bg-white/5 p-4 mb-4">
               <p className="text-xs text-slate-600 dark:text-zinc-400 mb-2">{t('settings.changePlan', 'Change plan')}</p>
-              <div className="flex flex-wrap gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <select
                   value={selectedPlan}
                   onChange={(e) => setSelectedPlan(e.target.value)}
@@ -970,14 +1290,41 @@ export default function SettingsPage() {
                     <option key={plan.id} value={plan.id}>{plan.name}</option>
                   ))}
                 </select>
+
+                <div className="inline-flex rounded-lg border border-slate-300 dark:border-white/10 overflow-hidden text-xs">
+                  {['month', 'year'].map((interval) => (
+                    <button
+                      key={interval}
+                      type="button"
+                      onClick={() => setSelectedInterval(interval)}
+                      aria-pressed={effectiveInterval === interval}
+                      className={`px-3 py-2 ${effectiveInterval === interval
+                        ? 'bg-blue-600 dark:bg-primary/20 text-white dark:text-primary'
+                        : 'bg-white dark:bg-black/30 text-slate-600 dark:text-zinc-400'}`}
+                    >
+                      {interval === 'year' ? t('settings.billingYearly', 'Annuelle') : t('settings.billingMonthly', 'Mensuelle')}
+                    </button>
+                  ))}
+                </div>
+
                 <button
-                  onClick={() => selectedPlan && runSubAction('change-plan', { plan_id: selectedPlan })}
-                  disabled={!subscription || !selectedPlan || subActionLoading === 'change-plan'}
+                  onClick={() => submitPlanChange(false)}
+                  disabled={!subscription || !selectedPlan || !planPreviewIsConfirmable || subActionLoading === 'change-plan'}
                   className="rounded-lg border border-blue-700 dark:border-primary/30 bg-blue-600 dark:bg-primary/10 px-3 py-2 text-xs text-white dark:text-primary hover:bg-blue-500 dark:hover:bg-primary/20 disabled:opacity-40"
                 >
-                  {subActionLoading === 'change-plan' ? '...' : t('settings.change', 'Change')}
+                  {subActionLoading === 'change-plan' ? '...' : t('settings.confirmChangePlan', 'Confirmer le changement')}
                 </button>
               </div>
+
+              {selectedPlan ? (
+                <PlanChangePreviewCard
+                  preview={planPreview}
+                  loading={planPreviewLoading}
+                  error={planPreviewError}
+                  classificationLabel={planPreview ? planChangeClassificationLabel(planPreview.classification) : ''}
+                  t={t}
+                />
+              ) : null}
             </div>
 
             <div className="rounded-lg border border-slate-300 dark:border-white/10 bg-white/5 p-4 mb-4">
@@ -1218,11 +1565,10 @@ export default function SettingsPage() {
                         </span>
                       </div>
                       <p className="mt-1 text-slate-700 dark:text-zinc-300 capitalize">{(row.operation_type || '').replace('_', ' ')}</p>
-                      <div className="mt-1 flex items-center justify-between gap-2">
+                      <div className="mt-1">
                         <span className={`font-mono font-semibold ${isInput ? 'text-green-400' : 'text-red-400'}`}>
                           {isInput ? '+' : '-'}{Number(row.credit).toLocaleString()} cr
                         </span>
-                        <span className="font-mono text-slate-500 dark:text-zinc-400">{Number(row.storage).toFixed(3)} Go</span>
                       </div>
                     </article>
                   );
@@ -1236,7 +1582,6 @@ export default function SettingsPage() {
                     <th className="px-3 py-2 text-left">{t("settings.type", "Type")}</th>
                     <th className="px-3 py-2 text-left">{t("settings.operation", "Opération")}</th>
                     <th className="px-3 py-2 text-right">{t("settings.credits", "Crédits")}</th>
-                    <th className="px-3 py-2 text-right">{t("settings.storage", "Stockage (Go)")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1263,9 +1608,6 @@ export default function SettingsPage() {
                         <td className="px-3 py-2 text-slate-700 dark:text-zinc-300 capitalize">{(row.operation_type || '').replace('_', ' ')}</td>
                         <td className={`px-3 py-2 text-right font-mono font-semibold ${isInput ? 'text-green-400' : 'text-red-400'}`}>
                           {isInput ? '+' : '-'}{Number(row.credit).toLocaleString()} cr
-                        </td>
-                        <td className="px-3 py-2 text-right font-mono text-slate-500 dark:text-zinc-400">
-                          {Number(row.storage).toFixed(3)}
                         </td>
                       </tr>
                     );

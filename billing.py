@@ -7,6 +7,8 @@ Pricing variables are read from environment (with sensible defaults).
 import os
 from typing import Dict, Any, Optional
 
+from retention_config import S3_STORAGE_COST_PER_GB_DAY
+
 # ---------------------------------------------------------------------------
 # Pricing constants (loaded from environment)
 # ---------------------------------------------------------------------------
@@ -221,6 +223,41 @@ def estimate_film_summary_render_cost_usd(
         "gemini_usd":      0.0,
         "total_usd":       round(total_usd, 6),
     }
+
+
+def estimate_retention_storage_cost_usd(media_size_gb: float, retention_days: int) -> float:
+    """Vireel's own internal cost assumption for keeping one media file in
+    S3 for its whole retention window:
+
+        retention_storage_cost = media_size_gb x retention_days x S3_STORAGE_COST_PER_GB_DAY
+
+    Distinct from (and additive to) the existing per-operation S3 cost
+    (PUT/GET/LIST + a flat per-GB proxy already baked into estimate_reel_
+    cost_usd/estimate_caption_cost_usd's own `s3_usd`) -- this is the
+    time-based cost of the retention *policy* itself, billed once for the
+    whole window rather than per day (see add_retention_cost_to_breakdown)."""
+    size_gb = max(0.0, float(media_size_gb or 0.0))
+    days = max(0, int(retention_days or 0))
+    return round(size_gb * days * S3_STORAGE_COST_PER_GB_DAY, 6)
+
+
+def add_retention_cost_to_breakdown(
+    cost_breakdown: Dict[str, Any], media_size_gb: float, retention_days: int,
+) -> Dict[str, Any]:
+    """Adds the media's retention storage cost to an already-computed
+    cost breakdown (from estimate_reel_cost_usd/estimate_caption_cost_usd/
+    etc, already run through calculate_credits_for_operation or not --
+    either way) as its own `retention_usd` line, folds it into `total_usd`,
+    and re-derives base_credits/final_credits through the SAME
+    calculate_credits_for_operation converter everything else already
+    uses -- never a second, parallel USD-to-credits conversion.
+
+    Additive only: every existing key (s3_usd, vps_usd, assembly_usd, ...)
+    is preserved as-is; this never replaces or recomputes them."""
+    retention_usd = estimate_retention_storage_cost_usd(media_size_gb, retention_days)
+    enriched = {**cost_breakdown, "retention_usd": retention_usd}
+    enriched["total_usd"] = round(float(cost_breakdown.get("total_usd", 0.0)) + retention_usd, 6)
+    return calculate_credits_for_operation(enriched)
 
 
 def calculate_credits_for_operation(cost_breakdown_usd: Dict[str, Any]) -> Dict[str, Any]:
