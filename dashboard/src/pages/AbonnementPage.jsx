@@ -442,10 +442,11 @@ export default function AbonnementPage() {
                 <ul className="flex flex-col gap-3">
                     {[
                         t("abonnement.offre1", "Génération de réels"),
-                        t("abonnement.offre2", "Génération de captions"),
+                        t("abonnement.offre2", "Génération de sous-titres"),
                         t("abonnement.offre3", "Publication et suivi sur les réseaux sociaux"),
-                        t("abonnement.offre4", "Génération des sous titres et hooks viraux"),
+                        t("abonnement.offre4", "Génération des histoires anonymes"),
                         t("abonnement.offre5", "Traduction de texte et sous-titres"),
+                        t("abonnement.offre6", "Génération de résumés de films"),
                     ].map((item) => (
                         <li key={item} className="flex items-start gap-2 text-sm text-slate-700 dark:text-zinc-300">
                             <Check size={16} className="text-blue-400 mt-0.5 shrink-0" />
