@@ -414,7 +414,7 @@ class _AssStyleParams:
 # remaining share of the frame) -- kept as a separate constant here since
 # this codebase doesn't share constants across feature modules, but the
 # two values must stay in sync if the split ratio ever changes.
-_VISUALS_SPLIT_VIDEO_RATIO = 0.65
+_VISUALS_SPLIT_VIDEO_RATIO = 0.50
 _ASS_DEFAULT_MARGIN_V = 25
 
 

@@ -6,7 +6,7 @@ EXPORT_VIDEO_PRESET = os.environ.get("VIREEL_EXPORT_PRESET", "medium")
 FFPROBE_TIMEOUT_SECONDS = int(os.environ.get("FFPROBE_TIMEOUT_SECONDS", "60"))
 FFMPEG_STEP_TIMEOUT_SECONDS = int(os.environ.get("FFMPEG_STEP_TIMEOUT_SECONDS", str(2 * 3600)))
 
-# Spec: ~35% of the frame for the image, ~65% for the video. Not
+# Spec: ~50% of the frame for the image, ~50% for the video. Not
 # user-configurable in V1. subtitles.py's bottom-split subtitle
 # repositioning assumes this exact ratio -- keep both in sync if it ever
 # changes.
@@ -48,16 +48,17 @@ def build_visuals_filter_complex(visuals, video_width: int, video_height: int) -
 
     Technique: for each visual, split the current video stream into an
     untouched "full screen" copy and a copy that gets cover-fit cropped
-    into its half of the split layout, padded onto a full-canvas black
-    frame, then overlaid with the (likewise cover-fit) image to build one
-    full-size "split frame". That split frame is overlaid back onto the
-    untouched full-screen copy, gated with enable='between(t,start,end)'
-    -- a full-size, time-gated overlay is effectively "replace the frame
-    for this window only", so outside any visual's window the output is
-    byte-identical to the plain video, with no duration/audio impact
-    (audio is never touched by this filter graph; see apply_visuals_to_video).
-    Visuals are chained stage-to-stage, which is safe only because their
-    windows never overlap (validated upstream)."""
+    into its half of the split layout. The chosen image is likewise
+    cover-fit cropped into the other half so both halves fully occupy their
+    allotted space, with no black padding or letterboxing. Those two
+    halves are composed into one full-size "split frame", which is then
+    overlaid back onto the untouched full-screen copy, gated with
+    enable='between(t,start,end)' -- a full-size, time-gated overlay is
+    effectively "replace the frame for this window only", so outside any
+    visual's window the output is byte-identical to the plain video, with
+    no duration/audio impact (audio is never touched by this filter graph;
+    see apply_visuals_to_video). Visuals are chained stage-to-stage, which
+    is safe only because their windows never overlap (validated upstream)."""
     video_width = _even(video_width)
     video_height = _even(video_height)
     image_height = _even(video_height * SPLIT_IMAGE_RATIO)
@@ -88,14 +89,14 @@ def build_visuals_filter_complex(visuals, video_width: int, video_height: int) -
         filter_parts.append(f"[{current_label}]split=2[{full_label}][{src_label}]")
         filter_parts.append(
             f"[{src_label}]scale={video_width}:{video_half_height}:force_original_aspect_ratio=increase,"
-            f"crop={video_width}:{video_half_height}[{cropped_label}]"
+            f"crop={video_width}:{video_half_height}:(iw-ow)/2:(ih-oh)/2[{cropped_label}]"
         )
         filter_parts.append(
             f"[{cropped_label}]pad={video_width}:{video_height}:0:{video_y}:black[{padded_label}]"
         )
         filter_parts.append(
             f"[{image_input_index}:v]scale={video_width}:{image_height}:force_original_aspect_ratio=increase,"
-            f"crop={video_width}:{image_height}[{img_label}]"
+            f"crop={video_width}:{image_height}:(iw-ow)/2:(ih-oh)/2[{img_label}]"
         )
         filter_parts.append(f"[{padded_label}][{img_label}]overlay=0:{image_y}[{composed_label}]")
         filter_parts.append(
