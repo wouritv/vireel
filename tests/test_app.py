@@ -6836,8 +6836,12 @@ def test_get_my_referrals_returns_code_link_and_summary(monkeypatch):
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "supabase_get_or_create_referral_code", AsyncMock(return_value="ABC1234"))
     monkeypatch.setattr(app, "supabase_list_referrals_by_referrer", AsyncMock(return_value=[
-        {"created_at": "t1", "status": "pending", "subscription_reward_granted_at": None},
-        {"created_at": "t2", "status": "rewarded", "subscription_reward_granted_at": "t3", "first_subscription_type": "month"},
+        {"created_at": "t1", "status": "pending", "subscription_reward_granted_at": None, "referred_user_id": "ru1"},
+        {"created_at": "t2", "status": "rewarded", "subscription_reward_granted_at": "t3", "first_subscription_type": "month", "referred_user_id": "ru2"},
+    ]))
+    monkeypatch.setattr(app, "supabase_get_auth_user_identity", AsyncMock(side_effect=[
+        {"email": "filleul1@example.com", "display_name": "Marie Dupont"},
+        {"email": "filleul2@example.com", "display_name": None},
     ]))
 
     with TestClient(app.app) as client:
@@ -6849,10 +6853,25 @@ def test_get_my_referrals_returns_code_link_and_summary(monkeypatch):
     assert data["link"].endswith("/r/ABC1234")
     assert data["referred_count"] == 2
     assert data["rewarded_count"] == 1
-    assert data["referrals"][0]["label"] == "Filleul #1"
-    # No PII anywhere in the per-referral summary.
-    assert "email" not in data["referrals"][0]
+    assert data["referrals"][0]["label"] == "Marie Dupont"
+    assert data["referrals"][1]["label"] == "filleul2@example.com"
     assert "referred_user_id" not in data["referrals"][0]
+
+
+def test_get_my_referrals_falls_back_to_generic_label_on_lookup_failure(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "supabase_get_or_create_referral_code", AsyncMock(return_value="ABC1234"))
+    monkeypatch.setattr(app, "supabase_list_referrals_by_referrer", AsyncMock(return_value=[
+        {"created_at": "t1", "status": "pending", "subscription_reward_granted_at": None, "referred_user_id": "ru1"},
+    ]))
+    monkeypatch.setattr(app, "supabase_get_auth_user_identity", AsyncMock(return_value=None))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/referrals/me", headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    assert resp.json()["referrals"][0]["label"] == "Filleul"
 
 
 def test_associate_referral_success_grants_signup_bonus(monkeypatch):

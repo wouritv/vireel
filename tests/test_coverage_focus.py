@@ -128,7 +128,7 @@ def _import_app_with_stubs(monkeypatch):
         "get_or_create_referral_code", "get_referral_code_owner",
         "get_referral_by_referred_user", "insert_referral", "update_referral_row",
         "claim_referral_subscription_reward", "list_referrals_by_referrer",
-        "invalidate_referral", "get_auth_user_created_at",
+        "invalidate_referral", "get_auth_user_created_at", "get_auth_user_identity",
         "insert_promotional_credit_batch", "list_active_promotional_credit_batches",
         "revoke_promotional_credit_batches_by_source_reference",
         "insert_notification", "list_notifications", "mark_notification_read",

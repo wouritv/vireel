@@ -2501,6 +2501,27 @@ async def get_auth_user_created_at(user_id: str) -> Optional[datetime]:
 		return None
 
 
+async def get_auth_user_identity(user_id: str) -> Optional[Dict[str, Optional[str]]]:
+	"""The Supabase Auth account's own email and display name, via the
+	Admin Auth API (same precedent as get_auth_user_created_at). Used to
+	show a referrer who exactly they referred (name/email) instead of an
+	anonymous ordinal label. Returns None on any failure (unknown user,
+	Admin API error, ...) so the caller can fall back to something else."""
+	try:
+		client = await get_client()
+		response = await client.auth.admin.get_user_by_id(user_id)
+		user = getattr(response, "user", None)
+		if user is None:
+			return None
+		email = getattr(user, "email", None)
+		metadata = getattr(user, "user_metadata", None) or {}
+		display_name = metadata.get("display_name") if isinstance(metadata, dict) else None
+		return {"email": email, "display_name": display_name}
+	except Exception:
+		logger.warning("Failed to fetch auth user identity for %s", user_id, exc_info=True)
+		return None
+
+
 # --------------------------------------------------------------------------
 # Promotional credits (generic ledger -- referrals are the first source,
 # not the only one; see the migration's comment on promotional_credit_batches)
