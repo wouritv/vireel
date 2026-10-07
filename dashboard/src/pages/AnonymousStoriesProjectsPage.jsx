@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Edit3, FolderOpen, Loader2, Plus, Search, Trash2 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { getApiUrl } from "../config";
+import GridThumbnail from "../components/GridThumbnail";
 import MobileFilterDropdown from "../components/MobileFilterDropdown";
 import { useAuth } from "../state/AuthContext";
 import { useTranslation } from "../state/LanguageContext";
@@ -229,175 +230,75 @@ export default function AnonymousStoriesProjectsPage() {
                     </button>
                 </div>
 
-                <div className="space-y-3 md:hidden">
-                    {loading ? (
-                        <div className="rounded-xl border border-slate-300 dark:border-white/10 bg-white/5 px-3 py-6 text-center text-slate-500 dark:text-zinc-400">
-                            <span className="inline-flex items-center gap-2"><Loader2 size={14} className="animate-spin" /> {t("reels.loading", "Loading...")}</span>
-                        </div>
-                    ) : null}
+                {loading ? (
+                    <div className="rounded-xl border border-slate-300 dark:border-white/10 bg-white/5 px-3 py-6 text-center text-slate-500 dark:text-zinc-400">
+                        <span className="inline-flex items-center gap-2"><Loader2 size={14} className="animate-spin" /> {t("reels.loading", "Loading...")}</span>
+                    </div>
+                ) : null}
 
-                    {!loading && items.length === 0 ? (
-                        <div className="rounded-xl border border-slate-300 dark:border-white/10 bg-white/5 px-3 py-6 text-center text-slate-500 dark:text-zinc-400">{t("common.noItemsFound", "Aucun element trouve")}</div>
-                    ) : null}
+                {!loading && items.length === 0 ? (
+                    <div className="rounded-xl border border-slate-300 dark:border-white/10 bg-white/5 px-3 py-6 text-center text-slate-500 dark:text-zinc-400">{t("common.noItemsFound", "Aucun element trouve")}</div>
+                ) : null}
 
-                    {!loading && items.map((item) => (
-                        <article
-                            key={item.id}
-                            className="rounded-xl border border-slate-300 dark:border-white/10 bg-white/5 p-3 space-y-3 cursor-pointer"
-                            onClick={() => handleOpenProject(item)}
-                        >
-                            <div className="space-y-1">
-                                <p className="font-semibold text-slate-900 dark:text-white line-clamp-2">{item.name || t("generatedMedia.untitled", "Untitled")}</p>
-                                <p className="text-xs text-slate-500 dark:text-zinc-400 line-clamp-3">{item.description || "-"}</p>
-                            </div>
-
-                            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-zinc-400">
-                                <span>{t("generatedMedia.tableDuration", "Duration")}: {formatDurationHms(item.source_duration)}</span>
-                            </div>
-
-                            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-zinc-400">
-                                <span>{item.created_at ? new Date(item.created_at).toLocaleString() : "-"}</span>
-                            </div>
-
-                            <div>
-                                <span className={`inline-flex rounded-full border px-2 py-1 text-xs ${statusClass(item.status)}`}>{statusLabel(item.status)}</span>
-                            </div>
-
-                            <div className="flex flex-wrap gap-2">
-                                <button
-                                    type="button"
-                                    onClick={(e) => {
-                                        e.stopPropagation();
-                                        handleOpenProject(item);
-                                    }}
-                                    className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-sky-300 dark:border-white/10 bg-sky-100 dark:bg-white/5 text-sky-800 dark:text-zinc-200 shadow-sm hover:bg-sky-200 dark:hover:bg-white/10"
-                                    title={t("projects.open", "Ouvrir")}
-                                >
-                                    <FolderOpen size={14} />
-                                </button>
-                                <button
-                                    type="button"
-                                    disabled={savingId === item.id}
-                                    onClick={(e) => {
-                                        e.stopPropagation();
-                                        handleRename(item);
-                                    }}
-                                    className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-amber-300 dark:border-white/10 bg-amber-100 dark:bg-white/5 text-amber-800 dark:text-zinc-200 shadow-sm hover:bg-amber-200 dark:hover:bg-white/10 disabled:opacity-50"
-                                    title={t("projects.rename", "Renommer")}
-                                >
-                                    {savingId === item.id ? <Loader2 size={14} className="animate-spin" /> : <Edit3 size={14} />}
-                                </button>
-                                <button
-                                    type="button"
-                                    disabled={deletingId === item.id}
-                                    onClick={(e) => {
-                                        e.stopPropagation();
-                                        handleDelete(item);
-                                    }}
-                                    className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-red-500/30 bg-red-500/10 text-red-300 hover:bg-red-500/20 disabled:opacity-50"
-                                    title={t("projects.delete", "Supprimer")}
-                                >
-                                    {deletingId === item.id ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
-                                </button>
-                            </div>
-                        </article>
-                    ))}
-                </div>
-
-                <div className="hidden md:block">
-                    <table className="w-full table-fixed text-sm">
-                        <thead>
-                            <tr className="border-b border-slate-300 dark:border-white/10 text-left text-slate-500 dark:text-zinc-400 text-xs md:text-sm">
-                                <th className="w-[20%] px-2 md:px-3 py-3 font-medium">{t("projects.tableName", "Projet")}</th>
-                                <th className="hidden md:table-cell w-[26%] px-2 md:px-3 py-3 font-medium">{t("generatedMedia.tableDescription", "Description")}</th>
-                                <th className="hidden sm:table-cell w-[10%] px-2 md:px-3 py-3 font-medium">{t("generatedMedia.tableDuration", "Duration")}</th>
-                                <th className="w-[12%] px-2 md:px-3 py-3 font-medium">{t("generatedMedia.tableStatus", "Status")}</th>
-                                <th className="hidden lg:table-cell w-[14%] px-2 md:px-3 py-3 font-medium">{t("generatedMedia.tableCreatedAt", "Created at")}</th>
-                                <th className="w-[18%] px-2 md:px-3 py-3 font-medium text-right">{t("generatedMedia.tableActions", "Actions")}</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {loading ? (
-                                <tr>
-                                    <td colSpan={6} className="px-3 py-10 text-center text-slate-500 dark:text-zinc-400">
-                                        <span className="inline-flex items-center gap-2"><Loader2 size={14} className="animate-spin" /> {t("reels.loading", "Loading...")}</span>
-                                    </td>
-                                </tr>
-                            ) : null}
-
-                            {!loading && items.length === 0 ? (
-                                <tr>
-                                    <td colSpan={6} className="px-3 py-10 text-center text-slate-500 dark:text-zinc-400">{t("common.noItemsFound", "Aucun element trouve")}</td>
-                                </tr>
-                            ) : null}
-
-                            {!loading && items.map((item) => (
-                                <tr
-                                    key={item.id}
-                                    className="border-b border-slate-200 dark:border-white/5 align-top cursor-pointer hover:bg-white/5"
-                                    onClick={() => handleOpenProject(item)}
-                                >
-                                    <td className="px-2 md:px-3 py-2 md:py-3">
-                                        <p
-                                            className="font-semibold text-slate-900 dark:text-white line-clamp-2 break-words"
-                                            title={item.name || t("generatedMedia.untitled", "Untitled")}
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                    {!loading && !error && items.map((item) => (
+                        <div key={item.id} className="space-y-2">
+                            <GridThumbnail
+                                imageUrl={item.thumbnail_url}
+                                aspect="video"
+                                durationLabel={formatDurationHms(item.source_duration)}
+                                statusBadge={{ label: statusLabel(item.status), className: statusClass(item.status) }}
+                                badgePosition="top"
+                                onClick={() => handleOpenProject(item)}
+                                emptyLabel={t("projects.noPreview", "Aucun aperçu")}
+                                actions={
+                                    <>
+                                        <button
+                                            type="button"
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                handleOpenProject(item);
+                                            }}
+                                            className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-white/90 text-sky-800 shadow-sm hover:bg-white"
+                                            title={t("projects.open", "Ouvrir")}
                                         >
-                                            {truncateText(item.name, 60) || t("generatedMedia.untitled", "Untitled")}
-                                        </p>
-                                    </td>
-                                    <td className="hidden md:table-cell px-2 md:px-3 py-2 md:py-3 text-slate-700 dark:text-zinc-300">
-                                        <p className="line-clamp-3 break-words" title={item.description || ""}>
-                                            {truncateText(item.description, 140) || "-"}
-                                        </p>
-                                    </td>
-                                    <td className="hidden sm:table-cell px-2 md:px-3 py-2 md:py-3 text-slate-700 dark:text-zinc-300">{formatDurationHms(item.source_duration)}</td>
-                                    <td className="px-2 md:px-3 py-2 md:py-3">
-                                        <span className={`inline-flex rounded-full border px-2 py-1 text-xs ${statusClass(item.status)}`}>{statusLabel(item.status)}</span>
-                                    </td>
-                                    <td className="hidden lg:table-cell px-2 md:px-3 py-2 md:py-3 text-slate-500 dark:text-zinc-400">{item.created_at ? new Date(item.created_at).toLocaleString() : "-"}</td>
-                                    <td className="px-2 md:px-3 py-2 md:py-3">
-                                        <div className="flex items-center justify-end gap-1 md:gap-2">
-                                            <button
-                                                type="button"
-                                                onClick={(e) => {
-                                                    e.stopPropagation();
-                                                    handleOpenProject(item);
-                                                }}
-                                                className="inline-flex h-7 w-7 md:h-8 md:w-8 items-center justify-center rounded-lg border border-sky-300 dark:border-white/10 bg-sky-100 dark:bg-white/5 text-sky-800 dark:text-zinc-200 shadow-sm hover:bg-sky-200 dark:hover:bg-white/10"
-                                                title={t("projects.open", "Ouvrir")}
-                                            >
-                                                <FolderOpen size={14} />
-                                            </button>
-                                            <button
-                                                type="button"
-                                                disabled={savingId === item.id}
-                                                onClick={(e) => {
-                                                    e.stopPropagation();
-                                                    handleRename(item);
-                                                }}
-                                                className="inline-flex h-7 w-7 md:h-8 md:w-8 items-center justify-center rounded-lg border border-amber-300 dark:border-white/10 bg-amber-100 dark:bg-white/5 text-amber-800 dark:text-zinc-200 shadow-sm hover:bg-amber-200 dark:hover:bg-white/10 disabled:opacity-50"
-                                                title={t("projects.rename", "Renommer")}
-                                            >
-                                                {savingId === item.id ? <Loader2 size={14} className="animate-spin" /> : <Edit3 size={14} />}
-                                            </button>
-                                            <button
-                                                type="button"
-                                                disabled={deletingId === item.id}
-                                                onClick={(e) => {
-                                                    e.stopPropagation();
-                                                    handleDelete(item);
-                                                }}
-                                                className="inline-flex h-7 w-7 md:h-8 md:w-8 items-center justify-center rounded-lg border border-red-500/30 bg-red-500/10 text-red-300 hover:bg-red-500/20 disabled:opacity-50"
-                                                title={t("projects.delete", "Supprimer")}
-                                            >
-                                                {deletingId === item.id ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
-                                            </button>
-                                        </div>
-                                    </td>
-                                </tr>
-                            ))}
-                        </tbody>
-                    </table>
+                                            <FolderOpen size={16} />
+                                        </button>
+                                        <button
+                                            type="button"
+                                            disabled={savingId === item.id}
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                handleRename(item);
+                                            }}
+                                            className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-white/90 text-amber-800 shadow-sm hover:bg-white disabled:opacity-50"
+                                            title={t("projects.rename", "Renommer")}
+                                        >
+                                            {savingId === item.id ? <Loader2 size={16} className="animate-spin" /> : <Edit3 size={16} />}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            disabled={deletingId === item.id}
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                handleDelete(item);
+                                            }}
+                                            className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-white/90 text-red-700 shadow-sm hover:bg-white disabled:opacity-50"
+                                            title={t("projects.delete", "Supprimer")}
+                                        >
+                                            {deletingId === item.id ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />}
+                                        </button>
+                                    </>
+                                }
+                            />
+                            <p
+                                className="cursor-pointer font-semibold text-slate-900 dark:text-white line-clamp-2"
+                                onClick={() => handleOpenProject(item)}
+                            >
+                                {item.name || t("generatedMedia.untitled", "Untitled")}
+                            </p>
+                        </div>
+                    ))}
                 </div>
 
                 <div className="flex flex-col sm:flex-row items-center justify-between gap-2 sm:gap-0 border-t border-slate-300 dark:border-white/10 pt-4 text-sm">
