@@ -373,9 +373,11 @@ export default function ReelsPage({ projectId = "" }) {
                     ) : (
                         <h1 className="text-3xl font-black tracking-tight">{t('reels.title', 'Generated reels')}</h1>
                     )} <br/>
-                    <p className="mt-2 text-sm text-slate-500 dark:text-zinc-400">
-                        {projectId ? t('projects.reelProjectSubtitle', 'Contenus generes pour ce projet.') : t('reels.subtitle', 'Search, filter, delete, share and download.')}
-                    </p>
+                    {!projectId ? (
+                        <p className="mt-2 text-sm text-slate-500 dark:text-zinc-400">
+                            {t('reels.subtitle', 'Search, filter, delete, share and download.')}
+                        </p>
+                    ) : null}
                 </div>
 
                 {projectId ? (
@@ -535,7 +537,7 @@ export default function ReelsPage({ projectId = "" }) {
                                         </>
                                     }
                                 />
-                                <p className="font-semibold text-slate-900 dark:text-white line-clamp-2">{item.reel_title || t("generatedMedia.untitled", "Untitled")}</p>
+                                <p className="text-sm font-semibold text-slate-900 dark:text-white line-clamp-2">{item.reel_title || t("generatedMedia.untitled", "Untitled")}</p>
                                 <p className="text-xs text-slate-500 dark:text-zinc-400 line-clamp-3">{item.reel_description || "-"}</p>
                                 {media.translationKey ? (
                                     <p className="text-xs text-slate-500 dark:text-zinc-400">{t(media.translationKey, media.translationKey, media.params)}</p>

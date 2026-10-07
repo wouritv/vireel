@@ -373,9 +373,11 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
                     ) : (
                         <h1 className="text-2xl md:text-3xl font-black tracking-tight">{t("common.subtitles", "Sous-titres")}</h1>
                     )}
-                    <p className="mt-2 text-sm text-slate-500 dark:text-zinc-400">
-                        {projectId ? t("projects.captionProjectSubtitle", "Contenu genere pour ce projet.") : t("reels.subtitle2", "Search, filter, delete, share and download.")}
-                    </p>
+                    {!projectId ? (
+                        <p className="mt-2 text-sm text-slate-500 dark:text-zinc-400">
+                            {t("reels.subtitle2", "Search, filter, delete, share and download.")}
+                        </p>
+                    ) : null}
                 </div>
 
                 {projectId ? null : (
@@ -522,7 +524,7 @@ export default function CaptionsPage({ projectId = "", autoOpenFirst = false }) 
                                         </>
                                     }
                                 />
-                                <p className="font-semibold text-slate-900 dark:text-white line-clamp-2">{item.caption_title || t("generatedMedia.untitled", "Untitled")}</p>
+                                <p className="text-sm font-semibold text-slate-900 dark:text-white line-clamp-2">{item.caption_title || t("generatedMedia.untitled", "Untitled")}</p>
                                 {media.translationKey ? (
                                     <p className="text-xs text-slate-500 dark:text-zinc-400">{t(media.translationKey, media.translationKey, media.params)}</p>
                                 ) : null}

@@ -287,7 +287,7 @@ export default function ReelsProjectsPage() {
                                 }
                             />
                             <p
-                                className="cursor-pointer font-semibold text-slate-900 dark:text-white line-clamp-2"
+                                className="cursor-pointer text-sm font-semibold text-slate-900 dark:text-white line-clamp-2"
                                 onClick={() => handleOpenProject(item)}
                             >
                                 {item.name || t("generatedMedia.untitled", "Untitled")}
