@@ -145,6 +145,7 @@ from supabase_request import (
 	list_referrals_by_referrer as supabase_list_referrals_by_referrer,
 	invalidate_referral as supabase_invalidate_referral,
 	get_auth_user_created_at as supabase_get_auth_user_created_at,
+	get_auth_user_identity as supabase_get_auth_user_identity,
 	insert_promotional_credit_batch as supabase_insert_promotional_credit_batch,
 	list_active_promotional_credit_batches as supabase_list_active_promotional_credit_batches,
 	CREDIT_BATCH_TIER_PROMOTIONAL,
@@ -11959,11 +11960,25 @@ async def get_referral_config():
     }
 
 
+def _referral_label(identity: Optional[Dict[str, Optional[str]]]) -> str:
+    """The referred person's own name/email, falling back to a generic
+    label only when the Admin Auth API lookup itself failed (account
+    deleted, transient error, ...)."""
+    if identity:
+        display_name = (identity.get("display_name") or "").strip()
+        if display_name:
+            return display_name
+        email = identity.get("email")
+        if email:
+            return email
+    return "Filleul"
+
+
 @app.get("/api/referrals/me", responses={401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}, 503: {"description": "Service Unavailable"}})
 async def get_my_referrals(request: Request, user_id: Annotated[str, Depends(get_user_id_header)]):
-    """The authenticated user's own referral link, plus a privacy-minded
-    summary of who they've referred (section 14: ordinal labels only, no
-    referee email/name -- see dashboard/src/pages/ParrainagePage.jsx)."""
+    """The authenticated user's own referral link, plus a summary of who
+    they've referred -- each entry's label is the referred person's own
+    display name or email (see dashboard/src/pages/ParrainagePage.jsx)."""
     if not is_supabase_configured():
         raise HTTPException(status_code=503, detail=_SUPABASE_NOT_CONFIGURED)
 
@@ -11971,15 +11986,18 @@ async def get_my_referrals(request: Request, user_id: Annotated[str, Depends(get
     default_base_url = _frontend_base_url(request)
 
     rows = await supabase_list_referrals_by_referrer(user_id)
+    identities = await asyncio.gather(
+        *(supabase_get_auth_user_identity(row.get("referred_user_id")) for row in rows)
+    )
     referrals = [
         {
-            "label": f"Filleul #{index}",
+            "label": _referral_label(identity),
             "created_at": row.get("created_at"),
             "status": row.get("status"),
             "first_subscription_type": row.get("first_subscription_type"),
             "subscription_reward_granted_at": row.get("subscription_reward_granted_at"),
         }
-        for index, row in enumerate(rows, start=1)
+        for row, identity in zip(rows, identities)
     ]
 
     return {

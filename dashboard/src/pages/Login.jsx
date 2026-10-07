@@ -50,9 +50,22 @@ export default function Login() {
                 return;
             }
 
+            const referralCode = getStoredReferralCode();
+
             const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
                 email,
                 password,
+                options: referralCode
+                    ? {
+                          // Carries the code in the confirmation link itself
+                          // (not just this browser's localStorage) so the
+                          // association still works when the filleul opens
+                          // that link on a different browser/device --
+                          // ReferralCapture.jsx picks "ref" back up from the
+                          // URL on whichever browser lands here.
+                          emailRedirectTo: `${window.location.origin}/dashboard?ref=${encodeURIComponent(referralCode)}`,
+                      }
+                    : undefined,
             });
 
             if (signUpError) {
@@ -60,7 +73,6 @@ export default function Login() {
                 return;
             }
 
-            const referralCode = getStoredReferralCode();
             if (referralCode && signUpData?.user?.id) {
                 // Fire-and-forget: never block navigation on this, and the
                 // backend decides whether the reward is actually honored.

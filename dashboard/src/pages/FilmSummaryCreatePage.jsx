@@ -36,7 +36,7 @@ const NARRATION_STYLE_KEYS = [
 
 export default function FilmSummaryCreatePage() {
     const { user } = useAuth();
-    const { credits } = useUserCredits();
+    const { hasCredits } = useUserCredits();
     const { t } = useTranslation();
     const navigate = useNavigate();
     const location = useLocation();
@@ -115,7 +115,7 @@ export default function FilmSummaryCreatePage() {
         }
     };
 
-    const hasCredits = Number(credits || 0) > 0;
+    const hasCreditsAvailable = hasCredits !== false;
 
     useEffect(() => {
         let active = true;
@@ -259,7 +259,7 @@ export default function FilmSummaryCreatePage() {
             setError("Authentication required. Please reconnect your session.");
             return;
         }
-        if (!hasCredits) {
+        if (!hasCreditsAvailable) {
             const message = t("common.insufficientCreditsStart", "Credits insuffisants pour initier cette operation.");
             setError(message);
             globalThis.alert(message);
@@ -354,7 +354,7 @@ export default function FilmSummaryCreatePage() {
                     <div className="rounded-lg border border-slate-300 dark:border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-500 dark:text-zinc-400">
                         {t("filmSummary.sourceNotice", "Seuls les films narratifs complets sont acceptes -- les courts extraits, publicites ou contenus non fictionnels seront rejetes apres analyse.")}
                     </div>
-                    {!hasCredits ? (
+                    {!hasCreditsAvailable ? (
                         <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
                             {t("common.insufficientCreditsStart", "Credits insuffisants pour initier cette operation.")}
                         </div>
@@ -523,9 +523,9 @@ export default function FilmSummaryCreatePage() {
                     <MediaInput
                         onProcess={handleProcess}
                         isProcessing={isProcessing}
-                        isCreditBlocked={!hasCredits}
-                        disableActions={!hasCredits}
-                        creditWarning={!hasCredits ? t("common.insufficientCreditsStart", "Credits insuffisants pour initier cette operation.") : ""}
+                        isCreditBlocked={!hasCreditsAvailable}
+                        disableActions={!hasCreditsAvailable}
+                        creditWarning={!hasCreditsAvailable ? t("common.insufficientCreditsStart", "Credits insuffisants pour initier cette operation.") : ""}
                         submitLabel={t("filmSummary.generateCta", "Analyser le film")}
                         processingLabel={t("mediaInput.processing", "Processing Video...")}
                     />

@@ -2116,6 +2116,64 @@ def test_get_auth_user_created_at_returns_none_on_failure(monkeypatch):
     assert asyncio.run(supabase_request.get_auth_user_created_at("u1")) is None
 
 
+def test_get_auth_user_identity_returns_email_and_display_name(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+
+    class _FakeAdmin:
+        async def get_user_by_id(self, user_id):
+            return types.SimpleNamespace(user=types.SimpleNamespace(
+                email="marie@example.com", user_metadata={"display_name": "Marie Dupont"},
+            ))
+
+    class _FakeAuth:
+        admin = _FakeAdmin()
+
+    class _FakeClientWithAuth:
+        auth = _FakeAuth()
+
+    _patch_get_client(monkeypatch, supabase_request, _FakeClientWithAuth())
+
+    result = asyncio.run(supabase_request.get_auth_user_identity("u1"))
+    assert result == {"email": "marie@example.com", "display_name": "Marie Dupont"}
+
+
+def test_get_auth_user_identity_handles_missing_display_name(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+
+    class _FakeAdmin:
+        async def get_user_by_id(self, user_id):
+            return types.SimpleNamespace(user=types.SimpleNamespace(email="jean@example.com", user_metadata={}))
+
+    class _FakeAuth:
+        admin = _FakeAdmin()
+
+    class _FakeClientWithAuth:
+        auth = _FakeAuth()
+
+    _patch_get_client(monkeypatch, supabase_request, _FakeClientWithAuth())
+
+    result = asyncio.run(supabase_request.get_auth_user_identity("u1"))
+    assert result == {"email": "jean@example.com", "display_name": None}
+
+
+def test_get_auth_user_identity_returns_none_on_failure(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+
+    class _FakeAdmin:
+        async def get_user_by_id(self, user_id):
+            raise RuntimeError("not found")
+
+    class _FakeAuth:
+        admin = _FakeAdmin()
+
+    class _FakeClientWithAuth:
+        auth = _FakeAuth()
+
+    _patch_get_client(monkeypatch, supabase_request, _FakeClientWithAuth())
+
+    assert asyncio.run(supabase_request.get_auth_user_identity("u1")) is None
+
+
 # --------------------------------------------------------------------------
 # Promotional credits
 # --------------------------------------------------------------------------

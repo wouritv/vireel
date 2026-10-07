@@ -18,7 +18,7 @@ function normalizeStatus(status) {
 
 export default function NewCaptionPage() {
     const { user } = useAuth();
-    const { credits } = useUserCredits();
+    const { hasCredits } = useUserCredits();
     const { t } = useTranslation();
     const navigate = useNavigate();
     const location = useLocation();
@@ -31,7 +31,7 @@ export default function NewCaptionPage() {
     const lastLoggedCountRef = useRef(0);
     const pollFailureCountRef = useRef(0);
 
-    const hasCreditsForCaption = Number(credits || 0) > 0;
+    const hasCreditsForCaption = hasCredits !== false;
     const breadcrumbItems = [
         { label: t("breadcrumbs.dashboard", "Dashboard"), href: "/dashboard" },
         { label: t("breadcrumbs.captions", "Captions"), href: "/dashboard/captions" },

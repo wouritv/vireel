@@ -19,15 +19,16 @@ export default function CreditGuard({
     requiredCredits = 1,
     operationLabel = "cette opération",
 }) {
-    const { credits, hasCredits, loading } = useUserCredits();
+    const { credits, totalCredits, canAfford, loading } = useUserCredits();
     const navigate = useNavigate();
 
     // While credits haven't loaded yet we allow the action (optimistic).
-    if (loading || hasCredits === null) return <>{children}</>;
-
-    const sufficient = credits >= requiredCredits;
+    const sufficient = canAfford(requiredCredits);
+    if (loading || sufficient === null) return <>{children}</>;
 
     if (sufficient) return <>{children}</>;
+
+    const availableCredits = Number(totalCredits ?? credits ?? 0);
 
     return (
         <div className="flex flex-col gap-2">
@@ -41,7 +42,7 @@ export default function CreditGuard({
                 <span>
                     Crédits insuffisants pour {operationLabel}.
                     Il vous faut au moins <strong>{requiredCredits.toLocaleString()} cr</strong>
-                    {" "}(solde : <strong>{credits.toLocaleString()} cr</strong>).{" "}
+                    {" "}(solde total : <strong>{availableCredits.toLocaleString()} cr</strong>).{" "}
                 </span>
                 <button
                     onClick={() => navigate("/dashboard/settings?buy=1")}
