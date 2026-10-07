@@ -41,7 +41,7 @@ export default function GridThumbnail({
             {(durationLabel || statusBadge) ? (
                 <div className={`pointer-events-none absolute inset-x-2 ${badgeRowClass} flex items-center justify-between gap-2`}>
                     {durationLabel ? (
-                        <span className="rounded-md bg-black/80 px-1.5 py-0.5 text-[10px] font-medium text-white shadow-sm">
+                        <span className="rounded-md bg-black/80 px-1.5 py-0.5 text-[10px] font-medium text-[#ffffff] shadow-sm">
                             {durationLabel}
                         </span>
                     ) : <span />}
