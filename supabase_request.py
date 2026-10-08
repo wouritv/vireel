@@ -2029,6 +2029,39 @@ async def _restore_promotional_credits(client: AsyncClient, batches: Optional[Li
 		logger.warning("Failed to restore promotional credit batches: %s", batches, exc_info=True)
 
 
+async def _restore_promotional_credits_headroom(client: AsyncClient, user_id: str, amount: float) -> Dict[str, Any]:
+	"""Refills headroom in the user's promotional credit batches (never
+	past what each batch originally held) by up to ``amount``, same
+	tier-then-expiry order consume_promotional_credits drains in. Used by
+	refund_user_credits so a reservation's refund lands back in the pool
+	it was drawn from instead of always becoming subscription credit (see
+	the restore_promotional_credits_headroom migration's comment for the
+	billing bug this fixes). A no-op for amount <= 0."""
+	if not amount or amount <= 0:
+		return {"restored": 0.0, "batches": []}
+	response = await client.rpc(
+		"restore_promotional_credits_headroom", {"p_user_id": user_id, "p_amount": float(amount)}
+	).execute()
+	data = response.data
+	if isinstance(data, list):
+		data = data[0] if data else None
+	return data or {"restored": 0.0, "batches": []}
+
+
+async def _undo_promotional_credits_headroom_restore(client: AsyncClient, batches: Optional[List[Dict[str, Any]]]) -> None:
+	"""Reverses a prior _restore_promotional_credits_headroom draw -- used
+	when the rest of a refund (the user_data update) ultimately fails
+	after all retries, so headroom restored for a refund that never
+	actually landed isn't left sitting in the promo pool. Best-effort,
+	mirrors _restore_promotional_credits."""
+	if not batches:
+		return
+	try:
+		await client.rpc("undo_promotional_credits_headroom_restore", {"p_batches": batches}).execute()
+	except Exception:
+		logger.warning("Failed to undo promotional credit headroom restore: %s", batches, exc_info=True)
+
+
 async def deduct_user_credits(
 	user_id: str,
 	credits: float,
@@ -2096,26 +2129,48 @@ async def refund_user_credits(
 	completed job whose actual cost was lower than its reservation).
 
 	Existing debt is paid down first, same as set_user_data_balance's
-	top-up logic, before any surplus is added to the spendable balance.
+	top-up logic. Any surplus left after that refills headroom in the
+	user's promotional credit batches before falling back to the plain
+	subscription balance -- deduct_user_credits always drains promo
+	before subscription credit, so reversing a reservation in the
+	opposite order (debt, then promo, then subscription) undoes it the
+	same way it was built up, instead of always turning a promo-funded
+	reservation's refund into subscription credit (see the
+	restore_promotional_credits_headroom migration's comment for the bug
+	this fixes).
+
 	Uses the same optimistic-concurrency retry as deduct_user_credits so a
-	concurrent refund/debit can never be silently lost.
+	concurrent refund/debit can never be silently lost. The promo-headroom
+	restore itself happens once, before the retry loop -- it has nothing
+	to do with the user_data row's optimistic lock, so retrying it on
+	every conflicting attempt would double-restore it.
 	"""
 	if credits <= 0 and storage_delta == 0:
 		return True
 	client = await get_client()
+	credit_amount = max(0.0, float(credits or 0.0))
+
+	existing = await get_user_data(user_id)
+	if not existing:
+		return False
+	current_debt = float(existing.get("credit_debt", 0) or 0.0)
+	debt_paid = min(current_debt, credit_amount)
+	surplus = credit_amount - debt_paid
+	promo_restore = await _restore_promotional_credits_headroom(client, user_id, surplus)
+	promo_restored = float(promo_restore.get("restored") or 0.0)
+	promo_batches = promo_restore.get("batches") or []
+	credit_to_add = surplus - promo_restored
 
 	for _ in range(max_attempts):
 		existing = await get_user_data(user_id)
 		if not existing:
+			await _undo_promotional_credits_headroom_restore(client, promo_batches)
 			return False
 
 		current_credits = float(existing.get("credit", 0) or 0.0)
-		current_debt = float(existing.get("credit_debt", 0) or 0.0)
-		credit_amount = max(0.0, float(credits or 0.0))
-
-		debt_paid = min(current_debt, credit_amount)
-		new_debt = current_debt - debt_paid
-		new_credit = current_credits + (credit_amount - debt_paid)
+		fresh_debt = float(existing.get("credit_debt", 0) or 0.0)
+		new_debt = max(0.0, fresh_debt - debt_paid)
+		new_credit = current_credits + credit_to_add
 
 		current_storage = float(existing.get("stockage", 0) or 0.0)
 		new_storage = current_storage + float(storage_delta)
@@ -2149,6 +2204,7 @@ async def refund_user_credits(
 			)
 		return True
 
+	await _undo_promotional_credits_headroom_restore(client, promo_batches)
 	return False
 
 
