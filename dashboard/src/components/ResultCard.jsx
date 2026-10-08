@@ -48,7 +48,7 @@ const isLikelyVideoAsset = (value) => {
 export default function ResultCard({ clip, index, jobId, onPlay, onPause, compactActions = false, hideVideoPreview = false }) {
     const { t } = useTranslation();
     const { user } = useAuth();
-    const { credits, hasActiveSubscription } = useUserCredits();
+    const { totalCredits, canAfford, hasActiveSubscription } = useUserCredits();
     const safeClip = clip && typeof clip === 'object' ? clip : {};
     const clipIndexForApi = Number.isFinite(Number(safeClip.reel_clip_index))
         ? Number(safeClip.reel_clip_index)
@@ -61,7 +61,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
         ? (safeClip.reel_playback_url || safeClip.caption_playback_url || safeClip.media_url || safeClip.video_url)
         : '';
     const hasClipContext = Boolean(jobId) && Number.isFinite(Number(clipIndexForApi));
-    const hasAnyEditingCredit = Number(credits || 0) > 0;
+    const hasAnyEditingCredit = canAfford(1) !== false;
     const canShare = hasActiveSubscription === true;
 
     const [showModal, setShowModal] = useState(false);
@@ -116,6 +116,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
     const insufficientCreditsMessage = () => (
         t("common.insufficientCreditsStart", "Crédits insuffisants pour initier cette opération.")
     );
+    const availableCredits = Number(totalCredits ?? 0);
 
 
     // Accumulate Remotion layers across operations
@@ -988,7 +989,7 @@ export default function ResultCard({ clip, index, jobId, onPlay, onPause, compac
                 {!hasAnyEditingCredit && (
                     <div className="mb-3 p-2 bg-amber-500/10 border border-amber-500/20 text-amber-300 text-[10px] rounded-lg flex items-center gap-2">
                         <AlertCircle size={12} className="shrink-0" />
-                        {insufficientCreditsMessage()}
+                        {insufficientCreditsMessage()} (solde total : {availableCredits.toLocaleString()} cr)
                     </div>
                 )}
 

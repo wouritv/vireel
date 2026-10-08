@@ -78,7 +78,7 @@ function ProcessingChecklist({ status, currentStep, isLoadingStatus, t }) {
 
 export default function AnonymousStoryCreatePage() {
     const { user } = useAuth();
-    const { credits } = useUserCredits();
+    const { hasCredits } = useUserCredits();
     const { t } = useTranslation();
     const navigate = useNavigate();
     const location = useLocation();
@@ -99,7 +99,7 @@ export default function AnonymousStoryCreatePage() {
     const [pageName, setPageName] = useState("");
     const [targetLanguage, setTargetLanguage] = useState("");
 
-    const hasCredits = Number(credits || 0) > 0;
+    const hasCreditsAvailable = hasCredits !== false;
 
     // Resume an in-progress (or just-failed) project opened back from the
     // projects list -- same recovery flow as NewCaptionPage.
@@ -203,7 +203,7 @@ export default function AnonymousStoryCreatePage() {
             setError("Authentication required. Please reconnect your session.");
             return;
         }
-        if (!hasCredits) {
+        if (!hasCreditsAvailable) {
             const message = t("common.insufficientCreditsStart", "Credits insuffisants pour initier cette operation.");
             setError(message);
             globalThis.alert(message);
@@ -289,7 +289,7 @@ export default function AnonymousStoryCreatePage() {
                     <div className="rounded-lg border border-slate-300 dark:border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-500 dark:text-zinc-400">
                         {t("anonymousStories.facebookNotice", "Une video Facebook doit d'abord etre telechargee, puis importee ici comme fichier.")}
                     </div>
-                    {!hasCredits ? (
+                    {!hasCreditsAvailable ? (
                         <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
                             {t("common.insufficientCreditsStart", "Credits insuffisants pour initier cette operation.")}
                         </div>
@@ -330,9 +330,9 @@ export default function AnonymousStoryCreatePage() {
                     <MediaInput
                         onProcess={handleProcess}
                         isProcessing={isProcessing}
-                        isCreditBlocked={!hasCredits}
-                        disableActions={!hasCredits}
-                        creditWarning={!hasCredits ? t("common.insufficientCreditsStart", "Credits insuffisants pour initier cette operation.") : ""}
+                        isCreditBlocked={!hasCreditsAvailable}
+                        disableActions={!hasCreditsAvailable}
+                        creditWarning={!hasCreditsAvailable ? t("common.insufficientCreditsStart", "Credits insuffisants pour initier cette operation.") : ""}
                         submitLabel={t("anonymousStories.generateCta", "Generer l'histoire")}
                         processingLabel={t("mediaInput.processing", "Processing Video...")}
                     />

@@ -62,6 +62,7 @@ export function UserCreditsProvider({ children }) {
         credits:          credits?.credit   ?? 0,
         creditMax:        credits?.credit_max ?? 0,
         creditRatio:      (credits?.credit_max ?? 0) > 0 ? (credits?.credit ?? 0) / (credits?.credit_max ?? 1) : 0,
+        totalCredits:     credits ? (credits.credit ?? 0) + (credits.promotional_credit ?? 0) + (credits.purchased_credit ?? 0) : 0,
         // Three distinct pools, always consumed in this order: promotional,
         // then purchased, then standard (subscription) -- `credits` above
         // is the subscription pool only. Promotional and purchased each
@@ -71,7 +72,7 @@ export function UserCreditsProvider({ children }) {
         purchasedCredit: credits?.purchased_credit ?? 0,
         purchasedCreditExpirations: credits?.purchased_credit_expirations ?? [],
         // Total available always combines all three pools.
-        hasCredits:       credits ? (credits.credit ?? 0) + (credits.promotional_credit ?? 0) + (credits.purchased_credit ?? 0) > 0 : null,  // null = unknown
+        hasCredits:       credits ? ((credits.credit ?? 0) + (credits.promotional_credit ?? 0) + (credits.purchased_credit ?? 0)) > 0 : null,  // null = unknown
         hasActiveSubscription: credits ? Boolean(credits.has_active_subscription) : null,  // null = unknown
         hasAnalyticsAccess: credits ? Boolean(credits.has_analytics_access) : null,  // null = unknown
         aboCosts:         credits?.abo_costs ?? {},
@@ -82,7 +83,7 @@ export function UserCreditsProvider({ children }) {
         /** Check if user has at least `required` credits, across all three pools combined (null when not loaded yet). */
         canAfford: (required = 1) => {
             if (credits === null) return null;
-            return (credits.credit ?? 0) + (credits.promotional_credit ?? 0) + (credits.purchased_credit ?? 0) >= required;
+            return ((credits.credit ?? 0) + (credits.promotional_credit ?? 0) + (credits.purchased_credit ?? 0)) >= required;
         },
     }), [credits, loading, error, fetch_credits]);
 
