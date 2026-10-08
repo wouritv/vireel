@@ -3707,28 +3707,57 @@ def test_finalize_source_media_retention_skips_without_project(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     debit_mock = AsyncMock()
-    app.reel_job_manager.debit_credits_for_job = debit_mock
+    monkeypatch.setattr(app, "supabase_deduct_user_credits", debit_mock)
 
     asyncio.run(app._finalize_source_media_retention("job-6", "u6", None, 1024 ** 3, "bucket", "key"))
     debit_mock.assert_not_awaited()
 
 
 def test_finalize_source_media_retention_debits_standalone_retention_charge(monkeypatch):
+    # Regression test for a production FK violation (job_logs_job_id_fkey):
+    # this runs during project creation, BEFORE the pipeline's own job row
+    # is persisted to Supabase, so it must debit directly rather than via
+    # job_manager.debit_credits_for_job (whose job_logs/jobs bookkeeping
+    # assumes the job row already exists).
     app = _import_app_with_stubs(monkeypatch)
     monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
     monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
     monkeypatch.setattr(app, "supabase_insert_media_asset", AsyncMock(return_value={"id": "asset5"}))
     debit_mock = AsyncMock(return_value=True)
-    app.reel_job_manager.debit_credits_for_job = debit_mock
+    monkeypatch.setattr(app, "supabase_deduct_user_credits", debit_mock)
+    history_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_upsert_user_data_history_entry", history_mock)
+    job_record_mock = AsyncMock()
+    app.reel_job_manager.debit_credits_for_job = job_record_mock
 
     asyncio.run(app._finalize_source_media_retention(
         "job-7", "u7", {"id": "proj-7"}, 4 * 1024 ** 3, "bucket", "key",
     ))
 
     debit_mock.assert_awaited_once()
-    assert debit_mock.await_args.kwargs["operation_type"] == "retention_storage_source"
-    assert debit_mock.await_args.kwargs["reserved_credits"] == 0.0
-    assert debit_mock.await_args.kwargs["credits"] > 0
+    assert debit_mock.await_args.args[0] == "u7"
+    assert debit_mock.await_args.args[1] > 0
+    history_mock.assert_awaited_once()
+    assert history_mock.await_args.kwargs["operation_type"] == "retention_storage_source"
+    assert history_mock.await_args.kwargs["operation_id"] == "job-7"
+    # Never touches the jobs/job_logs tables -- the job row doesn't exist yet.
+    job_record_mock.assert_not_awaited()
+
+
+def test_finalize_source_media_retention_skips_history_on_insufficient_balance(monkeypatch):
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "is_supabase_configured", lambda: True)
+    monkeypatch.setattr(app, "get_user_abonnement", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "supabase_insert_media_asset", AsyncMock(return_value={"id": "asset8"}))
+    monkeypatch.setattr(app, "supabase_deduct_user_credits", AsyncMock(return_value=False))
+    history_mock = AsyncMock()
+    monkeypatch.setattr(app, "supabase_upsert_user_data_history_entry", history_mock)
+
+    asyncio.run(app._finalize_source_media_retention(
+        "job-8", "u8", {"id": "proj-8"}, 4 * 1024 ** 3, "bucket", "key",
+    ))
+
+    history_mock.assert_not_awaited()
 
 
 def test_attach_media_asset_fields_enriches_rows_from_batch_lookup(monkeypatch):

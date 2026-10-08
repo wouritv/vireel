@@ -118,6 +118,8 @@ class _FakeClient:
         self.rpc_response_map = {
             "consume_promotional_credits": _FakeResponse(data={"consumed": 0.0, "batches": []}),
             "restore_promotional_credits": _FakeResponse(data=None),
+            "restore_promotional_credits_headroom": _FakeResponse(data={"restored": 0.0, "batches": []}),
+            "undo_promotional_credits_headroom_restore": _FakeResponse(data=None),
             **(rpc_response_map or {}),
         }
 
@@ -2523,6 +2525,126 @@ def test_deduct_user_credits_retries_on_concurrent_standard_balance_conflict(mon
     assert len(update_calls) == 2
     # The winning retry's update is against the fresh 90, not the stale 100.
     assert update_calls[1][2][0]["credit"] == 80.0
+
+
+def test_refund_user_credits_restores_promo_headroom_before_subscription(monkeypatch):
+    # Regression test for a production billing bug: a job reserved 50
+    # credits (draining a 50-credit promo batch to 0), then settled at an
+    # actual cost of 41, so refund_user_credits(user_id, 9) is called for
+    # the delta. Before this fix, that 9 always landed in user_data.credit
+    # (500 -> 509) while the promo batch stayed stuck at amount_remaining=0
+    # (should be 9) -- silently converting promo credit into subscription
+    # credit. It must now refill the promo batch's headroom instead.
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_USER_DATA_TABLE: [
+            _FakeResponse(data=[{"user_id": "u1", "credit": 500.0, "stockage": 0.0, "credit_debt": 0.0}]),
+            _FakeResponse(data=[{"user_id": "u1", "credit": 500.0, "stockage": 0.0, "credit_debt": 0.0}]),
+            _FakeResponse(data=[{"user_id": "u1", "credit": 500.0}]),
+        ]},
+        rpc_response_map={
+            "restore_promotional_credits_headroom": _FakeResponse(
+                data={"restored": 9.0, "batches": [{"id": "b1", "amount": 9.0}]}
+            ),
+        },
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.refund_user_credits("u1", 9.0))
+    assert result is True
+
+    headroom_calls = [e for e in fake_client.events if e[0] == "rpc" and e[1] == "restore_promotional_credits_headroom"]
+    assert len(headroom_calls) == 1
+    assert headroom_calls[0][3] == {"p_user_id": "u1", "p_amount": 9.0}
+
+    update_args = _event_args(fake_client.events, supabase_request.SUPABASE_USER_DATA_TABLE, "update")
+    # The subscription balance must stay untouched -- promo absorbed it all.
+    assert update_args[0]["credit"] == 500.0
+
+
+def test_refund_user_credits_leftover_after_promo_headroom_goes_to_subscription(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_USER_DATA_TABLE: [
+            _FakeResponse(data=[{"user_id": "u1", "credit": 500.0, "stockage": 0.0, "credit_debt": 0.0}]),
+            _FakeResponse(data=[{"user_id": "u1", "credit": 500.0, "stockage": 0.0, "credit_debt": 0.0}]),
+            _FakeResponse(data=[{"user_id": "u1", "credit": 503.0}]),
+        ]},
+        rpc_response_map={
+            # Only 6 of the 9 requested could be absorbed by promo headroom.
+            "restore_promotional_credits_headroom": _FakeResponse(
+                data={"restored": 6.0, "batches": [{"id": "b1", "amount": 6.0}]}
+            ),
+        },
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.refund_user_credits("u1", 9.0))
+    assert result is True
+    update_args = _event_args(fake_client.events, supabase_request.SUPABASE_USER_DATA_TABLE, "update")
+    assert update_args[0]["credit"] == 503.0  # 500 + (9 - 6)
+
+
+def test_refund_user_credits_pays_down_debt_before_promo_headroom(monkeypatch):
+    # Debt is only ever created once promo AND subscription credit are both
+    # already exhausted, so reversing a refund must pay it down first --
+    # mirrors deduct_user_credits' own draw order in reverse.
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_USER_DATA_TABLE: [
+            _FakeResponse(data=[{"user_id": "u1", "credit": 0.0, "stockage": 0.0, "credit_debt": 5.0}]),
+            _FakeResponse(data=[{"user_id": "u1", "credit": 0.0, "stockage": 0.0, "credit_debt": 5.0}]),
+            _FakeResponse(data=[{"user_id": "u1", "credit": 0.0, "credit_debt": 0.0}]),
+        ]},
+        rpc_response_map={
+            "restore_promotional_credits_headroom": _FakeResponse(
+                data={"restored": 2.0, "batches": [{"id": "b1", "amount": 2.0}]}
+            ),
+        },
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.refund_user_credits("u1", 9.0))
+    assert result is True
+
+    # 5 pays off the debt first; only the remaining 4 is offered to promo headroom.
+    headroom_calls = [e for e in fake_client.events if e[0] == "rpc" and e[1] == "restore_promotional_credits_headroom"]
+    assert headroom_calls[0][3] == {"p_user_id": "u1", "p_amount": 4.0}
+    update_args = _event_args(fake_client.events, supabase_request.SUPABASE_USER_DATA_TABLE, "update")
+    assert update_args[0]["credit_debt"] == 0.0
+    assert update_args[0]["credit"] == 2.0  # 0 + (4 - 2 restored to promo)
+
+
+def test_refund_user_credits_returns_false_when_no_user_data(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient({supabase_request.SUPABASE_USER_DATA_TABLE: [_FakeResponse(data=[])]})
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.refund_user_credits("u1", 9.0))
+    assert result is False
+
+
+def test_refund_user_credits_undoes_promo_headroom_restore_when_row_disappears_mid_retry(monkeypatch):
+    supabase_request = _import_supabase_request_with_stubs(monkeypatch)
+    fake_client = _FakeClient(
+        {supabase_request.SUPABASE_USER_DATA_TABLE: [
+            _FakeResponse(data=[{"user_id": "u1", "credit": 500.0, "stockage": 0.0, "credit_debt": 0.0}]),
+            _FakeResponse(data=[]),  # the row is gone by the time the retry loop re-reads it
+        ]},
+        rpc_response_map={
+            "restore_promotional_credits_headroom": _FakeResponse(
+                data={"restored": 9.0, "batches": [{"id": "b1", "amount": 9.0}]}
+            ),
+            "undo_promotional_credits_headroom_restore": _FakeResponse(data=None),
+        },
+    )
+    _patch_get_client(monkeypatch, supabase_request, fake_client)
+
+    result = asyncio.run(supabase_request.refund_user_credits("u1", 9.0))
+    assert result is False
+    undo_calls = [e for e in fake_client.events if e[0] == "rpc" and e[1] == "undo_promotional_credits_headroom_restore"]
+    assert len(undo_calls) == 1
+    assert undo_calls[0][3] == {"p_batches": [{"id": "b1", "amount": 9.0}]}
 
 
 # --------------------------------------------------------------------------

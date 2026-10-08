@@ -4453,9 +4453,19 @@ async def _finalize_source_media_retention(
     _create_anonymous_story_endpoint_project/_create_film_summary_endpoint_project).
     Unlike produced media, no credits are reserved/debited for a source
     upload elsewhere in the existing flow, so this is its own small,
-    standalone debit (reserved_credits=0.0) for just the retention line
-    item -- never blocks the upload/job itself on failure, only logs,
-    exactly like the other best-effort debit_ok checks in this file."""
+    standalone debit for just the retention line item -- never blocks the
+    upload/job itself on failure, only logs, exactly like the other
+    best-effort debit_ok checks in this file.
+
+    Deliberately debits directly (supabase_deduct_user_credits +
+    supabase_upsert_user_data_history_entry) rather than going through
+    job_manager.debit_credits_for_job: this runs during project creation,
+    which every pipeline calls BEFORE its own job row is persisted to
+    Supabase (see _create_process_endpoint_project and friends), so
+    debit_credits_for_job's job_logs/jobs bookkeeping would reference a
+    job_id that doesn't exist yet and fail its job_logs insert on the
+    job_logs_job_id_fkey constraint -- as it did in production (job
+    44ca60a8-687d-4112-886c-86e644fa2fee)."""
     if not project or not project.get("id"):
         return
     retention = await _finalize_retention_billing_batch(job_id, user_id, [
@@ -4471,15 +4481,17 @@ async def _finalize_source_media_retention(
     retention_credits = retention["retention_storage_credit_cost"]
     if user_id and is_supabase_configured() and retention_credits > 0:
         try:
-            debit_ok = await reel_job_manager.debit_credits_for_job(
-                job_id=job_id,
-                user_id=user_id,
-                credits=retention_credits,
-                storage_delta=0.0,
-                operation_type="retention_storage_source",
-                reserved_credits=0.0,
-            )
-            if not debit_ok:
+            debited = await supabase_deduct_user_credits(user_id, retention_credits, 0.0)
+            if debited:
+                await supabase_upsert_user_data_history_entry(
+                    user_id=user_id,
+                    credit=retention_credits,
+                    storage=0.0,
+                    operation="output",
+                    operation_type="retention_storage_source",
+                    operation_id=job_id or "",
+                )
+            else:
                 logger.warning("Insufficient balance to settle source-media retention (job %s)", job_id)
         except Exception:
             logger.exception("Failed to debit source-media retention cost (job %s)", job_id)
