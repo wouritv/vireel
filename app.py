@@ -19546,6 +19546,7 @@ async def _sync_tiktok_account_insights(account: Dict[str, Any]) -> None:
     daily_metrics = dict(metrics)
     for key in ("impressions", "engagement", "comments"):
         daily_metrics[key] = max(0, int(cumulative_now.get(key, 0)) - int(previous_cumulative.get(key, 0)))
+    daily_metrics["monetization"] = result.get("monetization")
 
     await _upsert_social_insights_daily_row(account_id, account["user_id"], "tiktok", today.isoformat(), daily_metrics)
 
@@ -19572,12 +19573,14 @@ async def _sync_day_bucketed_platform_account_insights(account: Dict[str, Any]) 
         result = await _fetch_youtube_analytics(token, since.isoformat(), until.isoformat())
 
     followers = (result.get("metrics") or {}).get("followers")
+    monetization = result.get("monetization")
     for day_entry in result.get("daily") or []:
         day = day_entry.get("date")
         if not day:
             continue
         daily_metrics = {key: value for key, value in day_entry.items() if key != "date"}
         daily_metrics["followers"] = followers
+        daily_metrics["monetization"] = monetization
         await _upsert_social_insights_daily_row(account["id"], account["user_id"], platform, day, daily_metrics)
 
 
@@ -19606,6 +19609,7 @@ async def _sync_linkedin_account_insights(account: Dict[str, Any]) -> None:
             if not day_str:
                 continue
             daily_metrics = {key: value for key, value in day_entry.items() if key != "date"}
+            daily_metrics["monetization"] = result.get("monetization")
             await _upsert_social_insights_daily_row(account["id"], account["user_id"], "linkedin_analytics", day_str, daily_metrics)
 
 
@@ -19654,10 +19658,11 @@ _SOCIAL_INSIGHTS_SUM_KEYS = (
 
 def _aggregate_social_insights_daily_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Collapses a list of per-day stored rows into the same
-    {metrics, daily} shape the old live-fetch path returned -- every
-    per-day metric (views, engagement, comments, ...) is summed across
-    the range, except "followers", which is a point-in-time snapshot and
-    takes the LAST day's value instead.
+    {metrics, daily, monetization} shape the old live-fetch path
+    returned -- every per-day metric (views, engagement, comments, ...)
+    is summed across the range, except "followers" and "monetization",
+    which are point-in-time/whole-window snapshots (not something to sum
+    across days) and take the LAST day's value instead.
 
     "totals" (plain dict, only keys that actually had data) is returned
     alongside "metrics" (every known key, defaulting to None) specifically
@@ -19667,20 +19672,23 @@ def _aggregate_social_insights_daily_rows(rows: List[Dict[str, Any]]) -> Dict[st
     totals: Dict[str, Any] = {}
     daily: List[Dict[str, Any]] = []
     latest_followers = None
+    latest_monetization = None
     for row in rows:
         day_metrics = row.get("metrics") or {}
-        daily.append({"date": row.get("day"), **day_metrics})
+        daily.append({"date": row.get("day"), **{key: value for key, value in day_metrics.items() if key != "monetization"}})
         for key in _SOCIAL_INSIGHTS_SUM_KEYS:
             value = day_metrics.get(key)
             if value is not None:
                 totals[key] = totals.get(key, 0) + value
         if day_metrics.get("followers") is not None:
             latest_followers = day_metrics["followers"]
+        if day_metrics.get("monetization") is not None:
+            latest_monetization = day_metrics["monetization"]
 
     metrics = _empty_social_insights_metrics()
     metrics.update(totals)
     metrics["followers"] = latest_followers
-    return {"metrics": metrics, "totals": totals, "daily": daily}
+    return {"metrics": metrics, "totals": totals, "daily": daily, "monetization": latest_monetization}
 
 
 async def _get_stored_social_insights_for_account(account: Dict[str, Any], range_days: int) -> Dict[str, Any]:
@@ -19701,6 +19709,7 @@ async def _get_stored_social_insights_for_account(account: Dict[str, Any], range
         "metrics": current["metrics"],
         "daily": current["daily"],
         "trends": trends,
+        "monetization": current["monetization"],
         "last_synced_at": account.get("last_insights_synced_at"),
     }
 

@@ -9642,6 +9642,33 @@ def test_get_social_insights_reads_from_storage_not_live_api(monkeypatch):
     assert len(data["daily"]) == 2
 
 
+def test_get_social_insights_surfaces_stored_monetization_snapshot(monkeypatch):
+    # Regression test: the storage-backed endpoint must still return the
+    # "monetization" block (ad impressions/earnings/cpm) the dashboard's
+    # MonetizationCard renders -- it was silently dropped when the live
+    # per-request fetch was replaced by reads from social_insights_daily.
+    app = _import_app_with_stubs(monkeypatch)
+    monkeypatch.setattr(app, "_assert_user_can_access_analytics", AsyncMock())
+    monkeypatch.setattr(app, "_get_social_account_by_id", AsyncMock(return_value={
+        "id": "acct-1", "platform": "facebook", "platform_account_name": "My Page",
+        "last_insights_synced_at": "2026-10-10T08:00:00+00:00",
+    }))
+    monkeypatch.setattr(app, "_list_social_insights_daily", AsyncMock(return_value=[
+        {"day": "2026-10-10", "metrics": {
+            "impressions": 10,
+            "monetization": {"supported": True, "available": True, "ad_impressions": 1000, "ad_earnings_cents": 250, "ad_cpm_cents": 30},
+        }},
+    ]))
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/social/insights", params={"account_id": "acct-1"}, headers=_auth_headers("u1"))
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["monetization"]["supported"] is True
+    assert data["monetization"]["ad_impressions"] == 1000
+
+
 def test_aggregate_social_insights_daily_rows_sums_deltas_snapshots_followers(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     rows = [
@@ -9655,6 +9682,22 @@ def test_aggregate_social_insights_daily_rows_sums_deltas_snapshots_followers(mo
     assert result["totals"] == {"impressions": 25, "comments": 3}
 
 
+def test_aggregate_social_insights_daily_rows_keeps_latest_monetization_snapshot(monkeypatch):
+    # Like "followers", monetization is a whole-window snapshot (not a
+    # per-day delta) -- the latest day's value wins, and it must not leak
+    # into each "daily" chart entry (those feed a recharts <Line> series
+    # keyed by numeric values only).
+    app = _import_app_with_stubs(monkeypatch)
+    rows = [
+        {"day": "2026-10-09", "metrics": {"impressions": 10, "monetization": {"supported": True, "ad_impressions": 100}}},
+        {"day": "2026-10-10", "metrics": {"impressions": 15, "monetization": {"supported": True, "ad_impressions": 140}}},
+    ]
+    result = app._aggregate_social_insights_daily_rows(rows)
+    assert result["monetization"] == {"supported": True, "ad_impressions": 140}
+    assert "monetization" not in result["daily"][0]
+    assert "monetization" not in result["daily"][1]
+
+
 def test_aggregate_social_insights_daily_rows_handles_empty_rows(monkeypatch):
     app = _import_app_with_stubs(monkeypatch)
     result = app._aggregate_social_insights_daily_rows([])
@@ -9662,6 +9705,7 @@ def test_aggregate_social_insights_daily_rows_handles_empty_rows(monkeypatch):
     assert result["metrics"]["impressions"] is None
     assert result["totals"] == {}
     assert result["daily"] == []
+    assert result["monetization"] is None
 
 
 def test_sync_tiktok_account_insights_computes_delta_from_previous_day(monkeypatch):
@@ -9687,6 +9731,7 @@ def test_sync_tiktok_account_insights_computes_delta_from_previous_day(monkeypat
     assert daily_metrics["engagement"] == 10    # 50 - 40
     assert daily_metrics["comments"] == 2       # 10 - 8
     assert daily_metrics["followers"] == 500    # snapshot, untouched by the diff
+    assert daily_metrics["monetization"] == {}
 
 
 def test_sync_tiktok_account_insights_no_previous_snapshot_uses_full_total(monkeypatch):
@@ -9716,6 +9761,7 @@ def test_sync_day_bucketed_platform_account_insights_upserts_each_day(monkeypatc
             {"date": "2026-10-09", "impressions": 10, "engagement": 2},
             {"date": "2026-10-10", "impressions": 15, "engagement": 3},
         ],
+        "monetization": {"supported": True, "available": True, "ad_impressions": 1000},
     }))
     upsert_mock = AsyncMock()
     monkeypatch.setattr(app, "_upsert_social_insights_daily_row", upsert_mock)
@@ -9728,6 +9774,7 @@ def test_sync_day_bucketed_platform_account_insights_upserts_each_day(monkeypatc
     first_call_metrics = upsert_mock.await_args_list[0].args[4]
     assert first_call_metrics["impressions"] == 10
     assert first_call_metrics["followers"] == 200
+    assert first_call_metrics["monetization"]["ad_impressions"] == 1000
 
 
 def test_refresh_social_insights_enforces_cooldown(monkeypatch):
@@ -10237,6 +10284,7 @@ def test_sync_linkedin_account_insights_backfills_trailing_week(monkeypatch):
     assert first_args[2] == "linkedin_analytics"
     assert first_args[3] == today
     assert first_args[4]["impressions"] == 50
+    assert first_args[4]["monetization"] == {}
 
 
 def test_platform_config_splits_linkedin_publishing_and_analytics_apps(monkeypatch):
